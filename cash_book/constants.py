@@ -45,3 +45,28 @@ MAX_BUNCH_ENTRIES = 200
 #: type-ahead over a payroll of thousands, like the G/L picker: a search that
 #: needs more than this needs better words.
 SALARY_ADVANCE_PEOPLE_LIMIT = 50
+
+#: The G/L heads that make a payment an advance against somebody's wages.
+#:
+#: The same pair the accounts board totals under "Salary advance"
+#: (``accounts_board.constants.SALARY_ADJUSTMENT_CODES``), and named again here
+#: rather than imported for the reason that module gives for its own copy: the
+#: two answer different questions, and one could later want a narrower list
+#: without silently moving the other. ``test_salary_advances`` asserts they
+#: still agree, so a drift is a failing test rather than a screen that quietly
+#: stops showing half the vouchers.
+#:
+#: 1101015 is a BALANCE SHEET account and the other is a P&L one, which is
+#: exactly why they are one line: from the cash box both are "we paid a person
+#: something that is not an expense of running the factory today".
+SALARY_ADVANCE_GL_CODES = (
+    "1101015",  # SUNDRY DEBTORS STAFF -- advance against salary
+    "5630001",  # SALARY EXPENSE -- increments and arrears paid in cash
+)
+
+#: Words a custodian types in the Item column that name nobody. When Item is
+#: one of these the narrative is shown instead, because "Advance" as a label on
+#: a list of advances tells the reader nothing at all.
+GENERIC_ITEM_WORDS = frozenset(
+    {"advacne", "advance", "salary", "increment", "advances"}
+)

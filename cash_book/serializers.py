@@ -595,6 +595,48 @@ class MarkDeductedSerializer(serializers.Serializer):
     deducted_on = serializers.DateField(required=False, allow_null=True, default=None)
 
 
+class SalaryAdvanceRowSerializer(serializers.Serializer):
+    """One line of the Advance Salary screen. Output only.
+
+    A voucher on the register, carrying HR's verdict when it has one. Built by
+    :func:`cash_book.services.salary_advance_rows` from two sources, so it is
+    a plain Serializer over dicts rather than a ModelSerializer -- there is no
+    one model behind a row.
+
+    ``id`` is the HR record's, and is null on a voucher nobody has sent to HR
+    yet. ``employee_name`` is empty on those too: the screen shows the
+    register's own words in ``description`` and claims to identify nobody.
+    """
+
+    id = serializers.IntegerField(allow_null=True)
+    state = serializers.CharField()
+    #: The server's own wording for the state, so every one of them reads the
+    #: same on the page, in the admin and in an export.
+    state_label = serializers.CharField()
+    cash_entry = serializers.IntegerField(allow_null=True)
+    voucher_number = serializers.IntegerField(allow_null=True)
+    paid_on = serializers.DateField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    #: The register's own words -- its Item, or the narrative when Item is one
+    #: of the custodian's generic ones.
+    description = serializers.CharField(allow_blank=True)
+    gl_account_name = serializers.CharField(allow_blank=True)
+
+    employee = serializers.IntegerField(allow_null=True)
+    employee_name = serializers.CharField(allow_blank=True)
+    employee_code = serializers.CharField(allow_blank=True)
+    department = serializers.CharField(allow_blank=True)
+    reason = serializers.CharField(allow_blank=True)
+
+    decided_at = serializers.DateTimeField(allow_null=True)
+    decided_by_name = serializers.CharField(allow_blank=True)
+    decision_note = serializers.CharField(allow_blank=True)
+    deduct_from = serializers.DateField(allow_null=True)
+    deducted_on = serializers.DateField(allow_null=True)
+    is_outstanding = serializers.BooleanField()
+    is_active = serializers.BooleanField()
+
+
 __all__ = [
     "CashBunchSummarySerializer",
     "CreateBunchSerializer",
@@ -621,6 +663,7 @@ __all__ = [
     "MarkDeductedSerializer",
     "RecordSalaryAdvanceSerializer",
     "SalaryAdvanceEmployeeSerializer",
+    "SalaryAdvanceRowSerializer",
     "SalaryAdvanceSerializer",
     "UpdateSalaryAdvanceSerializer",
 ]

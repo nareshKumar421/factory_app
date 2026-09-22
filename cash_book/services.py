@@ -27,7 +27,12 @@ from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
 
-from .constants import MAX_BUNCH_ENTRIES, SALARY_ADVANCE_PEOPLE_LIMIT
+from .constants import (
+    GENERIC_ITEM_WORDS,
+    MAX_BUNCH_ENTRIES,
+    SALARY_ADVANCE_GL_CODES,
+    SALARY_ADVANCE_PEOPLE_LIMIT,
+)
 from .permissions import APPROVE_PERMISSION
 
 #: The codename half of the approve right, for querying group membership.
@@ -1648,33 +1653,6 @@ def undo_salary_advance_deduction(*, user, advance: SalaryAdvance) -> SalaryAdva
     return advance
 
 
-def salary_advance_summary(company) -> dict:
-    """The five bands the screen heads itself with.
-
-    "Outstanding" is the one HR are really after: approved, not yet taken off
-    a wage. It is deliberately not "approved", which would keep counting an
-    advance that was recovered months ago -- so both are sent, and the screen
-    shows the one that answers the question in front of it.
-    """
-    live = SalaryAdvance.objects.filter(company=company, is_active=True)
-
-    def band(rows):
-        figures = rows.aggregate(amount=Sum("amount"), count=Count("id"))
-        return {
-            "amount": figures["amount"] or ZERO,
-            "count": figures["count"] or 0,
-        }
-
-    approved = live.filter(state=SalaryAdvanceState.APPROVED)
-    return {
-        "pending": band(live.filter(state=SalaryAdvanceState.PENDING)),
-        "approved": band(approved),
-        "outstanding": band(approved.filter(deducted_on__isnull=True)),
-        "deducted": band(approved.filter(deducted_on__isnull=False)),
-        "rejected": band(live.filter(state=SalaryAdvanceState.REJECTED)),
-    }
-
-
 def salary_advance_employees(company, search=""):
     """The people an advance can be recorded against.
 
@@ -1699,3 +1677,219 @@ def salary_advance_employees(company, search=""):
             Q(full_name__icontains=needle) | Q(employee_code__icontains=needle)
         )
     return people.order_by("full_name")[:SALARY_ADVANCE_PEOPLE_LIMIT]
+
+
+# ----------------------------------------------------------------------
+# What the screen actually lists
+# ----------------------------------------------------------------------
+#
+# The register has been recording advances against salary all along, as
+# payments on the two staff heads -- that is where the accounts board's
+# "Salary advance" figure comes from, and it is the real history. A screen
+# that listed only the HR records would open empty on a factory with years of
+# advances behind it and look broken.
+#
+# So a row here is the VOUCHER, and HR's verdict is something attached to it.
+# A voucher nobody has sent to HR yet is a real state with its own name, and
+# it is the state almost every historical row is in.
+
+
+#: A voucher on the register that HR have not been told about. Not a
+#: :class:`SalaryAdvanceState` -- those are HR's three answers, and "nobody has
+#: asked them" is not one of them.
+NOT_SENT = "NOT_SENT"
+
+#: Its wording, sent with the row like the model's own labels, so every state
+#: reads the same on the page, in a test and in an export.
+NOT_SENT_LABEL = "Not sent to HR"
+
+
+def voucher_label(entry) -> str:
+    """What a salary voucher is called on screen: the register's own words.
+
+    The Item column when it says something -- it is usually the person's name
+    -- and the narrative when Item is one of the custodian's generic words
+    ("Advacne", "Salary"), which carry no information at all.
+
+    Quoting the register is not attributing money to an employee. Nothing is
+    matched against the directory and no name is parsed out of prose: this is
+    what the voucher says, which is what the Cash Book screen shows for the
+    same row. Naming the person is HR's act, and it happens when they send it
+    for deduction against somebody they picked themselves.
+    """
+    item = (entry.item or "").strip()
+    if item and item.lower() not in GENERIC_ITEM_WORDS:
+        return item
+    return (entry.detail or "").strip() or item
+
+
+def salary_advance_vouchers(company):
+    """Every payment the register booked against a staff head.
+
+    The accounts board's "Salary advance" filter exactly: money out, on the
+    two heads that move a person's pay rather than buying anything.
+    """
+    return (
+        CashEntry.objects.filter(
+            company=company,
+            is_active=True,
+            direction=CashDirection.OUT,
+            gl_account_code__in=SALARY_ADVANCE_GL_CODES,
+        )
+        .select_related("branch")
+        .prefetch_related("salary_advances")
+    )
+
+
+def _row(entry, advance):
+    """One line of the screen, from a voucher, an HR record, or both."""
+    if advance is not None:
+        employee = advance.employee
+        decided_by = advance.decided_by
+        row = {
+            "id": advance.id,
+            "state": advance.state,
+            "state_label": SalaryAdvanceState(advance.state).label,
+            "employee": employee.id,
+            "employee_name": employee.full_name,
+            "employee_code": employee.employee_code,
+            "department": (
+                employee.department.name if employee.department_id else ""
+            ),
+            "reason": advance.reason,
+            "decided_at": advance.decided_at,
+            "decided_by_name": (
+                getattr(decided_by, "full_name", "") or getattr(decided_by, "email", "")
+                if decided_by
+                else ""
+            ),
+            "decision_note": advance.decision_note,
+            "deduct_from": advance.deduct_from,
+            "deducted_on": advance.deducted_on,
+            "is_outstanding": advance.is_outstanding,
+            "is_active": advance.is_active,
+        }
+    else:
+        # A voucher nobody has sent to HR. It names no employee, and the screen
+        # must not invent one -- ``advance_holder`` means "whose float this
+        # clears", which is a different question and on the live register
+        # answers it wrongly. HR pick the person when they send it.
+        row = {
+            "id": None,
+            "state": NOT_SENT,
+            "state_label": NOT_SENT_LABEL,
+            "employee": None,
+            "employee_name": "",
+            "employee_code": "",
+            "department": "",
+            "reason": "",
+            "decided_at": None,
+            "decided_by_name": "",
+            "decision_note": "",
+            "deduct_from": None,
+            "deducted_on": None,
+            "is_outstanding": False,
+            "is_active": True,
+        }
+
+    if entry is not None:
+        row.update(
+            {
+                "cash_entry": entry.id,
+                "voucher_number": entry.serial_number,
+                "paid_on": entry.entry_date,
+                "amount": entry.amount,
+                "description": voucher_label(entry),
+                "gl_account_name": entry.gl_account_name,
+            }
+        )
+    else:
+        # Recorded on this screen with no voucher behind it -- the cash went
+        # out by bank transfer, or on a line nobody joined up.
+        row.update(
+            {
+                "cash_entry": None,
+                "voucher_number": None,
+                "paid_on": advance.paid_on,
+                "amount": advance.amount,
+                "description": advance.reason,
+                "gl_account_name": "",
+            }
+        )
+    return row
+
+
+def salary_advance_rows(company, *, state=None, employee=None, include_cancelled=False):
+    """The screen's list: every salary voucher, carrying HR's verdict.
+
+    Ordered newest first, which is the order the vouchers were paid in rather
+    than the order HR got to them -- the question asked of this screen is
+    "what has gone out lately", and a queue sorted by decision date buries it.
+    """
+    advances = SalaryAdvance.objects.filter(company=company).select_related(
+        "employee", "employee__department", "decided_by"
+    )
+    if not include_cancelled:
+        advances = advances.filter(is_active=True)
+
+    by_entry = {}
+    standalone = []
+    for advance in advances:
+        if advance.cash_entry_id:
+            by_entry[advance.cash_entry_id] = advance
+        else:
+            standalone.append(advance)
+
+    rows = [
+        _row(entry, by_entry.get(entry.id))
+        for entry in salary_advance_vouchers(company)
+    ]
+    rows.extend(_row(None, advance) for advance in standalone)
+
+    if state:
+        rows = [row for row in rows if row["state"] == state]
+    if employee is not None:
+        # One person's history, for the question asked at the counter: "how
+        # many has he had this year?" A voucher nobody has attributed cannot
+        # answer it, so it is not offered as though it might.
+        rows = [row for row in rows if row["employee"] == employee.id]
+
+    rows.sort(key=lambda row: (row["paid_on"], row["cash_entry"] or 0), reverse=True)
+    return rows
+
+
+def salary_advance_summary(company) -> dict:
+    """The bands the screen heads itself with.
+
+    "Outstanding" is the one HR are really after: approved, not yet taken off
+    a wage. It is deliberately not "approved", which would keep counting an
+    advance that was recovered months ago -- so both are sent, and the screen
+    shows the one that answers the question in front of it.
+
+    "not_sent" is read off the register rather than off this table, because
+    that is the whole point of it: vouchers that went out against wages and
+    which nobody in HR has been shown.
+    """
+    live = SalaryAdvance.objects.filter(company=company, is_active=True)
+
+    def band(rows):
+        figures = rows.aggregate(amount=Sum("amount"), count=Count("id"))
+        return {
+            "amount": figures["amount"] or ZERO,
+            "count": figures["count"] or 0,
+        }
+
+    approved = live.filter(state=SalaryAdvanceState.APPROVED)
+    sent = set(
+        live.exclude(cash_entry__isnull=True).values_list("cash_entry_id", flat=True)
+    )
+    not_sent = salary_advance_vouchers(company).exclude(id__in=sent)
+
+    return {
+        "not_sent": band(not_sent),
+        "pending": band(live.filter(state=SalaryAdvanceState.PENDING)),
+        "approved": band(approved),
+        "outstanding": band(approved.filter(deducted_on__isnull=True)),
+        "deducted": band(approved.filter(deducted_on__isnull=False)),
+        "rejected": band(live.filter(state=SalaryAdvanceState.REJECTED)),
+    }

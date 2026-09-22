@@ -26,12 +26,17 @@ from employee_hierarchy.constants import EmploymentStatus
 from employee_hierarchy.models import Department, Employee
 
 from . import services
+from .constants import SALARY_ADVANCE_GL_CODES
 from .models import CashBranch, CashDirection, SalaryAdvance, SalaryAdvanceState
 
 User = get_user_model()
 
 
-class SalaryAdvanceTestCase(TestCase):
+class SalaryAdvanceFixture(TestCase):
+    """The people and the rights every test here needs. No tests of its own,
+    so a second test class can reuse it without re-running the first's."""
+
+
     @classmethod
     def setUpTestData(cls):
         cls.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
@@ -90,10 +95,31 @@ class SalaryAdvanceTestCase(TestCase):
             **kwargs,
         )
 
+    def voucher(self, amount="5000.00", *, code="1101015", item="", detail="", **kwargs):
+        """A payment on a staff head -- what the register has always recorded."""
+        return services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date=kwargs.pop("entry_date", date(2026, 9, 17)),
+            direction=CashDirection.OUT,
+            amount=Decimal(amount),
+            detail=detail or "Cash paid Advance to somebody",
+            item=item,
+            branch=self.branch,
+            gl_account_code=code,
+            gl_account_name="SUNDRY DEBTORS STAFF",
+            require_approver=False,
+            **kwargs,
+        )
+
     def client_for(self, user):
         client = APIClient(headers={"Company-Code": self.company.code})
         client.force_authenticate(user=user)
         return client
+
+
+class SalaryAdvanceTests(SalaryAdvanceFixture):
+    """Recording an advance, and HR's verdict on it."""
 
     # -------------------------------------------------------------- the row
 
@@ -469,3 +495,161 @@ class SalaryAdvanceTestCase(TestCase):
             reverse("cash-book-salary-advance-detail", args=[advance.id])
         )
         self.assertEqual(response.data["voucher_number"], entry.serial_number)
+
+
+class SalaryVoucherListTests(SalaryAdvanceFixture):
+    """What the screen lists, which is the register's own vouchers.
+
+    The factory has been recording advances against salary for years, as
+    payments on the two staff heads -- that is where the accounts board's
+    "Salary advance" figure comes from. A screen that listed only the HR
+    records would open empty on all that history and look broken.
+    """
+
+    def test_the_filter_matches_the_accounts_board(self):
+        """Both name the same two heads. Named twice on purpose, so this test
+        is what stops them drifting into two different screens."""
+        from accounts_board.constants import SALARY_ADJUSTMENT_CODES
+
+        self.assertEqual(
+            set(SALARY_ADVANCE_GL_CODES), set(SALARY_ADJUSTMENT_CODES)
+        )
+
+    def test_a_staff_head_voucher_is_listed_without_anybody_recording_it(self):
+        entry = self.voucher(amount="1000.00", item="Parveen khatun")
+        (row,) = services.salary_advance_rows(self.company)
+        self.assertEqual(row["cash_entry"], entry.id)
+        self.assertEqual(row["amount"], Decimal("1000.00"))
+        self.assertEqual(row["state"], services.NOT_SENT)
+        self.assertIsNone(row["id"])
+
+    def test_a_voucher_on_any_other_head_is_not(self):
+        services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date=date(2026, 9, 17),
+            direction=CashDirection.OUT,
+            amount=Decimal("2000.00"),
+            detail="Cash paid for refreshment",
+            branch=self.branch,
+            gl_account_code="5630004",
+            gl_account_name="REFRESHMENT",
+            require_approver=False,
+        )
+        self.assertEqual(services.salary_advance_rows(self.company), [])
+
+    def test_cash_coming_in_is_not_an_advance(self):
+        """The head is the same on a repayment; the direction is not."""
+        services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date=date(2026, 9, 17),
+            direction=CashDirection.IN,
+            amount=Decimal("1000.00"),
+            detail="Advance returned by Parveen",
+            gl_account_code="1101015",
+            gl_account_name="SUNDRY DEBTORS STAFF",
+        )
+        self.assertEqual(services.salary_advance_rows(self.company), [])
+
+    def test_a_voucher_nobody_sent_names_nobody(self):
+        """`advance_holder` means "whose float this clears", which on the live
+        register answers a different question wrongly. HR pick the person."""
+        self.voucher(item="Parveen khatun")
+        (row,) = services.salary_advance_rows(self.company)
+        self.assertEqual(row["employee_name"], "")
+        self.assertIsNone(row["employee"])
+
+    def test_the_label_is_the_item_when_it_says_something(self):
+        self.voucher(item="Parveen khatun", detail="Cash paid advance")
+        (row,) = services.salary_advance_rows(self.company)
+        self.assertEqual(row["description"], "Parveen khatun")
+
+    def test_the_label_falls_back_to_the_narrative_on_a_generic_item(self):
+        """"Advance" as a label on a list of advances tells nobody anything."""
+        self.voucher(
+            item="Advacne",
+            detail="Cash paid advance to Shyam shukla (Deduct of sep. salary)",
+        )
+        (row,) = services.salary_advance_rows(self.company)
+        self.assertEqual(
+            row["description"],
+            "Cash paid advance to Shyam shukla (Deduct of sep. salary)",
+        )
+
+    def test_hr_s_verdict_rides_on_the_voucher_once_it_is_sent(self):
+        entry = self.voucher(amount="4000.00")
+        advance = services.record_salary_advance(
+            user=self.custodian,
+            company=self.company,
+            employee=self.parveen,
+            paid_on=entry.entry_date,
+            amount=entry.amount,
+            cash_entry=entry,
+        )
+        services.decide_salary_advances(
+            user=self.hr, company=self.company, advance_ids=[advance.id], approve=True
+        )
+
+        # Still ONE row: the verdict attached to the voucher, not beside it.
+        (row,) = services.salary_advance_rows(self.company)
+        self.assertEqual(row["cash_entry"], entry.id)
+        self.assertEqual(row["id"], advance.id)
+        self.assertEqual(row["state"], SalaryAdvanceState.APPROVED)
+        self.assertEqual(row["employee_name"], "Parveen Khatun")
+        self.assertTrue(row["is_outstanding"])
+
+    def test_an_advance_with_no_voucher_is_listed_too(self):
+        """The cash went out by bank transfer, or on a line nobody joined up."""
+        self.advance(amount="700.00")
+        (row,) = services.salary_advance_rows(self.company)
+        self.assertIsNone(row["cash_entry"])
+        self.assertEqual(row["amount"], Decimal("700.00"))
+        self.assertEqual(row["state"], SalaryAdvanceState.PENDING)
+
+    def test_rows_come_back_newest_paid_first(self):
+        self.voucher(amount="100.00", entry_date=date(2026, 9, 1))
+        self.voucher(amount="200.00", entry_date=date(2026, 9, 20))
+        self.voucher(amount="300.00", entry_date=date(2026, 9, 10))
+        paid = [row["paid_on"] for row in services.salary_advance_rows(self.company)]
+        self.assertEqual(
+            paid, [date(2026, 9, 20), date(2026, 9, 10), date(2026, 9, 1)]
+        )
+
+    def test_a_tab_narrows_to_one_state(self):
+        self.voucher(amount="100.00")
+        self.advance(amount="200.00")
+        not_sent = services.salary_advance_rows(
+            self.company, state=services.NOT_SENT
+        )
+        self.assertEqual([row["amount"] for row in not_sent], [Decimal("100.00")])
+        pending = services.salary_advance_rows(self.company, state="PENDING")
+        self.assertEqual([row["amount"] for row in pending], [Decimal("200.00")])
+
+    def test_not_sent_is_totalled_off_the_register(self):
+        """The figure that says how much went out against wages with nobody in
+        HR told -- which is the whole reason the screen exists."""
+        self.voucher(amount="1000.00")
+        entry = self.voucher(amount="2500.00")
+        services.record_salary_advance(
+            user=self.custodian,
+            company=self.company,
+            employee=self.parveen,
+            paid_on=entry.entry_date,
+            amount=entry.amount,
+            cash_entry=entry,
+        )
+
+        summary = services.salary_advance_summary(self.company)
+        self.assertEqual(summary["not_sent"]["amount"], Decimal("1000.00"))
+        self.assertEqual(summary["not_sent"]["count"], 1)
+        self.assertEqual(summary["pending"]["amount"], Decimal("2500.00"))
+
+    def test_the_screen_serves_the_register_over_the_wire(self):
+        self.voucher(amount="1000.00", item="Parveen khatun")
+        response = self.client_for(self.hr).get(reverse("cash-book-salary-advances"))
+        self.assertEqual(response.status_code, 200)
+        (row,) = response.data["results"]
+        self.assertEqual(row["state"], services.NOT_SENT)
+        self.assertEqual(row["description"], "Parveen khatun")
+        self.assertEqual(Decimal(row["amount"]), Decimal("1000.00"))

@@ -85,6 +85,7 @@ from .serializers import (
     MarkDeductedSerializer,
     RecordSalaryAdvanceSerializer,
     SalaryAdvanceEmployeeSerializer,
+    SalaryAdvanceRowSerializer,
     SalaryAdvanceSerializer,
     UpdateSalaryAdvanceSerializer,
 )
@@ -1372,21 +1373,23 @@ class SalaryAdvanceListCreateAPI(APIView):
     def get(self, request):
         company = _company(request)
         state = request.query_params.get("state") or None
-        if state and state not in SalaryAdvanceState.values:
+        # NOT_SENT is a state of the screen, not of the model: it is a voucher
+        # on the register nobody has shown HR, and it is the state almost
+        # every historical row is in.
+        allowed = set(SalaryAdvanceState.values) | {services.NOT_SENT}
+        if state and state not in allowed:
             raise ValidationError({"state": f"No such state: {state}."})
 
         employee_id = _parse_positive_int(request.query_params.get("employee"), None)
-        employee = _employee_for(company, employee_id) if employee_id else None
-
-        rows = services.salary_advances(
+        rows = services.salary_advance_rows(
             company,
             state=state,
-            employee=employee,
+            employee=_employee_for(company, employee_id) if employee_id else None,
             include_cancelled=request.query_params.get("include_cancelled") == "true",
         )
         return Response(
             {
-                "results": SalaryAdvanceSerializer(rows, many=True).data,
+                "results": SalaryAdvanceRowSerializer(rows, many=True).data,
                 # The summary is over the whole book, not the narrowed list:
                 # a tab showing four pending advances must not restate what is
                 # outstanding as though the other tabs were empty.
