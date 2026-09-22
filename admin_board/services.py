@@ -1147,17 +1147,17 @@ class AdminBoardService:
             extra = extras.get(spec["key"]) or {}
             basis = None
             if spec["key"] == "electricity":
-                # NOT the wall board's bucket. The wall prices every meter on
-                # the campus; this board is Jivo Oil's, so it prices the meters
-                # tagged Jivo Oil and drops the Beverages-only ones — see
+                # NOT the wall board's bucket. The wall adds up every meter on
+                # the campus; this board is Jivo Oil's and prices ONE meter —
+                # the main its supply comes in on — because the rest of the
+                # register measures slices of that same supply. See
                 # _electricity_oil.
                 amount = power["cost"]
                 warning = power["warning"]
                 # Off the tile's face, onto the line itself. The user took the
                 # footnote off the card on 2026-09-16; the disclosure it carried
-                # is still true, so it moves to the row's tooltip rather than
-                # being deleted — this figure counts the mains and the
-                # sub-meters that re-measure the same supply.
+                # is still needed, so it moves to the row's tooltip rather than
+                # being deleted — it now says which meter the figure is.
                 basis = self._electricity_note()
             if spec["key"] == "labour":
                 # NOT the wall board's figure. See _labour_departments: the wall
@@ -1219,9 +1219,10 @@ class AdminBoardService:
             "avg_per_day": round(total / elapsed, 2) if elapsed else None,
             "slices": slices,
             "warnings": warnings,
-            # The electricity line reads every meter on the site, and the site's
-            # mains are meters too. Said on the tile because the figure is
-            # ~3x the metered bill by design — see the Company Expense board.
+            # Which meter the electricity line is, said on the tile: it is the
+            # main the supply comes in on, not the register's total — the
+            # Company Expense wall adds every sub-meter to it and reads ~3x
+            # this, and a reader with both screens open has to know why.
             "electricity_note": self._electricity_note(),
         }
 
@@ -1561,22 +1562,60 @@ class AdminBoardService:
             ),
         }
 
+    def _electricity_nil(
+        self, warning: str, detail: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """A powerless electricity line, with the reason attached.
+
+        Zero here always means "no reading reached this line", never "the plant
+        drew nothing" — ``_cost`` reads the warning beside it and draws the
+        slice as unsourced rather than as a real nil.
+        """
+        return {
+            "cost": 0.0,
+            "today": 0.0,
+            "today_detail": None,
+            "today_units": 0.0,
+            "rows": [],
+            "detail": {"value": 0, "text": detail} if detail else {},
+            "warning": warning,
+        }
+
     def _electricity_oil(self) -> Dict[str, Any]:
-        """Month-to-date electricity on Jivo Oil's meters, and only those.
+        """Month-to-date electricity on the one meter the supply comes in on.
 
-        **The campus is not one company.** The Daily Electricity register is
-        factory-wide — Beverages' boiler, ETP, RO and terrace meters are entered
-        on the same page as Oil's — and the factory expense wall prices every
-        one of them on purpose, because "what did the campus spend" is a campus
-        question. This board is Jivo Oil's, so it prices the meters tagged Jivo
-        Oil and drops the Beverages-only ones: ₹22.7 L against ₹17.1 L, 13
-        meters against 8, on the live register for 1-16 Sep 2026.
+        **ONE METER, NOT TWELVE.** The Daily Electricity register keeps a
+        reading per meter per day, and all but a handful of those meters are
+        sub-meters measuring a slice of a supply another meter has already
+        measured whole. Adding them up — which this line did until 2026-09-22,
+        at Rs 29.7 L across 12 meters for 1-22 Sep — prices the same
+        electricity two and three times over. The line reads the MAIN meter and
+        nothing else: Rs 12.03 L on KWH over that same span.
 
-        **A meter shared with Beverages counts IN FULL, not at a share.** KWH,
-        KVAH, LP-196, TR 40 and TR 125 feed both companies, and the register
-        keeps one reading per meter per day with no split behind it — any
-        apportionment here would be a number this service invented rather than
-        one anybody measured. The tile says so on the line.
+        **Which main.** More than one supply comes into the campus — the grid
+        and the DG set, which swap over on a day the grid is out — so
+        ``is_main`` does not by itself name one meter. The tile has room for one
+        and spends it on the biggest, which is the supply the factory actually
+        ran on.
+
+        **Never a meter the master keeps out of the supply total.** KVAH is the
+        grid's KWH counted as apparent energy — the same electricity, not a
+        second feed — and carries ``counts_as_supply=False`` for that reason.
+        It reads HIGHER than KWH (Rs 12.84 L against Rs 12.03 L on the live
+        register for 1-22 Sep), so "the biggest main" would land on the
+        duplicate if the flag were not honoured.
+
+        **The campus is not one company.** Beverages' boiler, ETP, RO and
+        terrace meters are entered on the same page as Oil's, and the factory
+        expense wall prices every one of them on purpose, because what the
+        campus spent is a campus question. This board is Jivo Oil's, so it
+        reads the meters tagged Jivo Oil and drops the Beverages-only ones.
+
+        **A main shared with Beverages counts IN FULL.** All three mains feed
+        both companies, and the register holds one reading per meter per day
+        with no split behind it — any apportionment here would be a number this
+        service invented rather than one anybody measured. The tile says so on
+        the line.
 
         The company filter is forced on rather than read from the wall board's
         ``electricity_only_company_meters`` switch. That switch exists so the
@@ -1584,26 +1623,21 @@ class AdminBoardService:
         Oil-only figure must not quietly widen back into a campus one. The
         settings row is changed in memory and never saved.
 
-        Counting the meters that were READ, rather than the rows of the meter
-        master, is deliberate: a meter nobody has read this month contributes no
-        rupees and must not be claimed as measured.
+        **A main nobody read is not a nil.** Where the register holds Oil
+        readings this month but none on a main meter, this reports zero with a
+        warning rather than falling back to the biggest sub-meter: a sub-meter
+        in the headline would understate the supply by whatever nobody metered,
+        and would read as a measurement instead of as a gap in the register.
         """
         from factory_expense.services import electricity_costs, get_settings
+        from maintenance.models import ElectricityMeter
 
         company = Company.objects.filter(code=ELECTRICITY_COMPANY).first()
         if company is None:
-            return {
-                "cost": 0.0,
-                "today": 0.0,
-                "today_detail": None,
-                "today_units": 0.0,
-                "rows": [],
-                "detail": {},
-                "warning": (
-                    f"No '{ELECTRICITY_COMPANY}' company on this deployment, so "
-                    "the electricity line has no meters to read."
-                ),
-            }
+            return self._electricity_nil(
+                f"No '{ELECTRICITY_COMPANY}' company on this deployment, so "
+                "the electricity line has no meters to read."
+            )
 
         settings_row = get_settings(company)
         settings_row.electricity_only_company_meters = True  # in memory only
@@ -1611,62 +1645,72 @@ class AdminBoardService:
             self.month_first + timedelta(days=offset)
             for offset in range((self.today - self.month_first).days + 1)
         ]
-        per_date, meters = electricity_costs(
-            [company], dates, settings_row, focus=set(dates)
-        )
-        cost = sum(_f(bucket.get("cost")) for bucket in per_date.values())
-        units = sum(_f(bucket.get("units")) for bucket in per_date.values())
-        today_bucket = per_date.get(self.today) or {}
-        today_cost = _f(today_bucket.get("cost"))
-        today_units = _f(today_bucket.get("units"))
+        _, meters = electricity_costs([company], dates, settings_row, focus=set(dates))
 
         if not meters:
-            return {
-                "cost": 0.0,
-                "today": 0.0,
-                "today_detail": None,
-                "today_units": 0.0,
-                "rows": [],
-                "detail": {"value": 0, "text": f"no {company.name} meter read this month"},
-                "warning": (
-                    f"No reading on a {company.name} meter this month — "
-                    "Maintenance › Daily Electricity."
-                ),
-            }
+            return self._electricity_nil(
+                f"No reading on a {company.name} meter this month — "
+                "Maintenance › Daily Electricity.",
+                detail=f"no {company.name} meter read this month",
+            )
 
-        # Today's readings on their own, so a meter can say what it cost today
+        # Counting the meters that were READ, rather than the rows of the meter
+        # master, is deliberate here too: a main nobody has read this month
+        # contributes no rupees and must not be claimed as measured.
+        mains = set(
+            ElectricityMeter.objects.filter(
+                is_main=True, counts_as_supply=True, is_active=True
+            ).values_list("name", flat=True)
+        )
+        read_mains = {
+            name: bucket for name, bucket in meters.items() if name in mains
+        }
+        if not read_mains:
+            return self._electricity_nil(
+                f"No reading on a main {company.name} meter this month — the "
+                "meters that were read measure slices of the supply, not the "
+                "supply. Maintenance › Daily Electricity.",
+                detail="no main meter read this month",
+            )
+
+        # Money first, units only to break a tie: two mains on the same tariff
+        # rank the same either way, and where the tariffs differ it is the bill
+        # this tile is drawing, not the dial.
+        name, bucket = max(
+            read_mains.items(),
+            key=lambda entry: (_f(entry[1].get("cost")), _f(entry[1].get("units"))),
+        )
+        cost = _f(bucket.get("cost"))
+        units = _f(bucket.get("units"))
+        rate = _f(bucket.get("rate"))
+
+        # Today's reading on its own, so the meter can say what it cost today
         # beside what it has cost all month. A second read over ONE day rather
         # than a second month-wide pass: the month's own call is the expensive
         # one and this adds a day to it, not another month.
         _, today_meters = electricity_costs(
             [company], [self.today], settings_row, focus={self.today}
         )
+        read_today = today_meters.get(name)
+        today_cost = _f(read_today.get("cost")) if read_today is not None else 0.0
+        today_units = _f(read_today.get("units")) if read_today is not None else 0.0
 
-        rows = []
-        for name, bucket in meters.items():
-            meter_units = _f(bucket.get("units"))
-            meter_rate = _f(bucket.get("rate"))
-            read_today = today_meters.get(name)
-            rows.append(
-                {
-                    "label": name,
-                    "detail": (
-                        f"{meter_units:,.0f} units at ₹{meter_rate:,.2f}/unit"
-                        if meter_units and meter_rate
-                        else (f"{meter_units:,.0f} units" if meter_units else None)
-                    ),
-                    "amount": round(_f(bucket.get("cost")), 2),
-                    # None, not zero, on a meter nobody read today. A meter
-                    # carries on drawing power whether or not somebody wrote
-                    # the number down, and nil here would say it did not.
-                    "today": (
-                        round(_f(read_today.get("cost")), 2)
-                        if read_today is not None
-                        else None
-                    ),
-                }
-            )
-        rows.sort(key=lambda row: row["amount"], reverse=True)
+        detail = (
+            f"{units:,.0f} units at ₹{rate:,.2f}/unit"
+            if units and rate
+            else (f"{units:,.0f} units" if units else None)
+        )
+        rows = [
+            {
+                "label": name,
+                "detail": detail,
+                "amount": round(cost, 2),
+                # None, not zero, on a day nobody read the dial. The meter
+                # carries on drawing power whether or not somebody wrote the
+                # number down, and nil here would say it did not.
+                "today": round(today_cost, 2) if read_today is not None else None,
+            }
+        ]
 
         return {
             "cost": round(cost, 2),
@@ -1681,20 +1725,20 @@ class AdminBoardService:
             "today_units": round(today_units, 2),
             "rows": rows,
             "detail": {
-                "value": len(meters),
-                "text": (
-                    f"{len(meters)} {company.name} meters · {units:,.0f} units"
-                    if units
-                    else f"{len(meters)} {company.name} meters"
-                ),
+                # The units behind the money, not a count of meters: there is
+                # one meter on this line and its name is already in the text.
+                "value": round(units, 2),
+                "text": f"{name} · {units:,.0f} units" if units else name,
             },
             "warning": None,
         }
 
     def _electricity_note(self) -> str:
-        """Why the electricity figure is bigger than the electricity bill."""
+        """Which meter the electricity figure is, and which it is not."""
         return (
-            "Jivo Oil's meters only, mains included — the sub-meters measure "
-            "the same supply again, and the five shared with Beverages count in "
-            "full, so this runs well above the metered bill."
+            "The main meter Jivo Oil's supply comes in on, alone — the "
+            "sub-meters re-measure slices of that same supply, so adding them "
+            "would price the same electricity two and three times over. The "
+            "mains are shared with Beverages and count in full: the register "
+            "keeps one reading a day per meter, with no split behind it."
         )

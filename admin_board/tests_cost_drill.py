@@ -314,30 +314,25 @@ class ElectricityRowTests(TestCase):
             )
 
         self.floor = meter("Production Floor OIL")
-        self.kwh = meter("KWH")
+        self.kwh = meter("KWH", main=True)
         reading(self.floor, date(2026, 9, 2), "0", "1000")
         reading(self.floor, TODAY, "1000", "1500")
         reading(self.kwh, date(2026, 9, 2), "0", "2000")
+        reading(self.kwh, TODAY, "2000", "2500")
 
     def _power(self):
         return line(cost(), "electricity")
 
-    def test_one_row_per_meter_read_this_month_with_its_own_rate(self):
+    def test_the_one_row_is_the_main_meter_with_its_own_rate(self):
         rows = self._power()["rows"]
         self.assertEqual(
             [(row["label"], row["detail"], row["amount"]) for row in rows],
-            [
-                ("KWH", "2,000 units at ₹7.00/unit", 14_000.0),
-                ("Production Floor OIL", "1,500 units at ₹7.00/unit", 10_500.0),
-            ],
+            [("KWH", "2,500 units at ₹7.00/unit", 17_500.0)],
         )
 
-    def test_a_meter_nobody_read_today_says_unknown_not_nil(self):
-        # A meter carries on drawing power whether or not somebody wrote the
-        # number down. Nil here would report that KWH's line stopped.
-        by_meter = {row["label"]: row["today"] for row in self._power()["rows"]}
-        self.assertEqual(by_meter["Production Floor OIL"], 3_500.0)
-        self.assertIsNone(by_meter["KWH"])
+    def test_the_row_adds_up_to_the_line_that_opened_it(self):
+        power = self._power()
+        self.assertEqual(sum(row["amount"] for row in power["rows"]), power["amount"])
 
     def test_today_names_the_units_behind_the_money(self):
         power = self._power()
@@ -345,6 +340,14 @@ class ElectricityRowTests(TestCase):
         self.assertEqual(power["today_detail"], "500 units today")
         self.assertEqual(power["today_detail_value"], 500.0)
         self.assertEqual(power["today_detail_unit"], "units")
+
+    def test_a_meter_nobody_read_today_says_unknown_not_nil(self):
+        # A meter carries on drawing power whether or not somebody wrote the
+        # number down. Nil on the row would report that KWH's line stopped.
+        from maintenance.models import DailyElectricityReading
+
+        DailyElectricityReading.objects.filter(meter=self.kwh, date=TODAY).delete()
+        self.assertIsNone(self._power()["rows"][0]["today"])
 
     def test_a_day_with_no_reading_entered_says_that_rather_than_nothing(self):
         from maintenance.models import DailyElectricityReading

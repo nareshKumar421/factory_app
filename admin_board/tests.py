@@ -507,18 +507,25 @@ class NamedDepartmentLabourCostTests(TestCase):
         self.assertEqual(keys_seen["electricity"], "Electricity")
         self.assertNotIn("others", keys_seen)
 
-    def test_the_electricity_note_says_why_it_beats_the_bill(self):
-        self.assertIn("mains", self._cost()["electricity_note"])
+    def test_the_electricity_note_names_the_meter_the_line_is(self):
+        # The wall board reads ~3x this line, and the only thing that explains
+        # the gap is WHICH meter each of them is.
+        note = self._cost()["electricity_note"]
+        self.assertIn("main meter", note)
+        self.assertIn("sub-meters", note)
 
 
 class OilOnlyElectricityTests(TestCase):
-    """The electricity line reads Jivo Oil's meters and nobody else's.
+    """The electricity line is ONE meter: Jivo Oil's incoming supply.
 
-    The Daily Electricity register is campus-wide: Beverages' boiler, ETP, RO
-    and terrace meters are entered on the same page as Oil's, and the Factory
-    Expense wall prices all of them on purpose. This board is Jivo Oil's, so a
-    Beverages-only meter must not reach it — on the live register for 1-16 Sep
-    that is the difference between Rs 22.7 L over 13 meters and Rs 17.1 L over 8.
+    Two rules meet on this line and neither one alone gets the figure right.
+    The register is campus-wide — Beverages' boiler, ETP, RO and terrace meters
+    are entered on the same page as Oil's, and the Factory Expense wall prices
+    all of them on purpose — so a Beverages-only meter must not reach this
+    board. And of Oil's own meters, all but the mains measure a slice of a
+    supply a main has already measured whole, so adding them up prices the same
+    electricity twice: Rs 29.7 L across 12 meters for 1-22 Sep on the live
+    register, against Rs 12.03 L on the main the factory actually ran on.
     """
 
     def setUp(self):
@@ -527,11 +534,13 @@ class OilOnlyElectricityTests(TestCase):
         self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
         self.bev = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
 
-        def meter(name, companies, units):
+        def meter(name, companies, units, main=False, counts=True):
             row = ElectricityMeter.objects.create(
                 name=name,
                 rate_per_unit=Decimal("7"),
                 multiplying_factor=Decimal("1"),
+                is_main=main,
+                counts_as_supply=counts,
             )
             row.companies.set(companies)
             DailyElectricityReading.objects.create(
@@ -544,8 +553,9 @@ class OilOnlyElectricityTests(TestCase):
             )
             return row
 
+        self.meter = meter
         meter("Production Floor OIL", [self.oil], "1000")
-        meter("KWH", [self.oil, self.bev], "2000")
+        meter("KWH", [self.oil, self.bev], "2000", main=True)
         meter("Boiler", [self.bev], "5000")
 
     def _electricity(self):
@@ -554,14 +564,31 @@ class OilOnlyElectricityTests(TestCase):
             entry for entry in service._cost()["slices"] if entry["key"] == "electricity"
         )
 
-    def test_a_beverages_meter_is_not_billed_to_this_board(self):
-        # 3,000 units at Rs 7, NOT 8,000 — the boiler is Beverages' alone.
-        self.assertEqual(self._electricity()["amount"], 21_000.0)
+    def test_the_line_is_the_main_meter_alone(self):
+        # 2,000 units at Rs 7 — NOT 3,000 with the production floor added on
+        # top, which re-measures part of the same supply, and not 8,000 with
+        # the boiler, which is Beverages' alone.
+        self.assertEqual(self._electricity()["amount"], 14_000.0)
 
-    def test_the_detail_counts_oil_meters_only_and_names_the_company(self):
+    def test_the_detail_names_the_meter_it_is_showing(self):
         detail = self._electricity()
-        self.assertEqual(detail["detail_value"], 2)
-        self.assertEqual(detail["detail"], "2 Jivo Oil meters · 3,000 units")
+        self.assertEqual(detail["detail"], "KWH · 2,000 units")
+        self.assertEqual(detail["detail_value"], 2_000.0)
+
+    def test_the_biggest_main_is_the_one_shown(self):
+        # A campus with two supplies (the grid and the DG set) has two mains,
+        # and the tile has room for one: the one the factory ran on.
+        self.meter("DG SET", [self.oil], "9000", main=True)
+        detail = self._electricity()
+        self.assertEqual(detail["detail"], "DG SET · 9,000 units")
+        self.assertEqual(detail["amount"], 63_000.0)
+
+    def test_a_main_that_re_reads_another_main_is_never_the_one_shown(self):
+        # KVAH is the grid's KWH as apparent energy — the same electricity, not
+        # a second feed — so the master keeps it out of the supply total. It
+        # reads HIGHER than KWH, and picking on size alone would land on it.
+        self.meter("KVAH", [self.oil, self.bev], "9000", main=True, counts=False)
+        self.assertEqual(self._electricity()["detail"], "KWH · 2,000 units")
 
     def test_a_shared_meter_counts_in_full_because_nothing_splits_it(self):
         # KWH feeds both companies and the register holds one reading a day with
@@ -581,6 +608,19 @@ class OilOnlyElectricityTests(TestCase):
         # The wall board stays quiet here — Beverages' boiler WAS read — so the
         # silence it would pass on cannot be trusted.
         self.assertIn("No reading on a Jivo Oil meter", power["warning"])
+
+    def test_sub_meters_alone_are_a_gap_in_the_register_not_a_figure(self):
+        # The production floor was read and the main was not. Pricing the floor
+        # as the line would report a fraction of the supply as if somebody had
+        # measured the whole of it.
+        from maintenance.models import DailyElectricityReading
+
+        DailyElectricityReading.objects.filter(meter__name="KWH").delete()
+        power = self._electricity()
+        self.assertEqual(power["amount"], 0.0)
+        self.assertFalse(power["has_source"])
+        self.assertEqual(power["detail"], "no main meter read this month")
+        self.assertIn("No reading on a main Jivo Oil meter", power["warning"])
 
 
 class EximTankReadingTests(SimpleTestCase):

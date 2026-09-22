@@ -191,9 +191,9 @@ LABOUR_DEPARTMENTS = [
 #: The Daily Electricity register is CAMPUS-WIDE — Beverages' boiler, ETP, RO
 #: and terrace meters are entered on the same page as Oil's — and the factory
 #: expense wall deliberately prices every one of them. This board is Jivo Oil's,
-#: so its electricity line reads Oil's meters only. See
-#: ``AdminBoardService._electricity_oil`` for why a meter shared with Beverages
-#: still counts in full.
+#: so its electricity line reads Oil's meters only, and of those the ONE main
+#: its supply comes in on. See ``AdminBoardService._electricity_oil`` for which
+#: main, and for why one shared with Beverages still counts in full.
 ELECTRICITY_COMPANY = "JIVO_OIL"
 
 #: The opening words of the factory expense wall's "nobody read a meter"
