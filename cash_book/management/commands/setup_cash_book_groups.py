@@ -6,7 +6,8 @@ Usage::
     python manage.py setup_cash_book_groups           # create / update
     python manage.py setup_cash_book_groups --list    # show what each holds
 
-Four roles, because a cash box needs four:
+Five roles. Four are the cash box's own; the fifth is HR's, and it holds
+nothing but the salary advance screen:
 
 * **Cash Book Viewer**    -- anybody who has to read the book: accounts, audit,
   a plant head checking what a department is spending.
@@ -18,6 +19,10 @@ Four roles, because a cash box needs four:
   granting both should be something somebody chose to do.
 * **Cash Book Administrator** -- keeps the book *and* configures the branch
   list behind it (Settings -> Cash Book Branches).
+* **Salary Advance HR** -- decides whether an advance accounts handed over
+  comes back off a wage, and ticks it off once it has. The one group here that
+  is not given the view right: agreeing to dock somebody's pay is a payroll
+  decision, and it does not need the petty cash register to make it.
 
 Each group lists the view right explicitly as well as its own. It is implied at
 the endpoints, but a group that lists both reads correctly off the admin screen.
@@ -30,6 +35,7 @@ VIEW = "cash_book.can_view_cash_book"
 MANAGE = "cash_book.can_manage_cash_book"
 APPROVE = "cash_book.can_approve_cash_entries"
 BRANCHES = "cash_book.can_manage_cash_branches"
+SALARY_ADVANCES = "cash_book.can_approve_salary_advances"
 
 CASH_BOOK_GROUPS = {
     "Cash Book Viewer": [VIEW],
@@ -39,11 +45,16 @@ CASH_BOOK_GROUPS = {
     # because renaming or retiring a branch reaches back through the
     # whole register -- a settings decision, not a day's cash handling.
     "Cash Book Administrator": [VIEW, MANAGE, BRANCHES],
+    # HR, and only the one screen. No view right: they decide whether an
+    # advance comes off a wage, which is a payroll decision, and nothing about
+    # it needs them reading the factory's petty cash register. The Advance
+    # Salary endpoints admit this right by name.
+    "Salary Advance HR": [SALARY_ADVANCES],
 }
 
 
 class Command(BaseCommand):
-    help = "Create the Cash Book Viewer / Custodian / Approver / Administrator groups."
+    help = "Create the cash book's role groups and the Salary Advance HR group."
 
     def add_arguments(self, parser):
         parser.add_argument(

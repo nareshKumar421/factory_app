@@ -16,6 +16,7 @@ Two invariants are this module's whole job:
 """
 
 import pathlib
+from datetime import timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -26,7 +27,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
 
-from .constants import MAX_BUNCH_ENTRIES
+from .constants import MAX_BUNCH_ENTRIES, SALARY_ADVANCE_PEOPLE_LIMIT
 from .permissions import APPROVE_PERMISSION
 
 #: The codename half of the approve right, for querying group membership.
@@ -42,6 +43,8 @@ from .models import (
     CashEntry,
     CashEntryAttachment,
     EntryApprovalStatus,
+    SalaryAdvance,
+    SalaryAdvanceState,
 )
 
 
@@ -1378,3 +1381,321 @@ def reconciliation(company) -> dict:
             + owed
         ),
     }
+
+
+# ----------------------------------------------------------------------
+# Advances against salary
+# ----------------------------------------------------------------------
+#
+# Two decisions, taken by two people, which is why this is not simply another
+# approval state on the voucher:
+#
+#   accounts hand the cash over  ->  the register says the box is that much
+#                                    lighter, and the cash approver agrees to
+#                                    it as they would to any payment.
+#   HR agree it comes off a wage ->  the amount is owed back out of pay, and
+#                                    somebody has to remember to take it.
+#
+# Nothing here touches ``balance_after``. The money left the box on the
+# voucher; a second row for it would take it off the balance twice.
+
+
+def _first_of_next_month(day):
+    """The salary month an advance paid on ``day`` comes off.
+
+    The next one, always. An advance handed over on the 3rd and one handed
+    over on the 28th are both docked from the wage after the wage they were
+    taken against -- there is no part-month here, because a salary is paid
+    whole or not at all.
+    """
+    return (day.replace(day=1) + timedelta(days=32)).replace(day=1)
+
+
+def _own_employee(company, employee):
+    """Refuse an employee from another company's payroll."""
+    if employee is None:
+        raise ValidationError({"employee": "Say whose wage this comes off."})
+    if employee.company_id != company.id:
+        raise ValidationError({"employee": "That person is not on this payroll."})
+    return employee
+
+
+def salary_advances(company, *, state=None, employee=None, include_cancelled=False):
+    """The advance list, narrowed the way the screen asks for it."""
+    rows = SalaryAdvance.objects.filter(company=company).select_related(
+        "employee",
+        "employee__department",
+        "employee__designation",
+        "cash_entry",
+        "decided_by",
+        "created_by",
+    )
+    if not include_cancelled:
+        rows = rows.filter(is_active=True)
+    if state:
+        rows = rows.filter(state=state)
+    if employee is not None:
+        rows = rows.filter(employee=employee)
+    return rows
+
+
+@transaction.atomic
+def record_salary_advance(
+    *,
+    user,
+    company,
+    employee,
+    paid_on,
+    amount,
+    reason="",
+    cash_entry=None,
+) -> SalaryAdvance:
+    """Write down an advance accounts have handed over.
+
+    It reaches HR as PENDING and nothing else: telling them is the whole
+    purpose of the row, so there is no draft for it to sit in.
+    """
+    employee = _own_employee(company, employee)
+    if cash_entry is not None and cash_entry.company_id != company.id:
+        raise ValidationError({"cash_entry": "That voucher is another company's."})
+
+    return SalaryAdvance.objects.create(
+        company=company,
+        employee=employee,
+        paid_on=paid_on,
+        amount=amount,
+        reason=(reason or "").strip(),
+        cash_entry=cash_entry,
+        state=SalaryAdvanceState.PENDING,
+        created_by=user,
+        updated_by=user,
+    )
+
+
+@transaction.atomic
+def update_salary_advance(*, user, advance: SalaryAdvance, **changes) -> SalaryAdvance:
+    """Correct an advance HR have not decided on yet.
+
+    Once they have, it is fixed. Their verdict was given on an amount and a
+    person, and quietly changing either underneath it would leave a decision
+    standing for something nobody agreed to.
+    """
+    if advance.state != SalaryAdvanceState.PENDING:
+        raise ValidationError(
+            {
+                "state": (
+                    "HR have already decided this one. Take it out and record "
+                    "it again if it was wrong."
+                )
+            }
+        )
+
+    for field in ("paid_on", "amount", "reason"):
+        if field in changes:
+            setattr(advance, field, changes[field])
+    if "employee" in changes:
+        advance.employee = _own_employee(company=advance.company, employee=changes["employee"])
+    if "cash_entry" in changes:
+        advance.cash_entry = changes["cash_entry"]
+
+    advance.reason = (advance.reason or "").strip()
+    advance.updated_by = user
+    advance.save()
+    return advance
+
+
+@transaction.atomic
+def cancel_salary_advance(*, user, advance: SalaryAdvance) -> SalaryAdvance:
+    """Take an advance out of the list, keeping the row.
+
+    Kept rather than deleted for the same reason a cancelled voucher is kept:
+    an amount somebody was told about, and then was not, is worth being able
+    to look up.
+    """
+    if not advance.is_active:
+        return advance
+    advance.is_active = False
+    advance.updated_by = user
+    advance.save(update_fields=["is_active", "updated_by", "updated_at"])
+    return advance
+
+
+def _advances_for_decision(company, advance_ids, *, verb):
+    """The rows a decision names, or a sentence about why it cannot be taken."""
+    ids = list(dict.fromkeys(advance_ids or []))
+    if not ids:
+        raise ValidationError({"advance_ids": "Pick at least one advance."})
+
+    rows = list(
+        SalaryAdvance.objects.select_for_update().filter(
+            company=company, id__in=ids, is_active=True
+        )
+    )
+    found = {row.id for row in rows}
+    missing = [advance_id for advance_id in ids if advance_id not in found]
+    if missing:
+        raise ValidationError(
+            {"advance_ids": f"No advance here with id {_join(missing)}."}
+        )
+
+    settled = [row.id for row in rows if row.state != SalaryAdvanceState.PENDING]
+    if settled:
+        raise ValidationError(
+            {
+                "advance_ids": (
+                    f"These were already decided, so they cannot be {verb}: "
+                    f"{_join(settled)}."
+                )
+            }
+        )
+    return rows
+
+
+@transaction.atomic
+def decide_salary_advances(
+    *, user, company, advance_ids, approve: bool, note="", deduct_from=None
+) -> list:
+    """HR's verdict on advances waiting on them.
+
+    Approving marks the amount for deduction and says which salary month it
+    comes off -- the month after it was paid unless HR pick another, because a
+    wage already run cannot be docked retrospectively.
+
+    Rejecting must say why. Accounts have already handed the cash over, so a
+    rejection is not "this will not happen" but "this is not coming back off a
+    wage" -- and somebody has to be told which, and on what grounds.
+    """
+    reason = (note or "").strip()
+    if not approve and not reason:
+        raise ValidationError(
+            {
+                "note": (
+                    "Say why. The cash is already with them, so a rejection "
+                    "has to tell accounts how it is being recovered instead."
+                )
+            }
+        )
+
+    rows = _advances_for_decision(
+        company, advance_ids, verb="approved" if approve else "rejected"
+    )
+    now = timezone.now()
+    for advance in rows:
+        advance.state = (
+            SalaryAdvanceState.APPROVED if approve else SalaryAdvanceState.REJECTED
+        )
+        advance.decided_at = now
+        advance.decided_by = user
+        advance.decision_note = reason
+        # A rejected advance is not owed off a wage, so it carries no month.
+        advance.deduct_from = (
+            (deduct_from or _first_of_next_month(advance.paid_on)) if approve else None
+        )
+        advance.updated_by = user
+
+    SalaryAdvance.objects.bulk_update(
+        rows,
+        [
+            "state",
+            "decided_at",
+            "decided_by",
+            "decision_note",
+            "deduct_from",
+            "updated_by",
+        ],
+    )
+    return rows
+
+
+@transaction.atomic
+def mark_salary_advance_deducted(
+    *, user, advance: SalaryAdvance, deducted_on=None
+) -> SalaryAdvance:
+    """Record that the amount has actually come off a wage.
+
+    The step that closes the loop. Without it "approved" only ever means
+    somebody agreed it should be docked, and an advance agreed to in April is
+    indistinguishable in September from one already recovered.
+    """
+    if advance.state != SalaryAdvanceState.APPROVED:
+        raise ValidationError(
+            {"state": "Only an advance HR approved can be deducted from a wage."}
+        )
+    if advance.deducted_on is not None:
+        raise ValidationError(
+            {"deducted_on": "That one has already been taken off a wage."}
+        )
+
+    advance.deducted_on = deducted_on or timezone.localdate()
+    advance.updated_by = user
+    advance.save(update_fields=["deducted_on", "updated_by", "updated_at"])
+    return advance
+
+
+@transaction.atomic
+def undo_salary_advance_deduction(*, user, advance: SalaryAdvance) -> SalaryAdvance:
+    """Put an advance back on the to-deduct list.
+
+    For the ordinary mistake: ticked off the wrong person, or a payroll run
+    that was reversed. It goes back to approved-and-owed, which is where it
+    was, rather than back to HR -- their verdict has not changed.
+    """
+    if advance.deducted_on is None:
+        return advance
+    advance.deducted_on = None
+    advance.updated_by = user
+    advance.save(update_fields=["deducted_on", "updated_by", "updated_at"])
+    return advance
+
+
+def salary_advance_summary(company) -> dict:
+    """The five bands the screen heads itself with.
+
+    "Outstanding" is the one HR are really after: approved, not yet taken off
+    a wage. It is deliberately not "approved", which would keep counting an
+    advance that was recovered months ago -- so both are sent, and the screen
+    shows the one that answers the question in front of it.
+    """
+    live = SalaryAdvance.objects.filter(company=company, is_active=True)
+
+    def band(rows):
+        figures = rows.aggregate(amount=Sum("amount"), count=Count("id"))
+        return {
+            "amount": figures["amount"] or ZERO,
+            "count": figures["count"] or 0,
+        }
+
+    approved = live.filter(state=SalaryAdvanceState.APPROVED)
+    return {
+        "pending": band(live.filter(state=SalaryAdvanceState.PENDING)),
+        "approved": band(approved),
+        "outstanding": band(approved.filter(deducted_on__isnull=True)),
+        "deducted": band(approved.filter(deducted_on__isnull=False)),
+        "rejected": band(live.filter(state=SalaryAdvanceState.REJECTED)),
+    }
+
+
+def salary_advance_employees(company, search=""):
+    """The people an advance can be recorded against.
+
+    Searched on the server and capped, like the G/L picker: a factory's roll
+    is thousands of names and a list that long is not a list anybody reads.
+
+    Still on the payroll only -- the directory's own ``IN_SERVICE_STATUSES``,
+    so probation, leave and suspension are all in. An advance to somebody who
+    has left is not a deduction from a wage, because there is no wage, and it
+    belongs with whoever chases what ex-employees owe.
+    """
+    from employee_hierarchy.constants import IN_SERVICE_STATUSES
+    from employee_hierarchy.models import Employee
+
+    people = Employee.objects.filter(
+        company=company, employment_status__in=IN_SERVICE_STATUSES
+    ).select_related("department", "designation")
+
+    needle = (search or "").strip()
+    if needle:
+        people = people.filter(
+            Q(full_name__icontains=needle) | Q(employee_code__icontains=needle)
+        )
+    return people.order_by("full_name")[:SALARY_ADVANCE_PEOPLE_LIMIT]

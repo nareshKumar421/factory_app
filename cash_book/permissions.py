@@ -1,16 +1,26 @@
 """
-Three rights, matching the three people a cash box involves.
+The rights, matching the people a cash box involves.
 
 ``can_view_cash_book``    -- read the register and the bunches.
 ``can_manage_cash_book``  -- record, correct and cancel entries; send a bunch.
 ``can_approve_cash_entries`` -- approve or reject payments somebody else
                              recorded.
+``can_manage_cash_branches`` -- configure the branch list every entry is
+                             filed under. Declared beside its own class below.
+``can_approve_salary_advances`` -- HR's: agree that an advance comes back off
+                             a wage. Also declared below, with the screen it
+                             guards.
 
 Manage and approve both imply view at the read endpoints: nobody should be able
 to act on a book they cannot look at. The custodian and the approver are
 deliberately separate rights, because that separation is the only control the
 module has -- but they are not mutually exclusive, so a small site can grant
 both to one person knowingly.
+
+The salary advance right is the one that does NOT imply view, and is the only
+right here that opens a screen without opening the register. Agreeing to dock
+somebody's pay is a payroll decision; it does not need the factory's petty
+cash. See :class:`SalaryAdvancePermission`.
 """
 
 from rest_framework.permissions import BasePermission
@@ -94,3 +104,64 @@ class CashBranchPermission(BasePermission):
         if request.method in WRITE_METHODS:
             return CanManageCashBranches().has_permission(request, view)
         return CanViewCashBook().has_permission(request, view)
+
+
+SALARY_ADVANCE_PERMISSION = "cash_book.can_approve_salary_advances"
+
+
+class CanApproveSalaryAdvances(BasePermission):
+    """HR's right: agree that an advance comes back off a wage.
+
+    Kept apart from ``can_approve_cash_entries`` on purpose. The cash approver
+    agrees that money should have left the box; this agrees to dock somebody's
+    pay, which is the payroll's decision and nobody else's. A site that wants
+    one person doing both grants both.
+    """
+
+    message = "You are not allowed to decide on advances against salary."
+
+    def has_permission(self, request, view):
+        return _has(request.user, SALARY_ADVANCE_PERMISSION)
+
+
+class SalaryAdvancePermission(BasePermission):
+    """Who may open the salary advance screen at all.
+
+    HR are let in on their own right, without the cash book's view permission.
+    They are not book-keepers and have no business reading the register -- but
+    the page they decide on is one of its screens, so the read has to admit
+    them by name.
+    """
+
+    message = "You do not have access to advances against salary."
+
+    def has_permission(self, request, view):
+        if request.method in WRITE_METHODS:
+            # Recording one is book-keeping; deciding it is HR's. The views
+            # that decide check the HR right themselves, so a writer here is
+            # either of them and the narrower check comes after.
+            return _has(request.user, MANAGE_PERMISSION, SALARY_ADVANCE_PERMISSION)
+        return _has(
+            request.user,
+            VIEW_PERMISSION,
+            MANAGE_PERMISSION,
+            APPROVE_PERMISSION,
+            SALARY_ADVANCE_PERMISSION,
+        )
+
+
+class SalaryAdvanceWritePermission(BasePermission):
+    """The one advance: readable by anyone on the screen, written by accounts.
+
+    Correcting or withdrawing an advance is book-keeping, not a verdict, so it
+    stays with whoever keeps the book. HR may still read the row -- refusing
+    them the row whose list they are already reading would be a distinction
+    without a reason.
+    """
+
+    message = "You may read advances against salary but not change one."
+
+    def has_permission(self, request, view):
+        if request.method in WRITE_METHODS:
+            return CanManageCashBook().has_permission(request, view)
+        return SalaryAdvancePermission().has_permission(request, view)

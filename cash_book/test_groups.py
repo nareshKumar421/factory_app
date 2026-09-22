@@ -48,6 +48,7 @@ class CashBookGroupTests(TestCase):
             guards.MANAGE_PERMISSION,
             guards.APPROVE_PERMISSION,
             guards.BRANCHES_PERMISSION,
+            guards.SALARY_ADVANCE_PERMISSION,
         }
         granted = {code for codes in CASH_BOOK_GROUPS.values() for code in codes}
         self.assertEqual(
@@ -56,7 +57,7 @@ class CashBookGroupTests(TestCase):
             "the API checks these, and no group hands them out",
         )
 
-    def test_the_four_roles_are_created_with_their_permissions(self):
+    def test_every_role_is_created_with_its_permissions(self):
         for name, codes in CASH_BOOK_GROUPS.items():
             with self.subTest(group=name):
                 group = Group.objects.get(name=name)
@@ -75,25 +76,55 @@ class CashBookGroupTests(TestCase):
         self.assertNotIn(guards.APPROVE_PERMISSION, custodian)
         self.assertNotIn(guards.MANAGE_PERMISSION, approver)
 
-    def test_every_role_can_read_the_book(self):
-        """Approving or configuring without being able to read is useless."""
+    def test_every_cash_book_role_can_read_the_book(self):
+        """Approving or configuring without being able to read is useless.
+
+        Salary Advance HR is the deliberate exception and is named here rather
+        than skipped by a pattern, so adding a group that cannot read the
+        register stays a decision somebody has to write down. HR decide whether
+        an advance comes off a wage; that is a payroll decision, and it does not
+        need the factory's petty cash register to make it.
+        """
         for name, codes in CASH_BOOK_GROUPS.items():
+            if name == "Salary Advance HR":
+                continue
             with self.subTest(group=name):
                 self.assertIn(guards.VIEW_PERMISSION, codes)
 
+    def test_hr_get_their_one_right_and_nothing_else(self):
+        """The whole point of the group: the screen, and none of the book."""
+        hr = set(CASH_BOOK_GROUPS["Salary Advance HR"])
+        self.assertEqual(hr, {guards.SALARY_ADVANCE_PERMISSION})
+
+    def test_the_cash_approver_is_not_given_hr_s_right(self):
+        """Agreeing to a payment and agreeing to dock a wage are different
+        decisions taken by different people."""
+        for name in ("Cash Book Approver", "Cash Book Administrator"):
+            with self.subTest(group=name):
+                self.assertNotIn(
+                    guards.SALARY_ADVANCE_PERMISSION, CASH_BOOK_GROUPS[name]
+                )
+
     def test_running_it_again_changes_nothing(self):
         """It is run at every deploy, so it has to be safe to repeat."""
-        before = {
-            group.name: sorted(group.permissions.values_list("codename", flat=True))
-            for group in Group.objects.filter(name__startswith="Cash Book")
-        }
+        # Named off the command's own table rather than a "Cash Book" prefix:
+        # the HR group is not called one, and a prefix would have quietly
+        # stopped covering it.
+        def snapshot():
+            return {
+                group.name: sorted(
+                    group.permissions.values_list("codename", flat=True)
+                )
+                for group in Group.objects.filter(name__in=CASH_BOOK_GROUPS)
+            }
+
+        before = snapshot()
         call_command("setup_cash_book_groups", verbosity=0)
-        after = {
-            group.name: sorted(group.permissions.values_list("codename", flat=True))
-            for group in Group.objects.filter(name__startswith="Cash Book")
-        }
-        self.assertEqual(before, after)
-        self.assertEqual(Group.objects.filter(name__startswith="Cash Book").count(), 4)
+        self.assertEqual(before, snapshot())
+        self.assertEqual(
+            Group.objects.filter(name__in=CASH_BOOK_GROUPS).count(),
+            len(CASH_BOOK_GROUPS),
+        )
 
     def test_it_does_not_hand_out_a_retired_permission(self):
         """Neither of the two 0007 buried."""

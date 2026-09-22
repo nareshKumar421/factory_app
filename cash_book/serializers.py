@@ -15,6 +15,7 @@ from .models import (
     CashBunch,
     CashDirection,
     CashEntry,
+    SalaryAdvance,
 )
 
 
@@ -469,6 +470,131 @@ class RecordAdvanceSerializer(serializers.Serializer):
     detail = serializers.CharField(required=False, allow_blank=True, default="")
 
 
+class SalaryAdvanceEmployeeSerializer(serializers.Serializer):
+    """A name the advance screen can be recorded against. Output only.
+
+    Deliberately thin. The picker is opened by whoever keeps the cash book,
+    who has no right to read a payroll -- so it carries what identifies a
+    person and nothing about what they earn.
+    """
+
+    id = serializers.IntegerField()
+    employee_code = serializers.CharField()
+    full_name = serializers.CharField()
+    department = serializers.CharField(source="department.name", default="")
+    designation = serializers.CharField(source="designation.name", default="")
+
+
+class SalaryAdvanceSerializer(serializers.ModelSerializer):
+    """One advance against salary, as both screens read it.
+
+    ``state_label`` is the server's wording rather than the client's, so the
+    three states read the same on the page, in the admin and in an export.
+    """
+
+    employee_name = serializers.CharField(source="employee.full_name", read_only=True)
+    employee_code = serializers.CharField(source="employee.employee_code", read_only=True)
+    department = serializers.SerializerMethodField()
+    state_label = serializers.CharField(source="get_state_display", read_only=True)
+    decided_by_name = serializers.SerializerMethodField()
+    recorded_by_name = serializers.SerializerMethodField()
+    voucher_number = serializers.IntegerField(
+        source="cash_entry.serial_number", read_only=True, default=None
+    )
+    is_outstanding = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = SalaryAdvance
+        fields = [
+            "id",
+            "employee",
+            "employee_name",
+            "employee_code",
+            "department",
+            "paid_on",
+            "amount",
+            "reason",
+            "cash_entry",
+            "voucher_number",
+            "state",
+            "state_label",
+            "decided_by",
+            "decided_by_name",
+            "decided_at",
+            "decision_note",
+            "deduct_from",
+            "deducted_on",
+            "is_outstanding",
+            "is_active",
+            "recorded_by_name",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_department(self, obj):
+        return obj.employee.department.name if obj.employee.department_id else ""
+
+    def _person(self, user):
+        if user is None:
+            return ""
+        return getattr(user, "full_name", "") or user.email
+
+    def get_decided_by_name(self, obj):
+        return self._person(obj.decided_by)
+
+    def get_recorded_by_name(self, obj):
+        return self._person(obj.created_by)
+
+
+class RecordSalaryAdvanceSerializer(serializers.Serializer):
+    """Input for writing down an advance accounts have handed over."""
+
+    employee = serializers.IntegerField(min_value=1)
+    paid_on = serializers.DateField()
+    amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.01")
+    )
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    # The voucher on the register that paid it out. Optional: the cash may
+    # have gone out by bank transfer, or on a voucher nobody joined up.
+    cash_entry = serializers.PrimaryKeyRelatedField(
+        queryset=CashEntry.objects.all(), required=False, allow_null=True, default=None
+    )
+
+
+class UpdateSalaryAdvanceSerializer(serializers.Serializer):
+    """Corrections to an advance HR have not decided on yet."""
+
+    employee = serializers.IntegerField(min_value=1, required=False)
+    paid_on = serializers.DateField(required=False)
+    amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.01"), required=False
+    )
+    reason = serializers.CharField(required=False, allow_blank=True)
+    cash_entry = serializers.PrimaryKeyRelatedField(
+        queryset=CashEntry.objects.all(), required=False, allow_null=True
+    )
+
+
+class DecideSalaryAdvanceSerializer(serializers.Serializer):
+    """HR's verdict on one or more advances."""
+
+    advance_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), allow_empty=False
+    )
+    approve = serializers.BooleanField()
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+    # Which salary month it comes off. Defaulted on the server to the month
+    # after it was paid, so HR only send one when they mean another.
+    deduct_from = serializers.DateField(required=False, allow_null=True, default=None)
+
+
+class MarkDeductedSerializer(serializers.Serializer):
+    """The day the amount actually came off a wage."""
+
+    deducted_on = serializers.DateField(required=False, allow_null=True, default=None)
+
+
 __all__ = [
     "CashBunchSummarySerializer",
     "CreateBunchSerializer",
@@ -491,4 +617,10 @@ __all__ = [
     "GLAccountSerializer",
     "RecordEntrySerializer",
     "UpdateEntrySerializer",
+    "DecideSalaryAdvanceSerializer",
+    "MarkDeductedSerializer",
+    "RecordSalaryAdvanceSerializer",
+    "SalaryAdvanceEmployeeSerializer",
+    "SalaryAdvanceSerializer",
+    "UpdateSalaryAdvanceSerializer",
 ]

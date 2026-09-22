@@ -29,6 +29,11 @@ from .views import (
     CashPeopleAPI,
     CashPersonCreateAPI,
     GLAccountSearchAPI,
+    SalaryAdvanceDecideAPI,
+    SalaryAdvanceDeductedAPI,
+    SalaryAdvanceDetailAPI,
+    SalaryAdvanceEmployeesAPI,
+    SalaryAdvanceListCreateAPI,
 )
 
 urlpatterns = [
@@ -72,6 +77,36 @@ urlpatterns = [
         "advances/holders/<int:pk>/",
         AdvanceStatementAPI.as_view(),
         name="cash-book-advance-statement",
+    ),
+    # Cash given against a wage, which comes back off it. A different thing
+    # from a float: this money became theirs, and HR decide how it returns.
+    path(
+        "salary-advances/",
+        SalaryAdvanceListCreateAPI.as_view(),
+        name="cash-book-salary-advances",
+    ),
+    # Before the detail route, so "decide" and "employees" are never read as
+    # an id -- they are words, and an int converter would 404 on them anyway,
+    # but the order is what makes that a certainty rather than a coincidence.
+    path(
+        "salary-advances/decide/",
+        SalaryAdvanceDecideAPI.as_view(),
+        name="cash-book-salary-advances-decide",
+    ),
+    path(
+        "salary-advances/employees/",
+        SalaryAdvanceEmployeesAPI.as_view(),
+        name="cash-book-salary-advance-employees",
+    ),
+    path(
+        "salary-advances/<int:pk>/",
+        SalaryAdvanceDetailAPI.as_view(),
+        name="cash-book-salary-advance-detail",
+    ),
+    path(
+        "salary-advances/<int:pk>/deducted/",
+        SalaryAdvanceDeductedAPI.as_view(),
+        name="cash-book-salary-advance-deducted",
     ),
     path("people/", CashPeopleAPI.as_view(), name="cash-book-people"),
     path(

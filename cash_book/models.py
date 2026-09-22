@@ -22,6 +22,15 @@ and when it came back signed. Here a bunch is :class:`CashBunch`: a set of
 entries sent for approval together, approved or rejected as one. The sheet's
 "Sign Date" is this module's ``decided_at``.
 
+ONE THING HERE IS NOT THE CASH BOX'S
+------------------------------------
+:class:`SalaryAdvance` is cash given against somebody's wages, which comes back
+off their pay rather than out of the box. It is kept here because that is where
+the money leaves from and where the voucher is written, but nothing about it
+moves ``balance_after`` and HR, not the cash approver, decide on it. See its own
+docstring for why it is not :class:`AdvanceEntry`, which it resembles and is the
+opposite of.
+
 NOTHING IS POSTED TO SAP. SAP supplies the chart of accounts and nothing else:
 this is the custodian's own record of a cash box, and the journal entry behind
 it is made in SAP by accounts, separately.
@@ -583,4 +592,156 @@ class CashEntry(BaseModel):
         return (
             self.direction == CashDirection.OUT
             and self.approval_state == EntryApprovalStatus.APPROVED
+        )
+
+
+class SalaryAdvanceState(models.TextChoices):
+    """Where an advance against salary has got to with HR.
+
+    Not the cash book's own approval, and the difference matters. The cash
+    approver agrees that the money should have left the box. HR agrees that it
+    comes back off a wage -- which is a decision about a person's pay, taken by
+    the people who run the payroll, after the cash has already been handed
+    over.
+
+    There is no "not sent yet". Accounts hand the money over and HR are told;
+    an advance nobody in HR has been shown is the exact failure this page
+    exists to stop, so a new one is with them from the moment it is recorded.
+    """
+
+    PENDING = "PENDING", "With HR"
+    APPROVED = "APPROVED", "Approved for deduction"
+    REJECTED = "REJECTED", "Rejected"
+
+
+class SalaryAdvance(BaseModel):
+    """Cash given against somebody's wages, and what HR decided about it.
+
+    Accounts hand it over; HR say whether it comes back off a salary. Those are
+    two different people answering two different questions, which is why the
+    verdict here is HR's own and not the cash book's.
+
+    **No cash moves because of this row.** The money leaving the box is the
+    voucher on the register (:attr:`cash_entry`, when the two were linked), and
+    counting it in both places would take it off the balance twice. This is the
+    record of a debt against a wage, kept beside the register rather than in
+    it.
+
+    Not :class:`AdvanceEntry`, which looks similar and is the opposite
+    arrangement: a float is cash somebody is *holding on the factory's behalf*
+    and will explain with receipts, and it is settled by spending it. This is
+    cash that became *theirs* the moment it was handed over, and it is settled
+    out of their pay.
+
+    ``employee`` is the HR record rather than a login, because the whole point
+    of the row is the salary it comes off, and only that record has one. A
+    labourer who is paid by the factory but has never logged into anything
+    still has an advance.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="salary_advances"
+    )
+    employee = models.ForeignKey(
+        "employee_hierarchy.Employee",
+        on_delete=models.PROTECT,
+        related_name="salary_advances",
+        help_text="Whose wage this comes back off.",
+    )
+    paid_on = models.DateField(help_text="The day the cash was handed over.")
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+    reason = models.TextField(
+        blank=True,
+        default="",
+        help_text="What they asked for it for, in their own words. HR decide "
+        "on this, so a blank one is a decision taken on the amount alone.",
+    )
+
+    cash_entry = models.ForeignKey(
+        CashEntry,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="salary_advances",
+        help_text="The voucher on the register that paid it out, when the two "
+        "were linked. Null when the cash went out some other way -- by bank "
+        "transfer, or on a voucher nobody joined up.",
+    )
+
+    # --- HR's verdict ------------------------------------------------------
+    state = models.CharField(
+        max_length=16,
+        choices=SalaryAdvanceState.choices,
+        default=SalaryAdvanceState.PENDING,
+        help_text="Whether HR have agreed this comes off a wage.",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided_salary_advances",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_note = models.TextField(
+        blank=True,
+        default="",
+        help_text="Required when rejecting, so accounts know why the money is "
+        "not coming back off a wage.",
+    )
+
+    # --- The deduction the verdict creates ---------------------------------
+    deduct_from = models.DateField(
+        null=True,
+        blank=True,
+        help_text="The first of the salary month the amount comes off. Set "
+        "when HR approve, and defaulted to the month after it was paid.",
+    )
+    deducted_on = models.DateField(
+        null=True,
+        blank=True,
+        help_text="The day HR recorded the deduction as actually taken. Until "
+        "it is set, the amount is still to come off a wage.",
+    )
+
+    class Meta:
+        ordering = ["-paid_on", "-id"]
+        verbose_name = "Salary advance"
+        verbose_name_plural = "Salary advances"
+        indexes = [
+            models.Index(fields=["company", "state", "-paid_on"]),
+            models.Index(fields=["company", "employee", "-paid_on"]),
+            # HR's own question: what is still to come off a wage.
+            models.Index(fields=["company", "state", "deducted_on"]),
+        ]
+        permissions = [
+            # HR's right, and only HR's. Deliberately not implied by the cash
+            # book's approve right: agreeing to a payment and agreeing to dock
+            # somebody's wages are different decisions, and the person who
+            # signs off petty cash is not the person who runs the payroll.
+            (
+                "can_approve_salary_advances",
+                "Can approve or reject advances against salary",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.employee} {self.amount} ({self.get_state_display()})"
+
+    @property
+    def is_outstanding(self) -> bool:
+        """Approved, and still to come off a wage.
+
+        The figure HR are actually asked for -- "what am I docking this month"
+        -- is the sum of these. A rejected advance is not owed, and one already
+        deducted has been paid back.
+        """
+        return (
+            self.is_active
+            and self.state == SalaryAdvanceState.APPROVED
+            and self.deducted_on is None
         )

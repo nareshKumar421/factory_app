@@ -40,3 +40,8 @@ MAX_PAGE_SIZE = 500
 #: How many entries one bunch may carry. A bunch is a day or two of vouchers
 #: walked to the approver together; a four-figure selection is a mis-click.
 MAX_BUNCH_ENTRIES = 200
+
+#: Names returned by one employee search on the salary advance screen. A
+#: type-ahead over a payroll of thousands, like the G/L picker: a search that
+#: needs more than this needs better words.
+SALARY_ADVANCE_PEOPLE_LIMIT = 50

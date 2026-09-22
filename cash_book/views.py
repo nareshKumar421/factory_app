@@ -41,9 +41,16 @@ from .models import (
     CashDirection,
     CashEntry,
     EntryApprovalStatus,
+    SalaryAdvance,
+    SalaryAdvanceState,
 )
 from .permissions import (
     CanApproveCashEntries,
+    CanApproveSalaryAdvances,
+    MANAGE_PERMISSION,
+    SALARY_ADVANCE_PERMISSION,
+    SalaryAdvancePermission,
+    SalaryAdvanceWritePermission,
     CashBranchPermission,
     CanManageCashBranches,
     CanManageCashBook,
@@ -74,6 +81,12 @@ from .serializers import (
     RecordAtmReceiptSerializer,
     RecordEntrySerializer,
     UpdateEntrySerializer,
+    DecideSalaryAdvanceSerializer,
+    MarkDeductedSerializer,
+    RecordSalaryAdvanceSerializer,
+    SalaryAdvanceEmployeeSerializer,
+    SalaryAdvanceSerializer,
+    UpdateSalaryAdvanceSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -1322,3 +1335,209 @@ class CashEntryColumnValuesAPI(APIView):
                 "total": len(values),
             }
         )
+
+
+# ----------------------------------------------------------------------
+# Advances against salary
+# ----------------------------------------------------------------------
+#
+# Read by two departments and written by two. Accounts record what they handed
+# over; HR decide whether it comes off a wage and, later, tick it off when it
+# has. The permission classes carry that split -- ``SalaryAdvancePermission``
+# lets HR in without the cash book's view right, and each write checks the
+# narrower right it actually needs.
+
+
+def _employee_for(company, employee_id):
+    """The person an advance names, refusing another company's payroll."""
+    from employee_hierarchy.models import Employee
+
+    return get_object_or_404(Employee, pk=employee_id, company=company)
+
+
+def _salary_advance(request, pk) -> SalaryAdvance:
+    return get_object_or_404(SalaryAdvance, pk=pk, company=_company(request))
+
+
+class SalaryAdvanceListCreateAPI(APIView):
+    """GET the advances against salary - POST one accounts have handed over.
+
+    ``?state=PENDING`` narrows to what HR have still to look at, which is the
+    tab the screen opens on. ``?employee=<id>`` is one person's history, for
+    the question asked at the counter: "how many has he had this year?"
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, SalaryAdvancePermission]
+
+    def get(self, request):
+        company = _company(request)
+        state = request.query_params.get("state") or None
+        if state and state not in SalaryAdvanceState.values:
+            raise ValidationError({"state": f"No such state: {state}."})
+
+        employee_id = _parse_positive_int(request.query_params.get("employee"), None)
+        employee = _employee_for(company, employee_id) if employee_id else None
+
+        rows = services.salary_advances(
+            company,
+            state=state,
+            employee=employee,
+            include_cancelled=request.query_params.get("include_cancelled") == "true",
+        )
+        return Response(
+            {
+                "results": SalaryAdvanceSerializer(rows, many=True).data,
+                # The summary is over the whole book, not the narrowed list:
+                # a tab showing four pending advances must not restate what is
+                # outstanding as though the other tabs were empty.
+                "summary": services.salary_advance_summary(company),
+                # Off the permission module's own constants, never a typed
+                # string. A permission name that does not exist answers False
+                # silently for everybody but a superuser, which is the bug
+                # test_groups.py was written for.
+                "can_record": request.user.has_perm(MANAGE_PERMISSION),
+                "can_decide": request.user.has_perm(SALARY_ADVANCE_PERMISSION),
+            }
+        )
+
+    def post(self, request):
+        # Recording is book-keeping, not HR's. The permission class admits
+        # either writer, because deciding is a write too; this is the narrower
+        # check, and it keeps an HR user from writing an advance for somebody.
+        if not CanManageCashBook().has_permission(request, self):
+            raise PermissionDenied(
+                "You may read advances against salary but not record one."
+            )
+
+        serializer = RecordSalaryAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        company = _company(request)
+
+        advance = services.record_salary_advance(
+            user=request.user,
+            company=company,
+            employee=_employee_for(company, data["employee"]),
+            paid_on=data["paid_on"],
+            amount=data["amount"],
+            reason=data.get("reason", ""),
+            cash_entry=data.get("cash_entry"),
+        )
+        return Response(
+            SalaryAdvanceSerializer(advance).data, status=status.HTTP_201_CREATED
+        )
+
+
+class SalaryAdvanceDetailAPI(APIView):
+    """GET one advance - PATCH to correct it - DELETE to take it out.
+
+    Read by anyone the screen admits, including HR; changed only by whoever
+    keeps the book. Correcting or withdrawing an advance is book-keeping, not
+    a verdict.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        SalaryAdvanceWritePermission,
+    ]
+
+    def get(self, request, pk):
+        return Response(SalaryAdvanceSerializer(_salary_advance(request, pk)).data)
+
+    def patch(self, request, pk):
+        advance = _salary_advance(request, pk)
+        serializer = UpdateSalaryAdvanceSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        changes = dict(serializer.validated_data)
+        if "employee" in changes:
+            changes["employee"] = _employee_for(advance.company, changes["employee"])
+
+        advance = services.update_salary_advance(
+            user=request.user, advance=advance, **changes
+        )
+        return Response(SalaryAdvanceSerializer(advance).data)
+
+    def delete(self, request, pk):
+        services.cancel_salary_advance(
+            user=request.user, advance=_salary_advance(request, pk)
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SalaryAdvanceDecideAPI(APIView):
+    """POST HR's verdict: approve for deduction, or reject with a reason.
+
+    Several at once, because that is how a morning's advances are actually
+    gone through -- but each carries its own verdict, so approving nine of ten
+    leaves the tenth exactly where it was.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanApproveSalaryAdvances,
+    ]
+
+    def post(self, request):
+        serializer = DecideSalaryAdvanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        rows = services.decide_salary_advances(
+            user=request.user,
+            company=_company(request),
+            advance_ids=data["advance_ids"],
+            approve=data["approve"],
+            note=data.get("note", ""),
+            deduct_from=data.get("deduct_from"),
+        )
+        return Response({"results": SalaryAdvanceSerializer(rows, many=True).data})
+
+
+class SalaryAdvanceDeductedAPI(APIView):
+    """POST that the amount has come off a wage - DELETE to put it back.
+
+    HR's, not accounts'. Only the payroll knows a deduction was actually
+    taken, and until somebody says so an approved advance is still owed.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanApproveSalaryAdvances,
+    ]
+
+    def post(self, request, pk):
+        serializer = MarkDeductedSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        advance = services.mark_salary_advance_deducted(
+            user=request.user,
+            advance=_salary_advance(request, pk),
+            deducted_on=serializer.validated_data.get("deducted_on"),
+        )
+        return Response(SalaryAdvanceSerializer(advance).data)
+
+    def delete(self, request, pk):
+        advance = services.undo_salary_advance_deduction(
+            user=request.user, advance=_salary_advance(request, pk)
+        )
+        return Response(SalaryAdvanceSerializer(advance).data)
+
+
+class SalaryAdvanceEmployeesAPI(APIView):
+    """GET the people an advance can be recorded against, searched on the server.
+
+    Its own endpoint rather than the directory's, because the custodian
+    recording an advance has no ``employee_hierarchy`` right and should not
+    need one: the list carries a name, a code and where they work, and nothing
+    about what they are paid.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, SalaryAdvancePermission]
+
+    def get(self, request):
+        people = services.salary_advance_employees(
+            _company(request), request.query_params.get("search", "")
+        )
+        return Response(SalaryAdvanceEmployeeSerializer(people, many=True).data)
