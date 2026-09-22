@@ -350,6 +350,17 @@ TREND_DAYS = 7
 #: nobody reads row 40 from across a factory floor.
 MAX_LISTED_ROWS = 12
 
+#: Rows the OPEN ORDER list carries, which is deliberately not the wall cap
+#: above. Ranked by value, the twelve largest open orders on this company are
+#: bottles, tins, cartons and caps every time, and the whole label family --
+#: nineteen of the sixty-six items on order in September 2026, the largest
+#: family by SKU count -- fell off the bottom of the panel. A buyer asking
+#: whether anything is on order for the sunflower label got a list that could
+#: not answer, only a footnote pointing at another page. The panel scrolls, so
+#: this list is the whole book; the cap that remains guards the payload rather
+#: than editing the answer.
+MAX_OPEN_PO_ROWS = 200
+
 #: Tiles this board does not compute, and what each is waiting on. Returned to
 #: the client so the wall can label an empty tile with the reason instead of
 #: rendering a zero that reads as fact.

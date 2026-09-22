@@ -85,6 +85,7 @@ from .constants import (
     BENCHMARK_STATUSES,
     LITRES_PER_TON,
     MAX_LISTED_ROWS,
+    MAX_OPEN_PO_ROWS,
     PENDING_TILES,
     PRODUCTION_FLOOR,
     REFRESH_SECONDS,
@@ -600,6 +601,11 @@ class PlantBoardService:
             # the panel that opens on it. Ranked by what is still OPEN, not by
             # what was ordered: the buyer's question is what is still coming.
             "open_po_rows": self._open_po_rows(rows, receipts.get("by_item") or {}),
+            # The same book by packaging family. See the helper: the panel is
+            # ranked by value and the cheap families sit at the bottom of it,
+            # so without this a buyer cannot tell a family with nothing on
+            # order from one whose orders are simply small.
+            "open_po_families": self._open_po_families(rows),
             # The gate's own count of what physically arrived, kept as the
             # independent check on the SAP figure above.
             "grpo_received_qty": self._grpo_received(window_from, window_to),
@@ -719,13 +725,22 @@ class PlantBoardService:
         was billed, so the two are deliberately not the same kind of money and
         are never added together.
 
-        Capped like every listed set on this board. The count beside the tile
-        is the whole population.
+        NOT capped at the board's twelve. Ranked by value, the top of this
+        list is bottles, tins, cartons and caps on every plan this company has
+        run, and a twelve-row cut hid the entire label family -- nineteen of
+        the sixty-six items on order in September 2026. The panel scrolls;
+        `MAX_OPEN_PO_ROWS` is a payload guard, not an edit. `open_po_families`
+        beside this is the same rows rolled up, for the reader who wants the
+        shape of the book without reading sixty-six lines.
         """
         listed = [
             {
                 "item_code": row.get("item_code"),
                 "item_name": row.get("item_name"),
+                # The packaging family off the item master, so a reader can
+                # see at a glance which part of the book a row belongs to and
+                # the strip above it can be tied back to these rows.
+                "sub_group": row.get("sub_group") or "",
                 "open_po_qty": _f(row.get("open_po_qty")),
                 "open_po_value": round(
                     _f(row.get("open_po_qty")) * _f(row.get("unit_price")), 2
@@ -749,7 +764,51 @@ class PlantBoardService:
             if _f(row.get("open_po_qty")) > 0
         ]
         listed.sort(key=lambda row: -row["open_po_value"])
-        return listed[:MAX_LISTED_ROWS]
+        return listed[:MAX_OPEN_PO_ROWS]
+
+    @staticmethod
+    def _open_po_families(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """The open book rolled up by packaging family.
+
+        THE WHOLE POPULATION, not the listed rows: this strip exists so that a
+        family cheap enough to rank last is still visibly on order. Labels are
+        the case that produced it -- nineteen items and a fifth of the SKUs on
+        order in September 2026, worth less than the twelfth bottle -- and the
+        question a buyer asks of this tile is as often "is the label covered"
+        as "what is the biggest order".
+
+        `item_count` sums to the tile's `open_po_count` and `open_po_value`
+        sums to its headline, priced the same way, so the strip is a partition
+        of the figure above it rather than a second opinion on it. An item the
+        master gives no family is grouped as Unclassified rather than dropped,
+        for the same reason: a row missing from a partition makes the parts
+        stop adding up.
+        """
+        families: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            open_qty = _f(row.get("open_po_qty"))
+            if open_qty <= 0:
+                continue
+            name = (row.get("sub_group") or "").strip() or "Unclassified"
+            family = families.setdefault(
+                name,
+                {"sub_group": name, "item_count": 0, "open_po_qty": 0.0, "open_po_value": 0.0},
+            )
+            family["item_count"] += 1
+            family["open_po_qty"] += open_qty
+            family["open_po_value"] += open_qty * _f(row.get("unit_price"))
+
+        listed = [
+            {
+                "sub_group": family["sub_group"],
+                "item_count": family["item_count"],
+                "open_po_qty": round(family["open_po_qty"], 3),
+                "open_po_value": round(family["open_po_value"], 2),
+            }
+            for family in families.values()
+        ]
+        listed.sort(key=lambda family: -family["open_po_value"])
+        return listed
 
     def _benchmark(self) -> Dict[str, Any]:
         """The Stock Benchmark dashboard's own numbers, for the same stores.

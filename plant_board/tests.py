@@ -32,7 +32,11 @@ from warehouse.models_pf_movement import PFStockMovement, PFStockMovementLine
 
 from stock_dashboard.models import PlantBoardSettings, PlantBoardWorkforce
 
-from .constants import MAX_LISTED_ROWS, STORE_WAREHOUSES, WORKFORCE_DEPARTMENTS
+from .constants import (
+    MAX_OPEN_PO_ROWS,
+    STORE_WAREHOUSES,
+    WORKFORCE_DEPARTMENTS,
+)
 from .workforce import departments, slugify_key, unique_key
 from .non_moving import non_moving_snapshot
 from .views_workforce import _clean, _payload
@@ -1349,6 +1353,7 @@ class OpenPoRowsTests(TestCase):
         base = {
             "item_code": code,
             "item_name": f"ITEM {code}",
+            "sub_group": "CARTON",
             "open_po_qty": open_qty,
             "unit_price": unit_price,
             "on_hand_qty": 0.0,
@@ -1404,12 +1409,71 @@ class OpenPoRowsTests(TestCase):
             [r["item_code"] for r in band["open_po_rows"]], ["BOTTLE", "FILM"]
         )
 
-    def test_the_list_is_capped_and_the_count_is_not(self):
-        """The panel shows the largest; the count beside it is the population."""
+    def test_the_list_is_the_whole_book_not_the_wall_cap(self):
+        """Every item on order is listed, because the panel scrolls.
+
+        Ranked by value, the board's twelve-row cut was always bottles, tins,
+        cartons and caps, and it hid the label family whole -- nineteen of the
+        sixty-six items on order in September 2026.
+        """
         rows = [self.row(f"I{n}", n + 1, 10.0) for n in range(29)]
         band, _ = self.band(rows)
-        self.assertEqual(len(band["open_po_rows"]), MAX_LISTED_ROWS)
+        self.assertEqual(len(band["open_po_rows"]), 29)
         self.assertEqual(band["open_po_count"], 29)
+
+    def test_the_list_is_still_guarded_against_a_runaway_payload(self):
+        """Uncapped is not unbounded: the guard is well past any real plan."""
+        rows = [self.row(f"I{n}", n + 1, 10.0) for n in range(MAX_OPEN_PO_ROWS + 15)]
+        band, _ = self.band(rows)
+        self.assertEqual(len(band["open_po_rows"]), MAX_OPEN_PO_ROWS)
+        self.assertEqual(band["open_po_count"], MAX_OPEN_PO_ROWS + 15)
+
+    def test_every_family_on_order_is_reported_however_cheap(self):
+        """The label case: last by value, and still visibly on order.
+
+        The strip is a partition of the tile -- its counts and its money add
+        up to the two figures above it -- so a family cannot be read off it as
+        absent when it is merely small.
+        """
+        band, _ = self.band(
+            [
+                self.row("BOTTLE", 10_000, 900.0, sub_group="PET BOTTLES"),
+                self.row("LBL1", 300_000, 0.4, sub_group="LABEL"),
+                self.row("LBL2", 100_000, 0.4, sub_group="LABEL"),
+                self.row("NOFAMILY", 100, 1.0, sub_group=""),
+            ]
+        )
+        families = band["open_po_families"]
+        self.assertEqual(
+            [f["sub_group"] for f in families],
+            ["PET BOTTLES", "LABEL", "Unclassified"],
+        )
+        label = next(f for f in families if f["sub_group"] == "LABEL")
+        self.assertEqual(label["item_count"], 2)
+        self.assertEqual(label["open_po_value"], 160000.0)
+        self.assertEqual(
+            sum(f["item_count"] for f in families), band["open_po_count"]
+        )
+        self.assertAlmostEqual(
+            sum(f["open_po_value"] for f in families), band["open_po_value"], places=2
+        )
+
+    def test_a_family_with_nothing_open_is_not_on_the_strip(self):
+        """An item with no open order is not an open order, family or not."""
+        band, _ = self.band(
+            [
+                self.row("BOTTLE", 10_000, 900.0, sub_group="PET BOTTLES"),
+                self.row("LBL1", 0, 0.4, sub_group="LABEL"),
+            ]
+        )
+        self.assertEqual(
+            [f["sub_group"] for f in band["open_po_families"]], ["PET BOTTLES"]
+        )
+
+    def test_each_listed_row_names_its_family(self):
+        """So the strip above the table ties to the rows underneath it."""
+        band, _ = self.band([self.row("LBL1", 100, 0.4, sub_group="LABEL")])
+        self.assertEqual(band["open_po_rows"][0]["sub_group"], "LABEL")
 
     def test_each_row_carries_when_it_lands_and_what_it_adds_to(self):
         """An overdue order is a chase; one due after the plan closes is stock
