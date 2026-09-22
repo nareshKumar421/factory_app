@@ -1080,6 +1080,47 @@ class AdminBoardService:
             "electricity": power["detail"],
             "salary": self._salary_detail(board),
         }
+        # Today, per line, and the rows behind each line.
+        #
+        # NEVER the wall board's own ``today`` bucket key: that holds whatever
+        # span was selected, and the span this board selects is the whole month
+        # — reading it here would print the month twice under two headings.
+        # Salary and maintenance are the same figure on both boards and come
+        # off the wall's per-day trend; labour and electricity are this tile's
+        # own subsets and are computed where those subsets are.
+        today_row = self._today_row(board)
+        extras = {
+            "labour": {
+                "today": labour["today"],
+                "today_detail": labour["today_detail"],
+                "today_detail_value": labour["today_heads"] or None,
+                "today_detail_unit": "in" if labour["today_heads"] else None,
+                "rows": labour["rows"],
+            },
+            "electricity": {
+                "today": power.get("today", 0.0),
+                "today_detail": power.get("today_detail"),
+                "today_detail_value": power.get("today_units") or None,
+                "today_detail_unit": "units" if power.get("today_units") else None,
+                "rows": power.get("rows") or [],
+            },
+            "salary": {
+                "today": _f(today_row.get("salary")),
+                # The accrual counts no THING — it is a fraction of a monthly
+                # bill, not a tally — so there is no unit to print beside it.
+                "today_detail": None,
+                "today_detail_value": None,
+                "today_detail_unit": None,
+                "rows": self._salary_rows(board),
+            },
+            "maintenance": {
+                "today": _f(today_row.get("maintenance")),
+                "today_detail": None,
+                "today_detail_value": None,
+                "today_detail_unit": None,
+                "rows": self._maintenance_rows(board),
+            },
+        }
         # The wall board's labour and electricity warnings are dropped in
         # favour of this tile's, which are stated over the rows THIS tile
         # prices: the wall's electricity warning is silent whenever any meter on
@@ -1103,6 +1144,7 @@ class AdminBoardService:
             amount = _f(bucket.get("mtd"))
             warning = bucket.get("warning")
             detail = details.get(spec["key"]) or {}
+            extra = extras.get(spec["key"]) or {}
             basis = None
             if spec["key"] == "electricity":
                 # NOT the wall board's bucket. The wall prices every meter on
@@ -1148,6 +1190,16 @@ class AdminBoardService:
                     # board. Shown where the line is, not in the alert list:
                     # it is an explanation, not something anybody must act on.
                     "basis": basis,
+                    # What the line cost TODAY, on the same basis as `amount`,
+                    # and what that money is made of in the line's own unit.
+                    "today": round(_f(extra.get("today")), 2),
+                    "today_detail": extra.get("today_detail"),
+                    "today_detail_value": extra.get("today_detail_value"),
+                    "today_detail_unit": extra.get("today_detail_unit"),
+                    # The line one level down. Empty rather than absent where
+                    # nothing is behind it: the panel decides whether a line
+                    # opens by asking how many rows it has.
+                    "rows": extra.get("rows") or [],
                 }
             )
             total += amount
@@ -1155,9 +1207,16 @@ class AdminBoardService:
         for entry in slices:
             entry["share_pct"] = _pct(entry["amount"], total)
 
+        # Elapsed days, not producing days: a salary accrues on a Sunday and
+        # so does a spare consumed on one. Here so today's figure has something
+        # to be read against — a bare rupee total for today answers nothing.
+        elapsed = (self.today - self.month_first).days + 1
+
         return {
             "currency": "INR",
             "total": round(total, 2),
+            "today_total": round(sum(entry["today"] for entry in slices), 2),
+            "avg_per_day": round(total / elapsed, 2) if elapsed else None,
             "slices": slices,
             "warnings": warnings,
             # The electricity line reads every meter on the site, and the site's
@@ -1258,12 +1317,37 @@ class AdminBoardService:
         days = set()
         seen_departments = set()
         flat_charged = set()
+        # One row per department, for the panel the tile opens onto. Built in
+        # this same pass rather than from a second query: the entries are here
+        # and a breakdown read separately would be free to disagree with the
+        # figure it sits under.
+        by_department: Dict[Any, Dict[str, Any]] = {}
+        today_heads = 0
+        today_cost = Decimal("0")
         for entry in entries:
             count = entry.count_in or 0
             heads += count
             if count:
                 days.add(entry.work_date)
                 seen_departments.add(entry.department_id)
+            row = by_department.setdefault(
+                entry.department_id,
+                {
+                    "label": entry.department.name,
+                    "heads": 0,
+                    "cost": Decimal("0"),
+                    "today_heads": 0,
+                    "today_cost": Decimal("0"),
+                },
+            )
+            row["heads"] += count
+            # Counted before the unpriced test below, so "who was on the floor
+            # today" stays true on a department whose people have no rate. The
+            # money and the head count answer different questions.
+            is_today = entry.work_date == self.today
+            if is_today:
+                today_heads += count
+                row["today_heads"] += count
             # The department is passed to the rate resolver now that these rows
             # carry one: a Cost Master rate scoped to a department must win over
             # the factory-wide rate for that department's own people.
@@ -1283,6 +1367,25 @@ class AdminBoardService:
                 else:
                     flat_charged.add(key)
             cost += charge
+            # The department gets what the line got, INCLUDING the zero a
+            # repeat flat day is charged above. Re-pricing it here would make
+            # the rows sum past the line they sit under.
+            row["cost"] += charge
+            if is_today:
+                today_cost += charge
+                row["today_cost"] += charge
+
+        rows = [
+            {
+                "label": row["label"],
+                "detail": f"{row['heads']:,} man-days",
+                "amount": round(float(row["cost"]), 2),
+                "today": round(float(row["today_cost"]), 2),
+            }
+            for row in by_department.values()
+            if row["heads"] or row["cost"]
+        ]
+        rows.sort(key=lambda row: row["amount"], reverse=True)
 
         named = len(LABOUR_DEPARTMENTS)
         if not heads:
@@ -1329,6 +1432,17 @@ class AdminBoardService:
 
         return {
             "cost": round(float(cost), 2),
+            "today": round(float(today_cost), 2),
+            # What today's money is made of, and why there is none where there
+            # is none: an empty floor is a real answer and reads differently
+            # from a floor nobody has entered yet.
+            "today_detail": (
+                f"{today_heads:,} on the floors today"
+                if today_heads
+                else ("nobody booked to these floors today" if heads else None)
+            ),
+            "today_heads": today_heads,
+            "rows": rows,
             "heads": heads,
             "gate_heads": gate_heads,
             "days": len(days),
@@ -1351,6 +1465,80 @@ class AdminBoardService:
                 )
             ),
         }
+
+    def _today_row(self, board: Dict[str, Any]) -> Dict[str, Any]:
+        """Today alone, out of the wall board's per-day series.
+
+        The wall board reports a bucket's ``today`` as whatever span the caller
+        selected, and the span this board selects is the whole month — so on
+        this board that key is the month over again. The trend is per-day
+        whatever the span, and it always reaches ``date_to``, which is today.
+        That makes it the only place a single day can be read without asking
+        for the board a second time over a one-day window.
+
+        Empty where the trend is missing, which is what a caller reading it
+        with ``.get`` wants: a day with no line is a nil day, not a failure.
+        """
+        for row in reversed(board.get("trend") or []):
+            if row.get("is_today"):
+                return row
+        return {}
+
+    def _salary_rows(self, board: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The payroll lines behind the accrual, accrued the same way it is.
+
+        The slice shows a month's bill spread over the month's days and charged
+        for the days elapsed. Every row is spread identically, because rows
+        carrying the whole month's bill under a tile showing a third of it
+        would read as the panel disagreeing with the tile that opened it.
+
+        ``today`` is one day of the same spread — it is the definition of the
+        line, not a reading of anything, so it is never nil while a rate is in
+        force.
+        """
+        elapsed = self.today.day
+        rows = []
+        for row in board.get("salary_departments") or []:
+            daily = _f(row.get("daily"))
+            monthly = _f(row.get("monthly"))
+            if not monthly and not daily:
+                continue
+            rows.append(
+                {
+                    "label": row.get("department") or "All departments",
+                    "detail": f"{_lakhs(monthly)}/month over {self.days_in_month} days",
+                    "amount": round(daily * elapsed, 2),
+                    "today": round(daily, 2),
+                }
+            )
+        rows.sort(key=lambda row: row["amount"], reverse=True)
+        return rows
+
+    def _maintenance_rows(self, board: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The spares and the indents behind the maintenance line.
+
+        ``today`` is None on every row, not zero. The register dates a spare
+        movement and an indent — which is how the LINE knows what it cost today
+        — but the line items the wall board hands over carry no date of their
+        own, so what one of them cost today is not in this payload. Nil would
+        answer a question this service cannot answer, and the panel prints the
+        two differently for exactly that reason.
+        """
+        rows = []
+        for item in board.get("maintenance_items") or []:
+            amount = _f(item.get("amount"))
+            if not amount:
+                continue
+            rows.append(
+                {
+                    "label": item.get("label") or "Unnamed",
+                    "detail": item.get("kind"),
+                    "amount": round(amount, 2),
+                    "today": None,
+                }
+            )
+        rows.sort(key=lambda row: row["amount"], reverse=True)
+        return rows
 
     def _salary_detail(self, board: Dict[str, Any]) -> Dict[str, Any]:
         """The monthly bill behind the accrual, and how much of it has run.
@@ -1406,6 +1594,10 @@ class AdminBoardService:
         if company is None:
             return {
                 "cost": 0.0,
+                "today": 0.0,
+                "today_detail": None,
+                "today_units": 0.0,
+                "rows": [],
                 "detail": {},
                 "warning": (
                     f"No '{ELECTRICITY_COMPANY}' company on this deployment, so "
@@ -1424,10 +1616,17 @@ class AdminBoardService:
         )
         cost = sum(_f(bucket.get("cost")) for bucket in per_date.values())
         units = sum(_f(bucket.get("units")) for bucket in per_date.values())
+        today_bucket = per_date.get(self.today) or {}
+        today_cost = _f(today_bucket.get("cost"))
+        today_units = _f(today_bucket.get("units"))
 
         if not meters:
             return {
                 "cost": 0.0,
+                "today": 0.0,
+                "today_detail": None,
+                "today_units": 0.0,
+                "rows": [],
                 "detail": {"value": 0, "text": f"no {company.name} meter read this month"},
                 "warning": (
                     f"No reading on a {company.name} meter this month — "
@@ -1435,8 +1634,52 @@ class AdminBoardService:
                 ),
             }
 
+        # Today's readings on their own, so a meter can say what it cost today
+        # beside what it has cost all month. A second read over ONE day rather
+        # than a second month-wide pass: the month's own call is the expensive
+        # one and this adds a day to it, not another month.
+        _, today_meters = electricity_costs(
+            [company], [self.today], settings_row, focus={self.today}
+        )
+
+        rows = []
+        for name, bucket in meters.items():
+            meter_units = _f(bucket.get("units"))
+            meter_rate = _f(bucket.get("rate"))
+            read_today = today_meters.get(name)
+            rows.append(
+                {
+                    "label": name,
+                    "detail": (
+                        f"{meter_units:,.0f} units at ₹{meter_rate:,.2f}/unit"
+                        if meter_units and meter_rate
+                        else (f"{meter_units:,.0f} units" if meter_units else None)
+                    ),
+                    "amount": round(_f(bucket.get("cost")), 2),
+                    # None, not zero, on a meter nobody read today. A meter
+                    # carries on drawing power whether or not somebody wrote
+                    # the number down, and nil here would say it did not.
+                    "today": (
+                        round(_f(read_today.get("cost")), 2)
+                        if read_today is not None
+                        else None
+                    ),
+                }
+            )
+        rows.sort(key=lambda row: row["amount"], reverse=True)
+
         return {
             "cost": round(cost, 2),
+            "today": round(today_cost, 2),
+            # The reason rather than the figure where there is no figure: the
+            # plant does not stop drawing power because the register is behind.
+            "today_detail": (
+                f"{today_units:,.0f} units today"
+                if today_units
+                else "no reading entered today"
+            ),
+            "today_units": round(today_units, 2),
+            "rows": rows,
             "detail": {
                 "value": len(meters),
                 "text": (
