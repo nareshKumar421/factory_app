@@ -863,6 +863,12 @@ class QCParameterSetDetailAPI(APIView):
             })
 
         with transaction.atomic():
+            # Inspections still being filled in are handed back to the default
+            # set first. Left pointing here they would load no parameters at
+            # all once the set is gone, and the screen offers no way back.
+            parameter_set_services.reassign_open_inspections(
+                parameter_set, request.user
+            )
             parameter_set.is_active = False
             parameter_set.updated_by = request.user
             parameter_set.save(update_fields=["is_active", "updated_by", "updated_at"])

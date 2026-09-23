@@ -7,6 +7,7 @@ if there is one, otherwise the default. Production QC has no vendor at all and
 always lands on the default.
 """
 
+from django.db.models import Count, Q
 from rest_framework.exceptions import ValidationError
 
 from ..models import QCParameterSet
@@ -26,11 +27,28 @@ def default_parameter_set(material_type):
 
 
 def vendor_parameter_set(material_type, vendor_code):
-    """The set for one vendor, or None if that vendor uses the default."""
+    """The set for one vendor, or None if that vendor uses the default.
+
+    A set holding no active parameters is not a spec -- it is a vendor tab that
+    was added and never filled in, or one whose parameters have all been
+    removed. Answering with it would pin the inspection to an empty parameter
+    list, which reads on screen as "this material has no QC at all", so it
+    falls through to the default instead.
+    """
     normalized = normalize_vendor_code(vendor_code)
     if not normalized:
         return None
-    return active_parameter_sets(material_type).filter(vendor_code=normalized).first()
+    return (
+        active_parameter_sets(material_type)
+        .filter(vendor_code=normalized)
+        .annotate(
+            live_parameters=Count(
+                "parameters", filter=Q(parameters__is_active=True)
+            )
+        )
+        .filter(live_parameters__gt=0)
+        .first()
+    )
 
 
 def resolve_parameter_set(material_type, vendor_code=None, required=True):
@@ -190,6 +208,55 @@ def sync_result_rows(container, parameter_set, user, result_model, container_fie
         row.save()
 
 
+def reassign_open_inspections(parameter_set, user=None):
+    """Move still-editable inspections off a set that is about to be deleted.
+
+    An inspection keeps a pointer to the set it is being judged against, and
+    every read of a set filters the deleted ones out. So removing a vendor's
+    set while one of their inspections is still open leaves that inspection
+    pointing at something nobody can load: the parameter list comes back empty
+    and the chemist has nothing to fill in, with no way to get back to the
+    material's own parameters.
+
+    Open inspections are therefore re-resolved onto the material type's default
+    set, with their result rows brought in line. Locked ones keep the pointer
+    they were approved under -- their result rows carry the definitions the
+    certificate reprints from, so the historical record stays intact.
+    """
+    from ..models import InspectionParameterResult
+
+    replacement = default_parameter_set(parameter_set.material_type)
+    moved = []
+
+    for inspection in parameter_set.inspections.filter(is_locked=False):
+        inspection.parameter_set = replacement
+        inspection.updated_by = user
+        inspection.save(
+            update_fields=["parameter_set", "updated_by", "updated_at"]
+        )
+
+        if replacement is not None:
+            sync_result_rows(
+                container=inspection,
+                parameter_set=replacement,
+                user=user,
+                result_model=InspectionParameterResult,
+                container_field="inspection",
+            )
+        else:
+            # Nothing to move onto: the material type has no default set. The
+            # readings taken against the removed set would otherwise stay on
+            # screen pointing at parameters that no longer exist.
+            InspectionParameterResult.objects.filter(
+                inspection=inspection,
+                parameter_master__parameter_set=parameter_set,
+            ).update(is_active=False, updated_by=user)
+
+        moved.append(inspection)
+
+    return moved
+
+
 def ensure_vendor_code_is_free(material_type, vendor_code, exclude_id=None):
     """Reject a vendor that already has a set on this material type.
 
@@ -227,5 +294,6 @@ __all__ = [
     "get_or_create_default_set",
     "copy_parameters",
     "sync_result_rows",
+    "reassign_open_inspections",
     "ensure_vendor_code_is_free",
 ]

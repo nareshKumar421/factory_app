@@ -293,6 +293,61 @@ class VendorParameterSetTests(APITestCase):
         self.default_set.refresh_from_db()
         self.assertTrue(self.default_set.is_active)
 
+    def test_deleting_a_vendor_set_hands_open_inspections_to_the_default(self):
+        vendor_set = self._vendor_set("V010")
+        slip = self._slip("V010", "10")
+        self._create_inspection(slip, "10")
+        inspection = RawMaterialInspection.objects.get(arrival_slip=slip)
+        self.assertEqual(inspection.parameter_set_id, vendor_set.id)
+
+        response = self.client.delete(
+            f"/api/v1/quality-control/parameter-sets/{vendor_set.id}/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        inspection.refresh_from_db()
+        # Still pointing at the removed set, the chemist would be left with no
+        # parameters at all and no way back to the material's own list.
+        self.assertEqual(inspection.parameter_set_id, self.default_set.id)
+        live_results = inspection.parameter_results.filter(is_active=True)
+        self.assertEqual(
+            {row.parameter_master.parameter_set_id for row in live_results},
+            {self.default_set.id},
+        )
+
+    def test_deleting_a_vendor_set_leaves_a_locked_inspection_alone(self):
+        vendor_set = self._vendor_set("V011")
+        slip = self._slip("V011", "11")
+        self._create_inspection(slip, "11")
+        inspection = RawMaterialInspection.objects.get(arrival_slip=slip)
+        inspection.is_locked = True
+        inspection.save(update_fields=["is_locked"])
+
+        response = self.client.delete(
+            f"/api/v1/quality-control/parameter-sets/{vendor_set.id}/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        inspection.refresh_from_db()
+        # An approved inspection reprints from its own result rows, so the set
+        # it was judged under stays on the record.
+        self.assertEqual(inspection.parameter_set_id, vendor_set.id)
+
+    def test_a_vendor_set_with_no_parameters_falls_back_to_the_default(self):
+        QCParameterSet.objects.create(
+            material_type=self.material_type,
+            vendor_code="V012",
+            vendor_name="Supplier V012",
+        )
+        slip = self._slip("V012", "12")
+
+        response = self._create_inspection(slip, "12")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        inspection = RawMaterialInspection.objects.get(arrival_slip=slip)
+        self.assertEqual(inspection.parameter_set_id, self.default_set.id)
+        self.assertEqual(inspection.parameter_results.filter(is_active=True).count(), 1)
+
     def test_creating_a_vendor_set_can_seed_from_the_default(self):
         response = self.client.post(
             f"/api/v1/quality-control/material-types/{self.material_type.id}/parameter-sets/",
