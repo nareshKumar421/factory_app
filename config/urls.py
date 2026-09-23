@@ -36,6 +36,7 @@ urlpatterns = [
     path("api/v1/company/", include("company.urls")),
     path("api/v1/driver-management/", include("driver_management.urls")),
     path("api/v1/vehicle-management/", include("vehicle_management.urls")),
+    path("api/v1/company-vehicles/", include("company_vehicle.urls")),
     path("api/v1/security-checks/", include("security_checks.urls")),
     path("api/v1/po/", include("sap_client.urls")),
     # Who each app user is inside SAP — the mapping approval decisions are

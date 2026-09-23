@@ -242,6 +242,11 @@ INSTALLED_APPS = [
     # bunches of vouchers sent for approval. Picks its G/L heads out of SAP's
     # chart of accounts and posts nothing back.
     'cash_book.apps.CashBookConfig',
+    # The company's OWN vehicles -- the trucks, the cars, the Eeco, the scooty
+    # -- and what they cost to run: every fuel filling and every service bill,
+    # each approved before it counts. Deliberately not vehicle_management,
+    # which is the gate's register of the outside trucks that arrive.
+    'company_vehicle.apps.CompanyVehicleConfig',
 ]
 
 MIDDLEWARE = [
