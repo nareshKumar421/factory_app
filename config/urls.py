@@ -126,6 +126,9 @@ urlpatterns = [
     path("api/v1/issues/", include("issues.urls")),
     path("api/v1/cash-book/", include("cash_book.urls")),
     path("api/v1/employee-hierarchy/", include("employee_hierarchy.urls")),
+    # Construction projects: the budget, the approval, and the daily record
+    # of what was done and what it cost.
+    path("api/v1/construction/", include("construction_projects.urls")),
 
 ]
 

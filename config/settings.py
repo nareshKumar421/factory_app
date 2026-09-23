@@ -202,6 +202,11 @@ INSTALLED_APPS = [
     'org_chart.apps.OrgChartConfig',
     'budget_approvals',
     'issues.apps.IssuesConfig',
+    # Every construction and civil-work project on the campus: raise it with
+    # a budget and an expected ending, get both approved, then record what
+    # happened each day and what the money went on. The project spine behind
+    # the material that construction_gatein logs at the gate.
+    'construction_projects.apps.ConstructionProjectsConfig',
     # The plant control board. Composes the reports above into one
     # wall-screen read and owns no data of its own -- no models, so no
     # migration and no permission row to create on a live database.
