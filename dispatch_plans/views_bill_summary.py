@@ -27,6 +27,7 @@ from .permissions import (
     CanCancelBillSummary,
     CanCreateBillSummary,
     CanPickBillSummary,
+    CanPrintInvoice,
     CanViewBillSummary,
 )
 from .serializers_bill_summary import (
@@ -217,9 +218,13 @@ class BillSummaryInvoicePrintAPI(APIView):
 
     Read only when somebody asks for it: every print is a HANA read, and most
     people open a sheet to check it rather than to reprint the bill.
+
+    Open to the dispatch planners as well as the bill-summary desk: the Plan page
+    hands them the bill for a row on their own board, and they have no reason to
+    hold a picking-sheet permission for it.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBillSummary]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanPrintInvoice]
 
     def get(self, request, doc_entry):
         try:

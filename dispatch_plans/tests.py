@@ -1768,3 +1768,38 @@ class CanLookupDispatchBillTests(SimpleTestCase):
     def test_everyone_else_is_refused(self):
         self.assertFalse(self._allowed(self._user_with("goods_return.can_view_goods_return")))
         self.assertFalse(self._allowed(self._user_with()))
+
+
+class CanPrintInvoiceTests(SimpleTestCase):
+    """SAP's TAX INVOICE is served to two desks. The bill-summary desk prints it
+    beside the picking sheet; the Plan page's Invoice button prints it off a row
+    of the planner's own board. A planner holds no picking-sheet permission and
+    should not need one to hand over a bill the board already shows them."""
+
+    def _user_with(self, *perms):
+        user = MagicMock()
+        user.has_perm.side_effect = lambda perm: perm in perms
+        return user
+
+    def _allowed(self, user):
+        from .permissions import CanPrintInvoice
+
+        return CanPrintInvoice().has_permission(MagicMock(user=user), view=None)
+
+    def test_dispatch_plans_viewer_may_print_a_bill(self):
+        self.assertTrue(self._allowed(self._user_with("dispatch_plans.can_view_dispatch_plans")))
+
+    def test_the_bill_summary_desk_still_may(self):
+        for perm in (
+            "dispatch_plans.can_view_bill_summary",
+            "dispatch_plans.can_create_bill_summary",
+            "dispatch_plans.can_pick_bill_summary",
+        ):
+            with self.subTest(perm=perm):
+                self.assertTrue(self._allowed(self._user_with(perm)))
+
+    def test_everyone_else_is_refused(self):
+        # Selecting bills is not viewing the board, and the bill is the board's
+        # document — the widening stops at the Plan page's own view permission.
+        self.assertFalse(self._allowed(self._user_with("dispatch_plans.can_select_dispatch_bills")))
+        self.assertFalse(self._allowed(self._user_with()))
