@@ -175,6 +175,13 @@ INSTALLED_APPS = [
     'marketplace',
     'blowing',
     'attendance',
+    # Who asked to be away, and who allowed it. Sits next to attendance
+    # because that is where an approved leave ends up: it never writes the
+    # machine's reading, it projects onto the effective status through the
+    # same override door a human correction uses. Routes its approvals down
+    # employee_hierarchy's reporting tree -- the first module here to decide
+    # anything by org position rather than by permission alone.
+    'leave.apps.LeaveConfig',
     'goods_return',
     # The warehouse's own return note: stock a posted bill says went out but
     # which never left the floor.

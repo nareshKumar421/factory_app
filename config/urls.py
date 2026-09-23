@@ -79,6 +79,9 @@ urlpatterns = [
     path("api/v1/goods-return/", include("goods_return.urls")),
     path("api/v1/short-dispatch/", include("short_dispatch.urls")),
     path("api/v1/attendance/", include("attendance.urls")),
+    # Who asked to be away and who allowed it. Next to attendance because an
+    # approved leave ends up on that sheet.
+    path("api/v1/leave/", include("leave.urls")),
     path("api/v1/invoice-approvals/", include("invoice_approval.urls")),
     path("api/v1/ar-invoices/", include("ar_invoice.urls")),
     path("api/v1/artwork/", include("artwork.urls")),

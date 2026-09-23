@@ -59,6 +59,11 @@ class NotificationType(models.TextChoices):
         "FACTORY_HEAD_DECISION_RECORDED",
         "Factory Head Decision Recorded",
     )
+    # Leave. Raised to the approver the reporting tree names, and the decision
+    # sent back to whoever applied -- both best-effort: a push that fails must
+    # never hold up the decision it is describing.
+    LEAVE_REQUESTED = "LEAVE_REQUESTED", "Leave Requested"
+    LEAVE_DECIDED = "LEAVE_DECIDED", "Leave Approved or Rejected"
     PO_RECEIVED = "PO_RECEIVED", "PO Items Received"
     GATE_ENTRY_COMPLETED = "GATE_ENTRY_COMPLETED", "Gate Entry Completed"
     DAILY_NEED_ENTRY_CREATED = "DAILY_NEED_ENTRY_CREATED", "Daily Need Gate Entry Created"
