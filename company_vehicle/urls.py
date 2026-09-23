@@ -9,7 +9,6 @@ from .views import (
     FleetVehicleDetailAPI,
     FleetVehicleListCreateAPI,
     FleetVehicleSummaryAPI,
-    FuelEntryApprovalAPI,
     FuelEntryDetailAPI,
     FuelEntryListCreateAPI,
     PendingApprovalsAPI,
@@ -41,11 +40,6 @@ urlpatterns = [
 
     path("fuel-entries/", FuelEntryListCreateAPI.as_view(), name="fleet-fuel-entries"),
     path("fuel-entries/<int:pk>/", FuelEntryDetailAPI.as_view(), name="fleet-fuel-entry-detail"),
-    path(
-        "fuel-entries/<int:pk>/approval/",
-        FuelEntryApprovalAPI.as_view(),
-        name="fleet-fuel-entry-approval",
-    ),
 
     path("service-entries/", ServiceEntryListCreateAPI.as_view(), name="fleet-service-entries"),
     path(

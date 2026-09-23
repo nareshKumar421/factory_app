@@ -13,8 +13,12 @@ Four tables:
 ``ServiceEntry``   one service or repair bill.
 ``VehicleDocument``insurance, PUC, fitness and the rest, held for their expiry.
 
-Both money tables carry their own approval: an entry is PENDING until someone
-with the approve right passes it, and only APPROVED rows are counted as spend.
+Only ``ServiceEntry`` carries an approval: a workshop bill is PENDING until
+someone with the approve right passes it, and only an APPROVED one is counted
+as spend. A fuel filling has none -- it is a pump slip for a few thousand
+rupees, entered daily, and making somebody pass each one was work without a
+decision in it. A filling counts the moment it is recorded.
+
 Nothing here posts to the cash book or the accounts module -- ``payment_mode``
 records how a bill was paid and stops there.
 """
@@ -66,10 +70,12 @@ def _bill_upload_path(instance, filename):
 
 
 class ApprovableEntry(BaseModel):
-    """The approval half of a money entry, shared by fuel and service.
+    """The approval half of a money entry.
 
-    Abstract: each entry keeps its own table, but the four columns and the two
-    transitions are written once.
+    Abstract, and used by :class:`ServiceEntry` alone. It stays a mixin rather
+    than being folded into that model because the next thing anyone puts
+    through an approval -- a tyre account, a hired vehicle -- wants the same
+    four columns and the same two transitions.
     """
 
     approval_status = models.CharField(
@@ -189,12 +195,16 @@ class FleetVehicle(BaseModel):
         return max(readings) if readings else None
 
 
-class FuelEntry(ApprovableEntry):
+class FuelEntry(BaseModel):
     """One filling at a pump.
 
     The screen a driver or clerk uses every day, so it asks for as little as it
     can: vehicle, date, meter reading, quantity and amount. Rate is derived
     when it is left out, because a pump slip prints the amount and the litres.
+
+    No approval, unlike :class:`ServiceEntry`: a filling counts as spend the
+    moment it is recorded. ``created_by`` says who entered it, which is the
+    part anyone actually goes back to.
 
     ``distance_km`` and ``mileage`` are written by
     :func:`company_vehicle.services.recalculate_fuel_metrics`, never typed in.

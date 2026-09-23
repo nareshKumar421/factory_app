@@ -43,7 +43,6 @@ def fill(vehicle, day, odometer, quantity, amount="1000.00", full=True, fuel=Non
         quantity=Decimal(str(quantity)),
         amount=Decimal(amount),
         is_tank_full=full,
-        approval_status=ApprovalStatus.APPROVED,
     )
 
 
@@ -186,25 +185,29 @@ class FuelFormTests(TestCase):
 
 
 class SpendTests(TestCase):
-    """Only approved money is spend."""
+    """A workshop bill counts once approved. A filling counts at once."""
 
     def setUp(self):
         self.vehicle = make_vehicle()
 
-    def test_pending_fuel_is_not_counted(self):
+    def test_every_filling_is_counted(self):
+        """Fuel has no approval, so nothing is held back from the total."""
         fill(self.vehicle, TODAY, 10_000, 50, amount="4500.00")
-        FuelEntry.objects.create(
+        fill(self.vehicle, TODAY + timedelta(days=2), 10_400, 50, amount="4500.00")
+        summary = vehicle_summary(self.vehicle, None, None)
+        self.assertEqual(summary["fuel_cost"], Decimal("9000.00"))
+        self.assertNotIn("pending_fuel", summary)
+
+    def test_a_pending_workshop_bill_is_not_counted(self):
+        ServiceEntry.objects.create(
             vehicle=self.vehicle,
             entry_date=TODAY,
-            fuel_type=FuelType.DIESEL,
-            odometer=10_400,
-            quantity=Decimal("50"),
-            amount=Decimal("4500.00"),
+            total_amount=Decimal("2000.00"),
             approval_status=ApprovalStatus.PENDING,
         )
         summary = vehicle_summary(self.vehicle, None, None)
-        self.assertEqual(summary["fuel_cost"], Decimal("4500.00"))
-        self.assertEqual(summary["pending_fuel"], 1)
+        self.assertEqual(summary["service_cost"], Decimal("0"))
+        self.assertEqual(summary["pending_service"], 1)
 
     def test_cost_per_km_uses_fuel_and_service_together(self):
         fill(self.vehicle, TODAY, 10_000, 50, amount="4000.00")
@@ -226,7 +229,19 @@ class SpendTests(TestCase):
         self.assertIsNone(summary["distance_km"])
         self.assertIsNone(summary["cost_per_km"])
 
-    def test_fleet_summary_counts_what_is_waiting(self):
+    def test_fleet_summary_counts_only_workshop_bills_as_waiting(self):
+        ServiceEntry.objects.create(
+            vehicle=self.vehicle,
+            entry_date=date.today(),
+            total_amount=Decimal("2000.00"),
+            approval_status=ApprovalStatus.PENDING,
+        )
+        summary = fleet_summary()
+        self.assertEqual(summary["pending_approvals"]["total"], 1)
+        self.assertEqual(summary["pending_approvals"]["service"], 1)
+        self.assertNotIn("fuel", summary["pending_approvals"])
+
+    def test_this_month_fuel_needs_no_approval_to_show_up(self):
         FuelEntry.objects.create(
             vehicle=self.vehicle,
             entry_date=date.today(),
@@ -234,11 +249,8 @@ class SpendTests(TestCase):
             odometer=10_000,
             quantity=Decimal("50"),
             amount=Decimal("4500.00"),
-            approval_status=ApprovalStatus.PENDING,
         )
-        summary = fleet_summary()
-        self.assertEqual(summary["pending_approvals"]["fuel"], 1)
-        self.assertEqual(summary["month_fuel_cost"], Decimal("0"))
+        self.assertEqual(fleet_summary()["month_fuel_cost"], Decimal("4500.00"))
 
 
 # Writes a real file, so it gets a throwaway MEDIA_ROOT rather than the

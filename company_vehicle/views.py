@@ -1,8 +1,9 @@
 """The company vehicle register's API.
 
-Shape of it: a vehicle master with CRUD, two money registers that each add an
-approval endpoint, a document register read mostly by expiry, and the handful
-of read-only endpoints the dashboard and the cost report need.
+Shape of it: a vehicle master with CRUD, two money registers -- of which only
+the service one has an approval endpoint -- a document register read mostly by
+expiry, and the handful of read-only endpoints the dashboard and the cost
+report need.
 
 Every write to a fuel entry -- create, edit or delete -- ends by recomputing
 that vehicle's mileage chain, because all three move the row its neighbours
@@ -253,16 +254,19 @@ class _EntryListCreateAPI(generics.ListCreateAPIView):
     read_serializer = None
     write_serializer = None
     search_fields: tuple[str, ...] = ()
+    #: False for a register with no approval column -- fuel.
+    is_approvable = True
 
     def get_serializer_class(self):
         return self.write_serializer if self.request.method == "POST" else self.read_serializer
 
     def get_queryset(self):
         params = self.request.query_params
-        queryset = self.model.objects.select_related("vehicle", "approved_by", "created_by")
+        related = ["vehicle", "created_by"] + (["approved_by"] if self.is_approvable else [])
+        queryset = self.model.objects.select_related(*related)
         if params.get("vehicle"):
             queryset = queryset.filter(vehicle_id=params["vehicle"])
-        if params.get("approval_status"):
+        if self.is_approvable and params.get("approval_status"):
             queryset = queryset.filter(approval_status=params["approval_status"])
         date_from = _date(self.request, "from")
         date_to = _date(self.request, "to")
@@ -293,8 +297,10 @@ class _EntryListCreateAPI(generics.ListCreateAPIView):
 class _EntryDetailAPI(APIView):
     """Shared read/edit/delete for one money entry.
 
-    An approved entry is frozen: correcting it means sending it back first, so
-    a figure that was passed cannot quietly change afterwards.
+    An APPROVED entry is frozen: correcting it means sending it back first, so
+    a figure somebody passed cannot quietly change afterwards. A fuel entry has
+    no approval, so it stays editable -- ``getattr`` below is what makes the
+    same class serve both.
     """
 
     permission_classes = [IsAuthenticated, FleetExpensePermission]
@@ -314,7 +320,7 @@ class _EntryDetailAPI(APIView):
 
     def patch(self, request, pk):
         entry = self.get_object(pk)
-        if entry.approval_status == ApprovalStatus.APPROVED:
+        if getattr(entry, "approval_status", None) == ApprovalStatus.APPROVED:
             return Response(
                 {"detail": "This entry is approved. Send it back before changing it."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -328,7 +334,7 @@ class _EntryDetailAPI(APIView):
 
     def delete(self, request, pk):
         entry = self.get_object(pk)
-        if entry.approval_status == ApprovalStatus.APPROVED:
+        if getattr(entry, "approval_status", None) == ApprovalStatus.APPROVED:
             return Response(
                 {"detail": "This entry is approved. Send it back before deleting it."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -374,6 +380,7 @@ class _EntryApprovalAPI(APIView):
 
 
 class FuelEntryListCreateAPI(_EntryListCreateAPI):
+    is_approvable = False
     model = FuelEntry
     read_serializer = FuelEntrySerializer
     write_serializer = FuelEntryWriteSerializer
@@ -390,11 +397,6 @@ class FuelEntryDetailAPI(_EntryDetailAPI):
 
     def after_write(self, vehicle):
         services.recalculate_fuel_metrics(vehicle)
-
-
-class FuelEntryApprovalAPI(_EntryApprovalAPI):
-    model = FuelEntry
-    read_serializer = FuelEntrySerializer
 
 
 class ServiceEntryListCreateAPI(_EntryListCreateAPI):
@@ -416,27 +418,23 @@ class ServiceEntryApprovalAPI(_EntryApprovalAPI):
 
 
 class PendingApprovalsAPI(APIView):
-    """Both registers' pending bills in one list, oldest first.
+    """Workshop bills waiting to be passed, oldest first.
 
-    One endpoint rather than two so the approvals screen is a single queue: an
-    approver does not think in terms of which table a bill came from.
+    Fuel is absent by design: a filling has no approval. The response keeps its
+    ``fuel`` key, always empty, so a client that still reads it does not break.
     """
 
     permission_classes = [IsAuthenticated, CanViewFleet]
 
     def get(self, request):
-        fuel = FuelEntry.objects.filter(approval_status=ApprovalStatus.PENDING).select_related(
-            "vehicle", "created_by"
-        )
         service = ServiceEntry.objects.filter(
             approval_status=ApprovalStatus.PENDING
         ).select_related("vehicle", "created_by")
         if request.query_params.get("vehicle"):
-            fuel = fuel.filter(vehicle_id=request.query_params["vehicle"])
             service = service.filter(vehicle_id=request.query_params["vehicle"])
         return Response(
             {
-                "fuel": FuelEntrySerializer(fuel.order_by("entry_date", "id"), many=True).data,
+                "fuel": [],
                 "service": ServiceEntrySerializer(
                     service.order_by("entry_date", "id"), many=True
                 ).data,

@@ -20,9 +20,8 @@ class FuelEntryAdmin(admin.ModelAdmin):
         "quantity",
         "amount",
         "mileage",
-        "approval_status",
     )
-    list_filter = ("approval_status", "fuel_type", "payment_mode")
+    list_filter = ("fuel_type", "payment_mode")
     search_fields = ("vehicle__vehicle_number", "bill_number", "station_name")
     date_hierarchy = "entry_date"
     readonly_fields = ("distance_km", "mileage")

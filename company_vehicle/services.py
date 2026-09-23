@@ -84,7 +84,11 @@ def recalculate_fuel_metrics(vehicle: FleetVehicle) -> None:
 
 
 def _approved(queryset):
-    """Only approved money is spend. Pending bills are shown, never totalled."""
+    """Only an approved workshop bill is spend. A pending one is never totalled.
+
+    Fuel does not go through here: a filling has no approval and counts the
+    moment it is recorded.
+    """
     return queryset.filter(approval_status=ApprovalStatus.APPROVED)
 
 
@@ -110,18 +114,16 @@ def fleet_summary() -> dict:
     month_start = _month_start(today)
 
     vehicles = FleetVehicle.objects.filter(is_active=True)
-    month_fuel = _approved(
-        FuelEntry.objects.filter(entry_date__gte=month_start, entry_date__lte=today)
+    month_fuel = FuelEntry.objects.filter(
+        entry_date__gte=month_start, entry_date__lte=today
     ).aggregate(total=Sum("amount"), quantity=Sum("quantity"))
     month_service = _approved(
         ServiceEntry.objects.filter(entry_date__gte=month_start, entry_date__lte=today)
     ).aggregate(total=Sum("total_amount"))
 
-    pending = {
-        "fuel": FuelEntry.objects.filter(approval_status=ApprovalStatus.PENDING).count(),
-        "service": ServiceEntry.objects.filter(approval_status=ApprovalStatus.PENDING).count(),
-    }
-    pending["total"] = pending["fuel"] + pending["service"]
+    # Service alone: a filling has no approval to wait for.
+    pending_service = ServiceEntry.objects.filter(approval_status=ApprovalStatus.PENDING).count()
+    pending = {"service": pending_service, "total": pending_service}
 
     documents = expiring_documents()
     return {
@@ -159,7 +161,8 @@ def vehicle_summary(vehicle: FleetVehicle, date_from: date | None, date_to: date
         fuel = fuel.filter(entry_date__lte=date_to)
         service = service.filter(entry_date__lte=date_to)
 
-    approved_fuel = _approved(fuel)
+    # Every filling counts; only the workshop bills are filtered.
+    approved_fuel = fuel
     approved_service = _approved(service)
 
     fuel_totals = approved_fuel.aggregate(
@@ -232,7 +235,6 @@ def vehicle_summary(vehicle: FleetVehicle, date_from: date | None, date_to: date
         "distance_km": distance,
         "cost_per_km": cost_per_km,
         "mileage_by_fuel": mileage_by_fuel,
-        "pending_fuel": fuel.filter(approval_status=ApprovalStatus.PENDING).count(),
         "pending_service": service.filter(approval_status=ApprovalStatus.PENDING).count(),
         "monthly": series,
     }

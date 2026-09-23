@@ -14,7 +14,7 @@ paid and stops there.
 | Model | What it holds |
 |---|---|
 | `FleetVehicle` | The vehicle. Four required fields: number, category, fuel, status. |
-| `FuelEntry` | One filling. The row that gets written every day. |
+| `FuelEntry` | One filling. The row that gets written every day. No approval. |
 | `ServiceEntry` | One service or repair bill. |
 | `VehicleDocument` | Insurance, PUC, fitness, permit, road tax — held for the expiry date. |
 
@@ -23,14 +23,19 @@ the four permission rows.
 
 ## Approval
 
-`FuelEntry` and `ServiceEntry` both extend `ApprovableEntry`. Every entry is
-`PENDING` when written and only an `APPROVED` one is counted as spend — the
-summaries in `services.py` filter on it, and the pending count is reported
-separately so nothing is quietly left out.
+`ServiceEntry` alone extends `ApprovableEntry`. A workshop bill is `PENDING`
+when written and only an `APPROVED` one is counted as spend — `services.py`
+filters on it, and the pending count is reported separately so nothing is
+quietly left out.
 
-An approved entry is frozen: `PATCH` and `DELETE` are refused until it is sent
-back. Entering (`can_add_fleet_expense`) and approving
-(`can_approve_fleet_expense`) are separate rights on purpose.
+**Fuel has no approval.** A filling is a pump slip for a few thousand rupees,
+entered daily, and passing each one was work with no decision in it. A filling
+counts the moment it is recorded, and `created_by` says who entered it.
+
+An approved bill is frozen: `PATCH` and `DELETE` are refused until it is sent
+back. A fuel entry, having no approval, stays editable. Entering
+(`can_add_fleet_expense`) and approving (`can_approve_fleet_expense`) are
+separate rights on purpose.
 
 ## Mileage
 

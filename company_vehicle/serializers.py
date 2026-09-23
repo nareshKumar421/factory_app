@@ -44,7 +44,7 @@ def _user_name(user):
 
 
 class ApprovalActionSerializer(serializers.Serializer):
-    """The body of an approve or reject.
+    """The body of an approve or reject on a workshop bill.
 
     A rejection must say why: an entry sent back without a reason is one the
     clerk cannot act on.
@@ -68,7 +68,10 @@ class ApprovalActionSerializer(serializers.Serializer):
 
 
 class ApprovalFieldsMixin(serializers.Serializer):
-    """The four read-only approval fields both entry serializers show."""
+    """The read-only approval fields a serializer shows for an approvable entry.
+
+    Used by :class:`ServiceEntrySerializer` alone -- fuel has no approval.
+    """
 
     approval_status_label = serializers.CharField(
         source="get_approval_status_display", read_only=True
@@ -309,7 +312,9 @@ class FleetVehicleWriteSerializer(serializers.ModelSerializer):
 # -------------------------------------------------------------- fuel entries
 
 
-class FuelEntrySerializer(ApprovalFieldsMixin, serializers.ModelSerializer):
+class FuelEntrySerializer(serializers.ModelSerializer):
+    """One filling. No approval fields -- a filling counts when it is recorded."""
+
     vehicle_number = serializers.CharField(source="vehicle.vehicle_number", read_only=True)
     vehicle_nickname = serializers.CharField(source="vehicle.nickname", read_only=True)
     fuel_type_label = serializers.CharField(source="get_fuel_type_display", read_only=True)
@@ -347,23 +352,10 @@ class FuelEntrySerializer(ApprovalFieldsMixin, serializers.ModelSerializer):
             "distance_km",
             "mileage",
             "mileage_unit",
-            "approval_status",
-            "approval_status_label",
-            "approved_by_name",
-            "approved_at",
-            "rejection_reason",
             "entered_by_name",
             "created_at",
         ]
-        read_only_fields = [
-            "id",
-            "distance_km",
-            "mileage",
-            "approval_status",
-            "approved_at",
-            "rejection_reason",
-            "created_at",
-        ]
+        read_only_fields = ["id", "distance_km", "mileage", "created_at"]
         extra_kwargs = {"bill_photo": {"write_only": True, "required": False}}
 
     def get_mileage_unit(self, obj):
