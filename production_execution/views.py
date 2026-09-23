@@ -1,7 +1,9 @@
 import logging
 from collections import defaultdict, deque
 
+from django.db import IntegrityError, transaction
 from django.db.models import Q
+from django.utils.dateparse import parse_date
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -18,6 +20,7 @@ from .models import (
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, InProcessQCCheck, FinalQCCheck,
+    FillingCostSheet, FillingCostSheetEntry,
 )
 from .serializers import (
     # Master Data
@@ -67,6 +70,9 @@ from .serializers import (
     # Production Movement Dashboard
     ProductionMovementFilterOptionsSerializer, ProductionMovementFilterSerializer,
     ProductionMovementReportSerializer,
+    # Filling Cost Sheet
+    FillingCostSheetSerializer, FillingCostSheetWriteSerializer,
+    FillingCostSheetUpdateSerializer,
 )
 from .permissions import (
     CanManageProductionLines, CanManageMachines, CanManageChecklistTemplates,
@@ -85,6 +91,7 @@ from .permissions import (
     CanApproveWasteStore, CanApproveWasteHOD,
     CanViewReports,
     CanViewRunCost,
+    CanViewFillingCost, CanManageFillingCost, InFillingCostCompany,
 )
 
 logger = logging.getLogger(__name__)
@@ -2549,3 +2556,178 @@ class LineSkuConfigAutoFillAPI(APIView):
 
 # Cost-rate CRUD moved to the central Cost Master (/api/v1/cost-master/);
 # the run-costing engine resolves its rates from there.
+
+
+# ===========================================================================
+# FILLING COST SHEET — the month's filling cost, entered by hand
+# ===========================================================================
+
+def _filling_cost_queryset(request):
+    return (
+        FillingCostSheet.objects
+        .filter(company=request.company.company)
+        .select_related('line', 'created_by', 'updated_by')
+        .prefetch_related('entries')
+    )
+
+
+def _resolve_filling_cost_line(company, line_id):
+    """The line a sheet is for, or ``None`` for the floor as a whole.
+
+    Returns ``(line, error)``; ``error`` is a message when the id names a line
+    that is not this company's.
+    """
+    if not line_id:
+        return None, None
+    line = ProductionLine.objects.filter(id=line_id, company=company).first()
+    if line is None:
+        return None, 'That production line does not belong to this company.'
+    return line, None
+
+
+def _replace_filling_cost_entries(sheet, entries):
+    """Rewrite the sheet's rows, keeping the order they were sent in."""
+    sheet.entries.all().delete()
+    FillingCostSheetEntry.objects.bulk_create([
+        FillingCostSheetEntry(
+            sheet=sheet,
+            head=entry['head'],
+            amount=entry['amount'],
+            sort_order=index,
+        )
+        for index, entry in enumerate(entries)
+    ])
+
+
+class FillingCostSheetListCreateAPI(APIView):
+    """List the sheets entered so far, newest month first, or enter a new one."""
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                    CanViewFillingCost()]
+        return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                CanManageFillingCost()]
+
+    def get(self, request):
+        qs = _filling_cost_queryset(request)
+
+        line_id = request.GET.get('line_id')
+        if line_id == 'none':
+            # The floor-wide sheet, explicitly — distinct from "any line".
+            qs = qs.filter(line__isnull=True)
+        elif line_id:
+            if not line_id.isdigit():
+                return Response({'detail': 'line_id must be a number or "none".'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            qs = qs.filter(line_id=int(line_id))
+
+        period = request.GET.get('period')
+        if period:
+            parsed = parse_date(period)
+            if parsed is None:
+                return Response({'detail': 'period must be a date (YYYY-MM-DD).'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            # Any day in the month finds that month's sheet.
+            qs = qs.filter(period=parsed.replace(day=1))
+
+        return Response(FillingCostSheetSerializer(qs, many=True).data)
+
+    def post(self, request):
+        serializer = FillingCostSheetWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({'detail': 'Invalid data.', 'errors': serializer.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+        data = serializer.validated_data
+        company = request.company.company
+
+        line, error = _resolve_filling_cost_line(company, data.get('line_id'))
+        if error:
+            return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            with transaction.atomic():
+                sheet = FillingCostSheet.objects.create(
+                    company=company,
+                    line=line,
+                    period=data['period'],
+                    cases=data['cases'],
+                    notes=data.get('notes', ''),
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
+                _replace_filling_cost_entries(sheet, data['entries'])
+        except IntegrityError:
+            # One sheet per month per scope — edit the one that is there.
+            return Response(
+                {'detail': f"A filling cost sheet already exists for "
+                           f"{data['period']:%B %Y}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(FillingCostSheetSerializer(sheet).data,
+                        status=status.HTTP_201_CREATED)
+
+
+class FillingCostSheetDetailAPI(APIView):
+    """Read, correct or drop one month's sheet."""
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                    CanViewFillingCost()]
+        return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                CanManageFillingCost()]
+
+    def _get_sheet(self, request, sheet_id):
+        return _filling_cost_queryset(request).filter(id=sheet_id).first()
+
+    def get(self, request, sheet_id):
+        sheet = self._get_sheet(request, sheet_id)
+        if sheet is None:
+            return Response({'detail': 'Sheet not found.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        return Response(FillingCostSheetSerializer(sheet).data)
+
+    def patch(self, request, sheet_id):
+        sheet = self._get_sheet(request, sheet_id)
+        if sheet is None:
+            return Response({'detail': 'Sheet not found.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        serializer = FillingCostSheetUpdateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({'detail': 'Invalid data.', 'errors': serializer.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+        data = serializer.validated_data
+
+        if 'line_id' in data:
+            line, error = _resolve_filling_cost_line(
+                request.company.company, data['line_id'])
+            if error:
+                return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+            sheet.line = line
+        for field in ('period', 'cases', 'notes'):
+            if field in data:
+                setattr(sheet, field, data[field])
+        sheet.updated_by = request.user
+
+        try:
+            with transaction.atomic():
+                sheet.save()
+                if 'entries' in data:
+                    _replace_filling_cost_entries(sheet, data['entries'])
+        except IntegrityError:
+            return Response(
+                {'detail': f"A filling cost sheet already exists for "
+                           f"{sheet.period:%B %Y}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        sheet = self._get_sheet(request, sheet_id)
+        return Response(FillingCostSheetSerializer(sheet).data)
+
+    def delete(self, request, sheet_id):
+        sheet = self._get_sheet(request, sheet_id)
+        if sheet is None:
+            return Response({'detail': 'Sheet not found.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        sheet.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

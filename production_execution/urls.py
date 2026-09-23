@@ -63,6 +63,8 @@ from .views import (
     # Line SKU Config
     LineSkuConfigListCreateAPI, LineSkuConfigDetailAPI,
     LineSkuConfigAutoFillAPI,
+    # Filling Cost Sheet
+    FillingCostSheetListCreateAPI, FillingCostSheetDetailAPI,
     # Cost Master
 )
 
@@ -293,6 +295,12 @@ urlpatterns = [
     path('line-configs/', LineSkuConfigListCreateAPI.as_view(), name='pe-line-config-list-create'),
     path('line-configs/<int:config_id>/', LineSkuConfigDetailAPI.as_view(), name='pe-line-config-detail'),
     path('line-configs/auto-fill/', LineSkuConfigAutoFillAPI.as_view(), name='pe-line-config-autofill'),
+
+    # ------------------------------------------------------------------
+    # Filling Cost Sheet — manual monthly entry
+    # ------------------------------------------------------------------
+    path('filling-costs/', FillingCostSheetListCreateAPI.as_view(), name='pe-filling-cost-list-create'),
+    path('filling-costs/<int:sheet_id>/', FillingCostSheetDetailAPI.as_view(), name='pe-filling-cost-detail'),
 
     # ------------------------------------------------------------------
     # Cost Master — Cost Rates

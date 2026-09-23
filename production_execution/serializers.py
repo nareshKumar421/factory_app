@@ -16,6 +16,7 @@ from .models import (
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, ProductionRunCostLine, InProcessQCCheck, FinalQCCheck,
+    FillingCostSheet, FillingCostSheetEntry,
 )
 
 
@@ -1303,3 +1304,97 @@ class LineSkuConfigUpdateSerializer(serializers.Serializer):
 
 # Cost-rate serializers removed: rates are managed in the central Cost Master
 # (cost_master app) and resolved by the run-costing engine from there.
+
+
+# ---------------------------------------------------------------------------
+# Filling Cost Sheet — manual monthly entry
+# ---------------------------------------------------------------------------
+
+class FillingCostEntrySerializer(serializers.ModelSerializer):
+    per_case = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = FillingCostSheetEntry
+        fields = ['id', 'head', 'amount', 'sort_order', 'per_case']
+        read_only_fields = ['id', 'per_case']
+
+
+class FillingCostSheetSerializer(serializers.ModelSerializer):
+    line_name = serializers.SerializerMethodField()
+    entries = FillingCostEntrySerializer(many=True, read_only=True)
+    total_amount = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True)
+    total_per_case = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True)
+    created_by_name = serializers.CharField(
+        source='created_by.full_name', read_only=True, default='')
+    updated_by_name = serializers.CharField(
+        source='updated_by.full_name', read_only=True, default='')
+
+    class Meta:
+        model = FillingCostSheet
+        fields = [
+            'id', 'line', 'line_name', 'period', 'cases', 'notes',
+            'entries', 'total_amount', 'total_per_case',
+            'created_by_name', 'updated_by_name', 'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_line_name(self, obj):
+        return obj.line.name if obj.line_id else ''
+
+
+class FillingCostEntryWriteSerializer(serializers.Serializer):
+    head = serializers.CharField(max_length=120)
+    # No minimum: a head can be a credit, and the sheet is typed in as it was
+    # written, not argued with.
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+
+    def validate_head(self, value):
+        head = value.strip()
+        if not head:
+            raise serializers.ValidationError('A cost head cannot be blank.')
+        return head
+
+
+class FillingCostSheetWriteSerializer(serializers.Serializer):
+    """Create a sheet, rows and all.
+
+    The rows are sent as a list and kept in that order — the sheet is read down
+    the page, so the order it was entered in is part of it.
+    """
+    line_id = serializers.IntegerField(required=False, allow_null=True)
+    period = serializers.DateField()
+    cases = serializers.DecimalField(
+        max_digits=15, decimal_places=2, min_value=Decimal('0.01'),
+        help_text="The sheet's 'Per N Cases' divisor.")
+    notes = serializers.CharField(
+        max_length=300, required=False, allow_blank=True, default='')
+    entries = FillingCostEntryWriteSerializer(many=True)
+
+    def validate_period(self, value):
+        # A sheet covers a month; the day it was typed on is not part of it.
+        return value.replace(day=1)
+
+    def validate_entries(self, value):
+        if not value:
+            raise serializers.ValidationError('Enter at least one cost head.')
+        seen = set()
+        for entry in value:
+            head = entry['head'].casefold()
+            if head in seen:
+                raise serializers.ValidationError(
+                    f"'{entry['head']}' is listed twice.")
+            seen.add(head)
+        return value
+
+
+class FillingCostSheetUpdateSerializer(FillingCostSheetWriteSerializer):
+    """Every field optional. Sending ``entries`` replaces the sheet's rows
+    outright — which is what the page does on each save, so a row deleted on
+    screen is a row gone from the sheet."""
+    period = serializers.DateField(required=False)
+    cases = serializers.DecimalField(
+        max_digits=15, decimal_places=2, min_value=Decimal('0.01'), required=False)
+    entries = FillingCostEntryWriteSerializer(many=True, required=False)

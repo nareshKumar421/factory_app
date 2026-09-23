@@ -1,3 +1,5 @@
+from decimal import ROUND_HALF_UP, Decimal
+
 from django.db import models
 from django.conf import settings
 from django.utils import timezone
@@ -590,6 +592,8 @@ class ProductionRun(models.Model):
             ('can_approve_waste_hod', 'Can HOD-approve waste'),
             ('can_view_reports', 'Can view production reports'),
             ('can_view_run_cost', 'Can view run cost / costing'),
+            ('can_view_filling_cost', 'Can view the filling cost sheet'),
+            ('can_manage_filling_cost', 'Can enter/edit the filling cost sheet'),
             ('can_view_line_config', 'Can view line configuration (read-only)'),
             ('can_manage_line_config', 'Can edit line configuration'),
         ]
@@ -1288,6 +1292,137 @@ class ProductionRunCostLine(models.Model):
 
     def __str__(self):
         return f"{self.get_category_display()} — {self.amount}"
+
+
+# ---------------------------------------------------------------------------
+# Filling Cost Sheet — the month's filling cost, typed in by hand
+# ---------------------------------------------------------------------------
+
+def filling_cost_per_case(amount, cases):
+    """The per-case column of a filling sheet: ``amount`` over ``cases``.
+
+    Rounded half-up to paise, which is how the sheet is written by hand — a
+    60,000 batch-coding bill over 1,60,000 cases reads 0.38 there, not the 0.37
+    banker's rounding would give.
+    """
+    divisor = Decimal(str(cases or 0))
+    if divisor <= 0:
+        return Decimal('0.00')
+    return (Decimal(str(amount or 0)) / divisor).quantize(
+        Decimal('0.01'), rounding=ROUND_HALF_UP
+    )
+
+
+class FillingCostSheet(models.Model):
+    """One month of filling cost, entered by hand from the factory's own sheet.
+
+    Nothing on it is derived. Each head's amount for the month is typed in, and
+    the per-case column is that amount over ``cases`` — the "Per 1,60,000
+    Cases" the sheet is headed with. It is a record of what the sheet says.
+
+    Run costing is a separate thing and stays derived from the central Cost
+    Master (see ``services.cost_calculator``): entering a sheet here reprices
+    no run.
+    """
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT,
+        related_name='filling_cost_sheets'
+    )
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.PROTECT,
+        related_name='filling_cost_sheets', null=True, blank=True,
+        help_text="Blank = the filling floor as a whole; set = that line only."
+    )
+    period = models.DateField(
+        help_text="First day of the month the sheet covers."
+    )
+    cases = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('160000'),
+        help_text="Cases the month's cost is spread over — the sheet's "
+                  "'Per N Cases' heading, and the divisor behind every "
+                  "per-case figure on it."
+    )
+    notes = models.CharField(max_length=300, blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='filling_cost_sheets_created'
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='filling_cost_sheets_updated'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-period', 'line']
+        verbose_name = 'Filling Cost Sheet'
+        verbose_name_plural = 'Filling Cost Sheets'
+        constraints = [
+            # One sheet per month per scope. A NULL line never collides in a
+            # unique index, so the floor-wide sheet needs a constraint of its
+            # own rather than riding along on the per-line one.
+            models.UniqueConstraint(
+                fields=['company', 'period'],
+                condition=models.Q(line__isnull=True),
+                name='uniq_filling_cost_sheet_per_month',
+            ),
+            models.UniqueConstraint(
+                fields=['company', 'line', 'period'],
+                condition=models.Q(line__isnull=False),
+                name='uniq_filling_cost_sheet_per_line_month',
+            ),
+        ]
+
+    def __str__(self):
+        scope = self.line.name if self.line_id else 'All lines'
+        return f"Filling cost {self.period:%b %Y} — {scope}"
+
+    @property
+    def total_amount(self):
+        return sum((e.amount for e in self.entries.all()), Decimal('0.00'))
+
+    @property
+    def total_per_case(self):
+        """The sheet's total row: the month's total over the cases.
+
+        Deliberately not the sum of the per-case column — rounding each head to
+        paise first and adding those up reads 15.56 where the sheet says 15.55.
+        """
+        return filling_cost_per_case(self.total_amount, self.cases)
+
+
+class FillingCostSheetEntry(models.Model):
+    """One head on a filling cost sheet — 'Electricity', 8,00,000."""
+    sheet = models.ForeignKey(
+        FillingCostSheet, on_delete=models.CASCADE, related_name='entries'
+    )
+    head = models.CharField(
+        max_length=120,
+        help_text="The head as the sheet names it, e.g. 'Ground Water "
+                  "Extraction Bill'. Free text: the heads are the factory's, "
+                  "not a fixed list, and nothing resolves against them."
+    )
+    amount = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0'),
+        help_text="The month's amount for this head."
+    )
+    sort_order = models.PositiveIntegerField(
+        default=0, help_text="Row order on the sheet."
+    )
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+        unique_together = ('sheet', 'head')
+        verbose_name = 'Filling Cost Entry'
+        verbose_name_plural = 'Filling Cost Entries'
+
+    def __str__(self):
+        return f"{self.head} — {self.amount}"
+
+    @property
+    def per_case(self):
+        return filling_cost_per_case(self.amount, self.sheet.cases)
 
 
 # ---------------------------------------------------------------------------

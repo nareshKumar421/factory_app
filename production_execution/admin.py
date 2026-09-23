@@ -6,6 +6,7 @@ from .models import (
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem,
     MachineChecklistEntry, WasteLog,
+    FillingCostSheet, FillingCostSheetEntry,
 )
 
 
@@ -182,3 +183,21 @@ class WasteLogAdmin(admin.ModelAdmin):
     ]
     list_filter = ['wastage_approval_status']
     search_fields = ['material_name', 'material_code']
+
+
+# ---------------------------------------------------------------------------
+# Filling Cost Sheet
+# ---------------------------------------------------------------------------
+
+class FillingCostSheetEntryInline(admin.TabularInline):
+    model = FillingCostSheetEntry
+    extra = 0
+    fields = ['sort_order', 'head', 'amount']
+
+
+@admin.register(FillingCostSheet)
+class FillingCostSheetAdmin(admin.ModelAdmin):
+    list_display = ['id', 'period', 'company', 'line', 'cases', 'updated_at']
+    list_filter = ['company', 'line']
+    date_hierarchy = 'period'
+    inlines = [FillingCostSheetEntryInline]

@@ -216,3 +216,46 @@ class CanViewReports(BasePermission):
 class CanViewRunCost(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm('production_execution.can_view_run_cost')
+
+
+#: The filling cost sheet is Beverages'. The sheet is a Beverages practice and
+#: the figures on it are Beverages' own, so the page and its API exist for that
+#: company alone — a company added to the deployment later has to be named here
+#: on purpose before it can keep one.
+FILLING_COST_COMPANY_CODES = frozenset({'JIVO_BEVERAGES'})
+
+
+class InFillingCostCompany(BasePermission):
+    """The company context is one that keeps a filling cost sheet.
+
+    Sits alongside the view/manage permissions rather than inside them: holding
+    the permission and switching the ``Company-Code`` header must not be a way
+    to start a second company's sheet, so the check is on every read and write.
+    """
+    message = 'The filling cost sheet is kept by Jivo Beverages only.'
+
+    def has_permission(self, request, view):
+        # HasCompanyContext runs first and attaches the membership; be explicit
+        # anyway, so a reordering of the classes fails closed.
+        user_company = getattr(request, 'company', None)
+        if user_company is None:
+            return False
+        return user_company.company.code in FILLING_COST_COMPANY_CODES
+
+
+# Filling cost sheet — the month's filling cost, entered by hand. Cost figures,
+# so it follows can_view_run_cost: granted to no group by default (see
+# setup_production_groups) and held only by whoever is explicitly given it.
+# A run-cost holder reads the sheet too; entering one is its own permission.
+class CanViewFillingCost(BasePermission):
+    def has_permission(self, request, view):
+        return (
+            request.user.has_perm('production_execution.can_view_filling_cost') or
+            request.user.has_perm('production_execution.can_manage_filling_cost') or
+            request.user.has_perm('production_execution.can_view_run_cost')
+        )
+
+
+class CanManageFillingCost(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm('production_execution.can_manage_filling_cost')
