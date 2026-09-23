@@ -14,6 +14,7 @@ paid and stops there.
 | Model | What it holds |
 |---|---|
 | `FleetVehicle` | The vehicle. Four required fields: number, category, fuel, status. |
+| `DailyReading` | One meter reading on one day. One row per vehicle per day. |
 | `FuelEntry` | One filling. The row that gets written every day. No approval. |
 | `ServiceEntry` | One service or repair bill. |
 | `VehicleDocument` | Insurance, PUC, fitness, permit, road tax — held for the expiry date. |
@@ -68,6 +69,26 @@ what a pump slip looks like:
    `odometer_note` says why — meters get replaced and do break.
 3. **The same bill twice is queried once.** `confirm_duplicate` is how the page
    says it meant it.
+
+## The running log
+
+`running-log/` is the day-wise history. With `vehicle` it returns a row per day
+for that vehicle; without, a row per vehicle for the window — the fleet-wide
+answer to "which vehicle ran how much".
+
+Three tables hold meter readings: `DailyReading`, `FuelEntry` and
+`ServiceEntry`. A person at a pump is already writing the meter down, so the
+log merges all three and takes the day's **highest** reading as its closing
+figure. Nothing has to be typed twice.
+
+Distance is only claimed where two readings bracket it. Where the previous
+reading is older than the day before, the row carries `covers_days` so the
+page can say the figure is a stretch rather than a day's running — a truck
+nobody read on Sunday did not do 600 km on Monday. A day with no reading
+comes back as a row of nulls: the gaps are the point.
+
+`POST daily-readings/` is an **upsert** on (vehicle, date). Re-entering a day
+overwrites it, so correcting a typo is the same action as entering it.
 
 ## Files
 

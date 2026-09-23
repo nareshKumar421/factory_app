@@ -14,9 +14,19 @@ from django.core.files.base import ContentFile
 from django.test import TestCase, override_settings
 
 from .constants import ApprovalStatus, FuelType, VehicleCategory, VehicleStatus
-from .models import FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
-from .serializers import FuelEntryWriteSerializer, VehicleDocumentSerializer
-from .services import fleet_summary, recalculate_fuel_metrics, vehicle_summary
+from .models import DailyReading, FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
+from .serializers import (
+    DailyReadingSerializer,
+    FuelEntryWriteSerializer,
+    VehicleDocumentSerializer,
+)
+from .services import (
+    fleet_summary,
+    recalculate_fuel_metrics,
+    running_log,
+    running_log_by_vehicle,
+    vehicle_summary,
+)
 
 User = get_user_model()
 
@@ -295,3 +305,170 @@ class AttachmentLinkTests(TestCase):
         self.assertEqual(VehicleDocumentSerializer(past).data["expiry_state"], "EXPIRED")
         self.assertEqual(VehicleDocumentSerializer(soon).data["expiry_state"], "EXPIRING")
         self.assertEqual(VehicleDocumentSerializer(later).data["expiry_state"], "OK")
+
+
+def read(vehicle, day, odometer, remarks=""):
+    return DailyReading.objects.create(
+        vehicle=vehicle, reading_date=day, odometer=odometer, remarks=remarks
+    )
+
+
+class RunningLogTests(TestCase):
+    """The day-wise log: how far each vehicle ran, and what it cost."""
+
+    def setUp(self):
+        self.vehicle = make_vehicle()
+
+    def rows_by_date(self, date_from, date_to):
+        log = running_log(self.vehicle, date_from, date_to)
+        return {row["date"]: row for row in log["rows"]}, log["totals"]
+
+    def test_a_row_for_every_day_even_with_nothing_on_it(self):
+        rows, _ = self.rows_by_date(TODAY, TODAY + timedelta(days=4))
+        self.assertEqual(len(rows), 5)
+        self.assertIsNone(rows[TODAY + timedelta(days=3)]["odometer"])
+
+    def test_distance_is_the_gap_between_two_readings(self):
+        read(self.vehicle, TODAY, 10_000)
+        read(self.vehicle, TODAY + timedelta(days=1), 10_180)
+        rows, totals = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["distance_km"], 180)
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["covers_days"], 1)
+        self.assertEqual(totals["distance_km"], 180)
+
+    def test_a_missed_day_is_not_billed_to_the_next_one(self):
+        """The distance is still shown, but it says how many days it covers."""
+        read(self.vehicle, TODAY, 10_000)
+        read(self.vehicle, TODAY + timedelta(days=3), 10_600)
+        rows, _ = self.rows_by_date(TODAY, TODAY + timedelta(days=3))
+        row = rows[TODAY + timedelta(days=3)]
+        self.assertEqual(row["distance_km"], 600)
+        self.assertEqual(row["covers_days"], 3)
+        self.assertIsNone(rows[TODAY + timedelta(days=1)]["distance_km"])
+
+    def test_the_first_day_measures_against_a_reading_before_the_window(self):
+        read(self.vehicle, TODAY - timedelta(days=1), 9_900)
+        read(self.vehicle, TODAY, 10_000)
+        rows, _ = self.rows_by_date(TODAY, TODAY)
+        self.assertEqual(rows[TODAY]["distance_km"], 100)
+
+    def test_a_filling_counts_as_that_day_s_reading(self):
+        """Nobody types the meter twice: the pump slip already carried it."""
+        read(self.vehicle, TODAY, 10_000)
+        fill(self.vehicle, TODAY + timedelta(days=1), 10_250, 30, amount="2700.00")
+        rows, totals = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
+        row = rows[TODAY + timedelta(days=1)]
+        self.assertEqual(row["odometer"], 10_250)
+        self.assertEqual(row["distance_km"], 250)
+        self.assertEqual(row["fuel_cost"], Decimal("2700.00"))
+        self.assertEqual(row["fuel_quantity"], Decimal("30"))
+        self.assertEqual(totals["fuel_cost"], Decimal("2700.00"))
+
+    def test_the_days_highest_reading_wins(self):
+        """A morning reading and an evening fill: the closing figure is the fill."""
+        read(self.vehicle, TODAY, 10_000)
+        read(self.vehicle, TODAY + timedelta(days=1), 10_100)
+        fill(self.vehicle, TODAY + timedelta(days=1), 10_400, 30)
+        rows, _ = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["odometer"], 10_400)
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["distance_km"], 400)
+
+    def test_a_meter_that_went_backwards_claims_no_distance(self):
+        read(self.vehicle, TODAY, 10_000)
+        read(self.vehicle, TODAY + timedelta(days=1), 500, remarks="Meter replaced")
+        rows, totals = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
+        self.assertIsNone(rows[TODAY + timedelta(days=1)]["distance_km"])
+        self.assertEqual(totals["distance_km"], 0)
+
+    def test_totals_count_the_days_nobody_wrote_anything_down(self):
+        read(self.vehicle, TODAY, 10_000)
+        _, totals = self.rows_by_date(TODAY, TODAY + timedelta(days=4))
+        self.assertEqual(totals["days_in_range"], 5)
+        self.assertEqual(totals["days_with_reading"], 1)
+        self.assertEqual(totals["days_missing"], 4)
+
+    def test_cost_per_km_over_the_window(self):
+        read(self.vehicle, TODAY, 10_000)
+        fill(self.vehicle, TODAY + timedelta(days=1), 10_400, 40, amount="3600.00")
+        ServiceEntry.objects.create(
+            vehicle=self.vehicle,
+            entry_date=TODAY + timedelta(days=1),
+            total_amount=Decimal("400.00"),
+            approval_status=ApprovalStatus.APPROVED,
+        )
+        _, totals = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
+        self.assertEqual(totals["distance_km"], 400)
+        self.assertEqual(totals["total_cost"], Decimal("4000.00"))
+        self.assertEqual(totals["cost_per_km"], Decimal("10.00"))
+
+    def test_a_pending_workshop_bill_stays_out_of_the_log_totals(self):
+        read(self.vehicle, TODAY, 10_000)
+        ServiceEntry.objects.create(
+            vehicle=self.vehicle,
+            entry_date=TODAY,
+            total_amount=Decimal("5000.00"),
+            approval_status=ApprovalStatus.PENDING,
+        )
+        _, totals = self.rows_by_date(TODAY, TODAY)
+        self.assertEqual(totals["service_cost"], Decimal("0"))
+
+    def test_the_fleet_view_gives_one_row_per_vehicle(self):
+        other = make_vehicle(vehicle_number="PB65CD5678")
+        read(self.vehicle, TODAY, 10_000)
+        read(self.vehicle, TODAY + timedelta(days=1), 10_300)
+        read(other, TODAY, 5_000)
+        read(other, TODAY + timedelta(days=1), 5_050)
+        rows = {r["vehicle_number"]: r for r in running_log_by_vehicle(TODAY, TODAY + timedelta(days=1))}
+        self.assertEqual(rows["PB65AB1234"]["distance_km"], 300)
+        self.assertEqual(rows["PB65CD5678"]["distance_km"], 50)
+
+
+class DailyReadingTests(TestCase):
+    def setUp(self):
+        self.vehicle = make_vehicle()
+
+    def test_one_reading_per_vehicle_per_day(self):
+        from django.db import IntegrityError, transaction
+
+        read(self.vehicle, TODAY, 10_000)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            read(self.vehicle, TODAY, 10_050)
+
+    def test_two_vehicles_may_share_a_date(self):
+        other = make_vehicle(vehicle_number="PB65CD5678")
+        read(self.vehicle, TODAY, 10_000)
+        read(other, TODAY, 5_000)
+        self.assertEqual(DailyReading.objects.count(), 2)
+
+    def test_a_reading_below_the_last_one_needs_a_remark(self):
+        read(self.vehicle, TODAY, 10_000)
+        form = DailyReadingSerializer(
+            data={
+                "vehicle": self.vehicle.id,
+                "reading_date": (TODAY + timedelta(days=1)).isoformat(),
+                "odometer": 900,
+            }
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("odometer", form.errors)
+
+        form = DailyReadingSerializer(
+            data={
+                "vehicle": self.vehicle.id,
+                "reading_date": (TODAY + timedelta(days=1)).isoformat(),
+                "odometer": 900,
+                "remarks": "Meter replaced",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_a_reading_cannot_be_dated_in_the_future(self):
+        form = DailyReadingSerializer(
+            data={
+                "vehicle": self.vehicle.id,
+                "reading_date": date(2099, 1, 1).isoformat(),
+                "odometer": 10_000,
+            }
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("reading_date", form.errors)

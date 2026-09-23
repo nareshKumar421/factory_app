@@ -1,6 +1,8 @@
 from django.urls import path
 
 from .views import (
+    DailyReadingDetailAPI,
+    DailyReadingListCreateAPI,
     ExpiringDocumentsAPI,
     FleetAttachmentAPI,
     FleetCostReportAPI,
@@ -9,6 +11,7 @@ from .views import (
     FleetVehicleDetailAPI,
     FleetVehicleListCreateAPI,
     FleetVehicleSummaryAPI,
+    RunningLogAPI,
     FuelEntryDetailAPI,
     FuelEntryListCreateAPI,
     PendingApprovalsAPI,
@@ -36,6 +39,14 @@ urlpatterns = [
         "vehicles/<int:pk>/summary/",
         FleetVehicleSummaryAPI.as_view(),
         name="fleet-vehicle-summary",
+    ),
+
+    path("running-log/", RunningLogAPI.as_view(), name="fleet-running-log"),
+    path("daily-readings/", DailyReadingListCreateAPI.as_view(), name="fleet-daily-readings"),
+    path(
+        "daily-readings/<int:pk>/",
+        DailyReadingDetailAPI.as_view(),
+        name="fleet-daily-reading-detail",
     ),
 
     path("fuel-entries/", FuelEntryListCreateAPI.as_view(), name="fleet-fuel-entries"),

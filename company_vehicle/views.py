@@ -39,9 +39,10 @@ from .constants import (
     VehicleCategory,
     VehicleStatus,
 )
-from .models import FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
+from .models import DailyReading, FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
 from .permissions import (
     ADD_EXPENSE_PERMISSION,
+    CanAddFleetExpense,
     APPROVE_EXPENSE_PERMISSION,
     MANAGE_VEHICLE_PERMISSION,
     CanApproveFleetExpense,
@@ -51,6 +52,7 @@ from .permissions import (
 )
 from .serializers import (
     ApprovalActionSerializer,
+    DailyReadingSerializer,
     FleetVehicleSerializer,
     FleetVehicleWriteSerializer,
     FuelEntrySerializer,
@@ -495,6 +497,107 @@ class ExpiringDocumentsAPI(APIView):
             {
                 "days": within,
                 "rows": VehicleDocumentSerializer(documents, many=True).data,
+            }
+        )
+
+
+# ------------------------------------------------------------ running log
+
+
+class DailyReadingListCreateAPI(generics.ListCreateAPIView):
+    """GET the readings (filter by ``vehicle``, ``from``, ``to``), POST one.
+
+    POST is an upsert on (vehicle, date): re-entering a day overwrites it,
+    which is what someone correcting a typo expects, and it keeps the unique
+    constraint from turning a correction into an error page.
+    """
+
+    permission_classes = [IsAuthenticated, FleetExpensePermission]
+    serializer_class = DailyReadingSerializer
+
+    def get_queryset(self):
+        queryset = DailyReading.objects.select_related("vehicle", "created_by")
+        params = self.request.query_params
+        if params.get("vehicle"):
+            queryset = queryset.filter(vehicle_id=params["vehicle"])
+        date_from = _date(self.request, "from")
+        date_to = _date(self.request, "to")
+        if date_from:
+            queryset = queryset.filter(reading_date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(reading_date__lte=date_to)
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        existing = DailyReading.objects.filter(
+            vehicle_id=request.data.get("vehicle"),
+            reading_date=request.data.get("reading_date"),
+        ).first()
+        serializer = self.get_serializer(existing, data=request.data, partial=bool(existing))
+        serializer.is_valid(raise_exception=True)
+        if existing:
+            reading = serializer.save(updated_by=request.user)
+            code = status.HTTP_200_OK
+        else:
+            reading = serializer.save(created_by=request.user, updated_by=request.user)
+            code = status.HTTP_201_CREATED
+        return Response(DailyReadingSerializer(reading).data, status=code)
+
+
+class DailyReadingDetailAPI(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [IsAuthenticated, FleetExpensePermission]
+    serializer_class = DailyReadingSerializer
+    queryset = DailyReading.objects.select_related("vehicle")
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+class RunningLogAPI(APIView):
+    """The day-wise log.
+
+    With ``vehicle``: one row per day for that vehicle over ``from``/``to`` --
+    meter, distance, fuel and cost, gaps included. Without: one row per
+    vehicle, which is the "who ran how much" answer for the whole fleet.
+
+    The window defaults to this month. It is capped at 366 days, because the
+    day-wise shape means a row per day and nobody reads ten thousand of them.
+    """
+
+    permission_classes = [IsAuthenticated, CanViewFleet]
+    MAX_DAYS = 366
+
+    def get(self, request):
+        today = timezone.localdate()
+        date_from = _date(request, "from") or today.replace(day=1)
+        date_to = _date(request, "to") or today
+        if date_to < date_from:
+            date_from, date_to = date_to, date_from
+        if (date_to - date_from).days + 1 > self.MAX_DAYS:
+            return Response(
+                {"detail": f"Ask for at most {self.MAX_DAYS} days at a time."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if request.query_params.get("vehicle"):
+            vehicle = get_object_or_404(FleetVehicle, pk=request.query_params["vehicle"])
+            log = services.running_log(vehicle, date_from, date_to)
+            return Response(
+                {
+                    "from": date_from,
+                    "to": date_to,
+                    "vehicle": FleetVehicleSerializer(vehicle).data,
+                    "rows": log["rows"],
+                    "totals": log["totals"],
+                }
+            )
+
+        return Response(
+            {
+                "from": date_from,
+                "to": date_to,
+                "vehicle": None,
+                "rows": services.running_log_by_vehicle(date_from, date_to),
             }
         )
 

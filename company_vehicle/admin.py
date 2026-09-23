@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
+from .models import DailyReading, FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
 
 
 @admin.register(FleetVehicle)
@@ -40,3 +40,11 @@ class VehicleDocumentAdmin(admin.ModelAdmin):
     list_display = ("vehicle", "doc_type", "document_number", "expiry_date")
     list_filter = ("doc_type",)
     search_fields = ("vehicle__vehicle_number", "document_number")
+
+
+@admin.register(DailyReading)
+class DailyReadingAdmin(admin.ModelAdmin):
+    list_display = ("vehicle", "reading_date", "odometer")
+    list_filter = ("vehicle",)
+    search_fields = ("vehicle__vehicle_number",)
+    date_hierarchy = "reading_date"

@@ -6,9 +6,10 @@ a transporter, and it is about who delivered what. This one is about the
 handful of vehicles the company owns -- the trucks, the cars, the Eeco, the
 scooty -- and the two things they cost money for: fuel and service.
 
-Four tables:
+Five tables:
 
 ``FleetVehicle``   the vehicle itself, entered once.
+``DailyReading``   one meter reading on one day. What makes a running log possible.
 ``FuelEntry``      one filling. The screen that gets used every day.
 ``ServiceEntry``   one service or repair bill.
 ``VehicleDocument``insurance, PUC, fitness and the rest, held for their expiry.
@@ -182,17 +183,55 @@ class FleetVehicle(BaseModel):
 
     @property
     def last_odometer(self):
-        """Highest reading seen on any entry, fuel or service.
+        """Highest reading seen anywhere -- a daily reading, a filling, a service.
 
         The starting point the forms prefill and validate against.
         """
         readings = [
+            self.daily_readings.aggregate(m=models.Max("odometer"))["m"],
             self.fuel_entries.aggregate(m=models.Max("odometer"))["m"],
             self.service_entries.aggregate(m=models.Max("odometer"))["m"],
             self.opening_odometer,
         ]
         readings = [r for r in readings if r is not None]
         return max(readings) if readings else None
+
+
+class DailyReading(BaseModel):
+    """One vehicle's meter reading on one day.
+
+    Without this the app knows a truck ran 400 km *between two fillings*, but
+    not what it ran on Tuesday -- a meter reading only existed when somebody
+    bought fuel. A reading a day turns that into a running log.
+
+    One row per vehicle per day, enforced in the database: a second reading for
+    a day is the same fact typed twice, and two of them would make the day's
+    distance ambiguous. Re-entering a day overwrites it (the API does an
+    upsert), which is what somebody correcting a typo expects.
+
+    A filling records a meter reading too, and that one is not duplicated here
+    -- the log reads both tables and takes the day's highest reading, so
+    nothing has to be typed twice.
+    """
+
+    vehicle = models.ForeignKey(
+        FleetVehicle, on_delete=models.CASCADE, related_name="daily_readings"
+    )
+    reading_date = models.DateField(db_index=True)
+    odometer = models.PositiveIntegerField(help_text="Meter reading in km, as it read that day.")
+    remarks = models.CharField(max_length=255, blank=True, default="")
+
+    class Meta:
+        ordering = ["-reading_date", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vehicle", "reading_date"], name="uq_daily_reading_vehicle_date"
+            )
+        ]
+        indexes = [models.Index(fields=["vehicle", "reading_date"])]
+
+    def __str__(self):
+        return f"{self.vehicle.vehicle_number} {self.reading_date} {self.odometer}"
 
 
 class FuelEntry(BaseModel):

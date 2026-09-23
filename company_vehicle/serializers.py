@@ -21,7 +21,7 @@ from .constants import (
     FuelType,
     SERVICE_DUE_WARNING_KM,
 )
-from .models import FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
+from .models import DailyReading, FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
 
 TWO_PLACES = Decimal("0.01")
 
@@ -306,6 +306,68 @@ class FleetVehicleWriteSerializer(serializers.ModelSerializer):
                         "Changing it would make their mileage wrong."
                     }
                 )
+        return attrs
+
+
+# ----------------------------------------------------------- daily readings
+
+
+class DailyReadingSerializer(serializers.ModelSerializer):
+    """One day's meter reading."""
+
+    vehicle_number = serializers.CharField(source="vehicle.vehicle_number", read_only=True)
+    vehicle_nickname = serializers.CharField(source="vehicle.nickname", read_only=True)
+    entered_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DailyReading
+        fields = [
+            "id",
+            "vehicle",
+            "vehicle_number",
+            "vehicle_nickname",
+            "reading_date",
+            "odometer",
+            "remarks",
+            "entered_by_name",
+            "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def get_entered_by_name(self, obj):
+        return _user_name(obj.created_by)
+
+    def validate_reading_date(self, value):
+        if value > timezone.localdate():
+            raise serializers.ValidationError("A reading cannot be dated in the future.")
+        return value
+
+    def validate(self, attrs):
+        """A reading below the one before it needs saying out loud.
+
+        Same rule as the fuel form, and for the same reason: meters get
+        replaced and do break, so this is a question rather than a wall --
+        answer it in the remarks and it saves.
+        """
+        vehicle = attrs.get("vehicle") or getattr(self.instance, "vehicle", None)
+        on = attrs.get("reading_date") or getattr(self.instance, "reading_date", None)
+        odometer = attrs.get("odometer", getattr(self.instance, "odometer", None))
+        if not (vehicle and on and odometer is not None):
+            return attrs
+
+        previous = (
+            DailyReading.objects.filter(vehicle=vehicle, reading_date__lt=on)
+            .order_by("-reading_date")
+            .first()
+        )
+        last = previous.odometer if previous else None
+        if last is not None and odometer < last and not (attrs.get("remarks") or "").strip():
+            raise serializers.ValidationError(
+                {
+                    "odometer": f"The reading on {previous.reading_date} was {last} km. If the "
+                    "meter was replaced or is broken, say so in the remarks and save again."
+                }
+            )
         return attrs
 
 

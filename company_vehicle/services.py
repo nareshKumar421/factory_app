@@ -14,7 +14,7 @@ from django.db.models import Count, Max, Min, Sum
 from django.utils import timezone
 
 from .constants import ApprovalStatus, DOCUMENT_WARNING_DAYS
-from .models import FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
+from .models import DailyReading, FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
 
 TWO_PLACES = Decimal("0.01")
 
@@ -259,6 +259,179 @@ def fleet_cost_rows(date_from: date | None, date_to: date | None) -> list[dict]:
                 "distance_km": summary["distance_km"],
                 "cost_per_km": summary["cost_per_km"],
                 "mileage_by_fuel": summary["mileage_by_fuel"],
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------- running log
+
+
+def _readings_by_date(vehicle: FleetVehicle, upto: date | None = None) -> dict[date, int]:
+    """Every meter reading known for a vehicle, one per day, highest wins.
+
+    Three tables hold readings -- the daily log, the fillings and the service
+    bills -- because a person at a pump or a workshop is already writing the
+    meter down. Merging them here is what stops anyone typing it twice, and
+    taking the highest of a day's readings is what makes the day's closing
+    figure the closing figure.
+    """
+    readings: dict[date, int] = {}
+
+    def offer(on: date, value):
+        if value is None:
+            return
+        if on not in readings or value > readings[on]:
+            readings[on] = value
+
+    daily = DailyReading.objects.filter(vehicle=vehicle)
+    fuel = FuelEntry.objects.filter(vehicle=vehicle)
+    service = ServiceEntry.objects.filter(vehicle=vehicle).exclude(odometer__isnull=True)
+    if upto:
+        daily = daily.filter(reading_date__lte=upto)
+        fuel = fuel.filter(entry_date__lte=upto)
+        service = service.filter(entry_date__lte=upto)
+
+    for on, value in daily.values_list("reading_date", "odometer"):
+        offer(on, value)
+    for on, value in fuel.values_list("entry_date", "odometer"):
+        offer(on, value)
+    for on, value in service.values_list("entry_date", "odometer"):
+        offer(on, value)
+    return readings
+
+
+def running_log(vehicle: FleetVehicle, date_from: date, date_to: date) -> dict:
+    """One row per day: what the meter read, how far it ran, what it cost.
+
+    Distance is only claimed where two readings bracket it. Where the previous
+    reading is older than the day before, the row says so in ``covers_days``
+    rather than pretending the whole distance belongs to this day -- a truck
+    that was not read on Sunday did not do 600 km on Monday.
+
+    A day with no reading is returned as a row all the same, with nulls in it.
+    The gaps are the point: they are what tells a supervisor the log is not
+    being kept.
+    """
+    readings = _readings_by_date(vehicle, upto=date_to)
+
+    fuel_rows = FuelEntry.objects.filter(
+        vehicle=vehicle, entry_date__gte=date_from, entry_date__lte=date_to
+    )
+    service_rows = ServiceEntry.objects.filter(
+        vehicle=vehicle, entry_date__gte=date_from, entry_date__lte=date_to
+    )
+    notes = {
+        row.reading_date: row.remarks
+        for row in DailyReading.objects.filter(
+            vehicle=vehicle, reading_date__gte=date_from, reading_date__lte=date_to
+        )
+        if row.remarks
+    }
+
+    fuel_by_date: dict[date, dict] = {}
+    for row in fuel_rows:
+        day = fuel_by_date.setdefault(
+            row.entry_date, {"quantity": Decimal("0"), "cost": Decimal("0"), "fills": 0, "units": set()}
+        )
+        day["quantity"] += row.quantity or Decimal("0")
+        day["cost"] += row.amount or Decimal("0")
+        day["fills"] += 1
+        day["units"].add(row.unit)
+
+    service_by_date: dict[date, Decimal] = {}
+    for row in _approved(service_rows).values_list("entry_date", "total_amount"):
+        service_by_date[row[0]] = service_by_date.get(row[0], Decimal("0")) + (
+            row[1] or Decimal("0")
+        )
+
+    # The last reading before the window opens, so the first day in it can
+    # still report a distance.
+    earlier = [on for on in readings if on < date_from]
+    previous_date = max(earlier) if earlier else None
+    previous_value = readings[previous_date] if previous_date else None
+
+    rows = []
+    totals = {
+        "distance_km": 0,
+        "fuel_quantity": Decimal("0"),
+        "fuel_cost": Decimal("0"),
+        "service_cost": Decimal("0"),
+        "days_with_reading": 0,
+    }
+
+    day = date_from
+    while day <= date_to:
+        reading = readings.get(day)
+        fuel = fuel_by_date.get(day)
+        service_cost = service_by_date.get(day, Decimal("0"))
+
+        distance = None
+        covers_days = None
+        if reading is not None and previous_value is not None and reading >= previous_value:
+            distance = reading - previous_value
+            covers_days = (day - previous_date).days if previous_date else None
+
+        rows.append(
+            {
+                "date": day,
+                "odometer": reading,
+                "distance_km": distance,
+                # 1 means "since yesterday". More means the distance is the
+                # whole stretch since the last reading, not one day's running.
+                "covers_days": covers_days,
+                "fuel_quantity": fuel["quantity"] if fuel else None,
+                "fuel_cost": fuel["cost"] if fuel else None,
+                "fuel_fills": fuel["fills"] if fuel else 0,
+                "fuel_unit": "/".join(sorted(fuel["units"])) if fuel else "",
+                "service_cost": service_cost or None,
+                "remarks": notes.get(day, ""),
+            }
+        )
+
+        if reading is not None:
+            totals["days_with_reading"] += 1
+            previous_date, previous_value = day, reading
+        if distance:
+            totals["distance_km"] += distance
+        if fuel:
+            totals["fuel_quantity"] += fuel["quantity"]
+            totals["fuel_cost"] += fuel["cost"]
+        totals["service_cost"] += service_cost
+
+        day += timedelta(days=1)
+
+    totals["total_cost"] = totals["fuel_cost"] + totals["service_cost"]
+    totals["cost_per_km"] = (
+        (totals["total_cost"] / Decimal(totals["distance_km"])).quantize(TWO_PLACES)
+        if totals["distance_km"]
+        else None
+    )
+    totals["days_in_range"] = (date_to - date_from).days + 1
+    totals["days_missing"] = totals["days_in_range"] - totals["days_with_reading"]
+
+    return {"vehicle": vehicle, "rows": rows, "totals": totals}
+
+
+def running_log_by_vehicle(date_from: date, date_to: date) -> list[dict]:
+    """One row per vehicle: how far it ran in the window, and what that cost.
+
+    The fleet-wide answer to "which vehicle ran how much", built from the same
+    readings as the day-wise log so the two can never disagree.
+    """
+    rows = []
+    for vehicle in FleetVehicle.objects.filter(is_active=True).order_by("vehicle_number"):
+        log = running_log(vehicle, date_from, date_to)
+        totals = log["totals"]
+        rows.append(
+            {
+                "vehicle_id": vehicle.id,
+                "vehicle_number": vehicle.vehicle_number,
+                "nickname": vehicle.nickname,
+                "category": vehicle.category,
+                "fuel_unit": vehicle.fuel_unit,
+                "last_odometer": vehicle.last_odometer,
+                **totals,
             }
         )
     return rows
