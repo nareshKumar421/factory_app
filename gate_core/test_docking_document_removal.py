@@ -318,3 +318,92 @@ class DockingDocumentRemovalTests(TestCase):
         ok, detail = detach_bill_from_gate_in(gi, 70002, self.user)
         self.assertFalse(ok)
         self.assertIn("loading has started", detail)
+
+    # ---- a removed bill must not leave with the truck it came off -------
+    def test_dispatch_ignores_removed_bill_now_on_another_truck(self):
+        """The bug behind 626090509 (2026-09-23).
+
+        A bill was pulled off ``DOCK-20260923-0001``, re-booked onto HR69E9959 an
+        hour later, and then the FIRST truck's gate-out dispatched it anyway:
+        ``mark_docking_dispatched`` collected its plans through the document join
+        without filtering ``is_active``, and removal only soft-deletes. Consuming
+        that plan's cover then retired the SECOND truck's gate-in and departed its
+        arrival while the truck stood loaded in the yard, leaving the bill visible
+        nowhere but Empty Vehicle In.
+        """
+        from decimal import Decimal
+
+        from weighment.models import Weighment
+
+        from gate_core.models import VehicleArrival, VehicleArrivalStatus
+        from gate_core.services.sales_dispatch_dispatch import mark_docking_dispatched
+
+        truck_a_gate_in = self._gate_in()
+        stays = self._plan(70001, truck_a_gate_in)
+        moves = self._plan(70002, truck_a_gate_in)
+        docking, docs = self._shared_docking(stays, moves)
+
+        # C1: pull the second bill off this docking.
+        resp = self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{docking.id}/documents/{docs[70002].id}/remove/",
+            HTTP_COMPANY_CODE=self.company.code,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        # It is re-booked onto a second truck, which gates in empty behind it.
+        truck_b = Vehicle.objects.create(vehicle_number="HR69E9959", transporter=self.transporter)
+        arrival_b = VehicleArrival.objects.create(
+            arrival_no="ARV-B-1", vehicle=truck_b, driver=self.driver,
+            gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+            tare_weight=Decimal("2170.000"), created_by=self.user, updated_by=self.user,
+        )
+        ve_b = VehicleEntry.objects.create(
+            entry_no="EVGI-B-1", company=self.company, vehicle=truck_b, driver=self.driver,
+            entry_type="EMPTY_VEHICLE", status="COMPLETED",
+            created_by=self.user, updated_by=self.user,
+        )
+        truck_b_gate_in = EmptyVehicleGateIn.objects.create(
+            company=self.company, entry_no="EVGI-B-1", vehicle_entry=ve_b, vehicle=truck_b,
+            driver=self.driver, reason="DISPATCH", arrival=arrival_b,
+            gate_in_date=timezone.localdate(), in_time=timezone.now().time(),
+            created_by=self.user, updated_by=self.user,
+        )
+        moves.refresh_from_db()
+        moves.vehicle = truck_b
+        moves.linked_vehicle_entry = ve_b
+        moves.save(update_fields=["vehicle", "linked_vehicle_entry"])
+        cover_b = EmptyVehicleGateInCover.objects.create(
+            empty_vehicle_gate_in=truck_b_gate_in, dispatch_plan=moves,
+            sap_doc_entry=70002, sap_doc_num="70002",
+            created_by=self.user, updated_by=self.user,
+        )
+
+        # The FIRST truck now goes out the gate with the bill it kept.
+        Weighment.objects.create(
+            vehicle_entry=docking.vehicle_entry, gross_weight=Decimal("3000.000"),
+            tare_weight=Decimal("250.000"), created_by=self.user, updated_by=self.user,
+        )
+        docking.status = SalesDispatchGateOutStatus.PRINT_COMMITTED
+        docking.gatepass_no = "DCK/JIVO_OIL/2026-27/0001"
+        docking.print_committed_by = self.user
+        docking.print_committed_at = timezone.now()
+        docking.save(update_fields=[
+            "status", "gatepass_no", "print_committed_by", "print_committed_at",
+        ])
+
+        mark_docking_dispatched(docking, self.user)
+
+        # The bill that stayed left with the truck.
+        stays.refresh_from_db()
+        self.assertEqual(stays.booking_status, DispatchPlanStatus.DISPATCHED)
+
+        # The bill that moved is untouched, and so is the truck now carrying it.
+        moves.refresh_from_db()
+        self.assertEqual(moves.booking_status, DispatchPlanStatus.BOOKED)
+        cover_b.refresh_from_db()
+        self.assertIsNone(cover_b.consumed_at)
+        truck_b_gate_in.refresh_from_db()
+        self.assertIsNone(truck_b_gate_in.retired_at)
+        arrival_b.refresh_from_db()
+        self.assertEqual(arrival_b.status, VehicleArrivalStatus.INSIDE)
+        self.assertIsNone(arrival_b.departed_at)

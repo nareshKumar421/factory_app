@@ -179,9 +179,16 @@ def mark_docking_dispatched(entry, user):
         entry.vehicle_entry.updated_by = user
         entry.vehicle_entry.save(update_fields=["status", "updated_by", "updated_at"])
 
+        # Only the bills STILL on this docking leave with it. A bill removed for a
+        # reschedule is soft-deleted (``is_active=False``), not unlinked, so without
+        # this filter the join still finds it: 626090509 was taken off
+        # DOCK-20260923-0001, re-booked onto another truck, and then dispatched by
+        # the first truck's gate-out -- which consumed its cover on the *new* truck
+        # and departed that truck's arrival while it stood in the yard.
         dispatch_plans = list(
             DispatchPlan.objects.filter(
-                sales_dispatch_gate_out_documents__sales_dispatch=entry
+                sales_dispatch_gate_out_documents__sales_dispatch=entry,
+                sales_dispatch_gate_out_documents__is_active=True,
             ).distinct()
         )
         if entry.dispatch_plan_id:
