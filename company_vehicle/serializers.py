@@ -142,6 +142,7 @@ class FleetVehicleSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     fuel_unit = serializers.CharField(read_only=True)
     last_odometer = serializers.IntegerField(read_only=True)
+    last_daily_reading = serializers.IntegerField(read_only=True)
     fuels_allowed = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
     photo_url = serializers.SerializerMethodField()
@@ -171,6 +172,7 @@ class FleetVehicleSerializer(serializers.ModelSerializer):
             "department",
             "opening_odometer",
             "last_odometer",
+            "last_daily_reading",
             "remarks",
             "photo",
             "photo_url",

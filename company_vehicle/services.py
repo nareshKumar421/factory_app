@@ -268,37 +268,25 @@ def fleet_cost_rows(date_from: date | None, date_to: date | None) -> list[dict]:
 
 
 def _readings_by_date(vehicle: FleetVehicle, upto: date | None = None) -> dict[date, int]:
-    """Every meter reading known for a vehicle, one per day, highest wins.
+    """The vehicle's daily readings, one per day.
 
-    Three tables hold readings -- the daily log, the fillings and the service
-    bills -- because a person at a pump or a workshop is already writing the
-    meter down. Merging them here is what stops anyone typing it twice, and
-    taking the highest of a day's readings is what makes the day's closing
-    figure the closing figure.
+    **Daily readings only.** The meter written on a fuel slip or a workshop
+    bill is deliberately NOT mixed in. It reads the same dial, but it is
+    somebody else's record kept for a different reason, and the two drift: a
+    pump slip gets the reading off the invoice, a driver reads the dash, and
+    one of them rounds or fat-fingers a digit. Merging them made a truck whose
+    daily readings were 129 and 120 appear to run 2,345,571 km, because a
+    filling that day carried 2,345,700.
+
+    So the running log measures one series -- what somebody wrote in the log --
+    and the fillings on a day are reported beside it as money and litres, never
+    as a reading. The two are compared by eye, which is the only place the
+    comparison belongs.
     """
-    readings: dict[date, int] = {}
-
-    def offer(on: date, value):
-        if value is None:
-            return
-        if on not in readings or value > readings[on]:
-            readings[on] = value
-
     daily = DailyReading.objects.filter(vehicle=vehicle)
-    fuel = FuelEntry.objects.filter(vehicle=vehicle)
-    service = ServiceEntry.objects.filter(vehicle=vehicle).exclude(odometer__isnull=True)
     if upto:
         daily = daily.filter(reading_date__lte=upto)
-        fuel = fuel.filter(entry_date__lte=upto)
-        service = service.filter(entry_date__lte=upto)
-
-    for on, value in daily.values_list("reading_date", "odometer"):
-        offer(on, value)
-    for on, value in fuel.values_list("entry_date", "odometer"):
-        offer(on, value)
-    for on, value in service.values_list("entry_date", "odometer"):
-        offer(on, value)
-    return readings
+    return {on: value for on, value in daily.values_list("reading_date", "odometer")}
 
 
 def running_log(vehicle: FleetVehicle, date_from: date, date_to: date) -> dict:
@@ -430,7 +418,9 @@ def running_log_by_vehicle(date_from: date, date_to: date) -> list[dict]:
                 "nickname": vehicle.nickname,
                 "category": vehicle.category,
                 "fuel_unit": vehicle.fuel_unit,
-                "last_odometer": vehicle.last_odometer,
+                # The last reading in the LOG, not the highest meter seen on a
+                # bill somewhere -- this page is about the log.
+                "last_odometer": vehicle.last_daily_reading,
                 **totals,
             }
         )

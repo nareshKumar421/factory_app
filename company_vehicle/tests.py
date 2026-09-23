@@ -352,10 +352,15 @@ class RunningLogTests(TestCase):
         rows, _ = self.rows_by_date(TODAY, TODAY)
         self.assertEqual(rows[TODAY]["distance_km"], 100)
 
-    def test_a_filling_counts_as_that_day_s_reading(self):
-        """Nobody types the meter twice: the pump slip already carried it."""
+    def test_a_filling_shows_its_money_but_never_supplies_a_reading(self):
+        """The log measures one series: what somebody wrote in the log.
+
+        A pump slip's meter is somebody else's record kept for another reason,
+        and the two drift. Beside the day it is money and litres, nothing more.
+        """
         read(self.vehicle, TODAY, 10_000)
-        fill(self.vehicle, TODAY + timedelta(days=1), 10_250, 30, amount="2700.00")
+        read(self.vehicle, TODAY + timedelta(days=1), 10_250)
+        fill(self.vehicle, TODAY + timedelta(days=1), 99_999, 30, amount="2700.00")
         rows, totals = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
         row = rows[TODAY + timedelta(days=1)]
         self.assertEqual(row["odometer"], 10_250)
@@ -364,14 +369,27 @@ class RunningLogTests(TestCase):
         self.assertEqual(row["fuel_quantity"], Decimal("30"))
         self.assertEqual(totals["fuel_cost"], Decimal("2700.00"))
 
-    def test_the_days_highest_reading_wins(self):
-        """A morning reading and an evening fill: the closing figure is the fill."""
+    def test_a_wild_meter_on_a_bill_cannot_wreck_the_day(self):
+        """The bug this rule exists for.
+
+        Daily readings of 129 then 120, and a filling that day carrying
+        2,345,700, once produced a day that ran 2,345,571 km.
+        """
+        read(self.vehicle, TODAY, 129)
+        read(self.vehicle, TODAY + timedelta(days=1), 140)
+        fill(self.vehicle, TODAY + timedelta(days=1), 2_345_700, 30)
+        rows, totals = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["odometer"], 140)
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["distance_km"], 11)
+        self.assertEqual(totals["distance_km"], 11)
+
+    def test_a_days_reading_is_the_one_that_was_logged(self):
         read(self.vehicle, TODAY, 10_000)
         read(self.vehicle, TODAY + timedelta(days=1), 10_100)
         fill(self.vehicle, TODAY + timedelta(days=1), 10_400, 30)
         rows, _ = self.rows_by_date(TODAY, TODAY + timedelta(days=1))
-        self.assertEqual(rows[TODAY + timedelta(days=1)]["odometer"], 10_400)
-        self.assertEqual(rows[TODAY + timedelta(days=1)]["distance_km"], 400)
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["odometer"], 10_100)
+        self.assertEqual(rows[TODAY + timedelta(days=1)]["distance_km"], 100)
 
     def test_a_meter_that_went_backwards_claims_no_distance(self):
         read(self.vehicle, TODAY, 10_000)
@@ -389,6 +407,7 @@ class RunningLogTests(TestCase):
 
     def test_cost_per_km_over_the_window(self):
         read(self.vehicle, TODAY, 10_000)
+        read(self.vehicle, TODAY + timedelta(days=1), 10_400)
         fill(self.vehicle, TODAY + timedelta(days=1), 10_400, 40, amount="3600.00")
         ServiceEntry.objects.create(
             vehicle=self.vehicle,
@@ -472,3 +491,24 @@ class DailyReadingTests(TestCase):
         )
         self.assertFalse(form.is_valid())
         self.assertIn("reading_date", form.errors)
+
+
+class ReadingSeriesTests(TestCase):
+    """The log's series and the bills' meters are kept apart on purpose."""
+
+    def setUp(self):
+        self.vehicle = make_vehicle()
+
+    def test_last_daily_reading_ignores_the_meter_on_a_bill(self):
+        read(self.vehicle, TODAY, 10_000)
+        fill(self.vehicle, TODAY, 2_345_700, 30)
+        self.assertEqual(self.vehicle.last_daily_reading, 10_000)
+
+    def test_last_odometer_still_sees_everything(self):
+        """The fuel form's hint wants the highest meter anyone has seen."""
+        read(self.vehicle, TODAY, 10_000)
+        fill(self.vehicle, TODAY, 2_345_700, 30)
+        self.assertEqual(self.vehicle.last_odometer, 2_345_700)
+
+    def test_a_vehicle_with_no_readings_has_none(self):
+        self.assertIsNone(self.vehicle.last_daily_reading)

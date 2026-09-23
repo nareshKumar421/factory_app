@@ -182,6 +182,17 @@ class FleetVehicle(BaseModel):
         return FUEL_UNITS.get(self.fuel_type, "L")
 
     @property
+    def last_daily_reading(self):
+        """The most recent reading written in the running log, or None.
+
+        Kept apart from :attr:`last_odometer`, which also sees the meters
+        written on fuel slips and workshop bills. The log is one series and
+        those are another; mixing them is what made a day's distance nonsense.
+        """
+        row = self.daily_readings.order_by("-reading_date", "-id").first()
+        return row.odometer if row else None
+
+    @property
     def last_odometer(self):
         """Highest reading seen anywhere -- a daily reading, a filling, a service.
 

@@ -76,10 +76,16 @@ what a pump slip looks like:
 for that vehicle; without, a row per vehicle for the window — the fleet-wide
 answer to "which vehicle ran how much".
 
-Three tables hold meter readings: `DailyReading`, `FuelEntry` and
-`ServiceEntry`. A person at a pump is already writing the meter down, so the
-log merges all three and takes the day's **highest** reading as its closing
-figure. Nothing has to be typed twice.
+**Distance comes from `DailyReading` and from nothing else.** A fuel slip and
+a workshop bill each carry a meter reading too, and those are deliberately not
+mixed in: they read the same dial but are somebody else's record kept for a
+different reason, and they drift. Merging them once made a truck whose daily
+readings were 129 and 120 appear to run 2,345,571 km, because a filling that
+day carried 2,345,700. The fillings on a day are reported beside the reading as
+money and litres, never as a reading.
+
+`FleetVehicle.last_daily_reading` is the log's series; `last_odometer` is the
+highest meter seen anywhere and is what the fuel form's hint uses.
 
 Distance is only claimed where two readings bracket it. Where the previous
 reading is older than the day before, the row carries `covers_days` so the
