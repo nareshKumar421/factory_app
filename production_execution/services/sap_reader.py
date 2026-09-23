@@ -351,6 +351,37 @@ class ProductionOrderReader:
     def get_bom_by_item_code(self, item_code: str) -> list:
         """Fetch the **material** components of a finished good's BOM (OITT/ITT1).
 
+        `PlannedQty` comes back as the quantity for ONE BOX, which is the unit
+        production is planned and entered in. Getting there needs both halves of
+        SAP's own arithmetic:
+
+        `ITT1."Quantity"` is the quantity for one *batch* of the recipe, and the
+        batch size is `OITT."Qauntity"` — the tree yield, counted in the parent's
+        inventory UoM, which on this data is a single bottle (`INV1` sells
+        `FG0000323` at Rs 6.27 a PCS; the "(12 PCS)" in the name is carton
+        config). Dividing gives the per-bottle rate, and `OITM."SalFactor2"`
+        turns that into a per-box one.
+
+        Skipping the division is only invisible while the yield happens to equal
+        the case size, which is how it survived: 274 of Beverages' 296 finished
+        goods are written that way, and every oil SKU is
+        (`FG0000121 CANOLA OIL 1 LTR 20 PCS` — yield 20, 20 bottles, 20 caps and
+        *one* carton). The 22 that are not were silently wrong by the case
+        factor. `FG0000328 PET BOTTLE 250 ML ... (24 PCS)` has yield 1, so its
+        lines are authored per bottle — one preform, one cap, 0.14 g of label —
+        and read as per-box they asked for one preform per 24-bottle case.
+
+        The multiplication comes before the division on purpose. A carton that
+        is 1 per 3-pack divides to 0.333… first, and 0.333… x 3 is 0.999…9 — a
+        whole carton turned into a fraction of one by arithmetic alone.
+
+        A yield of zero is corrupt master data; `NULLIF` makes it a NULL
+        `PlannedQty` rather than a division error, so the line surfaces as
+        unusable instead of taking the whole BOM down. A missing `SalFactor2`
+        falls back to the yield, which reproduces the per-batch figure — the
+        right answer whenever the recipe is written a box at a time, and the
+        only honest one when nothing says how big a box is.
+
         Resource lines are left out: see :data:`BOM_LINE_TYPE_ITEM`. They are not
         material, nobody issues them, and carried into a run they become a
         warehouse request for something the store does not have and cannot get.
@@ -361,13 +392,19 @@ class ProductionOrderReader:
             SELECT
                 T1."Code"      AS "ItemCode",
                 T1."ItemName"  AS "ItemName",
-                T1."Quantity"  AS "PlannedQty",
+                T1."Quantity" * COALESCE(NULLIF(F."SalFactor2", 0), T0."Qauntity")
+                    / NULLIF(T0."Qauntity", 0)
+                               AS "PlannedQty",
+                T1."Quantity"  AS "BomQty",
+                T0."Qauntity"  AS "BomBaseQty",
+                COALESCE(NULLIF(F."SalFactor2", 0), T0."Qauntity") AS "PiecesPerCase",
                 COALESCE(T1."Uom", I."InvntryUom") AS "UomCode",
                 T1."Warehouse" AS "Warehouse",
                 I."LastPurPrc" AS "UnitPrice"
             FROM "{schema}"."OITT" T0
             INNER JOIN "{schema}"."ITT1" T1 ON T0."Code" = T1."Father"
             LEFT JOIN "{schema}"."OITM" I ON T1."Code" = I."ItemCode"
+            LEFT JOIN "{schema}"."OITM" F ON T0."Code" = F."ItemCode"
             WHERE T0."Code" = '{item_code}'
               AND T1."Type" = {item_line}
             ORDER BY T1."VisOrder" ASC

@@ -523,6 +523,13 @@ class ProductionExecutionService:
         """
         Fetch BOM components from SAP and create ProductionMaterialUsage records.
         Priority: sap_doc_entry (WOR1) > product item code (OITT/ITT1).
+
+        The two sources are scaled differently, because they mean different
+        things. A production order's `PlannedQty` is the quantity for that whole
+        order — SAP has already done the multiplication, so it is taken as it
+        stands. An item BOM's is the quantity for ONE box, so it has to be
+        multiplied by the box count the run is for; without that a 6,000-box run
+        opened with a single box's worth of material.
         """
         from .sap_reader import ProductionOrderReader, SAPReadError
         from .bom_utils import get_run_item_code
@@ -538,9 +545,15 @@ class ProductionExecutionService:
             logger.info(f"No BOM components found for run {run.id}")
             return []
 
+        # A run with no quantity yet has nothing to scale by; leaving the boxes
+        # at 1 keeps the per-box figure rather than zeroing every line.
+        boxes = D(str(run.required_qty or 0)) if not run.sap_doc_entry else D('1')
+        if boxes <= 0:
+            boxes = D('1')
+
         saved = []
         for comp in components:
-            opening = D(str(comp.get('PlannedQty') or 0))
+            opening = D(str(comp.get('PlannedQty') or 0)) * boxes
             issued = D(str(comp.get('IssuedQty') or 0))
             unit_price = comp.get('UnitPrice')
             usage = ProductionMaterialUsage.objects.create(

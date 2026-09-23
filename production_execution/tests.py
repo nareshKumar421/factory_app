@@ -2129,6 +2129,35 @@ class BOMResourceLineTests(TestCase):
         self.assertIn('"ITT1"', sql)
         self.assertIn('T1."Type" = 4', sql)
 
+    def test_item_bom_query_converts_the_recipe_batch_into_a_box(self):
+        """`PlannedQty` must be per BOX, and the SQL is the only place it is.
+
+        `ITT1."Quantity"` is written for one `OITT."Qauntity"` of finished good
+        — a count of bottles, not boxes. Dropping the division, or the
+        `SalFactor2` that turns bottles into boxes, silently understated every
+        requirement on a bill whose batch is smaller than its case:
+        `FG0000328 ... (24 PCS)` has a yield of 1, and a 6,000-box run asked the
+        store for 6,000 caps instead of 144,000.
+
+        `NULLIF` guards a yield of zero — corrupt master data must surface as an
+        unusable line, never a division error that takes the whole BOM down.
+        """
+        reader = self._reader(lambda sql: [])
+        reader.get_bom_by_item_code('FG0000328')
+
+        sql = self.executed[-1]
+        self.assertIn('COALESCE(NULLIF(F."SalFactor2", 0), T0."Qauntity")', sql)
+        self.assertIn('/ NULLIF(T0."Qauntity", 0)', sql)
+        # Multiply before dividing: 1 carton per 3-pack divides to 0.333… and
+        # comes back 0.999…9 the other way round.
+        self.assertLess(
+            sql.index('COALESCE(NULLIF(F."SalFactor2"'),
+            sql.index('/ NULLIF(T0."Qauntity", 0)'),
+        )
+        # The case size is the PARENT's, so the second OITM join is on the BOM
+        # header, not on the component.
+        self.assertIn('LEFT JOIN "TEST"."OITM" F ON T0."Code" = F."ItemCode"', sql)
+
     def test_production_order_components_query_asks_for_material_lines_only(self):
         def rows(sql):
             if '"OWOR"' in sql:

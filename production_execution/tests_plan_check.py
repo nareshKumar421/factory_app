@@ -46,15 +46,15 @@ def bom_row(
 ):
     """One `ITT1` line as the reader returns it.
 
-    `per_case` is `ITT1."Quantity"` exactly as authored in SAP — the quantity for
-    ONE box, which is how this data is written (`FG0000118 CANOLA OIL 5 LTR 4
-    PCS`: 20 litres of oil, 4 bottles, 4 caps, 1 carton).
+    `per_case` is `ITT1."Quantity"` exactly as authored in SAP: the quantity for
+    one *batch* of the recipe, where the batch is `base_qty` (`OITT."Qauntity"`)
+    pieces of finished good. `QtyPerUnit` is derived from the two faithfully,
+    exactly as the reader computes it in SQL.
 
-    `base_qty` (`OITT."Qauntity"`) defaults to 20 and `QtyPerUnit` is derived
-    from it faithfully, so it is deliberately *not* equal to `per_case`. Any
-    code that goes back to dividing by the base quantity — a per-piece rate
-    multiplied by a case count — then fails these tests loudly instead of
-    quietly understating every requirement twentyfold.
+    The name `per_case` is kept because that is what the quantity amounts to on
+    the many bills whose batch IS a box — `FG0000118 CANOLA OIL 5 LTR 4 PCS`,
+    base 4, listing 20 litres of oil, 4 bottles, 4 caps and 1 carton. It is not
+    what it amounts to on a bill written per bottle; see `CaseSizeScalingTests`.
     """
     qty = Decimal(str(per_case)) if per_case is not None else None
     return {
@@ -646,12 +646,15 @@ class UncomparableWindowTests(PlanCheckBase):
 class PerBoxRequirementTests(PlanCheckBase):
     """The requirement is the BOM quantity per BOX times the number of boxes.
 
-    This is the arithmetic the screen exists for, and it was wrong once: the
-    check divided `ITT1."Quantity"` by the BOM's base quantity — a per-*piece*
-    rate — and then multiplied by a *case* count, reporting 200 litres of oil
-    where 4,000 were needed. The base quantity is not even consistent master
-    data (4 on `CANOLA OIL 5 LTR 4 PCS`, 20 on `1 LTR 20 PCS`, 1 on `REFINED OIL
-    1000 MLS`), while the child quantities are per box throughout.
+    This is the arithmetic the screen exists for, and it has been wrong in both
+    directions. Dividing by the base quantity and then multiplying by a *case*
+    count reports a per-piece rate as a per-case one — 200 litres of oil where
+    4,000 were needed. Not dividing at all, and not multiplying by the case
+    size either, understates any bill whose batch is smaller than a box; that
+    is `CaseSizeScalingTests`.
+
+    Every bill here has no case size on the item, so `pieces_per_case` falls
+    back to the recipe's own batch and `ITT1."Quantity"` comes back untouched.
     """
 
     def test_the_requirement_is_the_bom_quantity_times_the_box_count(self):
@@ -666,10 +669,14 @@ class PerBoxRequirementTests(PlanCheckBase):
         self.assertEqual(row['required_qty'], 4000)
         self.assertEqual(row['bom_required_qty'], 4000)
 
-    def test_the_bom_base_quantity_is_never_divided_by(self):
-        """Same per-box quantity, three different base quantities, one answer.
+    def test_with_no_case_size_the_recipe_batch_is_the_fallback(self):
+        """Same per-batch quantity, three different base quantities, one answer.
 
-        Base 4 / 20 / 1 are all real values on this company's BOMs.
+        Base 4 / 20 / 1 are all real values on this company's BOMs. With nothing
+        saying how big a box is, dividing by the batch and multiplying by it
+        again is a no-op, so the answer is `ITT1."Quantity"` — which is right
+        for every bill whose batch is its box, and the only honest guess for the
+        rest. Supply a case size and `CaseSizeScalingTests` takes over.
         """
         for base in (4, 20, 1):
             with self.subTest(base_qty=base):
@@ -707,6 +714,133 @@ class PerBoxRequirementTests(PlanCheckBase):
         ).check(line_id=self.line.id, item_code='FG001', required_qty=200, date=self.day)
 
         self.assertEqual(result['materials']['rows'][0]['required_qty'], 252)
+
+
+class CaseSizeScalingTests(PlanCheckBase):
+    """A recipe is written for a BATCH, and the batch is not always a box.
+
+    `ITT1."Quantity"` is the quantity for one `OITT."Qauntity"` of finished
+    good, and the finished good is counted in bottles — `INV1` sells
+    `FG0000323` at Rs 6.27 a PCS, so the "(12 PCS)" in the name is carton
+    config, not the unit. Reading the child quantity as a per-box figure is
+    therefore right only while the yield equals the case size. It usually does:
+    every oil SKU, and 274 of Beverages' 296 finished goods. The other 22 were
+    silently wrong by the case factor.
+
+    `FG0000328 PET BOTTLE 250 ML ... (24 PCS)` is the one that gave it away —
+    yield 1, so one preform, one cap and 0.14 g of label per BOTTLE. Read per
+    box, a 6,000-box run asked the store for 6,000 caps when it needed 144,000.
+    """
+
+    def test_a_per_bottle_recipe_scales_by_the_case_size(self):
+        """FG0000328: yield 1, one cap per bottle, 24 bottles to a box."""
+        result = self.service(
+            bom_rows=[bom_row('PM0000641', 'Cap Alaska sky blue A27W', 1, base_qty=1)],
+            stock_rows=[stock_row('PM0000641', 'BH-PM', 200000)],
+        ).check(
+            line_id=self.line.id, item_code='FG001', required_qty=6000,
+            date=self.day, pieces_per_case=24,
+        )
+
+        row = result['materials']['rows'][0]
+        self.assertEqual(row['qty_per_piece'], 1)
+        self.assertEqual(row['qty_per_case'], 24)
+        self.assertEqual(row['required_qty'], 144000)
+
+    def test_a_recipe_whose_batch_is_already_a_box_is_left_alone(self):
+        """FG0000323: yield 12, twelve caps a batch, twelve bottles to a box.
+
+        The same physical rate as the test above — one cap per bottle — written
+        the other way round. Both must land on one cap per bottle.
+        """
+        result = self.service(
+            bom_rows=[bom_row('PM0000641', 'Cap Alaska sky blue A27W', 12, base_qty=12)],
+            stock_rows=[stock_row('PM0000641', 'BH-PM', 200000)],
+        ).check(
+            line_id=self.line.id, item_code='FG001', required_qty=6000,
+            date=self.day, pieces_per_case=12,
+        )
+
+        row = result['materials']['rows'][0]
+        self.assertEqual(row['qty_per_piece'], 1)
+        self.assertEqual(row['qty_per_case'], 12)
+        self.assertEqual(row['required_qty'], 72000)
+
+    def test_a_fractional_per_bottle_line_scales_too(self):
+        """0.14 g of BOPP label a bottle — 3.36 a box, 20,160 g for the run.
+
+        Read per box it asked for 840 g: 0.14 g of film to wrap 24 labels.
+        """
+        result = self.service(
+            bom_rows=[bom_row(
+                'PM0000792', 'BOPP 250 MLS water', '0.14', base_qty=1, uom='GMS',
+            )],
+            stock_rows=[stock_row('PM0000792', 'BH-PM', 50000)],
+        ).check(
+            line_id=self.line.id, item_code='FG001', required_qty=6000,
+            date=self.day, pieces_per_case=24,
+        )
+
+        row = result['materials']['rows'][0]
+        # Row figures cross the wire as floats — `_num`, not Decimal.
+        self.assertAlmostEqual(row['qty_per_case'], 3.36, places=6)
+        self.assertEqual(row['required_qty'], 20160)
+
+    def test_the_case_size_comes_from_sap_when_the_form_omits_it(self):
+        """`OITM."SalFactor2"`, the same source the finish-time estimate uses.
+
+        One run must not be scaled two different ways, so the readiness check
+        reuses whatever the timing step already resolved.
+        """
+        result = self.service(
+            bom_rows=[bom_row('PM0000641', 'Caps', 1, base_qty=1)],
+            stock_rows=[stock_row('PM0000641', 'BH-PM', 200000)],
+            pieces_per_case={'FG001': 24},
+        ).check(
+            line_id=self.line.id, item_code='FG001', required_qty=6000,
+            date=self.day,
+        )
+
+        self.assertEqual(result['timing']['pieces_per_case'], 24)
+        self.assertEqual(result['materials']['rows'][0]['required_qty'], 144000)
+
+    def test_a_whole_carton_stays_whole_through_the_conversion(self):
+        """`FG0000018 COLD PRESS 5 LTR + 1 LTR 3 PCS SHRINKED`: base 3, 1 carton.
+
+        Dividing before multiplying makes this 0.333… x 3 = 0.999…9, and the
+        screen then asks the store for 199.99999 cartons and calls a whole one a
+        fraction. Multiplying first keeps it exact.
+        """
+        result = self.service(
+            bom_rows=[bom_row('PM0000012', 'Carton 5 LTR 3 PCS', 1, base_qty=3)],
+            stock_rows=[stock_row('PM0000012', 'BH-PM', 500)],
+        ).check(
+            line_id=self.line.id, item_code='FG001', required_qty=200,
+            date=self.day, pieces_per_case=3,
+        )
+
+        row = result['materials']['rows'][0]
+        self.assertEqual(row['qty_per_case'], 1)
+        self.assertEqual(row['required_qty'], 200)
+
+    def test_a_zero_base_quantity_is_reported_not_assumed(self):
+        """A batch of zero is corrupt master data — it cannot be scaled.
+
+        Planning & Purchase says the same thing about the same field rather
+        than dividing by zero or quietly requiring nothing.
+        """
+        result = self.service(
+            bom_rows=[bom_row('PM001', 'Caps', 20, base_qty=0)],
+        ).check(
+            line_id=self.line.id, item_code='FG001', required_qty=200,
+            date=self.day, pieces_per_case=20,
+        )
+
+        self.assertEqual(result['materials']['rows'], [])
+        unusable = result['materials']['unusable']
+        self.assertEqual(len(unusable), 1)
+        self.assertEqual(unusable[0]['item_code'], 'PM001')
+        self.assertIn('base quantity', unusable[0]['reason'])
 
 
 class WarehouseProvenanceTests(PlanCheckBase):

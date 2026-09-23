@@ -8,15 +8,31 @@ the second shift already claimed the same oil.
 
 So this module answers three things about a proposed plan, before it is saved:
 
-**How much does it need?** The BOM's `ITT1."Quantity"` is authored **per box**
-on this data — `FG0000121 CANOLA OIL 1 LTR 20 PCS` lists 20 litres of oil, 20
-bottles, 20 caps and *one* carton — so the requirement is that quantity times the
-number of boxes planned, full stop. `OITT."Qauntity"` (the BOM's base quantity)
-is deliberately **not** divided by: it is inconsistent master data, set to the
-piece count on some items (4 on the 5 LTR 4 PCS, 20 on the 1 LTR 20 PCS) and to
-1 on others whose children are per-box all the same. Dividing by it yields a
-*per-piece* rate, and multiplying that by a *case* count understates every line
-by the pieces-per-box — 200 litres of oil where 4,000 are needed.
+**How much does it need?** `ITT1."Quantity"` is the quantity for one *batch* of
+the recipe, not for one box, and the batch size is `OITT."Qauntity"` — the BOM's
+base quantity, counted in the parent's inventory UoM, which on this data is a
+single bottle. So the per-box requirement is
+
+    ITT1."Quantity" / OITT."Qauntity" * pieces_per_case * boxes
+
+and this module used to skip the division, on the reading that the recipe was
+authored a box at a time. That reading holds far more often than not —
+`FG0000121 CANOLA OIL 1 LTR 20 PCS` lists 20 litres of oil, 20 bottles, 20 caps
+and *one* carton — but only because its yield (20) happens to equal its case
+size (20). 274 of Beverages' 296 finished goods are written that way and every
+oil SKU is, which is why the shortcut survived. The other 22 were wrong by the
+case factor. `FG0000328 PET BOTTLE 250 ML ... (24 PCS)` has a yield of 1, so its
+lines are per bottle — one preform, one cap, 0.14 g of label — and reading them
+as per-box asked for one preform per 24-bottle case, understating every line
+24-fold. Planning & Purchase and Packing Material always divided
+(`planning_purchase/hana_reader.py` calls it "the BOM trap" and gives it its own
+regression test); this module is now consistent with them.
+
+When nothing says how big a box is, `pieces_per_case` falls back to the base
+quantity, which reproduces the per-batch figure — the right answer whenever the
+recipe *is* written a box at a time, and the only honest one otherwise. A base
+quantity of zero is corrupt master data and the line is reported unusable rather
+than silently requiring nothing.
 
 **Is the material there?** Two different answers, because raw material and
 packing material are counted by different people.
@@ -302,6 +318,10 @@ class ProductionPlanCheckService:
             required_qty=required_qty,
             competitors=competitors,
             basis=basis,
+            # `_timing` has already resolved this — from the form, or from
+            # SAP's `OITM.SalFactor2` when the form omitted it. Reusing its
+            # answer keeps one run from being scaled two different ways.
+            pieces_per_case=timing.get('pieces_per_case'),
             requirement_override=requirement_override,
         )
 
@@ -515,11 +535,13 @@ class ProductionPlanCheckService:
         required_qty,
         competitors: Sequence[Dict[str, Any]],
         basis: str,
+        pieces_per_case=None,
         requirement_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Readiness per BOM component.
 
-        The requirement is the BOM's per-box quantity times the box count.
+        The requirement is the BOM's per-piece quantity times the bottles per
+        box times the box count — see `_recipe`, which does the first two.
 
         `requirement_override` carries the quantities the supervisor actually
         typed on the screen, keyed by item code. The BOM figure is the starting
@@ -541,7 +563,7 @@ class ProductionPlanCheckService:
             }
 
         try:
-            recipe, unusable, resources = self._recipe(item_code)
+            recipe, unusable, resources = self._recipe(item_code, pieces_per_case)
         except Exception as e:  # noqa: BLE001 — SAP down must not hide the clash check
             logger.warning("plan check: BOM read failed for %s: %s", item_code, e)
             return {
@@ -672,6 +694,8 @@ class ProductionPlanCheckService:
                 'searched_warehouses': warehouse_scope.get(comp['material_type'], []),
                 'has_own_bom': comp['has_own_bom'],
                 'qty_per_case': _num(comp['qty_per_case']),
+                'qty_per_piece': _num(comp['qty_per_piece']),
+                'pieces_per_case': _num(comp['pieces_per_case']),
                 'bom_base_qty': _num(comp['bom_base_qty']),
                 'required_qty': _num(required),
                 'bom_required_qty': _num(from_bom),
@@ -744,21 +768,27 @@ class ProductionPlanCheckService:
             'basis': basis,
         }
 
-    def _recipe(self, item_code: str):
+    def _recipe(self, item_code: str, pieces_per_case=None):
         """Single-level BOM for one finished good, **per box**.
 
-        `BomQty` is `ITT1."Quantity"` exactly as authored, and on this data that
-        is the quantity for one box: `FG0000118 CANOLA OIL 5 LTR 4 PCS` lists 20
-        litres of oil, 4 HDPE bottles, 4 caps and 1 carton. Since the planning
-        screen's quantity is a box count, multiplying the two is the whole
-        calculation.
+        `QtyPerUnit` is what the reader computes in SQL as `ITT1."Quantity"` over
+        `OITT."Qauntity"`: the quantity for one *piece* of finished good — one
+        bottle. Multiplying by `pieces_per_case` puts it in the unit the planning
+        screen works in, because the quantity a supervisor types is a box count.
 
-        The reader also offers `QtyPerUnit` (`ITT1."Quantity"` / the BOM's base
-        quantity). That is a per-*piece* rate and is the right figure for
-        Planning & Purchase, whose plan lines are in pieces — but it is the wrong
-        one here, and the base quantity it divides by is not trustworthy anyway:
-        4 on the 5 LTR 4 PCS, 20 on the 1 LTR 20 PCS, and 1 on `FG0000013
-        REFINED OIL 1000 MLS` whose children are per-box just the same.
+        Taking `BomQty` (`ITT1."Quantity"`) as a per-box figure instead, which is
+        what this did before, is only right when the recipe's yield happens to
+        equal the case size. It usually does — `FG0000118 CANOLA OIL 5 LTR 4 PCS`
+        is written for a batch of 4 and lists 20 litres of oil, 4 HDPE bottles, 4
+        caps and 1 carton — but `FG0000328 PET BOTTLE 250 ML ... (24 PCS)` is
+        written for a batch of *one bottle*, and read per-box its lines asked for
+        a single preform per 24-bottle case. See this module's own docstring.
+
+        `pieces_per_case` falls back to the base quantity when it is unknown,
+        which returns exactly `BomQty` and so preserves the old answer for every
+        bill whose yield is its case size. A base quantity of zero leaves
+        `QtyPerUnit` NULL — corrupt master data, reported unusable rather than
+        quietly requiring nothing.
 
         Resource lines (conversion cost, `LineType` 290) are separated out rather
         than dropped: they are not stock and have no availability, but a screen
@@ -770,6 +800,7 @@ class ProductionPlanCheckService:
         recipe: List[Dict[str, Any]] = []
         unusable: List[Dict[str, Any]] = []
         resources: List[Dict[str, Any]] = []
+        per_case = _dec(pieces_per_case)
 
         for row in rows:
             name = row.get('ComponentName') or ''
@@ -778,23 +809,43 @@ class ProductionPlanCheckService:
                 resources.append({'item_code': code, 'item_name': name})
                 continue
 
-            per_box = row.get('BomQty')
-            if per_box is None:
-                # A component line with no quantity at all is corrupt master
-                # data. Say so rather than quietly requiring nothing of it.
+            bom_qty = row.get('BomQty')
+            base_qty = _dec(row.get('BomBaseQty'))
+            if bom_qty is None or base_qty <= ZERO:
+                # A line with no quantity, or a bill whose base quantity is zero,
+                # is corrupt master data. Say so rather than quietly requiring
+                # nothing of it.
                 unusable.append({
                     'item_code': code,
                     'item_name': name,
-                    'reason': 'This BOM line has no quantity in SAP — '
-                              'its requirement cannot be worked out.',
+                    'reason': (
+                        'This BOM line has no quantity in SAP — '
+                        'its requirement cannot be worked out.'
+                        if bom_qty is None else
+                        'This BOM has a base quantity of zero in SAP '
+                        '(OITT.Qauntity) — its requirement cannot be scaled.'
+                    ),
                 })
                 continue
+
+            # Nothing says how big a box is — fall back to the recipe's own
+            # batch, which gives back ITT1."Quantity" untouched.
+            scale = per_case if per_case > ZERO else base_qty
+            # Multiply BEFORE dividing, and off `BomQty` rather than the
+            # reader's pre-divided `QtyPerUnit`. A carton that is 1 per 3-pack
+            # divides to 0.333… first, and 0.333… x 3 is 0.999…9 — a whole
+            # carton turned into a fraction of one by arithmetic alone.
+            bom_qty = _dec(bom_qty)
+            per_box = bom_qty * scale / base_qty
+            per_piece = bom_qty / base_qty
 
             recipe.append({
                 'item_code': code,
                 'item_name': name,
-                'qty_per_case': _dec(per_box),
-                'bom_base_qty': _dec(row.get('BomBaseQty')),
+                'qty_per_case': per_box,
+                'qty_per_piece': per_piece,
+                'bom_base_qty': base_qty,
+                'pieces_per_case': scale,
                 'uom': row.get('Uom') or '',
                 'item_group': row.get('ItemGroup') or '',
                 'material_type': classify_material(row.get('ItemGroup')),
