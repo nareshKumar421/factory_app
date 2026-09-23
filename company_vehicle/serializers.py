@@ -26,6 +26,17 @@ from .models import FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
 TWO_PLACES = Decimal("0.01")
 
 
+#: Where :class:`company_vehicle.views.FleetAttachmentAPI` is mounted. The
+#: serializers hand out this path rather than ``file.url`` so a stored bill is
+#: only ever fetched through a permission check.
+ATTACHMENT_URL = "/api/v1/company-vehicles/attachments/{kind}/{pk}/"
+
+
+def _attachment(kind: str, instance, field: str):
+    """The API path for one stored file, or None when nothing is filed."""
+    return ATTACHMENT_URL.format(kind=kind, pk=instance.pk) if getattr(instance, field) else None
+
+
 def _user_name(user):
     if not user:
         return None
@@ -114,7 +125,7 @@ class VehicleDocumentSerializer(serializers.ModelSerializer):
         return "OK"
 
     def get_file_url(self, obj):
-        return obj.file.url if obj.file else None
+        return _attachment("document", obj, "file")
 
 
 # ----------------------------------------------------------------- vehicles
@@ -173,7 +184,7 @@ class FleetVehicleSerializer(serializers.ModelSerializer):
         return str(obj)
 
     def get_photo_url(self, obj):
-        return obj.photo.url if obj.photo else None
+        return _attachment("vehicle", obj, "photo")
 
     def get_fuels_allowed(self, obj):
         """Which fuels this vehicle's fill form may offer.
@@ -359,7 +370,7 @@ class FuelEntrySerializer(ApprovalFieldsMixin, serializers.ModelSerializer):
         return f"km/{obj.unit}"
 
     def get_bill_photo_url(self, obj):
-        return obj.bill_photo.url if obj.bill_photo else None
+        return _attachment("fuel", obj, "bill_photo")
 
     def get_entered_by_name(self, obj):
         return _user_name(obj.created_by)
@@ -547,7 +558,7 @@ class ServiceEntrySerializer(ApprovalFieldsMixin, serializers.ModelSerializer):
         extra_kwargs = {"bill_photo": {"write_only": True, "required": False}}
 
     def get_bill_photo_url(self, obj):
-        return obj.bill_photo.url if obj.bill_photo else None
+        return _attachment("service", obj, "bill_photo")
 
     def get_entered_by_name(self, obj):
         return _user_name(obj.created_by)

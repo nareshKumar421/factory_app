@@ -11,9 +11,11 @@ are measured against.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from django.db.models import Q
+from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status
@@ -73,6 +75,42 @@ def _date(request, name):
 
 def _choices(enum):
     return [{"value": value, "label": label} for value, label in enum.choices]
+
+
+#: Every stored file in the module, by the slug its URL uses. Kept in one
+#: place so the serializers and the endpoint cannot name different things.
+FILE_SOURCES = {
+    "fuel": (FuelEntry, "bill_photo"),
+    "service": (ServiceEntry, "bill_photo"),
+    "document": (VehicleDocument, "file"),
+    "vehicle": (FleetVehicle, "photo"),
+}
+
+
+class FleetAttachmentAPI(APIView):
+    """Stream one bill photo, scan or vehicle photo.
+
+    Served through here rather than linked at its ``/media/`` path, the way
+    ``artwork`` and ``quality_control`` serve theirs: the endpoint is
+    permission-checked, so the request has to carry the auth header, and a
+    plain media URL would hand a fuel bill or an insurance policy to anybody
+    who guessed the path. It is also the only way the link works when the page
+    and the API are not on the same host.
+    """
+
+    permission_classes = [IsAuthenticated, CanViewFleet]
+
+    def get(self, request, kind, pk):
+        source = FILE_SOURCES.get(kind)
+        if not source:
+            raise Http404("No such attachment")
+        model, field = source
+        stored = getattr(get_object_or_404(model, pk=pk), field)
+        if not stored:
+            raise Http404("Nothing filed here")
+        return FileResponse(
+            stored.open("rb"), as_attachment=False, filename=os.path.basename(stored.name)
+        )
 
 
 class FleetOptionsAPI(APIView):

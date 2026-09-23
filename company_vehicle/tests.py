@@ -5,15 +5,17 @@ this module nobody can check by eye: a wrong figure looks exactly like a right
 one until somebody acts on it.
 """
 
+import tempfile
 from datetime import date, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.core.files.base import ContentFile
+from django.test import TestCase, override_settings
 
 from .constants import ApprovalStatus, FuelType, VehicleCategory, VehicleStatus
-from .models import FleetVehicle, FuelEntry, ServiceEntry
-from .serializers import FuelEntryWriteSerializer
+from .models import FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
+from .serializers import FuelEntryWriteSerializer, VehicleDocumentSerializer
 from .services import fleet_summary, recalculate_fuel_metrics, vehicle_summary
 
 User = get_user_model()
@@ -237,3 +239,47 @@ class SpendTests(TestCase):
         summary = fleet_summary()
         self.assertEqual(summary["pending_approvals"]["fuel"], 1)
         self.assertEqual(summary["month_fuel_cost"], Decimal("0"))
+
+
+# Writes a real file, so it gets a throwaway MEDIA_ROOT rather than the
+# configured one, which is shared with the running app.
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class AttachmentLinkTests(TestCase):
+    """Stored files are linked through the API, never at their media path.
+
+    A `/media/` link is unauthenticated and relative to whatever host served
+    the page, so it would both leak a fuel bill and break wherever the SPA and
+    the API are not the same origin.
+    """
+
+    def setUp(self):
+        self.vehicle = make_vehicle()
+
+    def test_a_document_with_no_file_has_no_link(self):
+        document = VehicleDocument.objects.create(
+            vehicle=self.vehicle, doc_type="INSURANCE", expiry_date=date(2027, 3, 31)
+        )
+        self.assertIsNone(VehicleDocumentSerializer(document).data["file_url"])
+
+    def test_a_filed_document_links_through_the_permission_checked_endpoint(self):
+        document = VehicleDocument.objects.create(
+            vehicle=self.vehicle, doc_type="INSURANCE", expiry_date=date(2027, 3, 31)
+        )
+        document.file.save("policy.pdf", ContentFile(b"%PDF-1.4"), save=True)
+        url = VehicleDocumentSerializer(document).data["file_url"]
+        self.assertEqual(url, f"/api/v1/company-vehicles/attachments/document/{document.pk}/")
+        self.assertNotIn("/media/", url)
+
+    def test_the_expiry_state_is_what_colours_the_row(self):
+        past = VehicleDocument.objects.create(
+            vehicle=self.vehicle, doc_type="PUC", expiry_date=date.today() - timedelta(days=1)
+        )
+        soon = VehicleDocument.objects.create(
+            vehicle=self.vehicle, doc_type="FITNESS", expiry_date=date.today() + timedelta(days=10)
+        )
+        later = VehicleDocument.objects.create(
+            vehicle=self.vehicle, doc_type="PERMIT", expiry_date=date.today() + timedelta(days=200)
+        )
+        self.assertEqual(VehicleDocumentSerializer(past).data["expiry_state"], "EXPIRED")
+        self.assertEqual(VehicleDocumentSerializer(soon).data["expiry_state"], "EXPIRING")
+        self.assertEqual(VehicleDocumentSerializer(later).data["expiry_state"], "OK")

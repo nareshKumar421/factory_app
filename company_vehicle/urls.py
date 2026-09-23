@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     ExpiringDocumentsAPI,
+    FleetAttachmentAPI,
     FleetCostReportAPI,
     FleetOptionsAPI,
     FleetSummaryAPI,
@@ -21,6 +22,11 @@ from .views import (
 
 urlpatterns = [
     path("options/", FleetOptionsAPI.as_view(), name="fleet-options"),
+    path(
+        "attachments/<str:kind>/<int:pk>/",
+        FleetAttachmentAPI.as_view(),
+        name="fleet-attachment",
+    ),
     path("summary/", FleetSummaryAPI.as_view(), name="fleet-summary"),
     path("cost-report/", FleetCostReportAPI.as_view(), name="fleet-cost-report"),
     path("pending-approvals/", PendingApprovalsAPI.as_view(), name="fleet-pending-approvals"),
