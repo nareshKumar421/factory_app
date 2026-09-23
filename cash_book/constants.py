@@ -70,3 +70,17 @@ SALARY_ADVANCE_GL_CODES = (
 GENERIC_ITEM_WORDS = frozenset(
     {"advacne", "advance", "salary", "increment", "advances"}
 )
+
+#: What goes in the Sr.no. box to say a line has no voucher at all.
+#:
+#: Not everything the book records is a payment somebody wrote a voucher for.
+#: A bank deduction on a withdrawal is charged by the bank, not paid out by the
+#: custodian, so there is no paper to number -- but it still has to be in the
+#: book or the cash in hand is wrong. On the sheet those lines are written with
+#: a dash in the Sr. column, so a dash is what the form takes; the entry is
+#: then kept with no number, and the voucher run carries on unbroken to the
+#: next real one.
+#:
+#: Several dashes because a keyboard and a paste from the sheet do not agree on
+#: which one they produce.
+NO_VOUCHER_MARKS = frozenset({"-", "--", "–", "—"})

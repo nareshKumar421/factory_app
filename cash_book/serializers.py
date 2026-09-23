@@ -5,6 +5,7 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from .constants import NO_VOUCHER_MARKS
 from .models import (
     CashEntryAttachment,
     AdvanceDirection,
@@ -167,6 +168,43 @@ class CashEntrySerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class VoucherNumberField(serializers.Field):
+    """The Sr.no. box, which takes a number, a blank, or a dash.
+
+    Three answers rather than two, and the third is the point of the field
+    existing at all. A blank box asks for the next number, so it cannot also
+    mean "no number" -- and a plain ``IntegerField`` gives the custodian no way
+    to say that a line never had a voucher. A dash says it, as it does on the
+    paper sheet.
+
+    The dash is passed through as itself: what it comes to depends on the
+    company's register, so ``services._clean_serial`` settles it along with
+    every other answer.
+    """
+
+    def to_internal_value(self, data):
+        if isinstance(data, str):
+            text = data.strip()
+            # Blank and dash both leave here as strings; services reads one as
+            # "next please" and the other as "none at all".
+            if not text or text in NO_VOUCHER_MARKS:
+                return text
+            data = text
+        try:
+            number = int(data)
+        except (TypeError, ValueError):
+            raise serializers.ValidationError(
+                "A voucher number is a number, or a dash when the line has no "
+                "voucher."
+            )
+        if number < 1:
+            raise serializers.ValidationError("A voucher number starts at 1.")
+        return number
+
+    def to_representation(self, value):
+        return value
+
+
 class RecordEntrySerializer(serializers.Serializer):
     """Input for writing a line into the book.
 
@@ -175,10 +213,9 @@ class RecordEntrySerializer(serializers.Serializer):
     it holds for every caller; this only shapes the request.
     """
 
-    #: The voucher's own number. Left out, the next free one is used.
-    serial_number = serializers.IntegerField(
-        required=False, allow_null=True, min_value=1
-    )
+    #: The voucher's own number. Left out, the next free one is used; a dash
+    #: says the line has no voucher at all.
+    serial_number = VoucherNumberField(required=False, allow_null=True)
     entry_date = serializers.DateField()
     direction = serializers.ChoiceField(choices=CashDirection.choices)
     amount = serializers.DecimalField(

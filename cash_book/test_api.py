@@ -1821,6 +1821,117 @@ class VoucherNumbersTests(CashBookAPITestCase):
         )
 
 
+class LinesWithNoVoucherTests(CashBookAPITestCase):
+    """A dash in the Sr.no. box, which is a line nobody wrote a voucher for.
+
+    The bank's deduction on a cash withdrawal is the case that brought this
+    on: the custodian never paid it out, so there is no paper to number, but
+    it has to be in the book or the cash in hand is wrong. Before this, a
+    blank box was the only way to say "I have no number", and a blank box
+    means "give me the next one" -- so every deduction ate a voucher number
+    and the run drifted ahead of the paper.
+    """
+
+    def post(self, **overrides):
+        self.as_user(self.custodian)
+        payload = {
+            "entry_date": "2026-06-04",
+            "direction": "OUT",
+            "amount": "100.00",
+            "branch": self.branch.id,
+            "gl_account_code": "5630004",
+            "gl_account_name": "REFRESHMENT",
+            "detail": "Cash deducted by bank on withdrawal",
+            "approver": self.approver.id,
+        }
+        payload.update(overrides)
+        payload = {k: v for k, v in payload.items() if v is not None}
+        with patch("cash_book.views.GLAccountReader") as reader:
+            reader.return_value.resolve.return_value = {
+                "account_code": "5630004",
+                "account_name": "REFRESHMENT",
+            }
+            return self.client.post(f"{BASE}/entries/", payload, format="json")
+
+    def test_a_dash_records_the_line_with_no_number(self):
+        response = self.post(serial_number="-")
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNone(response.data["serial_number"])
+
+    def test_it_does_not_move_the_voucher_run_on(self):
+        """The whole point: the next voucher is still the next voucher."""
+        self.assertEqual(self.post().data["serial_number"], 1)
+        self.post(serial_number="-")
+        self.post(serial_number="-")
+        self.assertEqual(self.post().data["serial_number"], 2)
+
+    def test_the_form_is_still_told_two_is_next(self):
+        self.post()
+        self.post(serial_number="-")
+        self.as_user(self.viewer)
+        self.assertEqual(self.client.get(f"{BASE}/entries/").data["next_serial"], 2)
+
+    def test_a_blank_box_still_means_the_next_number(self):
+        """Blank and dash are two answers, not one."""
+        self.assertEqual(self.post(serial_number="").data["serial_number"], 1)
+
+    def test_several_lines_can_have_no_voucher(self):
+        """No number names no entry, so it cannot clash with another."""
+        self.assertEqual(self.post(serial_number="-").status_code, 201)
+        self.assertEqual(self.post(serial_number="-").status_code, 201)
+        self.assertEqual(
+            CashEntry.objects.filter(serial_number__isnull=True).count(), 2
+        )
+
+    def test_the_dash_the_sheet_pastes_is_read_the_same_way(self):
+        self.assertIsNone(self.post(serial_number="\u2013").data["serial_number"])
+
+    def test_a_number_can_be_taken_off_an_entry_that_has_one(self):
+        entry_id = self.post(serial_number=207).data["id"]
+        self.as_user(self.custodian)
+        response = self.client.patch(
+            f"{BASE}/entries/{entry_id}/", {"serial_number": "-"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["serial_number"])
+
+    def test_the_freed_number_is_handed_out_again(self):
+        """Nothing quotes a voucher that was never written, so it is free."""
+        entry_id = self.post().data["id"]
+        self.as_user(self.custodian)
+        self.client.patch(
+            f"{BASE}/entries/{entry_id}/", {"serial_number": "-"}, format="json"
+        )
+        self.assertEqual(self.post().data["serial_number"], 1)
+
+    def test_a_voucher_number_can_be_written_back_on(self):
+        entry_id = self.post(serial_number="-").data["id"]
+        self.as_user(self.custodian)
+        response = self.client.patch(
+            f"{BASE}/entries/{entry_id}/", {"serial_number": 7}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["serial_number"], 7)
+
+    def test_anything_that_is_neither_a_number_nor_a_dash_is_refused(self):
+        response = self.post(serial_number="none")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("serial_number", response.data)
+
+    def test_a_receipt_can_have_no_voucher_either(self):
+        """The bank's half of a withdrawal goes in as a receipt."""
+        response = self.post(
+            serial_number="-",
+            direction="IN",
+            branch=None,
+            approver=None,
+            gl_account_code="",
+            gl_account_name="",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNone(response.data["serial_number"])
+
+
 class ChangingWhoAPaymentIsWithTests(CashBookAPITestCase):
     """Correcting an entry to name a different approver.
 

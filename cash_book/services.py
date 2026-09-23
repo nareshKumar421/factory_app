@@ -30,6 +30,7 @@ from rest_framework.exceptions import ValidationError
 from .constants import (
     GENERIC_ITEM_WORDS,
     MAX_BUNCH_ENTRIES,
+    NO_VOUCHER_MARKS,
     SALARY_ADVANCE_GL_CODES,
     SALARY_ADVANCE_PEOPLE_LIMIT,
 )
@@ -366,6 +367,10 @@ def next_serial(company) -> int:
     cancelled line keeps its number, and handing it to somebody else would
     make two different payments answer to one voucher number in whatever
     paperwork already quotes it.
+
+    Lines with no voucher hold no number, so they never move this on: the book
+    can carry a fortnight of bank deductions and the next voucher is still the
+    one after the last voucher.
     """
     highest = CashEntry.objects.filter(company=company).aggregate(
         top=Max("serial_number")
@@ -374,14 +379,39 @@ def next_serial(company) -> int:
 
 
 def _clean_serial(company, serial, *, entry=None):
-    """Check a typed voucher number is free before it is written down."""
+    """Settle what number a line is written down under.
+
+    Three answers, and they are three different things:
+
+    * nothing given -- the next free number, which is the ordinary case;
+    * a dash -- no number at all, because no voucher was ever written for this
+      line (see :data:`~cash_book.constants.NO_VOUCHER_MARKS`);
+    * a number -- that one, if no other entry already answers to it.
+    """
     if serial is None:
         return next_serial(company)
+
+    if isinstance(serial, str):
+        serial = serial.strip()
+        if not serial:
+            return next_serial(company)
+        # A dash is the sheet's own way of saying "no voucher here", and it
+        # has to stay distinct from a blank box: blank asks for the next
+        # number, a dash asks for none.
+        if serial in NO_VOUCHER_MARKS:
+            return None
 
     try:
         number = int(serial)
     except (TypeError, ValueError):
-        raise ValidationError({"serial_number": "A voucher number is a number."})
+        raise ValidationError(
+            {
+                "serial_number": (
+                    "A voucher number is a number, or a dash when the line "
+                    "has no voucher."
+                )
+            }
+        )
     if number < 1:
         raise ValidationError({"serial_number": "A voucher number starts at 1."})
 
