@@ -943,6 +943,130 @@ class WasteLogTests(BaseTestCase):
         detail = self.client.get(f"{BASE_URL}/waste/{resp.data['id']}/")
         self.assertEqual(detail.status_code, status.HTTP_200_OK)
 
+    def test_reject_waste_records_reason_and_signature(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        resp = self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane',
+            'reason': 'Quantity looks too high for one shift',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['wastage_approval_status'], 'REJECTED')
+        self.assertEqual(resp.data['rejected_sign'], 'QA Jane')
+        self.assertEqual(
+            resp.data['rejection_reason'], 'Quantity looks too high for one shift'
+        )
+        self.assertIsNotNone(resp.data['rejected_at'])
+
+    def test_reject_waste_requires_a_reason(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        resp = self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_waste_rejects_an_approved_log(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        self.client.post(f'{BASE_URL}/waste/{waste_id}/approve/', {'sign': 'QA John'})
+        resp = self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane', 'reason': 'Changed my mind',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reject_waste_rejects_duplicate_rejection(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane', 'reason': 'Wrong material',
+        })
+        resp = self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane', 'reason': 'Wrong material again',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejected_waste_cannot_be_approved_until_resubmitted(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane', 'reason': 'Wrong material',
+        })
+        blocked = self.client.post(f'{BASE_URL}/waste/{waste_id}/approve/', {
+            'sign': 'QA John',
+        })
+        self.assertEqual(blocked.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.client.patch(f'{BASE_URL}/waste/{waste_id}/', {
+            'material_name': 'Palm Oil RBD',
+        }, format='json')
+        resp = self.client.post(f'{BASE_URL}/waste/{waste_id}/approve/', {
+            'sign': 'QA John',
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['wastage_approval_status'], 'FULLY_APPROVED')
+
+    def test_edit_rejected_waste_reopens_it_as_pending(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane', 'reason': 'Quantity too high',
+        })
+        resp = self.client.patch(f'{BASE_URL}/waste/{waste_id}/', {
+            'wastage_qty': '2.000',
+            'reason': 'Spill, re-measured',
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['wastage_approval_status'], 'PENDING')
+        self.assertEqual(resp.data['wastage_qty'], '2.000')
+        self.assertEqual(resp.data['reason'], 'Spill, re-measured')
+        # The reviewer's note stays on the row as history.
+        self.assertEqual(resp.data['rejection_reason'], 'Quantity too high')
+
+    def test_resubmit_without_edits_reopens_a_rejected_log(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane', 'reason': 'Please recheck',
+        })
+        resp = self.client.patch(f'{BASE_URL}/waste/{waste_id}/', {}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['wastage_approval_status'], 'PENDING')
+
+    def test_edit_rejects_zero_quantity(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        resp = self.client.patch(f'{BASE_URL}/waste/{waste_id}/', {
+            'wastage_qty': '0',
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_approved_waste_cannot_be_edited(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        self.client.post(f'{BASE_URL}/waste/{waste_id}/approve/', {'sign': 'QA John'})
+        resp = self.client.patch(f'{BASE_URL}/waste/{waste_id}/', {
+            'wastage_qty': '9.000',
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_waste_logs_filters_by_rejected_status(self):
+        r = self._create_waste()
+        waste_id = r.data['id']
+        self._create_waste()
+        self.client.post(f'{BASE_URL}/waste/{waste_id}/reject/', {
+            'sign': 'QA Jane', 'reason': 'Wrong material',
+        })
+        resp = self.client.get(f'{BASE_URL}/waste/', {'approval_status': 'REJECTED'})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual([w['id'] for w in resp.data], [waste_id])
+
+    def test_edit_missing_waste_log_returns_404(self):
+        resp = self.client.patch(f'{BASE_URL}/waste/999999/', {
+            'wastage_qty': '1.000',
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
     def test_unauthenticated_returns_401(self):
         unauthenticated_client = APIClient()
         resp = unauthenticated_client.get(f'{BASE_URL}/waste/')

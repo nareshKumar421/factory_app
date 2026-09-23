@@ -67,6 +67,7 @@ class WasteApprovalStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
     PARTIALLY_APPROVED = "PARTIALLY_APPROVED", "Partially Approved"
     FULLY_APPROVED = "FULLY_APPROVED", "Fully Approved"
+    REJECTED = "REJECTED", "Rejected"
 
 
 class ShiftChoice(models.TextChoices):
@@ -984,6 +985,17 @@ class WasteLog(models.Model):
         null=True, blank=True, related_name='hod_signed_waste'
     )
     hod_signed_at = models.DateTimeField(null=True, blank=True)
+
+    # Rejection hands the log back to whoever raised it: the row becomes
+    # editable again and returns to PENDING on resubmit. The last rejection is
+    # kept even after that, so the reviewer's note stays readable as history.
+    rejected_sign = models.CharField(max_length=200, blank=True, default='')
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='rejected_waste'
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True, default='')
 
     wastage_approval_status = models.CharField(
         max_length=20, choices=WasteApprovalStatus.choices,

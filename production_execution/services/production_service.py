@@ -2020,11 +2020,60 @@ class ProductionExecutionService:
 
         if waste.wastage_approval_status == WasteApprovalStatus.FULLY_APPROVED:
             raise ValueError("Waste log is already approved.")
+        if waste.wastage_approval_status == WasteApprovalStatus.REJECTED:
+            raise ValueError(
+                "Waste log was rejected and is back with its author. "
+                "It has to be resubmitted before it can be approved."
+            )
 
         waste.hod_sign = sign
         waste.hod_signed_by = user
         waste.hod_signed_at = now
         waste.wastage_approval_status = WasteApprovalStatus.FULLY_APPROVED
+
+        waste.save()
+        return waste
+
+    def reject_waste(self, waste_id: int, user, sign: str, reason: str) -> WasteLog:
+        """Send a waste log back to its author, with a reason they can act on."""
+        waste = self.get_waste_log(waste_id)
+
+        if waste.wastage_approval_status == WasteApprovalStatus.FULLY_APPROVED:
+            raise ValueError("Waste log is already approved.")
+        if waste.wastage_approval_status == WasteApprovalStatus.REJECTED:
+            raise ValueError("Waste log is already rejected.")
+        if not (reason or '').strip():
+            raise ValueError("A rejection reason is required.")
+
+        waste.rejected_sign = sign
+        waste.rejected_by = user
+        waste.rejected_at = timezone.now()
+        waste.rejection_reason = reason.strip()
+        waste.wastage_approval_status = WasteApprovalStatus.REJECTED
+
+        waste.save()
+        return waste
+
+    @transaction.atomic
+    def update_waste_log(self, waste_id: int, data: dict) -> WasteLog:
+        """Edit a waste log that is not approved yet, and resubmit it.
+
+        This is what a rejection reopens: the author corrects the row and it
+        goes straight back into the approval queue as PENDING. An empty edit
+        is a plain resubmit, for a rejection the author disagrees with.
+        """
+        waste = self.get_waste_log(waste_id)
+
+        if waste.wastage_approval_status == WasteApprovalStatus.FULLY_APPROVED:
+            raise ValueError("An approved waste log can no longer be edited.")
+
+        for field in ('material_code', 'material_name', 'wastage_qty', 'uom', 'reason'):
+            if field in data:
+                setattr(waste, field, data[field])
+
+        # The reviewer's note stays on the row as history; only the status moves.
+        if waste.wastage_approval_status == WasteApprovalStatus.REJECTED:
+            waste.wastage_approval_status = WasteApprovalStatus.PENDING
 
         waste.save()
         return waste

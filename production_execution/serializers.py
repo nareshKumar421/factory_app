@@ -811,6 +811,7 @@ class WasteLogSerializer(serializers.ModelSerializer):
             'am_sign', 'am_signed_by', 'am_signed_at',
             'store_sign', 'store_signed_by', 'store_signed_at',
             'hod_sign', 'hod_signed_by', 'hod_signed_at',
+            'rejected_sign', 'rejected_by', 'rejected_at', 'rejection_reason',
             'wastage_approval_status', 'approved_sign', 'approved_by', 'approved_at',
             'created_at', 'updated_at',
         ]
@@ -893,9 +894,34 @@ class WasteLogCreateSerializer(serializers.Serializer):
         return attrs
 
 
+class WasteLogUpdateSerializer(serializers.Serializer):
+    """Edit of a waste log that is not approved yet. Every field is optional:
+    an empty body is a plain resubmit of a rejected row."""
+    material_code = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    material_name = serializers.CharField(max_length=255, required=False)
+    wastage_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False
+    )
+    uom = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_wastage_qty(self, value):
+        if value <= Decimal('0'):
+            raise serializers.ValidationError(
+                'Enter a waste quantity greater than zero.'
+            )
+        return value
+
+
 class WasteApprovalSerializer(serializers.Serializer):
     sign = serializers.CharField(max_length=200)
     remarks = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class WasteRejectionSerializer(serializers.Serializer):
+    # The reason is what the author has to act on, so it is not optional.
+    sign = serializers.CharField(max_length=200)
+    reason = serializers.CharField()
 
 
 # ---------------------------------------------------------------------------

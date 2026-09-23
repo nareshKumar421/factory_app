@@ -49,7 +49,8 @@ from .serializers import (
     # Machine Checklists
     MachineChecklistEntrySerializer, MachineChecklistCreateSerializer,
     # Waste
-    WasteLogSerializer, WasteLogCreateSerializer, WasteApprovalSerializer,
+    WasteLogSerializer, WasteLogCreateSerializer, WasteLogUpdateSerializer,
+    WasteApprovalSerializer, WasteRejectionSerializer,
     # Resource Tracking
     ResourceElectricitySerializer, ResourceElectricityCreateSerializer,
     ResourceWaterSerializer, ResourceWaterCreateSerializer,
@@ -1184,7 +1185,12 @@ class WasteLogListCreateAPI(APIView):
 
 
 class WasteLogDetailAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewWasteLog]
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated(), HasCompanyContext(), CanViewWasteLog()]
+        # Editing is the other half of a rejection, so it is gated on the same
+        # permission as raising the log in the first place.
+        return [IsAuthenticated(), HasCompanyContext(), CanCreateWasteLog()]
 
     def get(self, request, waste_id):
         service = _get_service(request)
@@ -1192,6 +1198,26 @@ class WasteLogDetailAPI(APIView):
             waste = service.get_waste_log(waste_id)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        return Response(WasteLogSerializer(waste).data)
+
+    def patch(self, request, waste_id):
+        serializer = WasteLogUpdateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            # Resolved first so a missing log is a 404 here, the way the GET
+            # above answers, rather than the 400 the action endpoints give.
+            service.get_waste_log(waste_id)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            waste = service.update_waste_log(waste_id, serializer.validated_data)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(WasteLogSerializer(waste).data)
 
 
@@ -1208,6 +1234,28 @@ class WasteApproveAPI(APIView):
         service = _get_service(request)
         try:
             waste = service.approve_waste(waste_id, request.user, serializer.validated_data['sign'])
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(WasteLogSerializer(waste).data)
+
+
+class WasteRejectAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveWaste]
+
+    def post(self, request, waste_id):
+        serializer = WasteRejectionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        service = _get_service(request)
+        try:
+            waste = service.reject_waste(
+                waste_id, request.user,
+                serializer.validated_data['sign'],
+                serializer.validated_data['reason'],
+            )
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(WasteLogSerializer(waste).data)
