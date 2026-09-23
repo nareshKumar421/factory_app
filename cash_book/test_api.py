@@ -1822,6 +1822,74 @@ class VoucherNumbersTests(CashBookAPITestCase):
         )
 
 
+class BillLinksAreAbsoluteTests(CashBookAPITestCase):
+    """A bill has to be openable from the screen that shows it.
+
+    The app and the API are served on different hosts, so a bare ``/media/...``
+    resolves against the front end and 404s. The URL is built from the
+    request, which means every endpoint that sends an entry has to hand the
+    serializer the request -- and the one that uploads the bill always did, so
+    a freshly attached bill opened and the same bill opened again after a
+    refresh did not. That is the shape of this bug: intermittent, and looking
+    for all the world like the file had been removed.
+    """
+
+    def setUp(self):
+        self.entry = self.payment()
+        self.as_user(self.custodian)
+        self.client.post(
+            f"{BASE}/entries/{self.entry.id}/attachments/",
+            {"files": [SimpleUploadedFile("bill.jpg", b"\xff\xd8\xff", content_type="image/jpeg")]},
+            format="multipart",
+        )
+
+    def only_url(self, payload):
+        return payload["attachments"][0]["url"]
+
+    def test_the_register_sends_an_openable_link(self):
+        self.as_user(self.custodian)
+        rows = self.client.get(f"{BASE}/entries/").data["results"]
+        row = next(r for r in rows if r["id"] == self.entry.id)
+        self.assertTrue(self.only_url(row).startswith("http"))
+
+    def test_the_entry_itself_sends_an_openable_link(self):
+        self.as_user(self.custodian)
+        response = self.client.get(f"{BASE}/entries/{self.entry.id}/")
+        self.assertTrue(self.only_url(response.data).startswith("http"))
+
+    def test_a_correction_sends_an_openable_link(self):
+        self.as_user(self.custodian)
+        response = self.client.patch(
+            f"{BASE}/entries/{self.entry.id}/",
+            {"detail": "Corrected wording"},
+            format="json",
+        )
+        self.assertTrue(self.only_url(response.data).startswith("http"))
+
+    def test_the_approval_queue_sends_an_openable_link(self):
+        self.as_user(self.approver)
+        rows = self.client.get(f"{BASE}/approvals/").data["results"]
+        row = next(r for r in rows if r["id"] == self.entry.id)
+        self.assertTrue(self.only_url(row).startswith("http"))
+
+    def test_a_decision_sends_an_openable_link(self):
+        self.as_user(self.approver)
+        response = self.client.post(
+            f"{BASE}/entries/decide/", {"entry_ids": [self.entry.id]}, format="json"
+        )
+        self.assertTrue(self.only_url(response.data[0]).startswith("http"))
+
+    def test_the_upload_itself_sends_an_openable_link(self):
+        """The one that always worked, kept honest."""
+        self.as_user(self.custodian)
+        response = self.client.post(
+            f"{BASE}/entries/{self.entry.id}/attachments/",
+            {"files": [SimpleUploadedFile("second.jpg", b"\xff\xd8\xff", content_type="image/jpeg")]},
+            format="multipart",
+        )
+        self.assertTrue(response.data["attached"][0]["url"].startswith("http"))
+
+
 class ApprovedOnPaperTests(CashBookAPITestCase):
     """The custodian recording a signature they already have.
 

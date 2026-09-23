@@ -371,7 +371,9 @@ class CashEntryListCreateAPI(APIView):
         return Response(
             {
                 "results": CashEntrySerializer(
-                    queryset[start : start + page_size], many=True
+                    queryset[start : start + page_size],
+                    many=True,
+                    context={"request": request},
                 ).data,
                 "count": total,
                 "page": page,
@@ -419,7 +421,8 @@ class CashEntryListCreateAPI(APIView):
             item=data.get("item", ""),
         )
         return Response(
-            CashEntrySerializer(entry).data, status=status.HTTP_201_CREATED
+            CashEntrySerializer(entry, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -436,7 +439,11 @@ class CashEntryDetailAPI(APIView):
         )
 
     def get(self, request, pk):
-        return Response(CashEntrySerializer(self._entry(request, pk)).data)
+        return Response(
+            CashEntrySerializer(
+                self._entry(request, pk), context={"request": request}
+            ).data
+        )
 
     def patch(self, request, pk):
         entry = self._entry(request, pk)
@@ -460,7 +467,9 @@ class CashEntryDetailAPI(APIView):
             changes.pop("gl_account_name", None)
 
         entry = services.update_entry(user=request.user, entry=entry, **changes)
-        return Response(CashEntrySerializer(entry).data)
+        return Response(
+            CashEntrySerializer(entry, context={"request": request}).data
+        )
 
     # PUT behaves as PATCH: the form sends only what changed.
     put = patch
@@ -1211,7 +1220,11 @@ class CashEntryApprovalDecideAPI(APIView):
             approve=approve,
             note=serializer.validated_data.get("note", ""),
         )
-        return Response(CashEntrySerializer(entries, many=True).data)
+        return Response(
+            CashEntrySerializer(
+                entries, many=True, context={"request": request}
+            ).data
+        )
 
 
 class CashEntryApproveOnPaperAPI(APIView):
@@ -1277,7 +1290,9 @@ class CashApprovalQueueAPI(APIView):
         return Response(
             {
                 "state": state,
-                "results": CashEntrySerializer(rows, many=True).data,
+                "results": CashEntrySerializer(
+                    rows, many=True, context={"request": request}
+                ).data,
                 "total": sum((entry.amount for entry in rows), Decimal("0.00")),
                 "counts": {value: summary[value]["count"] for value in summary},
                 # Count and value per state, for the cards the page heads
