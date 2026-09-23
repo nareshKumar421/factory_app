@@ -29,6 +29,7 @@ from .models import (
     CashBranch,
     CashDirection,
     CashEntry,
+    EntryApprovalStatus,
 )
 
 User = get_user_model()
@@ -1819,6 +1820,193 @@ class VoucherNumbersTests(CashBookAPITestCase):
         self.assertEqual(
             services.next_serial(self.other_company), 1, "the other book starts again"
         )
+
+
+class ApprovedOnPaperTests(CashBookAPITestCase):
+    """The custodian recording a signature they already have.
+
+    Most of these are not really decided on the screen: the custodian walks a
+    stack of vouchers over, comes back with signatures, and until now had no
+    way to say so -- the entries sat in the queue waiting on an approval that
+    had already happened. The photograph of the signed voucher is what keeps
+    the shortcut honest, so it is the one thing this route will not do
+    without.
+    """
+
+    def proof(self, name="signed.jpg", content=b"\xff\xd8\xff"):
+        return SimpleUploadedFile(name, content, content_type="image/jpeg")
+
+    def post(self, entries, *, proof=True, note=None, as_user=None):
+        self.as_user(as_user or self.custodian)
+        payload = {"entry_ids": [e.id for e in entries]}
+        if proof:
+            payload["proof"] = self.proof() if proof is True else proof
+        if note is not None:
+            payload["note"] = note
+        return self.client.post(
+            f"{BASE}/entries/approve-on-paper/", payload, format="multipart"
+        )
+
+    def test_a_signed_voucher_approves_the_payment(self):
+        entry = self.payment()
+        response = self.post([entry])
+        self.assertEqual(response.status_code, 200)
+        entry.refresh_from_db()
+        self.assertEqual(entry.approval_state, EntryApprovalStatus.APPROVED)
+
+    def test_it_is_marked_as_signed_on_paper(self):
+        """APPROVED either way, but not the same evidence."""
+        entry = self.payment()
+        self.post([entry])
+        entry.refresh_from_db()
+        self.assertTrue(entry.approved_on_paper)
+
+    def test_an_ordinary_approval_is_not_marked(self):
+        entry = self.payment()
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[entry.id],
+            approve=True,
+        )
+        entry.refresh_from_db()
+        self.assertFalse(entry.approved_on_paper)
+
+    def test_the_proof_is_kept_against_the_entry(self):
+        entry = self.payment()
+        self.post([entry])
+        proof = entry.attachments.get()
+        self.assertTrue(proof.is_approval_proof)
+        self.assertEqual(proof.original_filename, "signed.jpg")
+
+    def test_the_proof_is_told_apart_from_the_bill(self):
+        """Two papers, two questions: what it bought, and who agreed."""
+        entry = self.payment()
+        services.attach_to_entry(
+            user=self.custodian, entry=entry, upload=self.proof("bill.jpg")
+        )
+        self.post([entry])
+        self.assertEqual(entry.attachments.filter(is_approval_proof=True).count(), 1)
+        self.assertEqual(entry.attachments.filter(is_approval_proof=False).count(), 1)
+
+    def test_without_a_photograph_it_is_refused(self):
+        """Otherwise it is just an approval by the person who wanted it."""
+        entry = self.payment()
+        response = self.post([entry], proof=False)
+        self.assertEqual(response.status_code, 400)
+        entry.refresh_from_db()
+        self.assertEqual(entry.approval_state, EntryApprovalStatus.PENDING)
+
+    def test_a_spreadsheet_is_not_a_signed_voucher(self):
+        entry = self.payment()
+        response = self.post(
+            [entry],
+            proof=SimpleUploadedFile("vouchers.xlsx", b"PK", content_type="app/x"),
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_one_photograph_covers_the_whole_stack(self):
+        """A signed sheet arrives as one photograph, not one per voucher."""
+        entries = [self.payment(), self.payment(), self.payment()]
+        response = self.post(entries)
+        self.assertEqual(response.status_code, 200)
+        for entry in entries:
+            entry.refresh_from_db()
+            self.assertTrue(entry.approved_on_paper)
+            self.assertEqual(entry.attachments.filter(is_approval_proof=True).count(), 1)
+
+    def test_every_entry_of_a_stack_gets_a_readable_copy(self):
+        """Django reads the upload to the end, so it has to be rewound."""
+        entries = [self.payment(), self.payment()]
+        self.post(entries)
+        for entry in entries:
+            proof = entry.attachments.get()
+            self.assertEqual(proof.file.size, 3)
+            self.assertEqual(proof.size_bytes, 3)
+
+    def test_a_bad_file_approves_nothing_at_all(self):
+        """A stack must not half-approve itself and then refuse the file."""
+        entries = [self.payment(), self.payment()]
+        self.post(
+            entries, proof=SimpleUploadedFile("x.txt", b"hi", content_type="text/plain")
+        )
+        for entry in entries:
+            entry.refresh_from_db()
+            self.assertEqual(entry.approval_state, EntryApprovalStatus.PENDING)
+
+    def test_it_counts_as_spent_like_any_approval(self):
+        entry = self.payment(amount="6000.00")
+        self.post([entry])
+        entry.refresh_from_db()
+        self.assertTrue(entry.counts_as_spent)
+
+    def test_it_freezes_the_entry_like_any_approval(self):
+        entry = self.payment()
+        self.post([entry])
+        entry.refresh_from_db()
+        self.assertTrue(entry.is_locked)
+
+    def test_it_says_who_wrote_it_down(self):
+        """The custodian, not whoever signed -- the photograph shows that."""
+        entry = self.payment()
+        self.post([entry])
+        entry.refresh_from_db()
+        self.assertEqual(entry.approval_decided_by, self.custodian)
+        self.assertIsNotNone(entry.approval_decided_at)
+
+    def test_a_note_can_name_who_signed(self):
+        entry = self.payment()
+        self.post([entry], note="Signed by Arvinder sir")
+        entry.refresh_from_db()
+        self.assertEqual(entry.approval_note, "Signed by Arvinder sir")
+
+    def test_an_entry_addressed_to_an_approver_can_still_be_recorded(self):
+        """The custodian is not an approver jumping another's queue."""
+        entry = self.payment()
+        self.assertEqual(entry.approver, self.approver)
+        self.assertEqual(self.post([entry]).status_code, 200)
+
+    def test_an_already_approved_entry_is_refused(self):
+        entry = self.payment()
+        services.decide_entries(
+            user=self.approver,
+            company=self.company,
+            entry_ids=[entry.id],
+            approve=True,
+        )
+        self.assertEqual(self.post([entry]).status_code, 400)
+
+    def test_a_receipt_is_refused(self):
+        """Nobody signs for money arriving."""
+        receipt = services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.IN,
+            amount=Decimal("500.00"),
+            detail="Cash receive by ATM card",
+            require_approver=False,
+        )
+        self.assertEqual(self.post([receipt]).status_code, 400)
+
+    def test_another_company_s_entry_is_refused(self):
+        other = self.payment(company=self.other_company)
+        self.assertEqual(self.post([other]).status_code, 400)
+
+    def test_an_approver_who_cannot_keep_the_book_is_refused(self):
+        """This is the custodian's button, not the approver's."""
+        entry = self.payment()
+        response = self.post([entry], as_user=self.approver)
+        self.assertEqual(response.status_code, 403)
+
+    def test_a_viewer_is_refused(self):
+        entry = self.payment()
+        self.assertEqual(self.post([entry], as_user=self.viewer).status_code, 403)
+
+    def test_the_marker_is_sent_to_the_screen(self):
+        entry = self.payment()
+        response = self.post([entry])
+        self.assertTrue(response.data[0]["approved_on_paper"])
 
 
 class LinesWithNoVoucherTests(CashBookAPITestCase):

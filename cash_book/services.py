@@ -1169,26 +1169,22 @@ ATTACHMENT_EXTENSIONS = frozenset(
 MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
 
 
-@transaction.atomic
-def attach_to_entry(*, user, entry: CashEntry, upload):
-    """Put a bill against a line of the book.
+def _check_upload(upload, *, noun="bill"):
+    """Refuse a file that is not a photograph or a PDF, and say why.
 
-    Refused once the entry is locked, for the same reason the entry itself
-    cannot be edited then: an approver agreed to what was in front of them,
-    and papers appearing afterwards make the thing they agreed to a different
-    thing. A bill wanted after approval is a correction -- reject the entry,
-    attach it, send it again.
+    Shared by the bill route and the paper-approval one, so the custodian
+    gets the same sentence about the same file whichever screen they are on.
+    Returns the name and size the attachment should be created with.
     """
-    _require_unlocked(entry, verb="given a bill")
-
     name = getattr(upload, "name", "") or ""
     suffix = pathlib.Path(name).suffix.lower()
     if suffix not in ATTACHMENT_EXTENSIONS:
         raise ValidationError(
             {
                 "file": (
-                    f"{name or 'That file'} is not a bill. Attach a photograph "
-                    f"or a PDF ({', '.join(sorted(ATTACHMENT_EXTENSIONS))})."
+                    f"{name or 'That file'} is not a {noun}. Attach a "
+                    f"photograph or a PDF "
+                    f"({', '.join(sorted(ATTACHMENT_EXTENSIONS))})."
                 )
             }
         )
@@ -1205,11 +1201,26 @@ def attach_to_entry(*, user, entry: CashEntry, upload):
                 )
             }
         )
+    return name[:255], size
+
+
+@transaction.atomic
+def attach_to_entry(*, user, entry: CashEntry, upload):
+    """Put a bill against a line of the book.
+
+    Refused once the entry is locked, for the same reason the entry itself
+    cannot be edited then: an approver agreed to what was in front of them,
+    and papers appearing afterwards make the thing they agreed to a different
+    thing. A bill wanted after approval is a correction -- reject the entry,
+    attach it, send it again.
+    """
+    _require_unlocked(entry, verb="given a bill")
+    name, size = _check_upload(upload)
 
     return CashEntryAttachment.objects.create(
         entry=entry,
         file=upload,
-        original_filename=name[:255],
+        original_filename=name,
         size_bytes=size,
         uploaded_by=user,
         created_by=user,
@@ -1331,6 +1342,98 @@ def decide_entries(*, user, company, entry_ids, approve: bool, note="") -> list:
         ],
     )
     return entries
+
+
+@transaction.atomic
+def approve_on_paper(*, user, company, entry_ids, proof, note="") -> list:
+    """Record that a payment was agreed on a signed voucher, not on the screen.
+
+    The screen is not where most of these are really decided. The custodian
+    walks a stack of vouchers to whoever has to sign them, comes back with
+    signatures on paper, and then has no way to say so: the entry sits in the
+    queue waiting for an approval that has already happened, and the register
+    goes on calling agreed money "awaiting approval".
+
+    So the custodian -- the person who ASKS for the approvals, not the one who
+    gives them -- can close that gap themselves. What keeps it honest is the
+    photograph: this is the one route to APPROVED that a signature cannot be
+    claimed on without producing one, and the file is kept flagged as the
+    proof of approval rather than filed in with the bills.
+
+    The entry ends up APPROVED like any other, because it *was* approved --
+    frozen, and counting as spent. ``approved_on_paper`` is what tells the two
+    apart afterwards.
+
+    One photograph covers every entry named, which is how a signed sheet
+    actually arrives: a copy is attached to each, so a row read on its own
+    still carries its own proof.
+    """
+    if proof is None:
+        raise ValidationError(
+            {"proof": "Attach a photograph of the signed voucher."}
+        )
+    # Checked once, before anything is written: a stack of twenty should not
+    # half-approve itself and then refuse the file.
+    _check_upload(proof, noun="signed voucher")
+
+    entries = _entries_for_decision(
+        company,
+        entry_ids,
+        expected={EntryApprovalStatus.PENDING},
+        verb="marked approved on paper",
+    )
+    # Deliberately no ``_refuse_somebody_elses``: the custodian is not the
+    # named approver and never will be. That check keeps one approver out of
+    # another's queue, and this is not an approver acting at all -- it is the
+    # person who asked for the signature writing down that they got it.
+
+    now = timezone.now()
+    for entry in entries:
+        # Attached first, while the entry is still unlocked -- approving it
+        # freezes it, and a frozen entry refuses attachments by design.
+        _attach_proof(user=user, entry=entry, upload=proof)
+        entry.approval_state = EntryApprovalStatus.APPROVED
+        entry.approved_on_paper = True
+        entry.approval_decided_at = now
+        # Who told the book, not who signed the paper -- the photograph shows
+        # that. ``approved_on_paper`` stops this reading as a self-approval.
+        entry.approval_decided_by = user
+        entry.approval_note = (note or "").strip()
+        entry.updated_by = user
+
+    CashEntry.objects.bulk_update(
+        entries,
+        [
+            "approval_state",
+            "approved_on_paper",
+            "approval_decided_at",
+            "approval_decided_by",
+            "approval_note",
+            "updated_by",
+        ],
+    )
+    return entries
+
+
+def _attach_proof(*, user, entry: CashEntry, upload):
+    """Put one copy of the signed-voucher photograph against one entry.
+
+    ``upload`` is rewound first. Django reads the file to the end as it saves
+    it, so the second entry of a stack would otherwise be given an empty one.
+    """
+    if hasattr(upload, "seek"):
+        upload.seek(0)
+    name = (getattr(upload, "name", "") or "")[:255]
+    return CashEntryAttachment.objects.create(
+        entry=entry,
+        file=upload,
+        original_filename=name,
+        size_bytes=getattr(upload, "size", 0) or 0,
+        is_approval_proof=True,
+        uploaded_by=user,
+        created_by=user,
+        updated_by=user,
+    )
 
 
 # ----------------------------------------------------------------------

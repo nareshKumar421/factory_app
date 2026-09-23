@@ -156,6 +156,16 @@ class CashEntryAttachment(BaseModel):
         related_name="attachments",
     )
     file = models.FileField(upload_to=_attachment_path)
+    #: True when this file is the proof of a paper approval rather than the
+    #: bill behind the payment. Two different papers answering two different
+    #: questions -- what the money bought, and who agreed to it -- and an
+    #: auditor asking the second should not have to guess which photograph
+    #: is the signed voucher.
+    is_approval_proof = models.BooleanField(
+        default=False,
+        help_text="A photograph of the signed voucher, attached when a "
+        "payment was approved on paper rather than on this screen.",
+    )
     #: What it was called on the way in. The stored name is sanitised by
     #: Django and a reader should still see the name they recognise.
     original_filename = models.CharField(max_length=255)
@@ -512,6 +522,15 @@ class CashEntry(BaseModel):
         help_text="Who this payment was sent to. Only they can decide it. "
         "Null on receipts, and on payments recorded before approvals were "
         "addressed to a person -- those stay open to any approver.",
+    )
+    approved_on_paper = models.BooleanField(
+        default=False,
+        help_text="True when this payment was agreed on a signed voucher "
+        "rather than on the approvals screen. It is APPROVED either way -- "
+        "frozen, and counting as spent -- but the two are not the same "
+        "evidence, and a register that cannot tell them apart cannot be "
+        "audited. Set only by the custodian, and only with a photograph of "
+        "the signed voucher against it.",
     )
     approval_sent_at = models.DateTimeField(null=True, blank=True)
     approval_decided_at = models.DateTimeField(null=True, blank=True)

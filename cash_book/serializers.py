@@ -73,6 +73,7 @@ class CashEntryAttachmentSerializer(serializers.ModelSerializer):
             "original_filename",
             "size_bytes",
             "url",
+            "is_approval_proof",
             "uploaded_at",
             "uploaded_by_name",
         ]
@@ -155,6 +156,7 @@ class CashEntrySerializer(serializers.ModelSerializer):
             "approval_sent_at",
             "approval_decided_at",
             "approval_decided_by_name",
+            "approved_on_paper",
             "approver",
             "approver_name",
             "attachments",
@@ -363,6 +365,24 @@ class EntryIdsSerializer(serializers.Serializer):
     entry_ids = serializers.ListField(
         child=serializers.IntegerField(min_value=1), allow_empty=False
     )
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class ApproveOnPaperSerializer(serializers.Serializer):
+    """Which entries were signed for, and the photograph that proves it.
+
+    Multipart rather than JSON, because the photograph is the point of the
+    request. ``entry_ids`` therefore arrives as repeated form fields, which
+    ``ListField`` reads off the QueryDict for us.
+    """
+
+    entry_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), allow_empty=False
+    )
+    #: Required. A paper approval nobody can produce the paper for is just an
+    #: approval by the person who wanted it.
+    proof = serializers.FileField()
+    #: Optional -- room to name whoever actually signed it.
     note = serializers.CharField(required=False, allow_blank=True, default="")
 
 

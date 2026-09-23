@@ -20,6 +20,7 @@ from .views import (
     CashBunchListCreateAPI,
     CashBunchSentAPI,
     CashEntryApprovalDecideAPI,
+    CashEntryApproveOnPaperAPI,
     CashEntryAttachmentAPI,
     CashEntryAttachmentDetailAPI,
     CashEntryBunchRemoveAPI,
@@ -143,6 +144,12 @@ urlpatterns = [
         "entries/decide/",
         CashEntryApprovalDecideAPI.as_view(),
         name="cash-book-entries-decide",
+    ),
+    # The other way in: the custodian recording a signature they already have.
+    path(
+        "entries/approve-on-paper/",
+        CashEntryApproveOnPaperAPI.as_view(),
+        name="cash-book-entries-approve-on-paper",
     ),
     path("approvals/", CashApprovalQueueAPI.as_view(), name="cash-book-approvals"),
     path("approvers/", CashApproversAPI.as_view(), name="cash-book-approvers"),

@@ -72,6 +72,7 @@ from .serializers import (
     EntryIdsSerializer,
     GLAccountSerializer,
     MarkSentSerializer,
+    ApproveOnPaperSerializer,
     CashEntryAttachmentSerializer,
     MovementSerializer,
     NewPersonSerializer,
@@ -1211,6 +1212,35 @@ class CashEntryApprovalDecideAPI(APIView):
             note=serializer.validated_data.get("note", ""),
         )
         return Response(CashEntrySerializer(entries, many=True).data)
+
+
+class CashEntryApproveOnPaperAPI(APIView):
+    """POST the signed vouchers: entries that were agreed on paper.
+
+    The custodian's route, not the approver's -- the person who ASKS for the
+    approvals, recording that they got them. Guarded by ``CanManageCashBook``
+    for that reason, and multipart because the photograph of the signed
+    voucher is what makes it more than a claim.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        serializer = ApproveOnPaperSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        entries = services.approve_on_paper(
+            user=request.user,
+            company=_company(request),
+            entry_ids=serializer.validated_data["entry_ids"],
+            proof=serializer.validated_data["proof"],
+            note=serializer.validated_data.get("note", ""),
+        )
+        return Response(
+            CashEntrySerializer(
+                entries, many=True, context={"request": request}
+            ).data
+        )
 
 
 class CashApprovalQueueAPI(APIView):
