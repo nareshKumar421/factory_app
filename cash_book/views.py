@@ -795,18 +795,28 @@ class AtmAccountListCreateAPI(APIView):
 
 
 class AtmAccountDetailAPI(APIView):
-    """GET one card's statement - PATCH to change it - DELETE to close it."""
+    """GET one card's statement - PATCH to change it - DELETE to close it.
+
+    ``?include_cancelled=true`` brings back the payments taken off the card,
+    the way the advance ledger's does.
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CashBookPermission]
 
     def get(self, request, pk):
         account = _atm_account(request, pk)
         account.balance = services.atm_balance(account)
+        include_cancelled = (
+            request.query_params.get("include_cancelled") == "true"
+        )
         return Response(
             {
                 "account": AtmAccountSerializer(account).data,
                 "movements": MovementSerializer(
-                    services.atm_statement(account), many=True
+                    services.atm_statement(
+                        account, include_cancelled=include_cancelled
+                    ),
+                    many=True,
                 ).data,
             }
         )

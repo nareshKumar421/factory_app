@@ -173,6 +173,33 @@ class CardTests(CardAndAdvanceTestCase):
             ],
         )
 
+    def test_a_cancelled_payment_is_hidden_unless_asked_for(self):
+        kept = services.record_atm_receipt(
+            user=self.custodian,
+            account=self.card,
+            received_on=date(2026, 6, 4),
+            amount=Decimal("100000.00"),
+        )
+        mistake = services.record_atm_receipt(
+            user=self.custodian,
+            account=self.card,
+            received_on=date(2026, 6, 5),
+            amount=Decimal("50000.00"),
+            detail="Recorded by mistake",
+        )
+        services.cancel_atm_receipt(user=self.custodian, receipt=mistake)
+
+        self.assertEqual(
+            [row["id"] for row in services.atm_statement(self.card)], [kept.id]
+        )
+        movements = services.atm_statement(self.card, include_cancelled=True)
+        self.assertEqual(
+            [(row["id"], row["is_active"], str(row["balance_after"])) for row in movements],
+            # Shown, but moving nothing in the running balance.
+            [(kept.id, True, "119538.00"), (mistake.id, False, "119538.00")],
+        )
+        self.assertEqual(services.atm_balance(self.card), Decimal("119538.00"))
+
     def test_a_payment_cannot_name_a_card(self):
         with self.assertRaises(ValidationError) as caught:
             self.expense(atm_account=self.card)

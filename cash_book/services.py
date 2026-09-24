@@ -821,13 +821,21 @@ def atm_balance(account) -> Decimal:
     return (account.opening_balance or ZERO) + paid_on - drawn_off
 
 
-def atm_statement(account):
+def atm_statement(account, *, include_cancelled=False):
     """The card's ledger: every movement in date order, with a running balance.
 
     Merged from two tables because a withdrawal is a cash receipt, not a row of
     its own. Sorted by date and then by when it was recorded, so two movements
     on one day read in the order they happened.
+
+    ``include_cancelled`` brings back the payments somebody took off the card,
+    on the same rule as :func:`advance_statement`: shown, but moving nothing
+    in the running balance beside them.
     """
+    receipts = AtmReceipt.objects.filter(account=account)
+    if not include_cancelled:
+        receipts = receipts.filter(is_active=True)
+
     movements = [
         {
             "kind": "RECEIPT",
@@ -835,11 +843,12 @@ def atm_statement(account):
             "date": receipt.received_on,
             "recorded": receipt.id,
             "amount": receipt.amount,
-            "signed": receipt.amount,
+            "signed": receipt.amount if receipt.is_active else ZERO,
             "detail": receipt.detail,
             "cash_entry_id": None,
+            "is_active": receipt.is_active,
         }
-        for receipt in AtmReceipt.objects.filter(account=account, is_active=True)
+        for receipt in receipts
     ] + [
         {
             "kind": "WITHDRAWAL",
@@ -850,6 +859,7 @@ def atm_statement(account):
             "signed": -entry.amount,
             "detail": entry.detail,
             "cash_entry_id": entry.id,
+            "is_active": True,
         }
         for entry in CashEntry.objects.filter(
             atm_account=account, is_active=True, direction=CashDirection.IN
