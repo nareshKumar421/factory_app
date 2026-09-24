@@ -203,8 +203,18 @@ class ReadTests(APITestCase):
         response = _client("can_manage_org_chart").get(URL)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    def test_without_a_permission_the_chart_is_closed(self):
-        self.assertEqual(_client().get(URL).status_code, status.HTTP_403_FORBIDDEN)
+    def test_any_signed_in_user_can_read_the_chart(self):
+        response = _client().get(URL)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["can_manage"])
+
+    def test_signed_out_the_chart_is_closed(self):
+        client = APIClient(headers={"Company-Code": OIL})
+        self.assertIn(
+            client.get(URL).status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
+        )
 
     def test_a_company_with_no_chart_yet_gets_an_empty_one_named_after_itself(self):
         response = _client("can_view_org_chart", company=MART).get(URL)
@@ -264,6 +274,11 @@ class SaveTests(APITestCase):
             for f in department["functions"]
             if f["name"] == name and f["subtitle"] == subtitle
         )
+
+    def test_a_user_with_no_grant_cannot_save(self):
+        payload = self._current()
+        response = _client().put(URL, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_a_viewer_cannot_save(self):
         payload = self._current()
