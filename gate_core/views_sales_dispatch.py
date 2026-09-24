@@ -3,7 +3,22 @@ from decimal import Decimal
 
 from django.core.paginator import Paginator
 from django.db import transaction
-from django.db.models import F, Prefetch, Q
+from django.db.models import (
+    BooleanField,
+    Case,
+    Count,
+    Exists,
+    F,
+    IntegerField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    TextField,
+    Value,
+    When,
+)
+from django.db.models.functions import Coalesce, NullIf, TruncDate
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse
@@ -120,6 +135,328 @@ SALES_DISPATCH_TERMINAL_STATUSES = [
     SalesDispatchGateOutStatus.CANCELLED,
     SalesDispatchGateOutStatus.REJECTED,
 ]
+
+
+# ---------------------------------------------------------------------------
+# The docking board's column filters and sort
+# ---------------------------------------------------------------------------
+#
+# The board reads like the Dispatch Sheet: a funnel and a sort on every column
+# header, so the header row IS the filter bar. Unlike the sheet, this board is
+# paged -- which is why both are the server's work here. Narrowing or ordering
+# the twenty-five rows that happened to land on a page only shuffles those
+# twenty-five, which reads as a filter and is not one, and a funnel offering
+# only what page one contained would hide most of its own options.
+#
+# One table drives three things -- the value list a column offers, the filter
+# it applies, and the order it sorts in -- so a column cannot end up filterable
+# but not sortable, or offering a value it then cannot match.
+
+
+#: Pipeline order of the statuses this board can show, mirroring the front
+#: end's ``PIPELINE_STAGE_ORDER``. Void dockings never reach the board (see
+#: ``SALES_DISPATCH_TERMINAL_STATUSES``), so they are not in it.
+DOCKING_STAGE_ORDER = [
+    SalesDispatchGateOutStatus.DOCKED,
+    SalesDispatchGateOutStatus.PHOTO_ATTACHED,
+    SalesDispatchGateOutStatus.READY_FOR_GATEPASS,
+    SalesDispatchGateOutStatus.GATEPASS_PRINTED,
+    SalesDispatchGateOutStatus.PRINT_COMMITTED,
+    SalesDispatchGateOutStatus.DISPATCHED,
+]
+
+#: How a column filter arrives: ``?f_status=DOCKED|DISPATCHED``. A pipe rather
+#: than a comma, because a customer name and an item summary are full of commas
+#: and a comma would split one value in half.
+DOCKING_FILTER_PREFIX = "f_"
+DOCKING_FILTER_SEPARATOR = "|"
+
+#: Stands for a row whose column is empty, so "no gatepass yet" can be ticked
+#: like any other value rather than being unfilterable. Matches the front end's
+#: ``BLANK`` in the spreadsheet kit.
+DOCKING_BLANK_VALUE = "—"
+
+#: A value list is a picker, not a report. Past this many distinct values the
+#: list is cut and the client is told, so a column of two thousand invoice
+#: numbers does not arrive as two thousand checkboxes nobody will scroll.
+DOCKING_MAX_COLUMN_VALUES = 300
+
+#: Newest planned dispatch first, which is how the board has always opened.
+DOCKING_DEFAULT_SORT = "-dispatch_date"
+
+
+def _docking_text(field):
+    """A text column's value, with an empty cell read as absent.
+
+    ``NullIf`` is what lets ``""`` and NULL become one "(blank)" entry: the two
+    are the same thing to somebody reading the board, and a column offering
+    both would list the same gap twice and tick only half of it.
+
+    The output field is said rather than inferred: these columns are a mix of
+    ``CharField`` and ``TextField``, and an empty ``Value("")`` is a
+    ``CharField``, so half of them would refuse to resolve at all.
+    """
+    return NullIf(F(field), Value(""), output_field=TextField())
+
+
+def _docking_active_documents():
+    """The bills still on a docking. A removed bill is deactivated, not deleted."""
+    return SalesDispatchGateOutDocument.objects.filter(
+        sales_dispatch=OuterRef("pk"), is_active=True
+    ).exclude(sap_doc_num="")
+
+
+def _docking_first_document_number():
+    """The first bill on a docking, for sorting the SAP Document column by.
+
+    A load carries many bills and the cell prints all of them, so there is no
+    single field to sort on. Ordering by the reverse relation directly would
+    multiply the row by its bills, which a paged endpoint cannot have. A
+    docking with no bill left falls back to its own header number -- which is
+    what the cell falls back to as well.
+    """
+    first = Subquery(_docking_active_documents().order_by("id").values("sap_doc_num")[:1])
+    return Coalesce(
+        NullIf(first, Value(""), output_field=TextField()),
+        _docking_text("sap_doc_num"),
+        output_field=TextField(),
+    )
+
+
+def _docking_gate_out_day():
+    """The day a truck actually left.
+
+    The cell prints the gate-out date and time the gate recorded, and falls
+    back to the moment the dispatch was committed when the gate stamped
+    neither. The filter reads the same pair, or every truck the gate did not
+    stamp would collect under "(blank)" while its row plainly shows a date.
+    """
+    return Coalesce(F("gate_out_date"), TruncDate(F("dispatched_at")))
+
+
+def _docking_stage_rank():
+    """Pipeline order, for sorting the Status column by.
+
+    Sorted by its own text, Status would run DOCKED, GATEPASS_PRINTED,
+    PHOTO_ATTACHED... -- the alphabet, which is not an order anything on this
+    board happens in. The badge names a stage of one pipeline; sorting walks
+    that pipeline, so the trucks furthest along gather at one end.
+    """
+    return Case(
+        *[
+            When(status=name, then=Value(index))
+            for index, name in enumerate(DOCKING_STAGE_ORDER)
+        ],
+        default=Value(len(DOCKING_STAGE_ORDER)),
+        output_field=IntegerField(),
+    )
+
+
+#: Each column of the board: what it is called on the wire, the value behind
+#: it, and -- where that value is the wrong thing to sort by -- what to sort by
+#: instead. ``blank_when`` names the rows a column prints nothing in although
+#: the field behind it holds something, so those rows tick under "(blank)"
+#: rather than under a value nobody can see on them.
+DOCKING_COLUMNS = {
+    "entry_no": {"value": lambda: _docking_text("entry_no")},
+    "company": {"value": lambda: _docking_text("company__name")},
+    "vehicle": {"value": lambda: _docking_text("vehicle_no")},
+    "status": {"value": lambda: _docking_text("status"), "sort": _docking_stage_rank},
+    # Read off the bills rather than the header, so a multi-bill load offers
+    # every number its cell prints. Handled apart from the rest, because the
+    # bills are a relation and a row matches on any one of them.
+    "document": {"value": _docking_first_document_number, "documents": True},
+    "customer": {"value": lambda: _docking_text("customer_name")},
+    "items": {"value": lambda: _docking_text("item_summary")},
+    "dispatch_date": {"value": lambda: F("dispatch_plan__dispatch_date")},
+    "gate_out": {
+        "value": _docking_gate_out_day,
+        # Until the truck is out the cell is a dash, whatever dates the record
+        # carries. Ticking a date under Actual Gate Out and getting back a row
+        # that plainly has not gone out is worse than having no filter on it.
+        "blank_when": ~Q(status=SalesDispatchGateOutStatus.DISPATCHED),
+    },
+    "gatepass": {"value": lambda: _docking_text("gatepass_no")},
+}
+
+
+def _docking_document_annotations(wanted):
+    """Whether a docking still carries a bill, and whether one of them matches.
+
+    ``Exists`` rather than a join: filtering ``documents__sap_doc_num__in``
+    directly multiplies each docking by its matching bills, which a paged
+    endpoint cannot have -- the count goes wrong and rows repeat across pages.
+    """
+    active = _docking_active_documents()
+    return {
+        "_doc_any": Exists(active),
+        "_doc_hit": (
+            Exists(active.filter(sap_doc_num__in=wanted))
+            if wanted
+            else Value(False, output_field=BooleanField())
+        ),
+    }
+
+
+def _docking_document_condition(chosen):
+    """The SAP Document column's filter, read over the bills not the header."""
+    wanted = [value for value in chosen if value != DOCKING_BLANK_VALUE]
+    condition = Q()
+    if wanted:
+        # A docking with no bill left on it still prints its header number, so
+        # that number has to be matchable too -- otherwise pulling the last
+        # bill makes the row unfindable by the number it is showing.
+        condition = Q(_doc_hit=True) | Q(_doc_any=False, sap_doc_num__in=wanted)
+    if DOCKING_BLANK_VALUE in chosen:
+        condition |= Q(_doc_any=False, sap_doc_num="")
+    return condition
+
+
+def apply_docking_column_filters(queryset, params, *, skip=None):
+    """Narrow the board by whatever each column's funnel has ticked.
+
+    ``skip`` leaves one column out, which is what lets that column's own value
+    list still offer the values it is currently hiding -- exactly as a
+    spreadsheet does, where reopening a filter you have already used still
+    shows everything, so a third value can be added without clearing the first
+    two. Every OTHER column's list does narrow, which is what makes them worth
+    having.
+    """
+    for name, spec in DOCKING_COLUMNS.items():
+        if name == skip:
+            continue
+        raw = params.get(f"{DOCKING_FILTER_PREFIX}{name}")
+        if not raw:
+            continue
+        chosen = [value for value in raw.split(DOCKING_FILTER_SEPARATOR) if value != ""]
+        if not chosen:
+            continue
+
+        if spec.get("documents"):
+            wanted = [value for value in chosen if value != DOCKING_BLANK_VALUE]
+            queryset = queryset.annotate(
+                **_docking_document_annotations(wanted)
+            ).filter(_docking_document_condition(chosen))
+            continue
+
+        alias = f"_col_{name}"
+        queryset = queryset.annotate(**{alias: spec["value"]()})
+        blank_when = spec.get("blank_when")
+        wanted = [value for value in chosen if value != DOCKING_BLANK_VALUE]
+
+        condition = Q()
+        if wanted:
+            match = Q(**{f"{alias}__in": wanted})
+            if blank_when is not None:
+                # The column prints nothing on these rows, so its value cannot
+                # be ticked there however much the field behind it matches.
+                match &= ~blank_when
+            condition = match
+        if DOCKING_BLANK_VALUE in chosen:
+            condition |= Q(**{f"{alias}__isnull": True})
+            if blank_when is not None:
+                condition |= blank_when
+        queryset = queryset.filter(condition)
+    return queryset
+
+
+def apply_docking_ordering(queryset, sort):
+    """Order the board by the column header that was clicked.
+
+    An unknown name falls back rather than refusing: a stale bookmark should
+    show the board, not an error.
+
+    Blanks sink whichever way the column points -- an undated dispatch is not
+    earlier than the 1st, it is absent, and absent rows are the ones to get out
+    of the way. The order ends in ``id`` so it is total: two rows of the same
+    value would otherwise swap places between requests, dropping one off a page
+    boundary while repeating the other.
+    """
+    raw = (sort or "").strip() or DOCKING_DEFAULT_SORT
+    descending = raw.startswith("-")
+    key = raw.lstrip("-")
+    if key not in DOCKING_COLUMNS:
+        raw = DOCKING_DEFAULT_SORT
+        descending = raw.startswith("-")
+        key = raw.lstrip("-")
+
+    spec = DOCKING_COLUMNS[key]
+    queryset = queryset.annotate(_sort_key=(spec.get("sort") or spec["value"])())
+    ordering = (
+        F("_sort_key").desc(nulls_last=True)
+        if descending
+        else F("_sort_key").asc(nulls_last=True)
+    )
+    return queryset.order_by(ordering, "-updated_at", "-id")
+
+
+def docking_column_values(queryset, column):
+    """What one column of the board holds, with a count of rows against each."""
+    spec = DOCKING_COLUMNS[column]
+    counted = {}
+
+    def bucket(value, blank, count):
+        key = DOCKING_BLANK_VALUE if blank else str(value)
+        entry = counted.setdefault(
+            key,
+            {"value": key, "label": "(blank)" if blank else key, "count": 0},
+        )
+        entry["count"] += count
+
+    if spec.get("documents"):
+        # Counted over the bills, so a load of four invoices offers all four --
+        # each against the number of dockings carrying it, not of lines.
+        rows = (
+            SalesDispatchGateOutDocument.objects
+            .filter(sales_dispatch__in=queryset.order_by().values("id"), is_active=True)
+            .exclude(sap_doc_num="")
+            .order_by()
+            .values("sap_doc_num")
+            .annotate(count=Count("sales_dispatch_id", distinct=True))
+        )
+        for row in rows:
+            bucket(row["sap_doc_num"], False, row["count"])
+        # A docking left with no bill prints its own header number instead.
+        headers = (
+            queryset.order_by()
+            .annotate(
+                _doc_any=Exists(_docking_active_documents()),
+                _header=_docking_text("sap_doc_num"),
+            )
+            .filter(_doc_any=False)
+            .values("_header")
+            .annotate(count=Count("id", distinct=True))
+        )
+        for row in headers:
+            bucket(row["_header"], row["_header"] is None, row["count"])
+    else:
+        queryset = queryset.order_by().annotate(_value=spec["value"]())
+        blank_when = spec.get("blank_when")
+        if blank_when is not None:
+            rows = (
+                queryset.annotate(
+                    _reads_blank=Case(
+                        When(blank_when, then=Value(True)),
+                        default=Value(False),
+                        output_field=BooleanField(),
+                    )
+                )
+                .values("_value", "_reads_blank")
+                .annotate(count=Count("id", distinct=True))
+            )
+        else:
+            rows = queryset.values("_value").annotate(count=Count("id", distinct=True))
+        for row in rows:
+            raw = row["_value"]
+            blank = row.get("_reads_blank") or raw is None or raw == ""
+            bucket(raw, blank, row["count"])
+
+    # Blank last, then by value: the drop-down is read top to bottom, and
+    # "(blank)" is the entry you scroll past rather than the one you start at.
+    return sorted(
+        counted.values(),
+        key=lambda entry: (entry["value"] == DOCKING_BLANK_VALUE, entry["value"]),
+    )
 
 
 def _sales_dispatch_base_queryset(**company_filter):
@@ -1254,6 +1591,63 @@ class SalesDispatchDocumentDetailView(APIView):
         return Response(SalesDispatchDocumentSerializer(document).data)
 
 
+class SalesDispatchColumnValuesView(APIView):
+    """GET the values one column of the docking board holds, with a count each.
+
+    What a spreadsheet's filter button drops down. Two things make it behave
+    the way people expect from one:
+
+    * the list is drawn from the **whole** date range, not the page on screen.
+      The board is paged, and a funnel offering only what page one happened to
+      contain would hide most of its own options;
+    * the other columns' funnels DO narrow it, but this column's own does not.
+      So ticking two companies still leaves all three showing when you reopen
+      that funnel, while the Vehicle list beside it has already narrowed to the
+      trucks those two companies actually sent.
+
+    Deliberately lean: no ``select_related``, no prefetch. Only one column's
+    values are ever counted -- the one whose drop-down is open -- and none of
+    the board's serialized relations are read to do it.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = {"GET": "gate_core.can_view_sales_dispatch_out"}
+
+    def get(self, request):
+        column = (request.query_params.get("column") or "").strip()
+        if column not in DOCKING_COLUMNS:
+            return Response(
+                {
+                    "detail": f"No such column: {column!r}. Known: "
+                    f"{', '.join(sorted(DOCKING_COLUMNS))}."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        company_filter = (
+            {"company_id__in": user_company_ids(request)}
+            if wants_all_companies(request)
+            else {"company": request.company.company}
+        )
+        base = (
+            SalesDispatchGateOut.objects
+            .filter(is_active=True, **company_filter)
+            .exclude(status__in=SALES_DISPATCH_TERMINAL_STATUSES)
+        )
+        qs = apply_sales_dispatch_filters(base, request.query_params)
+        qs = apply_docking_column_filters(qs, request.query_params, skip=column)
+
+        values = docking_column_values(qs, column)
+        return Response(
+            {
+                "column": column,
+                "values": values[:DOCKING_MAX_COLUMN_VALUES],
+                "truncated": len(values) > DOCKING_MAX_COLUMN_VALUES,
+                "total": len(values),
+            }
+        )
+
+
 class SalesDispatchGateOutListCreateView(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
     required_permissions = {
@@ -1276,11 +1670,26 @@ class SalesDispatchGateOutListCreateView(APIView):
             )
         )
         qs = apply_sales_dispatch_filters(base, request.query_params)
+        # The boards' column funnels (``?f_status=DOCKED|DISPATCHED``). Applied
+        # here rather than only on the paged path, so Export hands back exactly
+        # the rows the funnels left on screen -- across every page, not just the
+        # one being looked at.
+        qs = apply_docking_column_filters(qs, request.query_params)
+
+        # Ordered when a column header asked for it, and always when paging --
+        # page boundaries need a total order to hold, whereas an unpaged caller
+        # that named no column is left alone. That silence is what keeps the
+        # gate-out board's own "waiting to go out first" order: it arrives
+        # whole and sorts itself, until somebody clicks a heading.
+        sort = request.query_params.get("sort")
+        paged = request.query_params.get("page") is not None
+        if sort or paged:
+            qs = apply_docking_ordering(qs, sort)
 
         # Opt-in numbered-page pagination (the docking board). When ``page`` is
         # absent the endpoint keeps returning the full array so the export,
         # gate-out board, and other callers are unaffected.
-        if request.query_params.get("page") is not None:
+        if paged:
             return self._paginated_response(qs, request, with_items)
 
         serializer = SalesDispatchGateOutListSerializer(
@@ -1290,15 +1699,7 @@ class SalesDispatchGateOutListCreateView(APIView):
 
     @staticmethod
     def _paginated_response(qs, request, with_items):
-        # Stable ordering is required for page boundaries to hold: newest planned
-        # dispatch first (matching the board's old client-side sort), undated rows
-        # last, tie-broken by recency then id.
-        qs = qs.order_by(
-            F("dispatch_plan__dispatch_date").desc(nulls_last=True),
-            "-updated_at",
-            "-id",
-        )
-
+        # Already ordered by the caller -- see ``get``.
         try:
             page_number = max(int(request.query_params.get("page", 1)), 1)
         except (TypeError, ValueError):
