@@ -30,6 +30,16 @@ STANDARD_CLEARANCE_ITEMS = [
     "Environmental conditions (temperature/humidity) within limits",
 ]
 
+#: Companies whose floor may start a run without sending the RM/PM request to
+#: warehouse or a line clearance to QA. Each check is still opt-in: once the
+#: request (or the clearance) has been sent, that check gates the start exactly
+#: as it does everywhere else — a rejected request or an uncleared line blocks.
+OPTIONAL_START_CHECK_COMPANY_CODES = frozenset({'JIVO_BEVERAGES'})
+
+
+def start_checks_are_optional(company_code: str) -> bool:
+    return company_code in OPTIONAL_START_CHECK_COMPANY_CODES
+
 
 class ProductionExecutionService:
 
@@ -767,17 +777,24 @@ class ProductionExecutionService:
         # nothing to approve (raw material comes from the Raw Material register,
         # and any packing material was already staged at BH-PC), which is not the
         # same as NOT_REQUESTED, where nobody has submitted anything yet.
-        if run.warehouse_approval_status == 'NOT_REQUESTED':
+        # Where the checks are optional, NOT_REQUESTED passes too: the floor
+        # chose not to send one, and only a request actually sent is waited on.
+        optional = start_checks_are_optional(self.company_code)
+        if run.warehouse_approval_status == 'NOT_REQUESTED' and not optional:
             raise ValueError("Cannot start production — submit the BOM request to warehouse first.")
         if run.warehouse_approval_status == 'PENDING':
             raise ValueError("Cannot start production — BOM request is pending warehouse approval.")
         if run.warehouse_approval_status == 'REJECTED':
             raise ValueError("Cannot start production — BOM request was rejected by warehouse.")
 
-        # Line clearance gate — only allow start if QA has cleared
-        has_cleared = run.line_clearances.filter(status=ClearanceStatus.CLEARED).exists()
-        if not has_cleared:
-            raise ValueError("Cannot start production — line clearance has not been approved by QA.")
+        # Line clearance gate — only allow start if QA has cleared. Where it is
+        # optional, it applies once a clearance has been sent to QA; a draft
+        # nobody submitted has not been sent.
+        clearances = run.line_clearances.all()
+        clearance_sent = clearances.exclude(status=ClearanceStatus.DRAFT).exists()
+        if not optional or clearance_sent:
+            if not clearances.filter(status=ClearanceStatus.CLEARED).exists():
+                raise ValueError("Cannot start production — line clearance has not been approved by QA.")
 
         if run.segments.filter(is_active=True).exists():
             raise ValueError("Production is already running.")

@@ -17,6 +17,7 @@ from company.models import Company, UserCompany, UserRole
 from production_execution.models import ProductionRun
 from production_execution.services.report_service import _run_litres
 from production_execution.services.reconciliation_service import ReconciliationService
+from production_execution.services.production_service import ProductionExecutionService
 
 User = get_user_model()
 
@@ -2541,3 +2542,72 @@ class LineConfigPermissionTests(TestCase):
                 codename='can_view_line_config'
             ).exists()
         )
+
+
+class StartProductionGateTests(TestCase):
+    """Beverages may start a run without the RM/PM request or line clearance.
+
+    Each check is opt-in there: once the request (or clearance) has been sent,
+    it gates the start as it does for every other company.
+    """
+
+    def _run_for(self, code):
+        from production_execution.models import ProductionLine
+        company = Company.objects.create(code=code, name=code)
+        line = ProductionLine.objects.create(company=company, name='Line-1')
+        run = ProductionRun.objects.create(
+            company=company, line=line, run_number=1, date=date.today())
+        return run, ProductionExecutionService(code)
+
+    def _clearance(self, run, clearance_status):
+        from production_execution.models import LineClearance
+        return LineClearance.objects.create(
+            company=run.company, production_run=run, line=run.line,
+            date=run.date, status=clearance_status)
+
+    def test_other_company_still_needs_both_checks(self):
+        run, service = self._run_for('JIVO_OIL')
+        with self.assertRaisesMessage(ValueError, 'submit the BOM request'):
+            service.start_production(run.id)
+        run.warehouse_approval_status = 'APPROVED'
+        run.save()
+        with self.assertRaisesMessage(ValueError, 'line clearance'):
+            service.start_production(run.id)
+
+    def test_beverages_starts_with_neither_sent(self):
+        run, service = self._run_for('JIVO_BEVERAGES')
+        service.start_production(run.id)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'IN_PROGRESS')
+
+    def test_beverages_draft_clearance_is_not_sent(self):
+        run, service = self._run_for('JIVO_BEVERAGES')
+        self._clearance(run, 'DRAFT')
+        service.start_production(run.id)
+
+    def test_beverages_sent_request_must_be_approved(self):
+        run, service = self._run_for('JIVO_BEVERAGES')
+        for pending in ('PENDING', 'REJECTED'):
+            run.warehouse_approval_status = pending
+            run.save()
+            with self.assertRaises(ValueError):
+                service.start_production(run.id)
+        run.warehouse_approval_status = 'APPROVED'
+        run.save()
+        service.start_production(run.id)
+
+    def test_beverages_sent_clearance_must_be_cleared(self):
+        run, service = self._run_for('JIVO_BEVERAGES')
+        clearance = self._clearance(run, 'SUBMITTED')
+        with self.assertRaisesMessage(ValueError, 'line clearance'):
+            service.start_production(run.id)
+        clearance.status = 'CLEARED'
+        clearance.save()
+        service.start_production(run.id)
+
+    def test_detail_tells_the_page_the_checks_are_optional(self):
+        from production_execution.serializers import ProductionRunDetailSerializer
+        bev, _ = self._run_for('JIVO_BEVERAGES')
+        oil, _ = self._run_for('JIVO_OIL')
+        self.assertTrue(ProductionRunDetailSerializer(bev).data['start_checks_optional'])
+        self.assertFalse(ProductionRunDetailSerializer(oil).data['start_checks_optional'])

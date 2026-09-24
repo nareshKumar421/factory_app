@@ -18,6 +18,7 @@ from .models import (
     ProductionRunCost, ProductionRunCostLine, InProcessQCCheck, FinalQCCheck,
     FillingCostSheet, FillingCostSheetEntry,
 )
+from .services.production_service import start_checks_are_optional
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +384,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
     segments = serializers.SerializerMethodField()
     breakdowns = serializers.SerializerMethodField()
     machine_ids = serializers.SerializerMethodField()
+    start_checks_optional = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductionRun
@@ -399,11 +401,15 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
             'warehouse_approval_status',
             'status', 'created_by', 'created_at', 'updated_at',
-            'segments', 'breakdowns', 'machine_ids',
+            'segments', 'breakdowns', 'machine_ids', 'start_checks_optional',
         ]
 
     def get_machine_ids(self, obj):
         return list(obj.machines.values_list('id', flat=True))
+
+    def get_start_checks_optional(self, obj):
+        """The RM/PM request and line clearance gate a start only once sent."""
+        return start_checks_are_optional(obj.company.code)
 
     def get_segments(self, obj):
         return ProductionSegmentSerializer(obj.segments.all(), many=True).data
