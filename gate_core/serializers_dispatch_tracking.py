@@ -255,6 +255,7 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
     companies = serializers.SerializerMethodField()
     documents = serializers.SerializerMethodField()
     customers = serializers.SerializerMethodField()
+    customer_locations = serializers.SerializerMethodField()
     current_status = serializers.SerializerMethodField()
     current_status_display = serializers.SerializerMethodField()
     last_update_at = serializers.SerializerMethodField()
@@ -342,6 +343,38 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
             elif docking.customer_name and docking.customer_name not in names:
                 names.append(docking.customer_name)
         return names
+
+    def get_customer_locations(self, arrival):
+        """Where the truck's goods are going: each customer's ship-to address.
+
+        Read off the bills the same way ``get_customers`` is — the header of a
+        legacy single-document docking standing in for its bill — using the
+        cells the Dispatch Sheet shows as Location (``ship_to_address``) and
+        State (``place_of_supply``), so the two screens name the same place.
+
+        One entry per distinct customer + ship-to, carrying the bills going
+        there: a truck with four bills for one warehouse shows it once, while a
+        customer taking deliveries at two addresses shows both.
+        """
+        locations = {}
+        for docking in self._dispatched_dockings(arrival):
+            sources = [d for d in docking.documents.all() if d.is_active] or [docking]
+            for source in sources:
+                if not (source.customer_name or source.ship_to_code or source.ship_to_address):
+                    continue
+                key = (source.customer_name, source.ship_to_code, source.ship_to_address)
+                entry = locations.get(key)
+                if entry is None:
+                    entry = locations[key] = {
+                        "customer_name": source.customer_name,
+                        "ship_to_code": source.ship_to_code,
+                        "ship_to_address": source.ship_to_address,
+                        "place_of_supply": source.place_of_supply,
+                        "documents": [],
+                    }
+                if source.sap_doc_num and source.sap_doc_num not in entry["documents"]:
+                    entry["documents"].append(source.sap_doc_num)
+        return list(locations.values())
 
     def _latest_update(self, arrival):
         # dispatch_updates is prefetched and ordered -occurred_at, so [0] is newest.

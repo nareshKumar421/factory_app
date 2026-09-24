@@ -340,6 +340,77 @@ class TransporterOnTrackingTests(DispatchTrackingTests):
         self.assertEqual(late["transporter_name"], "Bhargave Road Carrier")
 
 
+class CustomerLocationOnTrackingTests(DispatchTrackingTests):
+    """Where each customer on the truck is, for the board's detail sheet.
+
+    Read off the bills (ship-to address + place of supply, as the Dispatch
+    Sheet reads them), one entry per customer + ship-to with its bills.
+    """
+
+    LIST_URL = "/api/v1/gate-core/dispatch-tracking/"
+
+    def _docking(self):
+        return SalesDispatchGateOut.objects.get(entry_no="DOCK-DT")
+
+    def _locations(self):
+        resp = self.client.get(self.LIST_URL, **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data["results"][0]["customer_locations"]
+
+    def _bill(self, doc_entry, customer, ship_to, address, state="HR"):
+        return SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=self._docking(), company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=doc_entry, sap_doc_num=f"INV-{doc_entry}", customer_name=customer,
+            ship_to_code=ship_to, ship_to_address=address, place_of_supply=state,
+            created_by=self.user, updated_by=self.user,
+        )
+
+    def test_legacy_docking_reads_the_location_off_its_header(self):
+        docking = self._docking()
+        docking.ship_to_code = "ACME LTD DELHI"
+        docking.ship_to_address = "C-26 HAZARA PARK\rDELHI-110051\rIN"
+        docking.place_of_supply = "DL"
+        docking.save(update_fields=["ship_to_code", "ship_to_address", "place_of_supply"])
+
+        self.assertEqual(self._locations(), [{
+            "customer_name": "ACME LTD",
+            "ship_to_code": "ACME LTD DELHI",
+            "ship_to_address": "C-26 HAZARA PARK\rDELHI-110051\rIN",
+            "place_of_supply": "DL",
+            "documents": ["INV-1001"],
+        }])
+
+    def test_bills_to_one_address_show_it_once_with_all_their_bills(self):
+        sohna = "ESR SOHNA LOGISTICS PARK\rGURUGRAM-122103\rIN"
+        self._bill(3001, "R K WORLDINFOCOM", "RK GURUGRAM", sohna)
+        self._bill(3002, "R K WORLDINFOCOM", "RK GURUGRAM", sohna)
+        self._bill(3003, "R K WORLDINFOCOM", "RK DADRI", "NIMANA ROAD\rDADRI TOE-124103\rIN")
+
+        locations = self._locations()
+        self.assertEqual(
+            [(loc["ship_to_code"], loc["documents"]) for loc in locations],
+            [("RK GURUGRAM", ["INV-3001", "INV-3002"]), ("RK DADRI", ["INV-3003"])],
+        )
+        self.assertEqual(locations[0]["ship_to_address"], sohna)
+        self.assertEqual(locations[0]["place_of_supply"], "HR")
+
+    def test_inactive_bill_is_not_a_destination(self):
+        self._bill(3001, "LIVE LTD", "LIVE", "SECTOR 18\rGURUGRAM-122001\rIN")
+        dropped = self._bill(3002, "DROPPED LTD", "DROPPED", "THIMAYYA MARG\rBHATINDA-151004\rIN")
+        dropped.is_active = False
+        dropped.save(update_fields=["is_active"])
+
+        self.assertEqual([loc["customer_name"] for loc in self._locations()], ["LIVE LTD"])
+
+    def test_a_bill_naming_no_customer_or_address_is_skipped(self):
+        docking = self._docking()
+        docking.customer_name = ""
+        docking.save(update_fields=["customer_name"])
+
+        self.assertEqual(self._locations(), [])
+
+
 class PartialDeliveryTests(TestCase):
     """Recording, item-wise, what the customer refused on a partial delivery."""
 
