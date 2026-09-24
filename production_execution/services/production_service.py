@@ -448,7 +448,13 @@ class ProductionExecutionService:
 
         parts = []
         if short:
-            parts.append(f"{short} component(s) short in the warehouse")
+            from .plan_check_service import STOCK_SCOPE_PRODUCTION_CONSUMPTION
+            where = (
+                "at the production consumption warehouse (BH-PC)"
+                if materials.get('stock_scope') == STOCK_SCOPE_PRODUCTION_CONSUMPTION
+                else "in the warehouse"
+            )
+            parts.append(f"{short} component(s) short {where}")
         if contested:
             parts.append(f"{contested} component(s) already claimed by another plan")
         raise ValueError(

@@ -128,6 +128,19 @@ CONFLICT_LINE_BUSY = 'LINE_BUSY'
 CONFLICT_DUPLICATE_SKU = 'DUPLICATE_SKU'
 CONFLICT_MATERIAL_CONTENTION = 'MATERIAL_CONTENTION'
 
+# Companies whose plans count only what is already at the line — the bill
+# line's production consumption warehouse (`BH-PC` unless the bill names
+# another) — for raw and packing material alike. Stock still in a godown or a
+# tank has to be fetched before the line can run on it, so a plan leaning on it
+# is a shortage the supervisor writes a reason for. Godown and register figures
+# still travel on the row (`sap_on_hand`, `register_as_of`) so the screen can
+# say where the material is.
+PC_ONLY_STOCK_COMPANY_CODES = frozenset({'JIVO_OIL'})
+
+# Where a row's `on_hand` was counted.
+STOCK_SCOPE_STORES = 'STORES'
+STOCK_SCOPE_PRODUCTION_CONSUMPTION = 'PRODUCTION_CONSUMPTION'
+
 # A run is a claim on the factory while it is planned or running. COMPLETED runs
 # have already consumed what they consumed and are out of the picture.
 ACTIVE_RUN_STATUSES = (RunStatus.DRAFT, RunStatus.IN_PROGRESS)
@@ -600,6 +613,9 @@ class ProductionPlanCheckService:
             [c['item_code'] for c in recipe if c['material_type'] == scope_raw()]
         )
 
+        pc_only = self.company_code in PC_ONLY_STOCK_COMPANY_CODES
+        register_whs = approval_scope.register_warehouse() if pc_only else ''
+
         qty = _dec(required_qty)
         overrides = {
             str(code): _dec(value)
@@ -637,6 +653,28 @@ class ProductionPlanCheckService:
                 free = on_hand - committed
                 holdings = (entry or {}).get('warehouses', [])
 
+            pc_code = approval_scope.consumption_warehouse_for_line(
+                comp['issue_warehouse']
+            )
+            at_pc = staged.get(code, {}).get(pc_code, ZERO)
+            searched = warehouse_scope.get(comp['material_type'], [])
+            # A raw line consumed straight out of the register's own warehouse
+            # is already at the line in the tank, and the register counts it.
+            pc_is_register = pc_only and is_raw and pc_code == register_whs
+            if pc_only and not pc_is_register:
+                source = SOURCE_SAP
+                on_hand = max(ZERO, at_pc)
+                # `OITW` committed is not read for the staging warehouse, and a
+                # guessed one would flag TIGHT on nothing.
+                committed = free = None
+                holdings = (
+                    [{'warehouse': pc_code, 'on_hand': at_pc, 'committed': ZERO}]
+                    if at_pc else []
+                )
+                searched = [pc_code]
+            elif pc_is_register:
+                searched = [pc_code]
+
             claimed = other_demand.get(code, {}).get('qty', ZERO)
 
             # Shortfall is judged on physical stock: the material is in the
@@ -646,13 +684,18 @@ class ProductionPlanCheckService:
             shortfall = max(ZERO, required - on_hand)
             after_others = on_hand - claimed - required
 
-            if stock_error and not is_raw:
+            if stock_error and (not is_raw or (pc_only and not pc_is_register)):
                 # The stock read failed. Every figure below it is unknown, and
                 # saying "short" here would turn a HANA outage into a fake
                 # material crisis — and would demand a written override for it.
                 status = STATUS_UNKNOWN
                 on_hand = committed = free = shortfall = None
                 after_others = None
+            elif pc_only and not pc_is_register:
+                status = STATUS_SHORT if shortfall > ZERO else (
+                    STATUS_CONTESTED if claimed > ZERO and after_others < ZERO
+                    else STATUS_OK
+                )
             elif is_raw and reg is None and required > ZERO:
                 # Not on the register at all — nobody has said this oil is
                 # anywhere, which is a different fix from "the tank is low".
@@ -673,13 +716,10 @@ class ProductionPlanCheckService:
             # the oil stores only, so reading BH-PC off it would always say
             # nothing is staged and promise a request twenty times the size of
             # the one that will actually be raised.
-            pc_code = approval_scope.consumption_warehouse_for_line(
-                comp['issue_warehouse']
-            )
             approval = approval_scope.line_approval(
                 comp['material_type'],
                 required,
-                staged.get(code, {}).get(pc_code, ZERO),
+                at_pc,
                 consumption_code=pc_code,
             )
 
@@ -691,7 +731,7 @@ class ProductionPlanCheckService:
                 'material_type': comp['material_type'],
                 'item_group': comp['item_group'],
                 'issue_warehouse': comp['issue_warehouse'],
-                'searched_warehouses': warehouse_scope.get(comp['material_type'], []),
+                'searched_warehouses': searched,
                 'has_own_bom': comp['has_own_bom'],
                 'qty_per_case': _num(comp['qty_per_case']),
                 'qty_per_piece': _num(comp['qty_per_piece']),
@@ -712,6 +752,10 @@ class ProductionPlanCheckService:
                 'status': status,
                 'stock_source': source,
                 'register_missing': bool(is_raw and reg is None),
+                'stock_scope': (
+                    STOCK_SCOPE_PRODUCTION_CONSUMPTION if pc_only
+                    else STOCK_SCOPE_STORES
+                ),
                 'register_as_of': (reg or {}).get('as_of_date'),
                 # SAP's own numbers travel even on a register-sourced row, so a
                 # register nobody has updated in a month is visible.
@@ -766,6 +810,9 @@ class ProductionPlanCheckService:
             'warehouses': warehouses,
             'warehouse_scope': warehouse_scope,
             'basis': basis,
+            'stock_scope': (
+                STOCK_SCOPE_PRODUCTION_CONSUMPTION if pc_only else STOCK_SCOPE_STORES
+            ),
         }
 
     def _recipe(self, item_code: str, pieces_per_case=None):
