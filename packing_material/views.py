@@ -30,7 +30,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
-from sap_client.exceptions import SAPConnectionError, SAPDataError
+from sap_client.exceptions import (
+    SAPConnectionError,
+    SAPDataError,
+    SAPValidationError,
+)
 
 from .errors import PlanNotFound
 from .permissions import CanViewPackingMaterial
@@ -187,6 +191,59 @@ class PackingMaterialPlanListAPI(_PackingMaterialAPI):
         if error:
             return error
         return Response(PlanListResponseSerializer(report).data)
+
+
+class PackingMaterialPurchaseOrderAPI(_PackingMaterialAPI):
+    """SAP's own Purchase Order sheet for one order on the requirement board.
+
+    GET /api/v1/packing-material/purchase-order/4131/
+
+    The requirement board can say a component has 166,544 on order across two
+    lines and name the supplier and the order number, and that is where its
+    own data stops. The next question a buyer asks -- what else is on that
+    order, at what rate, against which terms -- is answered by the order
+    itself, so this hands back the same sheet the vendor and the stores hold
+    rather than a summary of it. ``sap_client.hana.po_print_reader`` is the
+    one that reproduces the layout; nothing about it is re-implemented here.
+
+    Read live on every request and never cached. A purchase order can still be
+    amended or cancelled in SAP after this board counted it as cover, and a
+    stale copy is exactly the kind of error that gets noticed by the vendor
+    first.
+
+    Guarded by the board's own permission, following the precedent
+    ``grpo.permissions.CanPrintPurchaseOrder`` set: opening an order whose
+    number, supplier and quantity the operator is already reading off the
+    screen is not a capability beyond seeing it listed, and a permission of
+    its own would mean a new group row before the row would open. The order
+    is read from the company the request carries, which is the schema its
+    ``DocEntry`` came out of -- there is no way to reach another company's
+    book through this.
+    """
+
+    def get(self, request, doc_entry: int):
+        from sap_client.client import SAPClient
+
+        company_code = request.company.company.code
+        try:
+            order, error = self.guarded(
+                lambda: SAPClient(company_code=company_code).po_print(doc_entry)
+            )
+        except SAPValidationError as e:
+            # Reached when this company has no SAP configuration at all.
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        if error:
+            return error
+
+        if not order:
+            return Response(
+                {"detail": f"SAP has no purchase order {doc_entry} for {company_code}."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        # Passed through as the print reader shaped it. A serializer here would
+        # be a second copy of a layout that is already pinned field by field to
+        # a SAP-printed sheet, and the two would drift.
+        return Response(order)
 
 
 class PackingMaterialRequirementAPI(_PackingMaterialAPI):

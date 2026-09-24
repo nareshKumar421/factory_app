@@ -323,6 +323,25 @@ class RequirementDriverSerializer(serializers.Serializer):
     required_qty = serializers.FloatField()
 
 
+class RequirementPoLineSerializer(serializers.Serializer):
+    """One open purchase-order line behind a component's `PO` figure."""
+
+    doc_entry = serializers.IntegerField()
+    # What the buyer and the supplier both call the order.
+    doc_num = serializers.IntegerField()
+    line_num = serializers.IntegerField()
+    card_code = serializers.CharField(allow_blank=True)
+    card_name = serializers.CharField(allow_blank=True)
+    doc_date = serializers.CharField(allow_null=True)
+    # SAP leaves this empty on plenty of open lines, which is itself the
+    # finding -- an order with no promised date cannot be counted as cover.
+    due_date = serializers.CharField(allow_null=True)
+    ordered_qty = serializers.FloatField()
+    received_qty = serializers.FloatField()
+    # This is the one that sums to `open_po_qty` on the row.
+    open_qty = serializers.FloatField()
+
+
 class RequirementRowSerializer(serializers.Serializer):
     """One packing-material component the plan needs."""
 
@@ -370,6 +389,10 @@ class RequirementRowSerializer(serializers.Serializer):
 
     drivers = RequirementDriverSerializer(many=True)
     driver_count = serializers.IntegerField()
+
+    # The open orders themselves, soonest due first and capped -- `po_lines`
+    # above is the count of ALL of them, so a truncated list reads as one.
+    po_details = RequirementPoLineSerializer(many=True)
 
 
 class RequirementTotalsSerializer(serializers.Serializer):

@@ -22,6 +22,7 @@ from .services import (
     explode_dispatch,
     index_bom,
     index_drivers,
+    index_po_lines,
     index_master,
     issue_window,
     plan_coverage_summary,
@@ -980,6 +981,71 @@ class RequirementRowTests(SimpleTestCase):
         # Biggest contributor first, so a truncated list keeps the ones that
         # explain the figure.
         self.assertEqual(indexed["PM0000235"][0]["required_qty"], 12.0)
+
+
+class OpenPoLineTests(SimpleTestCase):
+    """The orders behind the `PO` column, as the dialog lists them."""
+
+    def line(self, doc_num, due, open_qty, ordered=None):
+        return {
+            "item_code": "PM0000121",
+            "doc_entry": doc_num,
+            "doc_num": doc_num,
+            "line_num": 0,
+            "card_code": "SUPP0001",
+            "card_name": "A SUPPLIER",
+            "doc_date": date(2026, 7, 1),
+            "due_date": due,
+            "ordered_qty": ordered if ordered is not None else open_qty,
+            "open_qty": open_qty,
+        }
+
+    def test_soonest_due_first(self):
+        indexed = index_po_lines(
+            [
+                self.line(2, date(2026, 9, 12), 46544),
+                self.line(1, date(2026, 8, 5), 120000),
+            ],
+            12,
+        )
+        self.assertEqual([row["doc_num"] for row in indexed["PM0000121"]], [1, 2])
+
+    def test_a_line_with_no_due_date_sorts_last(self):
+        # An absent date is not an urgent one. Sorting NULL to the top would
+        # put the least actionable line above a delivery that is weeks late.
+        indexed = index_po_lines(
+            [
+                self.line(1, None, 5000),
+                self.line(2, date(2026, 9, 12), 46544),
+            ],
+            12,
+        )
+        self.assertEqual([row["doc_num"] for row in indexed["PM0000121"]], [2, 1])
+        self.assertIsNone(indexed["PM0000121"][1]["due_date"])
+
+    def test_part_received_line_reports_what_has_landed(self):
+        indexed = index_po_lines([self.line(1, None, 20000, ordered=100000)], 12)
+        row = indexed["PM0000121"][0]
+        self.assertEqual(row["ordered_qty"], 100000.0)
+        self.assertEqual(row["received_qty"], 80000.0)
+        self.assertEqual(row["open_qty"], 20000.0)
+
+    def test_dates_come_back_as_iso_strings(self):
+        indexed = index_po_lines([self.line(1, date(2026, 8, 5), 120000)], 12)
+        self.assertEqual(indexed["PM0000121"][0]["due_date"], "2026-08-05")
+        self.assertEqual(indexed["PM0000121"][0]["doc_date"], "2026-07-01")
+
+    def test_the_list_is_capped_and_the_lines_still_sum_to_the_column(self):
+        # The cap is a payload limit only: `open_po_qty` on the row is the
+        # sum of every open line whether or not it is listed, and `po_lines`
+        # counts them all, so a truncated list cannot read as the whole.
+        lines = [
+            self.line(index, date(2026, 9, index), 1000)
+            for index in range(1, 21)
+        ]
+        indexed = index_po_lines(lines, 12)
+        self.assertEqual(len(indexed["PM0000121"]), 12)
+        self.assertEqual(indexed["PM0000121"][0]["doc_num"], 1)
 
 
 class OverPurchaseTests(SimpleTestCase):

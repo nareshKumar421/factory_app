@@ -751,6 +751,65 @@ HAVING ROUND(COALESCE(SUM(L."OpenQty"), 0), 3) <> 0
             for r in self._execute(query, [])
         ]
 
+    def pm_open_po_lines(self) -> List[Dict[str, Any]]:
+        """The same open orders, line by line, with who they were placed on.
+
+        ``pm_open_po`` above says a component has 166,544 on order across two
+        lines; this says the lines are 120,000 due 5 August on one supplier
+        and 46,544 due 12 September on another. That is the difference between
+        knowing a shortage is covered and being able to ring somebody about
+        it, and it cannot be derived from the aggregate.
+
+        The filters are character for character the aggregate's, so the lines
+        always add up to the column -- the only extra is dropping a line whose
+        own open quantity is zero, which contributes nothing and would show as
+        an order with nothing outstanding on it.
+
+        ``OpenQty`` and ``Quantity`` are the line's own, in the same unit the
+        aggregate sums. What has already landed is the difference, and it is
+        not read from a goods receipt: a line 80% received is one row here,
+        not a join across GRPO documents.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    L."ItemCode",
+    H."DocEntry",
+    H."DocNum",
+    L."LineNum",
+    COALESCE(H."CardCode", '') AS "CardCode",
+    COALESCE(H."CardName", '') AS "CardName",
+    H."DocDate",
+    L."ShipDate",
+    ROUND(COALESCE(L."Quantity", 0), 3) AS "OrderedQty",
+    ROUND(COALESCE(L."OpenQty", 0), 3) AS "OpenQty"
+FROM "{schema}"."OPOR" H
+INNER JOIN "{schema}"."POR1" L
+    ON L."DocEntry" = H."DocEntry"
+INNER JOIN "{schema}"."OITM" M
+    ON M."ItemCode" = L."ItemCode"
+WHERE H."DocStatus" = '{PO_STATUS_OPEN}'
+  AND L."LineStatus" = '{PO_STATUS_OPEN}'
+  AND M."ItmsGrpCod" = {PM_ITEM_GROUP}
+  AND ROUND(COALESCE(L."OpenQty", 0), 3) <> 0
+ORDER BY L."ItemCode", H."DocNum", L."LineNum"
+"""
+        return [
+            {
+                "item_code": r[0] or "",
+                "doc_entry": int(r[1] or 0),
+                "doc_num": int(r[2] or 0),
+                "line_num": int(r[3] or 0),
+                "card_code": r[4] or "",
+                "card_name": r[5] or "",
+                "doc_date": r[6],
+                "due_date": r[7],
+                "ordered_qty": float(r[8] or 0),
+                "open_qty": float(r[9] or 0),
+            }
+            for r in self._execute(query, [])
+        ]
+
     # ------------------------------------------------------------------
     # 13. How much of the plan could actually be exploded
     # ------------------------------------------------------------------

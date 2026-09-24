@@ -33,6 +33,7 @@ from .constants import (
     DISPATCH_BASIS,
     MAX_LISTED_DRIVERS,
     MAX_LISTED_ITEMS,
+    MAX_LISTED_PO_LINES,
     MAX_PLAN_LIST_LIMIT,
     OVER_PURCHASE_MIN_QTY,
     PLAN_LIST_LIMIT,
@@ -474,6 +475,61 @@ def index_drivers(
     }
 
 
+def index_po_lines(
+    lines: Iterable[Dict[str, Any]], max_per_item: int
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Open purchase-order lines per component, soonest due first, capped.
+
+    Soonest first because the order of the list is the order somebody works
+    it: the line that should already have landed is the call to make this
+    morning. Lines SAP holds no due date for sort last rather than first --
+    an absent date is not an urgent one, and sorting NULL to the top would put
+    the least actionable line above a delivery that is three weeks late.
+
+    The cap is a payload limit, the same as the drivers above: `open_po_qty`
+    is the sum of every open line whether or not it is listed, and `po_lines`
+    counts them all.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in lines:
+        code = row.get("item_code")
+        if not code:
+            continue
+        ordered = float(row.get("ordered_qty", 0) or 0)
+        open_qty = float(row.get("open_qty", 0) or 0)
+        doc_date = _as_date(row.get("doc_date"))
+        due_date = _as_date(row.get("due_date"))
+        grouped.setdefault(code, []).append(
+            {
+                "doc_entry": int(row.get("doc_entry", 0) or 0),
+                "doc_num": int(row.get("doc_num", 0) or 0),
+                "line_num": int(row.get("line_num", 0) or 0),
+                "card_code": row.get("card_code", "") or "",
+                "card_name": row.get("card_name", "") or "",
+                "doc_date": doc_date.isoformat() if doc_date else None,
+                "due_date": due_date.isoformat() if due_date else None,
+                "ordered_qty": round(ordered, 3),
+                # What has already come in against the line, as the ordered
+                # quantity less what is still open. Not read from the goods
+                # receipts: a part-received line is one row on this list, and
+                # the figure that matters on it is what is still to come.
+                "received_qty": round(max(0.0, ordered - open_qty), 3),
+                "open_qty": round(open_qty, 3),
+            }
+        )
+    return {
+        code: sorted(
+            rows,
+            key=lambda row: (
+                row["due_date"] is None,
+                row["due_date"] or "",
+                -row["open_qty"],
+            ),
+        )[:max_per_item]
+        for code, rows in grouped.items()
+    }
+
+
 def build_requirement_rows(
     requirement: Iterable[Dict[str, Any]],
     received: Iterable[Dict[str, Any]],
@@ -484,6 +540,7 @@ def build_requirement_rows(
     driver_counts: Dict[str, int],
     plan_end: Optional[date],
     as_of: date,
+    po_line_details: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     """One row per packing-material component the plan needs.
 
@@ -624,6 +681,11 @@ def build_requirement_rows(
                 ),
                 "drivers": drivers.get(code, []),
                 "driver_count": int(driver_counts.get(code, 0)),
+                # The orders behind `open_po_qty`, so the number can be
+                # chased rather than only believed. Empty where nothing is on
+                # order, and `po_lines` above says whether the list is all of
+                # them.
+                "po_details": (po_line_details or {}).get(code, []),
             }
         )
 
@@ -1042,8 +1104,8 @@ class PackingMaterialService:
     def get_requirement(self, abs_id: Optional[int] = None) -> Dict[str, Any]:
         """The plan, exploded through its BOMs, against stock and open orders.
 
-        Six reads, one response, deliberately -- unlike the three panels above.
-        Every column here is part of one row of arithmetic: `Req` cannot be
+        Seven reads, one response, deliberately -- unlike the three panels
+        above. Every column here is part of one row of arithmetic: `Req` cannot be
         computed without the plan AND the movements AND the stock, so there is
         no useful partial answer to stream, and splitting them would make the
         front end join what SQL already joined.
@@ -1076,6 +1138,7 @@ class PackingMaterialService:
         )
         on_hand = self.reader.pm_on_hand(supply_stores)
         open_po = self.reader.pm_open_po()
+        open_po_lines = self.reader.pm_open_po_lines()
         driver_rows = self.reader.plan_pm_drivers(plan["abs_id"])
         coverage = self.reader.plan_coverage(plan["abs_id"])
 
@@ -1096,6 +1159,7 @@ class PackingMaterialService:
             driver_counts,
             plan_end,
             today,
+            index_po_lines(open_po_lines, MAX_LISTED_PO_LINES),
         )
 
         return {

@@ -462,3 +462,12 @@ def supply_warehouses(company_code: str) -> List[str]:
 # `driver_count` says how many there are, so a truncated list can never be
 # read as the whole of it.
 MAX_LISTED_DRIVERS = 8
+
+# How many open purchase-order lines a component row carries as evidence.
+#
+# Same kind of cap as the drivers above: `open_po_qty` is always the sum of
+# EVERY open line and `po_lines` says how many there are, so a truncated list
+# reads as truncated. Larger than the driver cap because this is the list a
+# buyer chases supplier by supplier -- on Oil no packing material has had more
+# than a dozen lines open at once, so in practice nothing is cut.
+MAX_LISTED_PO_LINES = 12
