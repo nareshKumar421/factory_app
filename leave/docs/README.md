@@ -217,10 +217,12 @@ a client that re-derives it is a client that gets it wrong.
 
 ## The screens
 
-`/leave` (my leave, with balance cards and the history trail), `/leave/approvals`
-(the queue, with a sidebar badge fed by the count endpoint), `/leave/calendar`
-(who is out, with a per-day headcount) and `/leave/settings` — the leave types
-and the holiday calendar, gated on `can_manage_leave_types`. Before that last
+Under Organisation in the frontend: `/organization/leave` (my leave, with balance
+cards and the history trail), `/organization/leave/approvals` (the queue, with a
+sidebar badge fed by the count endpoint), `/organization/leave/calendar` (who is
+out, with a per-day headcount) and `/organization/leave/settings` — the leave types
+and the holiday calendar, gated on `can_manage_leave_types`. The old `/leave*` URLs
+redirect there. Before that last
 one existed both masters could only be reached through the Django admin, which
 meant HR could not add a leave type without a developer.
 

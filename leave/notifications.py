@@ -64,7 +64,7 @@ def notify_approver(request):
                 f"{request.leave_type.name} ({dates}, {request.total_days} day(s))."
             ),
             notification_type=NotificationType.LEAVE_REQUESTED,
-            click_action_url="/leave/approvals",
+            click_action_url="/organization/leave/approvals",
             reference_type="leave_request",
             reference_id=request.pk,
             company=request.company,
@@ -97,7 +97,7 @@ def notify_applicant(request, *, decided_by=None):
                 f"{verdict}." + (f" {note}" if note else "")
             ),
             notification_type=NotificationType.LEAVE_DECIDED,
-            click_action_url="/leave",
+            click_action_url="/organization/leave",
             reference_type="leave_request",
             reference_id=request.pk,
             company=request.company,

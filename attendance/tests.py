@@ -37,7 +37,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from company.models import Company
-from employee_hierarchy.models import Employee
+from employee_hierarchy.models import Branch, Employee
 
 from . import punch_store, services
 from .models import (
@@ -435,6 +435,80 @@ class ApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         # The fixture row is dated in the past, so "today" must exclude it.
         self.assertEqual(len(response.data), 0)
+
+
+class DailySheetBranchTests(APITestCase):
+    """The daily sheet names each person's branch, on screen and in the export.
+
+    A standalone class rather than more methods on :class:`ApiTests`, which
+    :class:`MusterRollTests` inherits -- every test there runs twice.
+    """
+
+    def setUp(self):
+        self.company, _ = Company.objects.get_or_create(
+            code="JIVO_OIL", defaults={"name": "Jivo Oil"}
+        )
+        self.branch = Branch.objects.create(company=self.company, code="SNP", name="Sonipat")
+        self.filed = Employee.objects.create(
+            company=self.company, employee_code="JWPL0593", first_name="Vishal",
+            last_name="Tyagi", branch=self.branch,
+        )
+        # Blank is allowed: the directory predates branches.
+        self.unfiled = Employee.objects.create(
+            company=self.company, employee_code="JWPL0594", first_name="Ravi", last_name="Kumar",
+        )
+        for employee in (self.filed, self.unfiled):
+            DailyAttendance.objects.create(
+                employee=employee, date=WEDNESDAY,
+                machine_status=AttendanceStatus.PRESENT,
+                effective_status=AttendanceStatus.PRESENT,
+            )
+        self.client.force_authenticate(ApiTests._user(self, "viewer", ["can_view_daily_attendance"]))
+
+    def test_each_row_carries_its_branch(self):
+        response = self.client.get(f"{BASE}/daily/?date={WEDNESDAY}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        by_code = {row["employee_code"]: row for row in response.data}
+        self.assertEqual(by_code["JWPL0593"]["branch_name"], "Sonipat")
+        self.assertIsNone(by_code["JWPL0594"]["branch_name"])
+
+    def test_branch_does_not_cost_a_query_per_row(self):
+        # Joined, not looked up per row: the sheet is ~300 people. The first
+        # request also loads the caller's permissions, so it is not the baseline.
+        self._count_list_queries()
+        before = self._count_list_queries()
+        extra = Employee.objects.create(
+            company=self.company, employee_code="JWPL0595", first_name="Amit",
+            branch=Branch.objects.create(company=self.company, code="DLH", name="Delhi"),
+        )
+        DailyAttendance.objects.create(
+            employee=extra, date=WEDNESDAY,
+            machine_status=AttendanceStatus.PRESENT, effective_status=AttendanceStatus.PRESENT,
+        )
+        self.assertEqual(self._count_list_queries(), before)
+
+    def _count_list_queries(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as ctx:
+            self.client.get(f"{BASE}/daily/?date={WEDNESDAY}")
+        return len(ctx.captured_queries)
+
+    def test_export_has_a_branch_column(self):
+        import io
+
+        import openpyxl
+
+        response = self.client.get(f"{BASE}/daily/export/?date={WEDNESDAY}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        sheet = openpyxl.load_workbook(io.BytesIO(response.content)).active
+        rows = list(sheet.iter_rows(values_only=True))
+        column = rows[0].index("Branch")
+        self.assertEqual(rows[0][column - 1], "Department")
+        by_code = {row[1]: row[column] for row in rows[1:]}
+        self.assertEqual(by_code["JWPL0593"], "Sonipat")
+        self.assertIn(by_code["JWPL0594"], (None, ""))
 
 
 class MusterRollTests(ApiTests):

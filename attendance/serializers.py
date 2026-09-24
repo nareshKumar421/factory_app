@@ -67,6 +67,11 @@ class DailyAttendanceSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(
         source="employee.department.name", read_only=True, default=None
     )
+    # The branch HR files the person under -- a label on the sheet, like the
+    # department, so the day can be read branch by branch.
+    branch_name = serializers.CharField(
+        source="employee.branch.name", read_only=True, default=None
+    )
     machine_status_display = serializers.CharField(source="get_machine_status_display", read_only=True)
     effective_status_display = serializers.CharField(source="get_effective_status_display", read_only=True)
     override_reason_code_display = serializers.CharField(
@@ -80,7 +85,8 @@ class DailyAttendanceSerializer(serializers.ModelSerializer):
         model = DailyAttendance
         fields = [
             "id", "date",
-            "employee", "employee_code", "employee_name", "department_name", "employee_detail",
+            "employee", "employee_code", "employee_name", "department_name", "branch_name",
+            "employee_detail",
             # What the machine said -- never written through this API.
             "machine_status", "machine_status_display", "machine_first_punch",
             "machine_last_punch", "machine_punch_count", "machine_worked_minutes", "devices",

@@ -140,7 +140,7 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         queryset = DailyAttendance.objects.select_related(
-            "employee", "employee__department", "overridden_by"
+            "employee", "employee__department", "employee__branch", "overridden_by"
         )
 
         date = _parse_date(self.request.query_params.get("date"))
@@ -496,7 +496,7 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
         sheet = book.active
         sheet.title = "Attendance"
         headers = [
-            "Date", "Employee Code", "Name", "Department",
+            "Date", "Employee Code", "Name", "Department", "Branch",
             "Machine Status", "First Punch", "Last Punch", "Punches", "Worked (min)",
             "Final Status", "Changed", "Reason", "Note", "Changed By",
         ]
@@ -510,6 +510,7 @@ class DailyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
                 row.employee.employee_code,
                 row.employee.full_name,
                 row.employee.department.name if row.employee.department_id else "",
+                row.employee.branch.name if row.employee.branch_id else "",
                 row.get_machine_status_display(),
                 row.machine_first_punch.strftime("%H:%M") if row.machine_first_punch else "",
                 row.machine_last_punch.strftime("%H:%M") if row.machine_last_punch else "",

@@ -171,6 +171,8 @@ class NotificationTests(LeaveAPITestBase):
         self.assertEqual(note.notification_type, "LEAVE_REQUESTED")
         self.assertEqual(note.reference_type, "leave_request")
         self.assertIn("Worker", note.body)
+        # Leave lives under Organisation in the frontend now.
+        self.assertEqual(note.click_action_url, "/organization/leave/approvals")
 
     def test_a_decision_notifies_the_applicant(self):
         request = apply_for_leave(
@@ -190,6 +192,7 @@ class NotificationTests(LeaveAPITestBase):
         ).first()
         self.assertIsNotNone(note)
         self.assertIn("Approved", note.body)
+        self.assertEqual(note.click_action_url, "/organization/leave")
 
     def test_an_applicant_with_no_login_notifies_whoever_raised_it(self):
         self.grant(self.hr_user, "leave.can_apply_leave_for_others")
