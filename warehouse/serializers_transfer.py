@@ -109,6 +109,8 @@ class TransferRequestDetailSerializer(serializers.ModelSerializer):
             'sap_leg2_doc_entry', 'sap_leg2_doc_num',
             'bst_transfer', 'bst_entry_no',
             'requested_by_name', 'reviewed_by_name', 'posted_by_name',
+            # Ids, so the page can offer posting only to these two people.
+            'requested_by', 'reviewed_by',
             'reviewed_at', 'posted_at', 'created_at', 'updated_at',
             'lines',
         ]

@@ -18,6 +18,7 @@ from decimal import Decimal
 
 from django.db import transaction
 from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
 
 from company.models import Company
 from sap_client.client import SAPClient
@@ -422,6 +423,7 @@ class TransferRequestService:
         specifying a production date, or clearing short-dated stock first).
         """
         request = self.get_request(request_id)
+        self._assert_can_post(request)
         destination = request.leg1_destination
         reader = self._batch_reader()
 
@@ -492,6 +494,7 @@ class TransferRequestService:
         and leave the rest alone.
         """
         request = self.get_request(request_id)
+        self._assert_can_post(request)
 
         if not request.is_approved:
             raise TransferRequestError(
@@ -544,6 +547,21 @@ class TransferRequestService:
         created = self._post_and_record(request, payload, is_second_leg=False)
         self._persist_transfer_lines(request, lines)
         return created
+
+    def _assert_can_post(self, request: WarehouseTransferRequest) -> None:
+        """Only the two people on the request may move its stock.
+
+        The one who raised it and the one who approved it — nobody else, not
+        even another holder of the post permission. Posting is what actually
+        moves stock in SAP, so it stays with the people who answer for the
+        request rather than with anyone who happens to have the button.
+        """
+        involved = {request.requested_by_id, request.reviewed_by_id} - {None}
+        if getattr(self.user, 'pk', None) not in involved:
+            raise PermissionDenied(
+                f"Only the person who raised {request.entry_no} or the person "
+                f"who approved it can post its stock to SAP."
+            )
 
     def _batch_reader(self):
         from sap_client.hana.batch_stock_reader import HanaBatchStockReader

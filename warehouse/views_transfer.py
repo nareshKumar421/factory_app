@@ -166,10 +166,12 @@ class TransferRequestRejectView(_TransferView):
 class TransferRequestAllocationPreviewView(_TransferView):
     """What batches posting would take, plus what else is on the shelf.
 
-    Read-only: nothing is reserved or moved by looking.
+    Read-only: nothing is reserved or moved by looking. Open to the same two
+    people who may post — the requester and the approver — and checked in the
+    service, not by the post permission.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanPostTransferToSAP]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewTransferRequest]
 
     def get(self, request, request_id: int):
         def action():
@@ -182,10 +184,11 @@ class TransferRequestPostView(_TransferView):
     """Post the approved quantities — the whole move, or leg 1 if cross-branch.
 
     Accepts an optional hand-picked batch split per line; anything omitted is
-    allocated oldest-first.
+    allocated oldest-first. Only the request's requester or approver may post;
+    the service checks that, so the post permission alone no longer suffices.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanPostTransferToSAP]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewTransferRequest]
 
     def post(self, request, request_id: int):
         serializer = TransferPostSerializer(data=request.data or {})
