@@ -337,28 +337,43 @@ def resync_docking_header(docking, user):
 
 def undocked_booked_bills(docking):
     """Bills booked to this docking's truck (its gate-in covers) that are not yet on
-    ANY active docking for the same truck + company.
+    ANY active docking for the same truck.
 
     Used to keep one docking per truck: before the load is locked (truck photo /
-    gatepass), every booked bill for the physical truck should already be on this
-    docking, else the un-docked ones will split onto a second docking + gatepass.
-    Returns a list of ``{"sap_doc_entry", "sap_doc_num"}`` (empty when fully docked).
-    """
-    from gate_core.models import (
-        EmptyVehicleGateIn,
-        EmptyVehicleGateInCover,
-        SalesDispatchGateOutDocument,
-    )
+    gatepass), every booked bill for the physical truck should already be docked,
+    else the un-docked ones will split onto a second docking + gatepass.
 
-    plan = docking.dispatch_plan
-    vehicle_entry_id = getattr(plan, "linked_vehicle_entry_id", None)
-    if not vehicle_entry_id:
-        return []
-    gate_in = EmptyVehicleGateIn.objects.filter(
-        vehicle_entry_id=vehicle_entry_id, company_id=docking.company_id
-    ).first()
-    if gate_in is None:
-        return []
+    On a cross-company truck (the docking has an ``arrival``) that means every
+    company's gate-in on the arrival, not only this docking's: a company whose bills
+    were never docked has no docking of its own to raise the alarm, so this one must.
+    A legacy docking with no arrival stays scoped to its own company's gate-in.
+
+    Returns a list of ``{"sap_doc_entry", "sap_doc_num", "company_code"}`` (empty
+    when fully docked).
+    """
+    from gate_core.models import EmptyVehicleGateIn
+
+    if docking.arrival_id:
+        gate_ins = EmptyVehicleGateIn.objects.filter(
+            arrival_id=docking.arrival_id, is_active=True, retired_at__isnull=True
+        ).select_related("company")
+    else:
+        vehicle_entry_id = getattr(docking.dispatch_plan, "linked_vehicle_entry_id", None)
+        if not vehicle_entry_id:
+            return []
+        gate_ins = EmptyVehicleGateIn.objects.filter(
+            vehicle_entry_id=vehicle_entry_id, company_id=docking.company_id
+        ).select_related("company")[:1]
+    undocked = []
+    for gate_in in gate_ins:
+        undocked.extend(_undocked_bills_on_gate_in(gate_in))
+    return undocked
+
+
+def _undocked_bills_on_gate_in(gate_in):
+    """One gate-in's booked (unconsumed) covers not on any active docking for it."""
+    from gate_core.models import EmptyVehicleGateInCover, SalesDispatchGateOutDocument
+
     booked = {
         c.sap_doc_entry: (c.sap_doc_num or str(c.sap_doc_entry))
         for c in EmptyVehicleGateInCover.objects.filter(
@@ -370,14 +385,14 @@ def undocked_booked_bills(docking):
     # Bills already on any active docking for this truck (same gate-in) + company.
     docked = set(
         SalesDispatchGateOutDocument.objects.filter(
-            company_id=docking.company_id,
+            company_id=gate_in.company_id,
             is_active=True,
             sales_dispatch__is_active=True,
-            sales_dispatch__dispatch_plan__linked_vehicle_entry_id=vehicle_entry_id,
+            sales_dispatch__dispatch_plan__linked_vehicle_entry_id=gate_in.vehicle_entry_id,
         ).values_list("sap_doc_entry", flat=True)
     )
     return [
-        {"sap_doc_entry": entry, "sap_doc_num": num}
+        {"sap_doc_entry": entry, "sap_doc_num": num, "company_code": gate_in.company.code}
         for entry, num in sorted(booked.items())
         if entry not in docked
     ]

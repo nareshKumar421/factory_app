@@ -114,12 +114,13 @@ def attach_truck_photo_to_arrival(
 
     if not allow_partial:
         # Merge each docking's still-un-loaded booked bills; any one blocks the lock.
+        # Keyed per company: doc entries are only unique within one company's SAP.
         undocked = {}
         for docking in dockings:
             for bill in docking_builder.undocked_booked_bills(docking):
-                undocked[bill["sap_doc_entry"]] = bill
+                undocked[(bill["company_code"], bill["sap_doc_entry"])] = bill
         if undocked:
-            raise PartialLoadLockError(sorted(undocked.values(), key=lambda b: b["sap_doc_entry"]))
+            raise PartialLoadLockError([undocked[key] for key in sorted(undocked)])
 
     # Read the upload once; hand each docking an independent copy (a single
     # UploadedFile can't be saved to N FileFields).

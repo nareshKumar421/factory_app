@@ -1764,6 +1764,12 @@ class SalesDispatchGateOutListCreateView(APIView):
         if validation_error:
             return validation_error
 
+        already_docked = self._already_docked_on_truck(company, documents)
+        if already_docked is not None:
+            response_data = SalesDispatchGateOutSerializer(already_docked).data
+            response_data["warnings"] = []
+            return Response(response_data, status=status.HTTP_200_OK)
+
         duplicate_response = self._duplicate_response(company, documents)
         if duplicate_response:
             return duplicate_response
@@ -1811,10 +1817,58 @@ class SalesDispatchGateOutListCreateView(APIView):
             request.user,
         )
         if reused is not None:
+            warnings.extend(self._dock_other_companies_on_truck(reused, request, data))
             response_data = SalesDispatchGateOutSerializer(reused).data
             response_data["warnings"] = warnings
             return Response(response_data, status=status.HTTP_200_OK)
 
+        transport_data = {
+            field: data[field]
+            for field in (
+                "eway_bill",
+                "bilty_no",
+                "bilty_date",
+                "freight",
+                "total_freight",
+            )
+            if field in request.data and field in data
+        }
+        entry = self._create_docking(
+            company=company,
+            documents=documents,
+            dispatch_plans_by_doc_entry=dispatch_plans_by_doc_entry,
+            vehicle=vehicle,
+            driver=driver,
+            data=data,
+            transport_data=transport_data,
+            user=request.user,
+        )
+        warnings.extend(self._dock_other_companies_on_truck(entry, request, data))
+
+        response_data = SalesDispatchGateOutSerializer(entry).data
+        response_data["warnings"] = warnings
+        return Response(response_data, status=status.HTTP_201_CREATED)
+
+    def _create_docking(
+        self,
+        *,
+        company,
+        documents,
+        dispatch_plans_by_doc_entry,
+        vehicle,
+        driver,
+        data,
+        transport_data,
+        user,
+    ):
+        """Create one company's docking for ``documents`` and return it.
+
+        ``documents[0]`` is the primary document. ``transport_data`` holds the
+        transport fields the caller actually sent, pushed down onto the plans.
+        """
+        primary_document = documents[0]
+        dispatch_plan = dispatch_plans_by_doc_entry.get(primary_document["doc_entry"])
+        transporter = vehicle.transporter
         with transaction.atomic():
             header_snapshot = docking_builder.header_snapshot(documents)
             if data.get("eway_bill"):
@@ -1828,14 +1882,14 @@ class SalesDispatchGateOutListCreateView(APIView):
                 entry_type="SALES_DISPATCH",
                 status="IN_PROGRESS",
                 remarks=data.get("remarks", ""),
-                created_by=request.user,
-                updated_by=request.user,
+                created_by=user,
+                updated_by=user,
             )
             source_entry = getattr(dispatch_plan, "linked_vehicle_entry", None)
             self._copy_empty_vehicle_tare_weighment(
                 source_entry=source_entry,
                 target_entry=vehicle_entry,
-                user=request.user,
+                user=user,
             )
             # Thread this docking onto the physical truck trip (cross-company arrival).
             arrival = None
@@ -1859,8 +1913,8 @@ class SalesDispatchGateOutListCreateView(APIView):
                 dock_incharge=data.get("dock_incharge", ""),
                 security_name=data.get("security_name", ""),
                 remarks=data.get("remarks", ""),
-                created_by=request.user,
-                updated_by=request.user,
+                created_by=user,
+                updated_by=user,
             )
             next_line_num = 0
             for document in documents:
@@ -1868,39 +1922,145 @@ class SalesDispatchGateOutListCreateView(APIView):
                     sales_dispatch=entry,
                     company=company,
                     dispatch_plan=dispatch_plans_by_doc_entry.get(document["doc_entry"]),
-                    created_by=request.user,
-                    updated_by=request.user,
+                    created_by=user,
+                    updated_by=user,
                     **docking_builder.document_snapshot(document),
                 )
                 next_line_num = docking_builder.create_items(
                     entry,
                     document_row,
                     document,
-                    request.user,
+                    user,
                     next_line_num,
                 )
-            transport_data = {
-                field: data[field]
-                for field in (
-                    "eway_bill",
-                    "bilty_no",
-                    "bilty_date",
-                    "freight",
-                    "total_freight",
-                )
-                if field in request.data and field in data
-            }
-            sync_sales_dispatch_transport_to_plans(entry, transport_data, request.user)
+            sync_sales_dispatch_transport_to_plans(entry, transport_data, user)
 
             # The physical truck is now being loaded for this trip.
             if arrival is not None and arrival.status == VehicleArrivalStatus.INSIDE:
                 arrival.status = VehicleArrivalStatus.LOADING
-                arrival.updated_by = request.user
+                arrival.updated_by = user
                 arrival.save(update_fields=["status", "updated_by", "updated_at"])
 
-        response_data = SalesDispatchGateOutSerializer(entry).data
-        response_data["warnings"] = warnings
-        return Response(response_data, status=status.HTTP_201_CREATED)
+        return entry
+
+    def _dock_other_companies_on_truck(self, entry, request, data):
+        """Dock every other company's pending bills on ``entry``'s truck. Returns warnings.
+
+        A cross-company truck is one physical load: docking one company must dock
+        them all, or the others surface later as a fresh "pending at dock" row and
+        go out on a second gatepass. The frontend used to decide this from a list
+        it fetched separately, and a Save before that list loaded docked one company
+        only. Deciding it here makes the split impossible whatever the client sent.
+
+        Each company is docked on its own; one that can't be (SAP down, bills on
+        different SAP branches, a company the user doesn't belong to) is left
+        pending with a warning, and the truck-photo lock still stops the load going
+        out without it.
+        """
+        if not entry.arrival_id:
+            return []
+        from gate_core.models import EmptyVehicleGateIn
+
+        allowed_company_ids = set(user_company_ids(request))
+        # A sibling's header is its own: never copy this company's e-way bill onto it.
+        sibling_data = {**data, "eway_bill": ""}
+        warnings = []
+        gate_ins = (
+            EmptyVehicleGateIn.objects.filter(
+                arrival_id=entry.arrival_id, is_active=True, retired_at__isnull=True
+            )
+            .exclude(company_id=entry.company_id)
+            .select_related("company")
+        )
+        for gate_in in gate_ins:
+            company = gate_in.company
+            plans = list(
+                pending_dispatch_plan_queryset(company).filter(
+                    linked_vehicle_entry_id=gate_in.vehicle_entry_id,
+                    sap_invoice_doc_entry__isnull=False,
+                )
+            )
+            if not plans:
+                continue
+            try:
+                if company.id not in allowed_company_ids:
+                    raise ValueError("you are not a member of that company")
+                service = SalesDispatchDocumentService(company)
+                documents = []
+                plans_by_doc_entry = {}
+                for plan in plans:
+                    document = service.get_document(
+                        SalesDispatchDocumentType.INVOICE, plan.sap_invoice_doc_entry
+                    )
+                    if not document:
+                        raise ValueError(
+                            f"invoice {plan.sap_invoice_doc_num} was not found in SAP"
+                        )
+                    documents.append(document)
+                    plans_by_doc_entry[document["doc_entry"]] = plan
+                if self._validate_document_set(company, documents) or self._duplicate_response(
+                    company, documents
+                ):
+                    raise ValueError("its bills cannot go on one docking")
+                primary_plan = plans_by_doc_entry[documents[0]["doc_entry"]]
+                with transaction.atomic():
+                    docked = self._append_to_open_docking(
+                        primary_plan,
+                        documents[0],
+                        documents,
+                        plans_by_doc_entry,
+                        service,
+                        request.user,
+                    ) or self._create_docking(
+                        company=company,
+                        documents=documents,
+                        dispatch_plans_by_doc_entry=plans_by_doc_entry,
+                        vehicle=entry.vehicle,
+                        driver=entry.driver,
+                        data=sibling_data,
+                        transport_data={},
+                        user=request.user,
+                    )
+                    if docked.arrival_id != entry.arrival_id:
+                        # Its plan points at a gate-in outside this truck's arrival;
+                        # don't guess, leave it for the operator.
+                        raise ValueError("its gate-in is not on this truck's arrival")
+            except (SAPConnectionError, SAPDataError, ValueError) as exc:
+                warnings.append(
+                    {
+                        "code": "TRUCK_COMPANY_NOT_DOCKED",
+                        "message": (
+                            f"{company.name}'s bills on this truck were not docked ({exc}). "
+                            f"Dock them from the board before the truck photo."
+                        ),
+                    }
+                )
+        return warnings
+
+    def _already_docked_on_truck(self, company, documents):
+        """The open truck docking that already holds every one of ``documents``, or None.
+
+        Docking one company docks the whole truck, so a client that still docks
+        company by company finds its later companies already done. Answer those
+        calls with the docking instead of a "already docked" error.
+        """
+        rows = list(
+            SalesDispatchGateOutDocument.objects.filter(
+                company=company,
+                is_active=True,
+                sales_dispatch__is_active=True,
+                sales_dispatch__arrival__isnull=False,
+                sales_dispatch__status__in=docking_builder.OPEN_DOCKING_STATUSES,
+                document_type__in={document["document_type"] for document in documents},
+                sap_doc_entry__in=[document["doc_entry"] for document in documents],
+            ).select_related("sales_dispatch")
+        )
+        dockings = {row.sales_dispatch_id: row.sales_dispatch for row in rows}
+        if len(dockings) != 1:
+            return None
+        if {row.sap_doc_entry for row in rows} != {document["doc_entry"] for document in documents}:
+            return None
+        return next(iter(dockings.values()))
 
     def _append_to_open_docking(
         self,
@@ -2220,14 +2380,18 @@ class SalesDispatchAttachmentListCreateView(APIView):
         ):
             undocked = docking_builder.undocked_booked_bills(entry)
             if undocked:
-                nums = ", ".join(b["sap_doc_num"] for b in undocked)
+                nums = ", ".join(
+                    b["sap_doc_num"]
+                    if b["company_code"] == entry.company.code
+                    else f"{b['sap_doc_num']} ({b['company_code']})"
+                    for b in undocked
+                )
                 return Response(
                     {
                         "detail": (
-                            f"This truck has {len(undocked)} more booked bill(s) not on this "
-                            f"docking ({nums}). Dock them onto this docking first so the truck "
-                            f"gets one gatepass, or resend with allow_partial to dispatch these "
-                            f"and leave the rest."
+                            f"This truck has {len(undocked)} more booked bill(s) not docked "
+                            f"yet ({nums}). Dock them first so the truck gets one gatepass, "
+                            f"or resend with allow_partial to dispatch these and leave the rest."
                         ),
                         "undocked_bills": undocked,
                         "requires_partial_override": True,
