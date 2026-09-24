@@ -120,15 +120,16 @@ class CostSliceContractTests(TestCase):
             self.assertEqual(missing, set(), f"{slice_['key']} is missing {missing}")
 
     def test_a_line_says_whether_its_rows_add_up_to_it(self):
-        # Three of the four are their rows, split. Electricity is not: it lists
-        # every meter the register was read on and is priced off ONE of them,
-        # so a panel that summed them would state a rival total.
+        # All four are their rows, split, since electricity stopped being one
+        # main among the meters it listed. The key stays on the payload: it is
+        # what a line whose rows are context rather than parts says about
+        # itself, and the panel states a total only where it is True.
         payload = cost()
         self.assertEqual(
             {entry["key"]: entry["rows_sum_to_line"] for entry in payload["slices"]},
             {
                 "labour": True,
-                "electricity": False,
+                "electricity": True,
                 "salary": True,
                 "maintenance": True,
             },
@@ -315,14 +316,16 @@ class ElectricityRowTests(TestCase):
         from maintenance.models import DailyElectricityReading, ElectricityMeter
 
         self.oil = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.bev = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
 
-        def meter(name):
+        def meter(name, companies=None, main=False):
             row = ElectricityMeter.objects.create(
                 name=name,
                 rate_per_unit=Decimal("7"),
                 multiplying_factor=Decimal("1"),
+                is_main=main,
             )
-            row.companies.set([self.oil])
+            row.companies.set(companies or [self.oil])
             return row
 
         def reading(row, day, opening, closing):
@@ -335,55 +338,62 @@ class ElectricityRowTests(TestCase):
                 rate_per_unit=Decimal("7"),
             )
 
+        self.reading = reading
         self.floor = meter("Production Floor OIL")
-        self.kwh = meter("KWH", main=True)
+        self.shared = meter("TR 125", [self.oil, self.bev])
+        self.kwh = meter("KWH", [self.oil, self.bev], main=True)
         reading(self.floor, date(2026, 9, 2), "0", "1000")
         reading(self.floor, TODAY, "1000", "1500")
+        reading(self.shared, date(2026, 9, 2), "0", "400")
+        reading(self.shared, TODAY, "400", "600")
         reading(self.kwh, date(2026, 9, 2), "0", "2000")
         reading(self.kwh, TODAY, "2000", "2500")
 
     def _power(self):
         return line(cost(), "electricity")
 
-    def test_one_row_per_meter_read_this_month_with_its_own_rate(self):
+    def test_one_row_per_oil_sub_meter_read_this_month(self):
+        # The main is not among them: it measures the supply these two draw
+        # from, so a list holding all three would show the same electricity
+        # twice and a sum of it would price it twice.
         rows = self._power()["rows"]
         self.assertEqual(
             [(row["label"], row["detail"], row["amount"]) for row in rows],
             [
-                ("KWH", "2,500 units at ₹7.00/unit", 17_500.0),
                 ("Production Floor OIL", "1,500 units at ₹7.00/unit", 10_500.0),
+                (
+                    "TR 125",
+                    "300 units at ₹7.00/unit · Jivo Oil's half, shared with "
+                    "Jivo Beverages",
+                    2_100.0,
+                ),
             ],
         )
 
-    def test_the_row_the_line_was_priced_from_is_the_one_marked(self):
-        # Not the biggest — on the live register the biggest is KVAH, which is
-        # the grid's own KWH counted again as apparent energy.
-        marked = [row["label"] for row in self._power()["rows"] if row["is_line"]]
-        self.assertEqual(marked, ["KWH"])
-
-    def test_the_rows_do_not_add_up_to_the_line_and_the_slice_says_so(self):
+    def test_the_rows_add_up_to_the_line(self):
+        # The panel prints their sum beside the line's own figure, so this is
+        # the assertion that keeps the two screens from disagreeing.
         power = self._power()
-        self.assertFalse(power["rows_sum_to_line"])
-        # The line is the marked row, NOT the 28,000 these two come to: the
-        # production floor re-measures part of what came in on KWH.
-        self.assertEqual(power["amount"], 17_500.0)
-        self.assertEqual(sum(row["amount"] for row in power["rows"]), 28_000.0)
+        self.assertTrue(power["rows_sum_to_line"])
+        self.assertEqual(power["amount"], 12_600.0)
+        self.assertEqual(sum(row["amount"] for row in power["rows"]), 12_600.0)
 
     def test_today_names_the_units_behind_the_money(self):
+        # 500 on the floor and Oil's half of the shared meter's 200.
         power = self._power()
-        self.assertEqual(power["today"], 3_500.0)
-        self.assertEqual(power["today_detail"], "500 units today")
-        self.assertEqual(power["today_detail_value"], 500.0)
+        self.assertEqual(power["today"], 4_200.0)
+        self.assertEqual(power["today_detail"], "600 units today")
+        self.assertEqual(power["today_detail_value"], 600.0)
         self.assertEqual(power["today_detail_unit"], "units")
 
     def test_a_meter_nobody_read_today_says_unknown_not_nil(self):
         # A meter carries on drawing power whether or not somebody wrote the
-        # number down. Nil on the row would report that KWH's line stopped.
+        # number down. Nil on the row would report that its line stopped.
         from maintenance.models import DailyElectricityReading
 
-        DailyElectricityReading.objects.filter(meter=self.kwh, date=TODAY).delete()
+        DailyElectricityReading.objects.filter(meter=self.shared, date=TODAY).delete()
         by_meter = {row["label"]: row["today"] for row in self._power()["rows"]}
-        self.assertIsNone(by_meter["KWH"])
+        self.assertIsNone(by_meter["TR 125"])
         self.assertEqual(by_meter["Production Floor OIL"], 3_500.0)
 
     def test_a_day_with_no_reading_entered_says_that_rather_than_nothing(self):
