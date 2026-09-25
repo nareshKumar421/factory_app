@@ -1501,13 +1501,14 @@ class BSTInvoiceFlowTests(TestCase):
             email="idst@example.com", full_name="Dst", employee_code="EMP-ID",
         )
 
-    def _dispatched_invoice_transfer(self, source, destination, barcodes, *, item_code="ITM1"):
-        """Build, scan and approve an INVOICE BST directly (no SAP round-trip)."""
+    def _unscanned_invoice_transfer(
+        self, source, destination, bill_boxes, *, item_code="ITM1", requires_gate=False,
+    ):
+        """Build an unscanned INVOICE BST directly (no SAP round-trip)."""
         # Companies are created per test here, not in setUp, so the warehouse
         # assignments have to be made once both ends are known.
         assign_test_warehouses(self.sender, source)
         assign_test_warehouses(self.receiver, destination)
-        src_svc = BSTService(source.code, self.sender)
         transfer = BSTTransfer.objects.create(
             company=source,
             entry_no=BSTTransfer.generate_entry_no(),
@@ -1517,6 +1518,7 @@ class BSTInvoiceFlowTests(TestCase):
             customer_name=destination.name,
             sap_doc_entry=900, sap_doc_num="INV-900",
             sap_from_warehouse="WH-A", sap_to_warehouse="",
+            requires_gate=requires_gate,
             status=BSTTransferStatus.SCANNING, created_by=self.sender,
         )
         doc = BSTTransferDoc.objects.create(
@@ -1527,14 +1529,106 @@ class BSTInvoiceFlowTests(TestCase):
         # not the quantity lock (see BSTScanCompletenessTests for that).
         BSTTransferItem.objects.create(
             transfer=transfer, doc=doc, line_num=0, item_code=item_code,
-            item_name="Item One", quantity=Decimal(str(len(barcodes))), uom="PCS",
-            from_warehouse="WH-A", to_warehouse="", expected_boxes=len(barcodes),
+            item_name="Item One", quantity=Decimal(str(bill_boxes)), uom="PCS",
+            from_warehouse="WH-A", to_warehouse="", expected_boxes=bill_boxes,
         )
+        return transfer
+
+    def _dispatched_invoice_transfer(self, source, destination, barcodes, *, item_code="ITM1"):
+        """Build, scan and approve an INVOICE BST directly (no SAP round-trip)."""
+        transfer = self._unscanned_invoice_transfer(
+            source, destination, len(barcodes), item_code=item_code,
+        )
+        src_svc = BSTService(source.code, self.sender)
         for code in barcodes:
             make_box(source, code, item_code=item_code)
             src_svc.scan(transfer, code)
         src_svc.approve(transfer)
         return transfer
+
+    # -- Live invoice (no truck): receivable from the first scan ------------
+
+    def _companies(self):
+        return (
+            Company.objects.create(name="Acme", code="ACME"),
+            Company.objects.create(name="Beta", code="BETA"),
+        )
+
+    def test_live_invoice_first_scan_goes_in_transit_and_incoming(self):
+        # An Oil → Mart invoice with no truck is receivable the moment the sender
+        # scans its first box — no approve needed to unlock the destination.
+        source, destination = self._companies()
+        transfer = self._unscanned_invoice_transfer(source, destination, 2)
+        make_box(source, "BOX-1")
+        BSTService(source.code, self.sender).scan(transfer, "BOX-1")
+
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.IN_TRANSIT)
+        self.assertIsNotNone(transfer.dispatched_at)
+        self.assertIsNone(transfer.scan_approved_at)
+        incoming = BSTService(destination.code, self.receiver).incoming_queryset()
+        self.assertEqual([t.id for t in incoming], [transfer.id])
+
+    def test_live_invoice_receiver_accepts_while_sender_still_scanning(self):
+        # The receiver takes BOX-1 (ownership moves to the destination at once)
+        # while the sender goes on to scan BOX-2; finalizing waits for the seal.
+        source, destination = self._companies()
+        transfer = self._unscanned_invoice_transfer(source, destination, 2)
+        src_svc = BSTService(source.code, self.sender)
+        dst_svc = BSTService(destination.code, self.receiver)
+        make_box(source, "BOX-1")
+        make_box(source, "BOX-2")
+
+        src_svc.scan(transfer, "BOX-1")
+        dst_svc.receive_scan(transfer, "BOX-1", decision="ACCEPTED")
+        self.assertEqual(Box.objects.get(box_barcode="BOX-1").company_id, destination.id)
+
+        self.assertEqual(src_svc.scan(transfer, "BOX-2")["created_count"], 1)
+        dst_svc.receive_scan(transfer, "BOX-2", decision="ACCEPTED")
+        with self.assertRaises(BSTError):
+            dst_svc.receive_complete(transfer)  # sender hasn't sealed yet
+
+        src_svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVING)  # seal never rewinds
+        dst_svc.receive_complete(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.RECEIVED)
+        self.assertEqual(
+            Box.objects.filter(box_barcode__in=["BOX-1", "BOX-2"], company=destination).count(), 2,
+        )
+
+    def test_live_invoice_sender_cannot_remove_box_receiver_accepted(self):
+        source, destination = self._companies()
+        transfer = self._unscanned_invoice_transfer(source, destination, 1)
+        make_box(source, "BOX-1")
+        src_svc = BSTService(source.code, self.sender)
+        src_svc.scan(transfer, "BOX-1")
+        BSTService(destination.code, self.receiver).receive_scan(
+            transfer, "BOX-1", decision="ACCEPTED",
+        )
+        scan = transfer.box_scans.get(box_barcode="BOX-1")
+        with self.assertRaises(BSTError):
+            src_svc.remove_scan(transfer, scan.id)
+        self.assertTrue(transfer.box_scans.filter(id=scan.id).exists())
+
+    def test_gated_invoice_stays_sequential(self):
+        # An invoice that leaves on a truck is not live: scanning doesn't make it
+        # receivable, and approve hands it to the gate.
+        source, destination = self._companies()
+        transfer = self._unscanned_invoice_transfer(source, destination, 1, requires_gate=True)
+        make_box(source, "BOX-1")
+        src_svc = BSTService(source.code, self.sender)
+        src_svc.scan(transfer, "BOX-1")
+
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.SCANNING)
+        self.assertEqual(
+            BSTService(destination.code, self.receiver).incoming_queryset().count(), 0,
+        )
+        src_svc.approve(transfer)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.status, BSTTransferStatus.AWAITING_GATE_OUT)
 
     def test_invoice_receipt_moves_box_ownership_to_destination_company(self):
         source = Company.objects.create(name="Acme", code="ACME")

@@ -24,14 +24,21 @@ scan-based flow:
 3. A **receiver** (warehouse user at the destination) **scans** the arriving boxes and
    resolves each as **accepted** or **rejected**, then finalizes the receipt.
 
-**Live internal transfers (no gate).** For an intra-company `STOCK_TRANSFER` with
-`requires_gate=False` the two sides run **concurrently**: the shipment becomes
-receivable the instant the sender scans its **first box** (it flips to `IN_TRANSIT`
-and shows on the destination's *Incoming* tab), so the receiver can start
-accepting while the sender is still scanning more pallets. `approve()` is then
-optional — it only *seals* the send (the sender stops scanning). INVOICE and gated
-transfers keep the classic sequential flow (scan → approve → [gate] → receive).
-See `BSTService._is_live` / `_live_editable`.
+**Live transfers (no truck).** For any BST with `requires_gate=False` — an
+intra-company `STOCK_TRANSFER` or a cross-company `INVOICE` (e.g. JIVO OIL → JIVO
+MART) alike — the two sides run **concurrently**: the shipment becomes receivable
+the instant the sender scans its **first box** (it flips to `IN_TRANSIT` and shows
+on the destination's *Incoming* tab), so the receiver can start accepting while the
+sender is still scanning more pallets. `approve()` is then optional — it only
+*seals* the send (the sender stops scanning). Only gated transfers keep the classic
+sequential flow (scan → approve → gate → receive). See `BSTService._is_live` /
+`_live_editable`.
+
+On a live INVOICE, accepting a box hands it (and its pallet) to the destination
+company at once, while the sender may still be scanning. Scan whole pallets: once
+the receiver accepts part of a pallet, the pallet itself belongs to the destination,
+so the sender can no longer scan it by its pallet code (its remaining boxes can
+still be scanned one by one).
 
 A BST has one of two `source_type`s, which decides how stock settles on receipt:
 
@@ -117,23 +124,22 @@ never entered — distinct from an entered `0`).
 ### Status lifecycle (`BSTTransferStatus`)
 
 ```
- LIVE (STOCK_TRANSFER, no gate):
+ LIVE (no gate — STOCK_TRANSFER or INVOICE):
    create() ─▶ SCANNING ──first scan──▶ IN_TRANSIT ⇄ (sender keeps scanning; approve() only seals)
                                             │ receive_scan()   [receiver runs concurrently]
                                             ▼
                                         RECEIVING ─▶ receive_complete() ─▶ RECEIVED / PARTIALLY_RECEIVED
    (remove last unreceived box ─▶ back to SCANNING, drops off Incoming)
 
- SEQUENTIAL (INVOICE, or gated STOCK_TRANSFER):
-                          approve()                         mark_gate_out()
- create() ─▶ SCANNING ───────────────┬── requires_gate ──▶ AWAITING_GATE_OUT ──▶ IN_TRANSIT
-   (SCANNING)                         └── no gate (INVOICE) ────────────────────▶ IN_TRANSIT
-                                                                                     │ receive_scan()
-                                                                                     ▼
-                                                                                 RECEIVING
-                                                                    receive_complete()
-                                                        ┌── all dispatched accepted ─▶ RECEIVED
-                                                        └── any rejected / short ────▶ PARTIALLY_RECEIVED
+ SEQUENTIAL (gated, either source type):
+                          approve()               mark_gate_out()
+ create() ─▶ SCANNING ──────────────▶ AWAITING_GATE_OUT ──▶ IN_TRANSIT
+                                                              │ receive_scan()
+                                                              ▼
+                                                          RECEIVING
+                                                      receive_complete()
+                                          ┌── all dispatched accepted ─▶ RECEIVED
+                                          └── any rejected / short ────▶ PARTIALLY_RECEIVED
  (any non-terminal state) ─▶ CANCELLED
 ```
 
@@ -225,9 +231,7 @@ then:
 - **Live transfer** → this is an optional **seal**: it just records the approver and
   keeps the transfer `IN_TRANSIT` (or `RECEIVING`, if the receiver already started). It
   never rewinds/blocks the receiver; afterwards the sender can no longer scan.
-- **Non-live**, `requires_gate` → **`AWAITING_GATE_OUT`** (handed to the gate);
-- **Non-live**, no gate (INVOICE) → **`IN_TRANSIT`** + `dispatched_by/at` (immediately
-  receivable).
+- **Non-live** (always `requires_gate`) → **`AWAITING_GATE_OUT`** (handed to the gate).
 
 ### 5. Gate out — `mark_gate_out()` (perm-gated)
 `AWAITING_GATE_OUT` → **`IN_TRANSIT`**, stamping `gated_out_*` and `dispatched_*`. (The

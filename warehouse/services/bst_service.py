@@ -369,8 +369,8 @@ IN_FLIGHT_STATUSES = (
 
 # Sender may still edit/scan only while in these states.
 #
-# Exception — *live* internal transfers (see `BSTService._is_live`): an
-# intra-company STOCK_TRANSFER with no gate step goes receivable the moment the
+# Exception — *live* transfers (see `BSTService._is_live`): a transfer with no
+# gate step — stock transfer or invoice — goes receivable the moment the
 # sender scans its first box (→ IN_TRANSIT), so the destination can scan
 # concurrently. The sender keeps scanning through IN_TRANSIT / RECEIVING until it
 # is *sealed* by `approve()` — see `BSTService._live_editable`.
@@ -839,15 +839,15 @@ class BSTService:
 
     @staticmethod
     def _is_live(transfer: BSTTransfer) -> bool:
-        """A *live* internal transfer: an intra-company STOCK_TRANSFER with no
-        gate step. These go receivable the instant the sender scans the first box
-        (→ IN_TRANSIT) so the destination can accept/reject concurrently while the
-        sender is still scanning. INVOICE (cross-company) and gated transfers keep
-        the classic sequential flow (scan → approve → [gate] → receive)."""
-        return (
-            transfer.source_type == BSTSourceType.STOCK_TRANSFER
-            and not transfer.requires_gate
-        )
+        """A *live* transfer: one with no gate step, i.e. no truck. These go
+        receivable the instant the sender scans the first box (→ IN_TRANSIT) so
+        the destination can accept/reject concurrently while the sender is still
+        scanning. Holds for both source types — an intra-company STOCK_TRANSFER
+        and a cross-company INVOICE (JIVO OIL → JIVO MART) alike: with no vehicle
+        to wait for, nothing stands between the sender's scan and the receiver's.
+        Gated transfers keep the classic sequential flow (scan → approve → gate →
+        receive)."""
+        return not transfer.requires_gate
 
     def _live_editable(self, transfer: BSTTransfer) -> bool:
         """True while the sender of a live transfer may still add/remove boxes:
@@ -1127,7 +1127,7 @@ class BSTService:
             )
             created.append(self._create_scan(transfer, box))
 
-        # Live internal transfer: the first scanned box makes the shipment
+        # Live transfer: the first scanned box makes the shipment
         # receivable immediately (→ IN_TRANSIT), so the destination sees the boxes
         # and can start scanning while the sender is still going. The sender stays
         # editable (see `_live_editable`) until they seal it via `approve()`.
@@ -1291,14 +1291,13 @@ class BSTService:
     def approve(self, transfer: BSTTransfer) -> BSTTransfer:
         """Warehouse review: the scanning is confirmed correct.
 
-        For a **live** internal transfer this is optional — the shipment is
+        For a **live** (non-gated) transfer this is optional — the shipment is
         already receivable from its first scan. Approving just *seals* the send
         (the sender stops scanning) and stamps who confirmed it; it never rewinds
         or blocks the receiver.
 
-        For a **non-live** transfer (any INVOICE, or a gated STOCK_TRANSFER) this
-        is the dispatch trigger: gated → wait for the gate to mark it out;
-        otherwise → straight in transit (receivable)."""
+        For a **gated** transfer this is the dispatch trigger: it waits for the
+        gate to mark the vehicle out."""
         transfer = self._lock(transfer)
         warehouse_scope.assert_can_send_from(
             self.user, self.company.code, self._source_warehouses(transfer),
@@ -1345,14 +1344,9 @@ class BSTService:
         fields = ["status", "scan_approved_by", "scan_approved_at", "updated_at"]
         fields += self._stamp_loaded(transfer, now)
 
-        if transfer.requires_gate:
-            # Hand off to the gate, which dispatches it when the vehicle leaves.
-            transfer.status = BSTTransferStatus.AWAITING_GATE_OUT
-        else:
-            transfer.status = BSTTransferStatus.IN_TRANSIT
-            transfer.dispatched_by = self.user
-            transfer.dispatched_at = now
-            fields += ["dispatched_by", "dispatched_at"]
+        # Not live means gated: hand off to the gate, which dispatches it when
+        # the vehicle leaves.
+        transfer.status = BSTTransferStatus.AWAITING_GATE_OUT
 
         transfer.save(update_fields=fields)
         return transfer
