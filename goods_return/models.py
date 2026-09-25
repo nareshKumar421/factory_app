@@ -136,8 +136,9 @@ class GoodsReturn(BaseModel):
     expected_arrival_at = models.DateField(null=True, blank=True)
 
     # Some returns come "on approval": the creator flags this, and an admin must
-    # approve before the return can be received (SAP-posted). Non-flagged returns
-    # stay NOT_REQUIRED and receive freely.
+    # approve before anything happens to it -- the gate cannot mark its truck in,
+    # and it cannot be received (SAP-posted). Non-flagged returns stay NOT_REQUIRED
+    # and move freely.
     requires_approval = models.BooleanField(default=False)
     approval_status = models.CharField(
         max_length=20,

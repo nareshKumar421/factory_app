@@ -206,6 +206,29 @@ class GoodsReturnFlowTests(TestCase):
         # Off the gate's queue once it is in.
         self.assertNotIn(gr, list(list_expected_returns(self.allowed)))
 
+    def test_a_return_on_approval_stays_outside_until_an_admin_approves_it(self):
+        gr = self.create(requires_approval=True)
+        with self.assertRaisesMessage(ValueError, "awaiting admin approval"):
+            mark_return_in(gr.id, self.user, {}, self.allowed)
+        gr.refresh_from_db()
+        self.assertEqual(gr.status, GoodsReturnStatus.AWAITING_ARRIVAL)
+        self.assertIsNone(gr.vehicle_entry_id)
+        # Still on the gate's queue, so the gate can see why it is waiting.
+        self.assertIn(gr, list(list_expected_returns(self.allowed)))
+
+        self.service.approve(gr.id, self.user, "", self.allowed)
+        gr = mark_return_in(gr.id, self.user, {}, self.allowed)
+        self.assertEqual(gr.status, GoodsReturnStatus.ARRIVED)
+
+    def test_a_rejected_return_is_never_marked_in(self):
+        gr = self.create(requires_approval=True)
+        self.service.reject(gr.id, self.user, "Not agreed", self.allowed)
+        with self.assertRaisesMessage(ValueError, "approval was rejected"):
+            mark_return_in(gr.id, self.user, {}, self.allowed)
+        gr.refresh_from_db()
+        self.assertEqual(gr.status, GoodsReturnStatus.AWAITING_ARRIVAL)
+        self.assertIsNone(gr.vehicle_entry_id)
+
     # -- submit ---------------------------------------------------------------
 
     def test_submit_records_the_clerk_without_moving_an_arrived_return_back(self):

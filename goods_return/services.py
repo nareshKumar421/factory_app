@@ -1347,7 +1347,9 @@ def list_expected_returns(company_ids):
 
     A return lands here the moment its first page is saved -- the clerk may still
     be keying in the items, and the gate does not have to wait for that to let the
-    truck in.
+    truck in. A return still awaiting (or refused) approval is listed too, though
+    ``mark_return_in`` will not let it in: the gate has to be able to tell the
+    driver why, rather than find no booking at all.
     """
     return (
         GoodsReturn.objects.filter(
@@ -1420,6 +1422,17 @@ def mark_return_in(pk, user, data, company_ids) -> GoodsReturn:
         raise PermissionDenied("This record belongs to a company you cannot access.")
     if gr.status != GoodsReturnStatus.AWAITING_ARRIVAL or gr.vehicle_entry_id:
         raise ValueError("This return is not awaiting a gate arrival.")
+    # A return coming on approval stays outside until an admin approves it. Holding
+    # only the receipt let the truck in and left goods on the premises that nobody
+    # had agreed to take back. It stays in the gate's queue so the gate can see why.
+    if gr.requires_approval and gr.approval_status != GoodsReturnApprovalStatus.APPROVED:
+        if gr.approval_status == GoodsReturnApprovalStatus.REJECTED:
+            raise ValueError(
+                "This return's approval was rejected; its vehicle cannot be marked in."
+            )
+        raise ValueError(
+            "This return is awaiting admin approval; its vehicle can be marked in once approved."
+        )
 
     # The clerk books the truck on the return's first page, so it is normally
     # already here. Returns booked before that was so can still arrive without
