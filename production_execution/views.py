@@ -2559,7 +2559,7 @@ class LineSkuConfigAutoFillAPI(APIView):
 
 
 # ===========================================================================
-# FILLING COST SHEET — the month's filling cost, entered by hand
+# FILLING COST SHEET — the day's filling cost, entered by hand
 # ===========================================================================
 
 def _filling_cost_queryset(request):
@@ -2585,6 +2585,11 @@ def _resolve_filling_cost_line(company, line_id):
     return line, None
 
 
+def _filling_cost_day(day):
+    """'26 September 2026' — how a sheet is named in a refusal."""
+    return f"{day.day} {day:%B %Y}"
+
+
 def _replace_filling_cost_entries(sheet, entries):
     """Rewrite the sheet's rows, keeping the order they were sent in."""
     sheet.entries.all().delete()
@@ -2600,7 +2605,7 @@ def _replace_filling_cost_entries(sheet, entries):
 
 
 class FillingCostSheetListCreateAPI(APIView):
-    """List the sheets entered so far, newest month first, or enter a new one."""
+    """List the sheets entered so far, newest day first, or enter a new one."""
 
     def get_permissions(self):
         if self.request.method == 'GET':
@@ -2622,14 +2627,22 @@ class FillingCostSheetListCreateAPI(APIView):
                                 status=status.HTTP_400_BAD_REQUEST)
             qs = qs.filter(line_id=int(line_id))
 
-        period = request.GET.get('period')
-        if period:
-            parsed = parse_date(period)
+        day = request.GET.get('date')
+        if day:
+            parsed = parse_date(day)
             if parsed is None:
-                return Response({'detail': 'period must be a date (YYYY-MM-DD).'},
+                return Response({'detail': 'date must be a date (YYYY-MM-DD).'},
                                 status=status.HTTP_400_BAD_REQUEST)
-            # Any day in the month finds that month's sheet.
-            qs = qs.filter(period=parsed.replace(day=1))
+            qs = qs.filter(date=parsed)
+
+        # A sheet a day adds up, so the page asks for the newest few it needs
+        # rather than every day ever entered.
+        limit = request.GET.get('limit')
+        if limit:
+            if not limit.isdigit() or int(limit) < 1:
+                return Response({'detail': 'limit must be a positive number.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            qs = qs[:int(limit)]
 
         return Response(FillingCostSheetSerializer(qs, many=True).data)
 
@@ -2650,7 +2663,7 @@ class FillingCostSheetListCreateAPI(APIView):
                 sheet = FillingCostSheet.objects.create(
                     company=company,
                     line=line,
-                    period=data['period'],
+                    date=data['date'],
                     cases=data['cases'],
                     notes=data.get('notes', ''),
                     created_by=request.user,
@@ -2658,10 +2671,10 @@ class FillingCostSheetListCreateAPI(APIView):
                 )
                 _replace_filling_cost_entries(sheet, data['entries'])
         except IntegrityError:
-            # One sheet per month per scope — edit the one that is there.
+            # One sheet per day per scope — edit the one that is there.
             return Response(
                 {'detail': f"A filling cost sheet already exists for "
-                           f"{data['period']:%B %Y}."},
+                           f"{_filling_cost_day(data['date'])}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(FillingCostSheetSerializer(sheet).data,
@@ -2669,7 +2682,7 @@ class FillingCostSheetListCreateAPI(APIView):
 
 
 class FillingCostSheetDetailAPI(APIView):
-    """Read, correct or drop one month's sheet."""
+    """Read, correct or drop one day's sheet."""
 
     def get_permissions(self):
         if self.request.method == 'GET':
@@ -2705,7 +2718,7 @@ class FillingCostSheetDetailAPI(APIView):
             if error:
                 return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
             sheet.line = line
-        for field in ('period', 'cases', 'notes'):
+        for field in ('date', 'cases', 'notes'):
             if field in data:
                 setattr(sheet, field, data[field])
         sheet.updated_by = request.user
@@ -2718,7 +2731,7 @@ class FillingCostSheetDetailAPI(APIView):
         except IntegrityError:
             return Response(
                 {'detail': f"A filling cost sheet already exists for "
-                           f"{sheet.period:%B %Y}."},
+                           f"{_filling_cost_day(sheet.date)}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         sheet = self._get_sheet(request, sheet_id)

@@ -1,4 +1,4 @@
-"""Tests for the filling cost sheet — the month's filling cost, typed in.
+"""Tests for the filling cost sheet — the day's filling cost, typed in.
 
 Run with:
     .venv/bin/python manage.py test production_execution.tests_filling_cost
@@ -81,7 +81,7 @@ class FillingCostSheetTests(APITestCase):
 
     def _post(self, **overrides):
         payload = {
-            'period': '2026-09-01',
+            'date': '2026-09-01',
             'cases': CASES,
             'entries': entries_payload(),
         }
@@ -120,22 +120,37 @@ class FillingCostSheetTests(APITestCase):
             [head for head, _ in SHEET],
         )
 
-    def test_any_day_of_the_month_is_stored_as_the_month(self):
-        response = self._post(period='2026-09-17')
-        self.assertEqual(response.data['period'], '2026-09-01')
+    def test_a_sheet_is_kept_for_its_own_day(self):
+        response = self._post(date='2026-09-17')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['date'], '2026-09-17')
+        # The next day of the same month is a sheet of its own.
+        response = self._post(date='2026-09-18')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(FillingCostSheet.objects.count(), 2)
+
+    def test_a_sheet_needs_its_case_count(self):
+        # No standing default: a day's cases are that day's, not a month's.
+        response = self.client.post(
+            self.list_url,
+            {'date': '2026-09-01', 'entries': entries_payload()},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('cases', response.data['errors'])
 
     def test_a_sheet_can_be_entered_for_one_line(self):
         response = self._post(line_id=self.line.id)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertEqual(response.data['line_name'], 'Line 1')
-        # The floor-wide sheet for the same month is a different sheet.
+        # The floor-wide sheet for the same day is a different sheet.
         self.assertEqual(self._post().status_code, status.HTTP_201_CREATED)
 
-    def test_second_sheet_for_the_same_month_is_refused(self):
+    def test_second_sheet_for_the_same_day_is_refused(self):
         self._post()
         response = self._post()
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('September 2026', response.data['detail'])
+        self.assertIn('1 September 2026', response.data['detail'])
 
     def test_a_head_cannot_be_listed_twice(self):
         response = self._post(entries=entries_payload(
@@ -179,13 +194,13 @@ class FillingCostSheetTests(APITestCase):
         self.assertEqual(per_case['Salary'], Decimal('15.00'))
         self.assertEqual(Decimal(response.data['total_per_case']), Decimal('31.11'))
 
-    def test_moving_a_sheet_onto_a_month_already_entered_is_refused(self):
-        self._post(period='2026-08-01')
-        sheet_id = self._post(period='2026-09-01').data['id']
+    def test_moving_a_sheet_onto_a_day_already_entered_is_refused(self):
+        self._post(date='2026-09-01')
+        sheet_id = self._post(date='2026-09-02').data['id']
         response = self.client.patch(
-            self._detail_url(sheet_id), {'period': '2026-08-01'}, format='json')
+            self._detail_url(sheet_id), {'date': '2026-09-01'}, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(FillingCostSheet.objects.get(id=sheet_id).period.month, 9)
+        self.assertEqual(FillingCostSheet.objects.get(id=sheet_id).date.day, 2)
 
     def test_a_sheet_can_be_deleted_with_its_rows(self):
         sheet_id = self._post().data['id']
@@ -195,16 +210,27 @@ class FillingCostSheetTests(APITestCase):
 
     # -- listing ------------------------------------------------------------
 
-    def test_list_is_newest_month_first_and_filters_by_month(self):
-        self._post(period='2026-08-01')
-        self._post(period='2026-09-01')
+    def test_list_is_newest_day_first_and_filters_by_day(self):
+        self._post(date='2026-09-24')
+        self._post(date='2026-09-25')
         response = self.client.get(self.list_url)
-        self.assertEqual([s['period'] for s in response.data],
-                         ['2026-09-01', '2026-08-01'])
+        self.assertEqual([s['date'] for s in response.data],
+                         ['2026-09-25', '2026-09-24'])
 
-        # Any day in the month finds that month's sheet.
-        response = self.client.get(self.list_url, {'period': '2026-08-20'})
-        self.assertEqual([s['period'] for s in response.data], ['2026-08-01'])
+        response = self.client.get(self.list_url, {'date': '2026-09-24'})
+        self.assertEqual([s['date'] for s in response.data], ['2026-09-24'])
+        # A day nobody entered finds nothing, not the nearest day.
+        response = self.client.get(self.list_url, {'date': '2026-09-23'})
+        self.assertEqual(response.data, [])
+
+    def test_list_can_be_limited_to_the_newest_days(self):
+        for day in ('2026-09-23', '2026-09-24', '2026-09-25'):
+            self._post(date=day)
+        response = self.client.get(self.list_url, {'limit': 2})
+        self.assertEqual([s['date'] for s in response.data],
+                         ['2026-09-25', '2026-09-24'])
+        self.assertEqual(self.client.get(self.list_url, {'limit': '0'}).status_code,
+                         status.HTTP_400_BAD_REQUEST)
 
     def test_list_filters_to_a_line_or_to_the_floor_wide_sheet(self):
         self._post()
@@ -219,7 +245,7 @@ class FillingCostSheetTests(APITestCase):
     def test_another_companys_sheets_are_not_listed(self):
         other = Company.objects.create(name='Jivo Oil', code='JIVO_OIL')
         FillingCostSheet.objects.create(
-            company=other, period='2026-09-01', cases=Decimal(CASES))
+            company=other, date='2026-09-01', cases=Decimal(CASES))
         response = self.client.get(self.list_url)
         self.assertEqual(response.data, [])
 

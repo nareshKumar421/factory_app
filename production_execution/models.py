@@ -1295,7 +1295,7 @@ class ProductionRunCostLine(models.Model):
 
 
 # ---------------------------------------------------------------------------
-# Filling Cost Sheet — the month's filling cost, typed in by hand
+# Filling Cost Sheet — the day's filling cost, typed in by hand
 # ---------------------------------------------------------------------------
 
 def filling_cost_per_case(amount, cases):
@@ -1314,11 +1314,11 @@ def filling_cost_per_case(amount, cases):
 
 
 class FillingCostSheet(models.Model):
-    """One month of filling cost, entered by hand from the factory's own sheet.
+    """One day of filling cost, entered by hand from the factory's own sheet.
 
-    Nothing on it is derived. Each head's amount for the month is typed in, and
-    the per-case column is that amount over ``cases`` — the "Per 1,60,000
-    Cases" the sheet is headed with. It is a record of what the sheet says.
+    Nothing on it is derived. Each head's amount for the day is typed in, and
+    the per-case column is that amount over ``cases`` — the "Per N Cases" the
+    sheet is headed with. It is a record of what the sheet says.
 
     Run costing is a separate thing and stays derived from the central Cost
     Master (see ``services.cost_calculator``): entering a sheet here reprices
@@ -1333,12 +1333,10 @@ class FillingCostSheet(models.Model):
         related_name='filling_cost_sheets', null=True, blank=True,
         help_text="Blank = the filling floor as a whole; set = that line only."
     )
-    period = models.DateField(
-        help_text="First day of the month the sheet covers."
-    )
+    date = models.DateField(help_text="The day the sheet covers.")
     cases = models.DecimalField(
-        max_digits=15, decimal_places=2, default=Decimal('160000'),
-        help_text="Cases the month's cost is spread over — the sheet's "
+        max_digits=15, decimal_places=2,
+        help_text="Cases the day's cost is spread over — the sheet's "
                   "'Per N Cases' heading, and the divisor behind every "
                   "per-case figure on it."
     )
@@ -1355,28 +1353,28 @@ class FillingCostSheet(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['-period', 'line']
+        ordering = ['-date', 'line']
         verbose_name = 'Filling Cost Sheet'
         verbose_name_plural = 'Filling Cost Sheets'
         constraints = [
-            # One sheet per month per scope. A NULL line never collides in a
+            # One sheet per day per scope. A NULL line never collides in a
             # unique index, so the floor-wide sheet needs a constraint of its
             # own rather than riding along on the per-line one.
             models.UniqueConstraint(
-                fields=['company', 'period'],
+                fields=['company', 'date'],
                 condition=models.Q(line__isnull=True),
-                name='uniq_filling_cost_sheet_per_month',
+                name='uniq_filling_cost_sheet_per_day',
             ),
             models.UniqueConstraint(
-                fields=['company', 'line', 'period'],
+                fields=['company', 'line', 'date'],
                 condition=models.Q(line__isnull=False),
-                name='uniq_filling_cost_sheet_per_line_month',
+                name='uniq_filling_cost_sheet_per_line_day',
             ),
         ]
 
     def __str__(self):
         scope = self.line.name if self.line_id else 'All lines'
-        return f"Filling cost {self.period:%b %Y} — {scope}"
+        return f"Filling cost {self.date:%d %b %Y} — {scope}"
 
     @property
     def total_amount(self):
@@ -1384,7 +1382,7 @@ class FillingCostSheet(models.Model):
 
     @property
     def total_per_case(self):
-        """The sheet's total row: the month's total over the cases.
+        """The sheet's total row: the day's total over the cases.
 
         Deliberately not the sum of the per-case column — rounding each head to
         paise first and adding those up reads 15.56 where the sheet says 15.55.
@@ -1405,7 +1403,7 @@ class FillingCostSheetEntry(models.Model):
     )
     amount = models.DecimalField(
         max_digits=15, decimal_places=2, default=Decimal('0'),
-        help_text="The month's amount for this head."
+        help_text="The day's amount for this head."
     )
     sort_order = models.PositiveIntegerField(
         default=0, help_text="Row order on the sheet."

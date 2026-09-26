@@ -198,9 +198,9 @@ class FillingCostSheetEntryInline(admin.TabularInline):
 
 @admin.register(FillingCostSheet)
 class FillingCostSheetAdmin(admin.ModelAdmin):
-    list_display = ['id', 'period', 'company', 'line', 'cases', 'updated_at']
+    list_display = ['id', 'date', 'company', 'line', 'cases', 'updated_at']
     list_filter = ['company', 'line']
-    date_hierarchy = 'period'
+    date_hierarchy = 'date'
     inlines = [FillingCostSheetEntryInline]
 
 

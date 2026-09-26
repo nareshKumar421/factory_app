@@ -259,7 +259,7 @@ class InFillingCostCompany(BasePermission):
         return user_company.company.code in FILLING_COST_COMPANY_CODES
 
 
-# Filling cost sheet — the month's filling cost, entered by hand. Cost figures,
+# Filling cost sheet — the day's filling cost, entered by hand. Cost figures,
 # so it follows can_view_run_cost: granted to no group by default (see
 # setup_production_groups) and held only by whoever is explicitly given it.
 # A run-cost holder reads the sheet too; entering one is its own permission.

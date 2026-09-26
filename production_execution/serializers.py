@@ -1336,7 +1336,7 @@ class LineSkuConfigUpdateSerializer(serializers.Serializer):
 
 
 # ---------------------------------------------------------------------------
-# Filling Cost Sheet — manual monthly entry
+# Filling Cost Sheet — manual daily entry
 # ---------------------------------------------------------------------------
 
 class FillingCostEntrySerializer(serializers.ModelSerializer):
@@ -1364,7 +1364,7 @@ class FillingCostSheetSerializer(serializers.ModelSerializer):
     class Meta:
         model = FillingCostSheet
         fields = [
-            'id', 'line', 'line_name', 'period', 'cases', 'notes',
+            'id', 'line', 'line_name', 'date', 'cases', 'notes',
             'entries', 'total_amount', 'total_per_case',
             'created_by_name', 'updated_by_name', 'created_at', 'updated_at',
         ]
@@ -1394,17 +1394,13 @@ class FillingCostSheetWriteSerializer(serializers.Serializer):
     the page, so the order it was entered in is part of it.
     """
     line_id = serializers.IntegerField(required=False, allow_null=True)
-    period = serializers.DateField()
+    date = serializers.DateField()
     cases = serializers.DecimalField(
         max_digits=15, decimal_places=2, min_value=Decimal('0.01'),
         help_text="The sheet's 'Per N Cases' divisor.")
     notes = serializers.CharField(
         max_length=300, required=False, allow_blank=True, default='')
     entries = FillingCostEntryWriteSerializer(many=True)
-
-    def validate_period(self, value):
-        # A sheet covers a month; the day it was typed on is not part of it.
-        return value.replace(day=1)
 
     def validate_entries(self, value):
         if not value:
@@ -1423,7 +1419,7 @@ class FillingCostSheetUpdateSerializer(FillingCostSheetWriteSerializer):
     """Every field optional. Sending ``entries`` replaces the sheet's rows
     outright — which is what the page does on each save, so a row deleted on
     screen is a row gone from the sheet."""
-    period = serializers.DateField(required=False)
+    date = serializers.DateField(required=False)
     cases = serializers.DecimalField(
         max_digits=15, decimal_places=2, min_value=Decimal('0.01'), required=False)
     entries = FillingCostEntryWriteSerializer(many=True, required=False)
