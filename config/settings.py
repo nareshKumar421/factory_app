@@ -803,6 +803,23 @@ SAP_FILE_UPLOADER_SOURCE_PATHS = {
     ),
 }
 
+# SAP attachment *download* service — ported from SAP Portal
+# (backend_v1/services/fileServiceClient.js, env FILE_SERVICE_BASE). A second
+# HTTP service on the SAP side, not the uploader above: other port, no API key,
+# serves ATC1 files by AbsEntry + line (or by name). The SAP document browser
+# (sap_documents) streams attachments through it. Empty = downloads switched
+# off with a clear message, rather than dialling an unknown host.
+SAP_FILE_SERVICE_BASE_URL = config("SAP_FILE_SERVICE_BASE_URL", default="")
+SAP_FILE_SERVICE_TIMEOUT_SECONDS = config(
+    "SAP_FILE_SERVICE_TIMEOUT_SECONDS", default=60, cast=int
+)
+# The file service's own company ids (the portal's COMPANY_FILE_IDS). Not secret.
+SAP_FILE_SERVICE_COMPANY_IDS = {
+    "JIVO_OIL": config("SAP_FILE_SERVICE_COMPANY_ID_JIVO_OIL", default="1"),
+    "JIVO_BEVERAGES": config("SAP_FILE_SERVICE_COMPANY_ID_JIVO_BEVERAGES", default="2"),
+    "JIVO_MART": config("SAP_FILE_SERVICE_COMPANY_ID_JIVO_MART", default="3"),
+}
+
 # OMS invoice-approval proxy — the external OMS app (repos harshit-jivo/OMS-*)
 # is where head-office billing raises AR invoices; the factory approver page
 # (frontend under Warehouse) shows OMS entries by default, with the direct SAP

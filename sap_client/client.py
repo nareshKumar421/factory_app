@@ -1,5 +1,6 @@
 from typing import List, Optional
 from .context import CompanyContext
+from .exceptions import SAPDataError, SAPValidationError
 from .hana.ar_invoice_print_reader import HanaARInvoicePrintReader
 from .hana.ar_invoice_reader import HanaARInvoiceReader
 from .hana.approval_reader import HanaApprovalReader
@@ -10,6 +11,7 @@ from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.transfer_draft_reader import HanaTransferDraftReader
 from .hana.customer_reader import HanaCustomerReader
 from .hana.fg_stock_reader import HanaFGStockReader
+from .hana.lookup_reader import HanaLookupReader
 from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_print_reader import HanaPOPrintReader
@@ -25,6 +27,11 @@ from .hana.vendor_reader import HanaVendorReader
 from .service_layer.ap_invoice_writer import APInvoiceWriter
 from .service_layer.ar_invoice_writer import ARInvoiceWriter
 from .service_layer.approval_writer import ApprovalRequestWriter
+from .service_layer.budget_writer import BudgetWriter
+from .service_layer.business_partner_writer import BusinessPartnerWriter
+from .service_layer.entity_client import ServiceLayerEntityClient
+from .service_layer.file_service_client import SapFileServiceClient
+from .service_layer.product_tree_writer import ProductTreeWriter
 from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWriter
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
@@ -485,6 +492,171 @@ class SAPClient:
         """
         reader = HanaServiceGRPOOptionsReader(self.context)
         return reader.get_expense_code_options()
+
+    # ---- Master-data lookups (pickers ported from SAP Portal) ----
+    def lookup_items(self, search: str, limit: int = 20) -> list[dict]:
+        return HanaLookupReader(self.context).search_items(search, limit=limit)
+
+    def lookup_sac_codes(self, search: str = "", limit: int = 50) -> list[dict]:
+        return HanaLookupReader(self.context).sac_codes(search, limit=limit)
+
+    def lookup_locations(self, search: str = "", limit: int = 40) -> list[dict]:
+        return HanaLookupReader(self.context).locations(search, limit=limit)
+
+    def lookup_tax_codes(self) -> list[dict]:
+        return HanaLookupReader(self.context).tax_codes()
+
+    def lookup_costing_codes(self, dimension: int, search: str = "", limit: int = 100) -> list[dict]:
+        return HanaLookupReader(self.context).costing_codes(dimension, search, limit=limit)
+
+    def lookup_branches(self) -> list[dict]:
+        return HanaLookupReader(self.context).branches()
+
+    def lookup_resources(self, search: str = "", limit: int = 50) -> list[dict]:
+        return HanaLookupReader(self.context).resources(search, limit=limit)
+
+    def lookup_gl_accounts(self, search: str = "", limit: int = 30) -> list[dict]:
+        return HanaLookupReader(self.context).gl_accounts(search, limit=limit)
+
+    def lookup_ar_accounts(self) -> list[dict]:
+        return HanaLookupReader(self.context).ar_accounts()
+
+    def lookup_ap_accounts(self) -> list[dict]:
+        return HanaLookupReader(self.context).ap_accounts()
+
+    def lookup_business_partners(
+        self, search: str = "", card_type: str | None = None, limit: int = 30
+    ) -> list[dict]:
+        return HanaLookupReader(self.context).search_business_partners(
+            search, card_type=card_type, limit=limit
+        )
+
+    def lookup_bp_groups(self, card_type: str) -> list[dict]:
+        return HanaLookupReader(self.context).bp_groups(card_type)
+
+    def lookup_sales_employees(self) -> list[dict]:
+        return HanaLookupReader(self.context).sales_employees()
+
+    def lookup_payment_terms(self) -> list[dict]:
+        return HanaLookupReader(self.context).payment_terms()
+
+    def lookup_states(self, country: str = "IN") -> list[dict]:
+        return HanaLookupReader(self.context).states(country)
+
+    def lookup_user_table(self, key: str) -> tuple[list[dict], str | None]:
+        """Rows of ``@MAIN_GROUP`` / ``@CHAIN``, plus a warning if the table is missing."""
+        return HanaLookupReader(self.context).user_table_values(key)
+
+    def lookup_banks(self, country: str = "IN") -> list[dict]:
+        """Banks of one country from the Service Layer ``Banks`` collection."""
+        from .service_layer.entity_client import odata_string
+
+        rows = ServiceLayerEntityClient(self.context).get_all(
+            "Banks",
+            select="BankCode,BankName,SwiftNo,CountryCode",
+            filter=f"CountryCode eq {odata_string((country or 'IN').strip().upper())}",
+            orderby="BankName",
+        )
+        return [
+            {
+                "code": row.get("BankCode") or "",
+                "name": row.get("BankName") or "",
+                "swift": row.get("SwiftNo") or "",
+                "country": row.get("CountryCode") or "",
+            }
+            for row in rows
+        ]
+
+    # ---- Business partners (registration ported from SAP Portal) ----
+    def business_partner(self, card_code: str) -> dict | None:
+        """One partner by exact code, whatever its state. Raises if SAP can't be read."""
+        return HanaLookupReader(self.context).business_partner(card_code)
+
+    def partners_with_tax_ids(self, card_type: str, gstin: str = "", pan: str = "") -> list[dict]:
+        """Existing partners of one type registered under this GSTIN or PAN."""
+        return HanaLookupReader(self.context).partners_with_tax_ids(card_type, gstin=gstin, pan=pan)
+
+    def next_card_code(self, prefix: str, card_type: str) -> str:
+        """Highest existing card code under ``prefix``, plus one."""
+        return HanaLookupReader(self.context).next_card_code(prefix, card_type)
+
+    def create_business_partner(self, payload: dict) -> dict:
+        """POST a customer or vendor. The caller locks its row and asks SAP first."""
+        return BusinessPartnerWriter(self.context).create(payload)
+
+    # ---- Bills of materials (BOM change requests ported from SAP Portal) ----
+    def create_product_tree(self, payload: dict) -> dict:
+        return ProductTreeWriter(self.context).create(payload)
+
+    def replace_product_tree(self, tree_code: str, payload: dict) -> dict:
+        return ProductTreeWriter(self.context).replace(tree_code, payload)
+
+    # ---- Budget UDO (ported from SAP Portal) ----
+    def list_budgets(self) -> list[dict]:
+        return BudgetWriter(self.context).list()
+
+    def get_budget(self, doc_entry: int) -> dict | None:
+        return BudgetWriter(self.context).get(doc_entry)
+
+    def create_budget(self, payload: dict) -> dict:
+        return BudgetWriter(self.context).create(payload)
+
+    def update_budget(self, doc_entry: int, payload: dict) -> None:
+        BudgetWriter(self.context).update(doc_entry, payload)
+
+    def delete_budget(self, doc_entry: int) -> None:
+        BudgetWriter(self.context).delete(doc_entry)
+
+    # ---- Production-order status (ported from SAP Portal) ----
+    def release_production_order(self, doc_entry: int) -> None:
+        ProductionOrderWriter(self.context).release(doc_entry)
+
+    def close_production_order(self, doc_entry: int) -> None:
+        ProductionOrderWriter(self.context).close(doc_entry)
+
+    # ---- Any approval request (the general inbox ported from SAP Portal) ----
+    def decide_approval_request(
+        self,
+        wdd_code: int,
+        approve: bool,
+        remarks: str = "",
+        approver: str | None = None,
+        password: str | None = None,
+        subject: str = "Document",
+    ) -> dict:
+        """Approve or reject one request, signed as ``approver``.
+
+        ``password`` is the approver's own SAP password when they typed it;
+        without it the stored ``SAP_APPROVER_CREDENTIALS`` entry is used.
+        """
+        return ApprovalRequestWriter(self.context).decide(
+            wdd_code, approve, remarks, approver=approver, subject=subject, password=password
+        )
+
+    def withdraw_approval_request(
+        self,
+        wdd_code: int,
+        originator: str,
+        password: str | None = None,
+        subject: str = "Approval request",
+    ) -> dict:
+        """Cancel a still-pending request, signed as the person who raised it."""
+        return ApprovalRequestWriter(self.context).cancel(
+            wdd_code, originator, password=password, subject=subject
+        )
+
+    # ---- Attachments (download; ported from SAP Portal) ----
+    def download_attachment(self, abs_entry: int, line: int, file_name: str = "") -> dict:
+        """One ATC1 attachment file by entry and line, falling back to its name."""
+        client = SapFileServiceClient(self.context.company_code)
+        try:
+            return client.fetch_by_entry(abs_entry, line, file_name)
+        except (SAPValidationError, SAPDataError):
+            # An older file server without the by-entry route answers 404; the
+            # name lookup is the portal's own fallback for that case.
+            if not file_name:
+                raise
+            return client.fetch_by_name(file_name)
 
     # ---- WRITE ----
     def create_production_order(self, payload: dict) -> dict:

@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 # SAP enum values, request header + decision line.
 REQUEST_PENDING = "arsPending"
+# The value SAP Portal sent to withdraw a request (routes/sap.js, 6250407) —
+# proven against this estate's Service Layer. Read-side labels accept both
+# spellings below.
+REQUEST_CANCELLED = "arsCancelled"
 DECISION_APPROVED = "ardApproved"
 DECISION_REJECTED = "ardNotApproved"
 
@@ -30,6 +34,7 @@ _REQUEST_STATUS_LABELS = {
     "arsApproved": "already approved",
     "arsNotApproved": "already rejected",
     "arsCanceled": "cancelled in SAP",
+    "arsCancelled": "cancelled in SAP",
     "arsGenerated": "already posted in SAP",
 }
 
@@ -44,8 +49,16 @@ class ApprovalRequestWriter:
         self.context = context
         self.sl_config = context.service_layer
 
-    def _approver_credentials(self, approver: str | None = None) -> tuple[str, str]:
+    def _approver_credentials(
+        self, approver: str | None = None, password: str | None = None
+    ) -> tuple[str, str]:
         """The SAP user that signs the decision.
+
+        ``password`` is one the person typed for their own SAP account (the
+        general approvals inbox ported from SAP Portal asks for it on each
+        decision). It is used as-is for this one call and never stored, logged
+        or cached; SAP itself checks it. It needs ``approver`` — the account it
+        belongs to.
 
         SAP authenticates this user and checks it may decide the request. When
         ``approver`` names a SAP user — the authorizer the request's current
@@ -57,6 +70,14 @@ class ApprovalRequestWriter:
         With no ``approver``, falls back to the single configured approval
         account and then to the Service Layer session user.
         """
+        if password is not None:
+            if not (approver or "").strip():
+                raise SAPValidationError(
+                    "A typed SAP password needs the SAP user it belongs to."
+                )
+            if not password:
+                raise SAPValidationError("Enter your SAP password to sign this decision.")
+            return approver.strip(), password
         if approver:
             code = approver.strip().upper()
             approvers = self.sl_config.get("approvers") or {}
@@ -79,6 +100,7 @@ class ApprovalRequestWriter:
         remarks: str = "",
         approver: str | None = None,
         subject: str = "Invoice",
+        password: str | None = None,
     ) -> dict:
         """Record a decision on approval request ``wdd_code``.
 
@@ -89,7 +111,7 @@ class ApprovalRequestWriter:
         Pre-checks that the request is still pending so a stale page gets a
         clean validation error instead of a raw SAP one.
         """
-        approver_user, approver_password = self._approver_credentials(approver)
+        approver_user, approver_password = self._approver_credentials(approver, password)
         # Log the Service Layer session in AS the approver, so both the session
         # and the decision line carry the same authenticated approver — the shape
         # SAP accepts most reliably.
@@ -152,6 +174,65 @@ class ApprovalRequestWriter:
             raise SAPValidationError(self._refusal(approver_user, error_msg))
         logger.error("SAP error deciding approval request %s: %s", wdd_code, error_msg)
         raise SAPDataError(f"Failed to record the decision in SAP: {error_msg}")
+
+    def cancel(
+        self,
+        wdd_code: int,
+        originator: str,
+        password: str | None = None,
+        subject: str = "Approval request",
+    ) -> dict:
+        """Withdraw a still-pending request, signed as the person who raised it.
+
+        SAP lets the request's owner cancel it while it is pending; once a stage
+        is decided or the document is generated it can no longer be withdrawn.
+        Ported from SAP Portal's ``POST /approval-requests/:id/cancel``: a PATCH
+        of ``Status`` sent AS the originator, so SAP records the right user.
+        ``password`` works as in :meth:`decide`.
+        """
+        user, user_password = self._approver_credentials(originator, password)
+        session_config = dict(self.sl_config, username=user, password=user_password)
+        cookies = self._get_session_cookies(session_config)
+        current = self._get_request(wdd_code, cookies, user)
+
+        status = current.get("Status")
+        if status != REQUEST_PENDING:
+            label = _REQUEST_STATUS_LABELS.get(status, f"in state {status}")
+            raise SAPValidationError(
+                f"Approval request {wdd_code} is {label}; only a pending request "
+                "can be withdrawn."
+            )
+
+        url = f"{self.sl_config['base_url']}/b1s/v2/ApprovalRequests({int(wdd_code)})"
+        try:
+            response = requests.patch(
+                url, json={"Status": REQUEST_CANCELLED}, cookies=cookies,
+                timeout=30, verify=False,
+            )
+        except requests.exceptions.ConnectionError as e:
+            logger.error("Connection error withdrawing approval request %s: %s", wdd_code, e)
+            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+        except requests.exceptions.Timeout as e:
+            logger.error("Timeout withdrawing approval request %s: %s", wdd_code, e)
+            raise SAPConnectionError(
+                "SAP did not answer in time. Check the request in SAP before trying again."
+            )
+
+        if response.status_code in (200, 204):
+            logger.info("Approval request %s withdrawn in SAP by %s", wdd_code, user)
+            return {"message": f"{subject} withdrawn in SAP.", "signed_as": user}
+
+        error_msg = self._extract_error_message(response)
+        if response.status_code == 400:
+            logger.error("SAP refused withdrawing %s: %s", wdd_code, error_msg)
+            raise SAPValidationError(error_msg)
+        if response.status_code in (401, 403):
+            logger.error("SAP refused withdrawing %s as %s: %s", wdd_code, user, error_msg)
+            raise SAPValidationError(
+                f"SAP refused to withdraw request {wdd_code} as '{user}': {error_msg}"
+            )
+        logger.error("SAP error withdrawing approval request %s: %s", wdd_code, error_msg)
+        raise SAPDataError(f"Failed to withdraw the request in SAP: {error_msg}")
 
     # ------------------------------------------------------------------
     # internals

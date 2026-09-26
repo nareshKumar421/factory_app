@@ -5,8 +5,16 @@ from decimal import Decimal
 from ..exceptions import SAPConnectionError, SAPDataError, SAPUnavailable, SAPValidationError
 from .errors import unanswered
 from .auth import ServiceLayerSession
+from .entity_client import ServiceLayerEntityClient
 
 logger = logging.getLogger(__name__)
+
+# Service Layer values of ``ProductionOrderStatus`` (BoProductionOrderStatusEnum).
+STATUS_RELEASED = "boposReleased"
+# SAP Portal sent the database code 'L' for close (routes/sap.js). The Service
+# Layer documents the enum name; prove it on the sandbox company before relying
+# on either (see sap_client/docs/sap_portal_port.md).
+STATUS_CLOSED = "boposClosed"
 
 
 def _convert_decimals(obj):
@@ -115,6 +123,23 @@ class ProductionOrderWriter:
         except Exception as e:
             logger.error(f"Unexpected error creating production order: {e}")
             raise SAPDataError(f"Unexpected error: {str(e)}")
+
+    def release(self, doc_entry: int) -> None:
+        """Release a planned order so materials can be issued against it."""
+        self._set_status(doc_entry, STATUS_RELEASED, "release")
+
+    def close(self, doc_entry: int) -> None:
+        """Close an order once production is finished (no further issues/receipts)."""
+        self._set_status(doc_entry, STATUS_CLOSED, "close")
+
+    def _set_status(self, doc_entry: int, status: str, verb: str) -> None:
+        ServiceLayerEntityClient(self.context).patch(
+            f"ProductionOrders({int(doc_entry)})",
+            {"ProductionOrderStatus": status},
+            timeout=60,
+            label=f"{verb} production order {int(doc_entry)}",
+        )
+        logger.info("Production order %s: %s in SAP", doc_entry, verb)
 
     def _extract_error_message(self, response) -> str:
         try:
