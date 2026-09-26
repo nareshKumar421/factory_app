@@ -217,6 +217,12 @@ INSTALLED_APPS = [
     # their own SAP account. Owns only the record of each decision taken from
     # here. Not the warehouse queues: those serve one family each, company-wide.
     'sap_approvals.apps.SapApprovalsConfig',
+    # SAP Portal's BOM requests, merged in: a change to a bill of materials
+    # (a new tree, or a replacement of an existing one) goes through level
+    # approvals and ends in a SAP ProductTrees write; plus a read-only viewer
+    # of the trees already in SAP. Not warehouse.BOMRequest -- that is
+    # production asking the store for material against a BOM.
+    'bom_changes.apps.BomChangesConfig',
     'factory_expense',
     'cost_master',
     'org_chart.apps.OrgChartConfig',
@@ -838,6 +844,18 @@ SAP_FILE_SERVICE_COMPANY_IDS = {
     "JIVO_BEVERAGES": config("SAP_FILE_SERVICE_COMPANY_ID_JIVO_BEVERAGES", default="2"),
     "JIVO_MART": config("SAP_FILE_SERVICE_COMPANY_ID_JIVO_MART", default="3"),
 }
+
+# BOM change requests (bom_changes): how many sign-offs a change needs, the
+# last one being the push that writes SAP. SAP Portal's BOM_APPROVAL_LEVELS,
+# with its default and the three shapes it knew: 2 = level 1, then the push;
+# 3 = level 1, level 2, push; 4 = level 1, level 2, then two different
+# pushers. Anything else is refused here: the portal had no flow for it and
+# failed on the first approval instead.
+BOM_CHANGE_APPROVAL_LEVELS = config("BOM_CHANGE_APPROVAL_LEVELS", default=3, cast=int)
+if BOM_CHANGE_APPROVAL_LEVELS not in (2, 3, 4):
+    raise ImproperlyConfigured(
+        f"BOM_CHANGE_APPROVAL_LEVELS must be 2, 3 or 4, not {BOM_CHANGE_APPROVAL_LEVELS}."
+    )
 
 # OMS invoice-approval proxy — the external OMS app (repos harshit-jivo/OMS-*)
 # is where head-office billing raises AR invoices; the factory approver page

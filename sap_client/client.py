@@ -800,6 +800,27 @@ class SAPClient:
 
         DraftLineWriter(self.context).set_without_qty_posting(draft_entry, line_nums, without_qty)
 
+    # ---- BOM changes (ported from SAP Portal) ----
+    # Reads of OITT/ITT1 for bom_changes; the writes are create_product_tree /
+    # replace_product_tree above. Imported here so this block stays one hunk.
+    def search_product_trees(self, search: str = "", limit: int = 50) -> list[dict]:
+        """Trees whose code or name contains ``search``, with line counts."""
+        from .hana.bom_reader import HanaBOMReader
+
+        return HanaBOMReader(self.context).search_trees(search, limit=limit)
+
+    def get_product_tree(self, tree_code: str) -> dict | None:
+        """One tree with all its lines, or ``None``. Raises if SAP cannot be read."""
+        from .hana.bom_reader import HanaBOMReader
+
+        return HanaBOMReader(self.context).get_tree(tree_code)
+
+    def product_tree_exists(self, tree_code: str) -> bool:
+        """Whether SAP holds a tree for ``tree_code``. Raises if it cannot tell."""
+        from .hana.bom_reader import HanaBOMReader
+
+        return HanaBOMReader(self.context).tree_exists(tree_code)
+
     # ---- WRITE ----
     def create_production_order(self, payload: dict) -> dict:
         writer = ProductionOrderWriter(self.context)

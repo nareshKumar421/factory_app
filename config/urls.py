@@ -100,6 +100,9 @@ urlpatterns = [
     path("api/v1/sap-documents/", include("sap_documents.urls")),
     # Every SAP approval request that involves the caller, any document type (from SAP Portal).
     path("api/v1/sap-approvals/", include("sap_approvals.urls")),
+    # BOM change requests with level approvals ending in a SAP ProductTrees write,
+    # and the SAP BOM viewer (from SAP Portal). Not warehouse/bom-requests/.
+    path("api/v1/bom-changes/", include("bom_changes.urls")),
     path("api/v1/etp/", include("etp.urls")),
     path(
         "api/v1/dashboards/factory-expense/",
