@@ -98,6 +98,8 @@ urlpatterns = [
     path("api/v1/sap-finance/", include("sap_finance.urls")),
     # SAP document browser, payment drafts and attachment downloads (from SAP Portal).
     path("api/v1/sap-documents/", include("sap_documents.urls")),
+    # Every SAP approval request that involves the caller, any document type (from SAP Portal).
+    path("api/v1/sap-approvals/", include("sap_approvals.urls")),
     path("api/v1/etp/", include("etp.urls")),
     path(
         "api/v1/dashboards/factory-expense/",

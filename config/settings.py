@@ -211,6 +211,12 @@ INSTALLED_APPS = [
     # sap_finance, the other SAP Portal screen; not universal_search, which
     # finds one number and opens nothing.
     'sap_documents.apps.SapDocumentsConfig',
+    # SAP Portal's approvals inbox, merged in: every SAP approval request of
+    # every document type that involves the caller (raised by them, or waiting
+    # on a stage of theirs), read live from HANA and decided or withdrawn as
+    # their own SAP account. Owns only the record of each decision taken from
+    # here. Not the warehouse queues: those serve one family each, company-wide.
+    'sap_approvals.apps.SapApprovalsConfig',
     'factory_expense',
     'cost_master',
     'org_chart.apps.OrgChartConfig',

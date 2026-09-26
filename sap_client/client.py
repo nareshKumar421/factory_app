@@ -749,6 +749,55 @@ class SAPClient:
         from .hana.document_reader import HanaDocumentReader
 
         return HanaDocumentReader(self.context).payment_draft(doc_entry)
+    # ---- SAP approvals inbox (ported from SAP Portal) ----
+    # Imported per method so this port stays one block beside its siblings.
+    def list_approval_inbox(self, sap_user_code: str, **filters) -> list[dict]:
+        """Approval requests of every type that involve ``sap_user_code``.
+
+        Filters: ``scope`` (waiting_on_me / raised_by_me / all), ``status``,
+        ``object_type``, ``date_from``, ``date_to``, ``search``, ``limit``.
+        """
+        from .hana.approval_inbox_reader import HanaApprovalInboxReader
+
+        return HanaApprovalInboxReader(self.context).list_requests(sap_user_code, **filters)
+
+    def count_approval_inbox_waiting(self, sap_user_code: str) -> int:
+        """Requests pending at a stage of ``sap_user_code`` (the sidebar badge)."""
+        from .hana.approval_inbox_reader import HanaApprovalInboxReader
+
+        return HanaApprovalInboxReader(self.context).waiting_count(sap_user_code)
+
+    def approval_inbox_detail(self, wdd_code: int, sap_user_code: str | None) -> dict | None:
+        """One request with its stages and the draft's lines; None if SAP has none."""
+        from .hana.approval_inbox_reader import HanaApprovalInboxReader
+
+        return HanaApprovalInboxReader(self.context).detail(wdd_code, sap_user_code)
+
+    def approval_inbox_stage(
+        self, wdd_code: int, *, with_duplicates: bool = False, with_item_lines: bool = False
+    ) -> dict | None:
+        """Any request as a decision or withdraw must judge it, read fresh."""
+        from .hana.approval_inbox_reader import HanaApprovalInboxReader
+
+        return HanaApprovalInboxReader(self.context).current_stage(
+            wdd_code, with_duplicates=with_duplicates, with_item_lines=with_item_lines
+        )
+
+    def verify_approval_signer(
+        self, wdd_code: int, approver: str, password: str | None = None
+    ) -> str:
+        """Log in as ``approver`` and confirm the request is pending; changes nothing."""
+        from .service_layer.approval_signer import ApprovalSignerCheck
+
+        return ApprovalSignerCheck(self.context).verify(wdd_code, approver, password=password)
+
+    def set_draft_lines_without_qty_posting(
+        self, draft_entry: int, line_nums, without_qty: bool
+    ) -> None:
+        """SAP's Without Qty Posting on the named lines of a draft."""
+        from .service_layer.draft_line_writer import DraftLineWriter
+
+        DraftLineWriter(self.context).set_without_qty_posting(draft_entry, line_nums, without_qty)
 
     # ---- WRITE ----
     def create_production_order(self, payload: dict) -> dict:
