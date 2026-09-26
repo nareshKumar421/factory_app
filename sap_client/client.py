@@ -749,6 +749,7 @@ class SAPClient:
         from .hana.document_reader import HanaDocumentReader
 
         return HanaDocumentReader(self.context).payment_draft(doc_entry)
+
     # ---- SAP approvals inbox (ported from SAP Portal) ----
     # Imported per method so this port stays one block beside its siblings.
     def list_approval_inbox(self, sap_user_code: str, **filters) -> list[dict]:
