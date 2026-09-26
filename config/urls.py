@@ -103,6 +103,8 @@ urlpatterns = [
     # BOM change requests with level approvals ending in a SAP ProductTrees write,
     # and the SAP BOM viewer (from SAP Portal). Not warehouse/bom-requests/.
     path("api/v1/bom-changes/", include("bom_changes.urls")),
+    # Customer and vendor registration: public forms, the approvals queue, create in SAP (from SAP Portal).
+    path("api/v1/partner-onboarding/", include("partner_onboarding.urls")),
     path("api/v1/etp/", include("etp.urls")),
     path(
         "api/v1/dashboards/factory-expense/",

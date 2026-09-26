@@ -223,6 +223,13 @@ INSTALLED_APPS = [
     # of the trees already in SAP. Not warehouse.BOMRequest -- that is
     # production asking the store for material against a BOM.
     'bom_changes.apps.BomChangesConfig',
+    # SAP Portal's customer and vendor registration, merged in: public forms
+    # (no login) → a verifier checks and corrects → an approver sets the SAP
+    # master data and the business partner is created in that company's SAP.
+    # Owns the registrations, their addresses, bank accounts, documents (as
+    # files) and history. Beside sap_finance: both came over from SAP Portal
+    # and both write to SAP through sap_client.
+    'partner_onboarding.apps.PartnerOnboardingConfig',
     'factory_expense',
     'cost_master',
     'org_chart.apps.OrgChartConfig',
