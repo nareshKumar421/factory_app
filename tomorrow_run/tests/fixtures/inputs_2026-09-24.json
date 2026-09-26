@@ -1,0 +1,3683 @@
+{
+ "for_date": "2026-09-24",
+ "read_at": "2026-09-23T18:13:06+05:30",
+ "sheet": {
+  "id": 1,
+  "file": "PLANNING FOR SEP 2026 19.09.2026 20 se closing tk ki planning - Copy.xlsx",
+  "tab": "P",
+  "title": "PRODUCTION PLANING MONTH OF SEP 2026",
+  "stock_date": "2026-09-19",
+  "from_date": "2026-09-20",
+  "date_basis": "the date in its file name",
+  "put_in_at": "2026-09-23T04:26:50+05:30",
+  "lines": [
+   {
+    "row": 1,
+    "code": "FG0000004",
+    "name": "COLD PRESS 5 LTR 4 PCS",
+    "plan_l": 150000.0,
+    "ecom_l": 40000.0,
+    "stock_l": 1830.0,
+    "net_l": 188170.0,
+    "machine": "Clearpack 5"
+   },
+   {
+    "row": 2,
+    "code": "FG0000194",
+    "name": "SOYABEAN OIL 1 LTR POUCH 12 PCS",
+    "plan_l": 100000.0,
+    "ecom_l": 0.0,
+    "stock_l": 5047.0,
+    "net_l": 94953.0,
+    "machine": "Pouch"
+   },
+   {
+    "row": 3,
+    "code": "FG0000090",
+    "name": "MUSTARD 1L + 1L",
+    "plan_l": 0.0,
+    "ecom_l": 90000.0,
+    "stock_l": 0.0,
+    "net_l": 90000.0,
+    "machine": "Clearpack 1"
+   },
+   {
+    "row": 4,
+    "code": "FG0000091",
+    "name": "SUNFLOWER 1L + 1L",
+    "plan_l": 0.0,
+    "ecom_l": 80000.0,
+    "stock_l": 0.0,
+    "net_l": 80000.0,
+    "machine": "Clearpack 1"
+   },
+   {
+    "row": 5,
+    "code": "FG0000008",
+    "name": "POMACE OLIVE 5 LTR TIN 4 PCS",
+    "plan_l": 85000.0,
+    "ecom_l": 0.0,
+    "stock_l": 13560.0,
+    "net_l": 71440.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 6,
+    "code": "FG0000011",
+    "name": "MUSTARD KACCHI GHANI 5 LTR 4 PCS",
+    "plan_l": 30000.0,
+    "ecom_l": 90000.0,
+    "stock_l": 18405.0,
+    "net_l": 101595.0,
+    "machine": "Clearpack 5"
+   },
+   {
+    "row": 7,
+    "code": "FG0000030",
+    "name": "MUSTARD KACHI GHANI 1 LTR 20 PCS",
+    "plan_l": 150000.0,
+    "ecom_l": 70000.0,
+    "stock_l": 128971.0,
+    "net_l": 91029.0,
+    "machine": "JP"
+   },
+   {
+    "row": 8,
+    "code": "FG0000015",
+    "name": "REFINED OIL 15 LTR",
+    "plan_l": 60000.0,
+    "ecom_l": 3000.0,
+    "stock_l": 12765.0,
+    "net_l": 50235.0,
+    "machine": "Tin"
+   },
+   {
+    "row": 9,
+    "code": "FG0000226",
+    "name": "RICE BRAN OIL 5 LTR 4 PCS",
+    "plan_l": 6000.0,
+    "ecom_l": 40000.0,
+    "stock_l": 0.0,
+    "net_l": 46000.0,
+    "machine": "Clearpack 5"
+   },
+   {
+    "row": 10,
+    "code": "FG0000143",
+    "name": "COLD PRESS GROUNDNUT OIL 5 LTR 4 PCS",
+    "plan_l": 10000.0,
+    "ecom_l": 32000.0,
+    "stock_l": 2820.0,
+    "net_l": 39180.0,
+    "machine": "Clearpack 5"
+   },
+   {
+    "row": 11,
+    "code": "FG0000053",
+    "name": "COLD PRESS SUNFLOWER 5 LTR 4 PCS",
+    "plan_l": 10000.0,
+    "ecom_l": 90000.0,
+    "stock_l": 27775.0,
+    "net_l": 72225.0,
+    "machine": "clearpack 5"
+   },
+   {
+    "row": 12,
+    "code": "FG0000151",
+    "name": "SANO POMACE OLIVE 5 LTR TIN 4 PCS",
+    "plan_l": 37500.0,
+    "ecom_l": 8000.0,
+    "stock_l": 9500.0,
+    "net_l": 36000.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 13,
+    "code": "FG0000306",
+    "name": "YELLOW MUSTARD OIL 1 LTR 20 PCS",
+    "plan_l": 25000.0,
+    "ecom_l": 8000.0,
+    "stock_l": 56.0,
+    "net_l": 32944.0,
+    "machine": "Clearpack 1"
+   },
+   {
+    "row": 14,
+    "code": "FG0000128",
+    "name": "JIVO GOLD 5 LTR 4 PCS",
+    "plan_l": 5000.0,
+    "ecom_l": 30000.0,
+    "stock_l": 3195.0,
+    "net_l": 31805.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 15,
+    "code": "FG0000034",
+    "name": "EXTRA LIGHT OLIVE 200 LTR 1 PCS",
+    "plan_l": 30000.0,
+    "ecom_l": 0.0,
+    "stock_l": 0.0,
+    "net_l": 30000.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 16,
+    "code": "FG0000227",
+    "name": "RICE BRAN OIL 1 LTR 16 PCS",
+    "plan_l": 6000.0,
+    "ecom_l": 30000.0,
+    "stock_l": 6777.0,
+    "net_l": 29223.0,
+    "machine": "clearpack 1"
+   },
+   {
+    "row": 17,
+    "code": "FG0000033",
+    "name": "COLD PRESS 1 LTR + 1 LTR COMBO 10 SET",
+    "plan_l": 30000.0,
+    "ecom_l": 0.0,
+    "stock_l": 6850.0,
+    "net_l": 23150.0,
+    "machine": "Clearpack 1"
+   },
+   {
+    "row": 18,
+    "code": "FG0000149",
+    "name": "JIVO GOLD 1 LTR 20 PCS",
+    "plan_l": 5000.0,
+    "ecom_l": 15000.0,
+    "stock_l": 14.0,
+    "net_l": 19986.0,
+    "machine": "JP"
+   },
+   {
+    "row": 19,
+    "code": "FG0000324",
+    "name": "SESAME OIL 1 LTR 20 PCS",
+    "plan_l": 5000.0,
+    "ecom_l": 15000.0,
+    "stock_l": 1425.0,
+    "net_l": 18575.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 20,
+    "code": "FG0000043",
+    "name": "COLD PRESS 3 LTR 6 PCS",
+    "plan_l": 20000.0,
+    "ecom_l": 0.0,
+    "stock_l": 2304.0,
+    "net_l": 17696.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 21,
+    "code": "FG0000106",
+    "name": "MUSTARD KACHHI GHANI 1 LTR POUCH 12 PCS",
+    "plan_l": 30000.0,
+    "ecom_l": 0.0,
+    "stock_l": 14070.0,
+    "net_l": 15930.0,
+    "machine": "Pouch"
+   },
+   {
+    "row": 22,
+    "code": "FG0000328",
+    "name": "SANO POMACE OLIVE 200 LTR 1 PCS",
+    "plan_l": 15000.0,
+    "ecom_l": 0.0,
+    "stock_l": 0.0,
+    "net_l": 15000.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 23,
+    "code": "FG0000191",
+    "name": "SOYABEAN OIL 15 LTR",
+    "plan_l": 15000.0,
+    "ecom_l": 0.0,
+    "stock_l": 0.0,
+    "net_l": 15000.0,
+    "machine": "Tin"
+   },
+   {
+    "row": 24,
+    "code": "FG0000379",
+    "name": "MUSTARD KACHI GHANI 1 LTR 20 PCS ROUND BOTTLE",
+    "plan_l": 15000.0,
+    "ecom_l": 0.0,
+    "stock_l": 109.0,
+    "net_l": 14891.0,
+    "machine": "JP"
+   },
+   {
+    "row": 25,
+    "code": "FG0000074",
+    "name": "EXTRA VIRGIN OLIVE 5 LTR TIN 4 PCS IMPORTED",
+    "plan_l": 5000.0,
+    "ecom_l": 8000.0,
+    "stock_l": 155.0,
+    "net_l": 12845.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 26,
+    "code": "FG0000232",
+    "name": "SO OLIVE OIL 5 LTR 4 PCS",
+    "plan_l": 2000.0,
+    "ecom_l": 10000.0,
+    "stock_l": 640.0,
+    "net_l": 11360.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 27,
+    "code": "FG0000081",
+    "name": "COLD PRESS SUNFLOWER 1 LTR 20 PCS",
+    "plan_l": 10000.0,
+    "ecom_l": 50000.0,
+    "stock_l": 103.0,
+    "net_l": 59897.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 28,
+    "code": "FG0000042",
+    "name": "EXTRA VIRGIN OLIVE 1 LTR 16 PCS",
+    "plan_l": 12000.0,
+    "ecom_l": 0.0,
+    "stock_l": 1083.0,
+    "net_l": 10917.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 29,
+    "code": "FG0000228",
+    "name": "SO OLIVE 1L",
+    "plan_l": 0.0,
+    "ecom_l": 10000.0,
+    "stock_l": 0.0,
+    "net_l": 10000.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 30,
+    "code": "FG0000192",
+    "name": "SOYABEAN OIL 5 LTR 4 PCS",
+    "plan_l": 10000.0,
+    "ecom_l": 0.0,
+    "stock_l": 15.0,
+    "net_l": 9985.0,
+    "machine": "Clearpack 5"
+   },
+   {
+    "row": 31,
+    "code": "FG0000193",
+    "name": "SOYABEAN OIL 1 LTR 20 PCS",
+    "plan_l": 10000.0,
+    "ecom_l": 0.0,
+    "stock_l": 63.0,
+    "net_l": 9937.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 32,
+    "code": "FG0000189",
+    "name": "ZANO POMACE OLIVE 1 LTR 16 PCS",
+    "plan_l": 10000.0,
+    "ecom_l": 0.0,
+    "stock_l": 77.0,
+    "net_l": 9923.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 33,
+    "code": "FG0000275",
+    "name": "COLD PRESS SUNFLOWER OIL 15 LTR",
+    "plan_l": 25000.0,
+    "ecom_l": 0.0,
+    "stock_l": 15960.0,
+    "net_l": 9040.0,
+    "machine": "Tin"
+   },
+   {
+    "row": 34,
+    "code": "FG0000158",
+    "name": "REFINED COTTON SEED OIL 15 LTR",
+    "plan_l": 8000.0,
+    "ecom_l": 0.0,
+    "stock_l": 0.0,
+    "net_l": 8000.0,
+    "machine": "Tin"
+   },
+   {
+    "row": 35,
+    "code": "FG0000420",
+    "name": "GROUNDNUT 200ML",
+    "plan_l": 0.0,
+    "ecom_l": 8000.0,
+    "stock_l": 0.0,
+    "net_l": 8000.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 36,
+    "code": "FG0000374",
+    "name": "YELLOW MUSTARD OIL 5 LTR TIN 4 PCS",
+    "plan_l": 8000.0,
+    "ecom_l": 0.0,
+    "stock_l": 200.0,
+    "net_l": 7800.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 37,
+    "code": "FG0000367",
+    "name": "SANO POMACE OLIVE OIL 15 L",
+    "plan_l": 8000.0,
+    "ecom_l": 0.0,
+    "stock_l": 405.0,
+    "net_l": 7595.0,
+    "machine": "Tin"
+   },
+   {
+    "row": 38,
+    "code": "FG0000026",
+    "name": "MUSTARD KACCHI GHANI 15 LTR printed",
+    "plan_l": 8000.0,
+    "ecom_l": 0.0,
+    "stock_l": 930.0,
+    "net_l": 7070.0,
+    "machine": "Tin"
+   },
+   {
+    "row": 39,
+    "code": "FG0000136",
+    "name": "SANO MUSTARD OIL 1 LTR 20 PCS",
+    "plan_l": 40000.0,
+    "ecom_l": 3000.0,
+    "stock_l": 4977.0,
+    "net_l": 38023.0,
+    "machine": "JP"
+   },
+   {
+    "row": 40,
+    "code": "FG0000038",
+    "name": "MUSTARD KACCHI GHANI 2 LTR 10 PCS",
+    "plan_l": 10000.0,
+    "ecom_l": 0.0,
+    "stock_l": 6070.0,
+    "net_l": 3930.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 41,
+    "code": "FG0000009",
+    "name": "EXTRA LIGHT OLIVE 5 LTR TIN 4 PCS",
+    "plan_l": 8000.0,
+    "ecom_l": 0.0,
+    "stock_l": 875.0,
+    "net_l": 7125.0,
+    "machine": "6 Head"
+   },
+   {
+    "row": 42,
+    "code": "FG0000178",
+    "name": "MUSTARD KACHI GHANI 15 KGS(PRINTED)",
+    "plan_l": 8000.0,
+    "ecom_l": 0.0,
+    "stock_l": 5307.68,
+    "net_l": 2692.3199999999997,
+    "machine": "Tin"
+   },
+   {
+    "row": 43,
+    "code": "FG0000112",
+    "name": "EXTRA VIRGIN OLIVE 250 MLS 4 PCS",
+    "plan_l": 500.0,
+    "ecom_l": 1500.0,
+    "stock_l": 1.0,
+    "net_l": 1999.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 44,
+    "code": "FG0000187",
+    "name": "ZANO EXTRA VIRGIN OLIVE1 LTR 16 PCS",
+    "plan_l": 3000.0,
+    "ecom_l": 0.0,
+    "stock_l": 1232.0,
+    "net_l": 1768.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 45,
+    "code": "FG0000021",
+    "name": "REFINED OIL 1 LTR POUCH 12 PCS",
+    "plan_l": 3000.0,
+    "ecom_l": 0.0,
+    "stock_l": 1596.0,
+    "net_l": 1404.0,
+    "machine": "Pouch"
+   },
+   {
+    "row": 46,
+    "code": "FG0000157",
+    "name": "EXTRA VIRGIN COCONUT OIL 500 MLS 24 PCS",
+    "plan_l": 500.0,
+    "ecom_l": 1000.0,
+    "stock_l": 424.0,
+    "net_l": 1076.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 47,
+    "code": "FG0000006",
+    "name": "POMACE OLIVE 200 LTR 1 PCS",
+    "plan_l": 1000.0,
+    "ecom_l": 0.0,
+    "stock_l": 0.0,
+    "net_l": 1000.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 48,
+    "code": "FG0000437",
+    "name": "EXTRA VIRGIN 200ML",
+    "plan_l": 0.0,
+    "ecom_l": 1000.0,
+    "stock_l": 0.0,
+    "net_l": 1000.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 49,
+    "code": "FG0000082",
+    "name": "A2 GHEE 500ML",
+    "plan_l": 0.0,
+    "ecom_l": 1000.0,
+    "stock_l": 0.0,
+    "net_l": 1000.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 50,
+    "code": "FG0000116",
+    "name": "EXTRA VIRGIN COCONUT OIL 1 LTR 16 PCS",
+    "plan_l": 1000.0,
+    "ecom_l": 0.0,
+    "stock_l": 1.0,
+    "net_l": 999.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 51,
+    "code": "FG0000352",
+    "name": "SESAME OIL (TOASTED) 500 MLS 12 PCS",
+    "plan_l": 1000.0,
+    "ecom_l": 0.0,
+    "stock_l": 443.0,
+    "net_l": 557.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 52,
+    "code": "FG0000070",
+    "name": "COLD PRESS 2 LTR 10 PCS HANDLE",
+    "plan_l": 5000.0,
+    "ecom_l": 0.0,
+    "stock_l": 4712.0,
+    "net_l": 288.0,
+    "machine": "-"
+   },
+   {
+    "row": 53,
+    "code": "FG0000381",
+    "name": "EXTRA VIRGIN OLIVE OIL 10ML",
+    "plan_l": 300.0,
+    "ecom_l": 0.0,
+    "stock_l": 55.65,
+    "net_l": 244.35,
+    "machine": "Manual"
+   },
+   {
+    "row": 54,
+    "code": "FG0000282",
+    "name": "EXTRA VIRGIN COCONUT OIL 200 MLS 6 PCS",
+    "plan_l": 500.0,
+    "ecom_l": 0.0,
+    "stock_l": 310.8,
+    "net_l": 189.2,
+    "machine": "Manual"
+   },
+   {
+    "row": 55,
+    "code": "FG0000028",
+    "name": "POMACE OLIVE 1 LTR 16 PCS",
+    "plan_l": 80000.0,
+    "ecom_l": 0.0,
+    "stock_l": 40303.0,
+    "net_l": 39697.0,
+    "machine": "Clearpack 1"
+   },
+   {
+    "row": 56,
+    "code": "FG0000005",
+    "name": "EXTRA LIGHT OLIVE 1 LTR 16 PCS",
+    "plan_l": 35000.0,
+    "ecom_l": 0.0,
+    "stock_l": 24957.0,
+    "net_l": 10043.0,
+    "machine": "Clearpack 1"
+   },
+   {
+    "row": 57,
+    "code": "FG0000064",
+    "name": "EXTRA LIGHT OIVE 2 LTR 10 PCS HANDLE",
+    "plan_l": 2000.0,
+    "ecom_l": 8000.0,
+    "stock_l": 578.0,
+    "net_l": 9422.0,
+    "machine": "10 Head"
+   },
+   {
+    "row": 58,
+    "code": "FG0000041",
+    "name": "EXTRA VIRGIN OLIVE PET BOTTLE 500 MLS 24 PCS",
+    "plan_l": 0.0,
+    "ecom_l": 0.0,
+    "stock_l": 0.0,
+    "net_l": 0.0,
+    "machine": "Manual"
+   },
+   {
+    "row": 59,
+    "code": "FG0000039",
+    "name": "EXTRA LIGHT OLIVE 500 MLS 24 PCS",
+    "plan_l": 500.0,
+    "ecom_l": 0.0,
+    "stock_l": 615.5,
+    "net_l": -115.5,
+    "machine": "-"
+   },
+   {
+    "row": 60,
+    "code": "FG0000150",
+    "name": "SANO POMACE OLIVE 1 LTR 16 PCS",
+    "plan_l": 30000.0,
+    "ecom_l": 0.0,
+    "stock_l": 41583.0,
+    "net_l": -11583.0,
+    "machine": "-"
+   },
+   {
+    "row": 61,
+    "code": "",
+    "name": "PREMIUM OLIVE OIL 500ML",
+    "plan_l": 1000.0,
+    "ecom_l": 0,
+    "stock_l": 0,
+    "net_l": 1000.0,
+    "machine": ""
+   }
+  ]
+ },
+ "aliases": {
+  "FG0000420": {
+   "planned_as": "FG0000441",
+   "book": "Jivo Mart",
+   "basis": "the recipe map"
+  },
+  "FG0000437": {
+   "planned_as": "FG0000349",
+   "book": "Jivo Mart",
+   "basis": "the recipe map"
+  }
+ },
+ "items": {
+  "FG0000420": {
+   "name": "COLD PRESS GROUNDNUT OIL 2 LTR 10 PCS",
+   "lp": 2.0
+  },
+  "FG0000437": {
+   "name": "COLD PRESS GROUNDNUT OIL 1 LTR + 1 LTR COMBO 8 SET",
+   "lp": 2.0
+  },
+  "FG0000004": {
+   "name": "COLD PRESS 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000194": {
+   "name": "SOYABEAN OIL 1 LTR POUCH 12 PCS",
+   "lp": 1.0
+  },
+  "FG0000090": {
+   "name": "MUSTARD KACCHI GHANI 1 LTR + 1 LTR COMBO 10 SET PLAIN",
+   "lp": 2.0
+  },
+  "FG0000091": {
+   "name": "COLD PRESS SUNFLOWER 1 LTR +1 LTR COMBO 10 SET PLAIN",
+   "lp": 2.0
+  },
+  "FG0000008": {
+   "name": "POMACE OLIVE 5 LTR TIN 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000011": {
+   "name": "MUSTARD KACCHI GHANI 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000030": {
+   "name": "MUSTARD KACHI GHANI 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000015": {
+   "name": "REFINED OIL 15 LTR",
+   "lp": 15.0
+  },
+  "FG0000226": {
+   "name": "RICE BRAN OIL 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000143": {
+   "name": "COLD PRESS GROUNDNUT OIL 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000053": {
+   "name": "COLD PRESS SUNFLOWER 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000151": {
+   "name": "SANO POMACE OLIVE 5 LTR TIN 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000306": {
+   "name": "YELLOW MUSTARD OIL 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000128": {
+   "name": "JIVO GOLD 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000034": {
+   "name": "EXTRA LIGHT OLIVE 200 LTR 1 PCS",
+   "lp": 200.0
+  },
+  "FG0000227": {
+   "name": "RICE BRAN OIL 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000033": {
+   "name": "COLD PRESS 1 LTR + 1 LTR COMBO 10 SET",
+   "lp": 2.0
+  },
+  "FG0000149": {
+   "name": "JIVO GOLD 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000324": {
+   "name": "SESAME OIL 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000043": {
+   "name": "COLD PRESS 3 LTR 6 PCS",
+   "lp": 3.0
+  },
+  "FG0000106": {
+   "name": "MUSTARD KACHHI GHANI 1 LTR POUCH 12 PCS",
+   "lp": 1.0
+  },
+  "FG0000328": {
+   "name": "SANO POMACE OLIVE 200 LTR 1 PCS",
+   "lp": 200.0
+  },
+  "FG0000191": {
+   "name": "SOYABEAN OIL 15 LTR",
+   "lp": 15.0
+  },
+  "FG0000379": {
+   "name": "MUSTARD KACHI GHANI 1 LTR 20 PCS ROUND BOTTLE",
+   "lp": 1.0
+  },
+  "FG0000074": {
+   "name": "EXTRA VIRGIN OLIVE 5 LTR TIN 4 PCS IMPORTED",
+   "lp": 5.0
+  },
+  "FG0000232": {
+   "name": "SO OLIVE OIL 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000081": {
+   "name": "COLD PRESS SUNFLOWER 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000042": {
+   "name": "EXTRA VIRGIN OLIVE 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000228": {
+   "name": "SO OLIVE OIL 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000192": {
+   "name": "SOYABEAN OIL 5 LTR 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000193": {
+   "name": "SOYABEAN OIL 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000189": {
+   "name": "ZANO POMACE OLIVE 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000275": {
+   "name": "COLD PRESS SUNFLOWER OIL 15 LTR",
+   "lp": 15.0
+  },
+  "FG0000158": {
+   "name": "REFINED COTTON SEED OIL 15 LTR",
+   "lp": 15.0
+  },
+  "FG0000441": {
+   "name": "COLD PRESS GROUNDNUT 200 MLS 70 PCS - BH",
+   "lp": 0.2
+  },
+  "FG0000374": {
+   "name": "YELLOW MUSTARD OIL 5 LTR TIN 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000367": {
+   "name": "SANO POMACE OLIVE OIL 15 L",
+   "lp": 15.0
+  },
+  "FG0000026": {
+   "name": "MUSTARD KACCHI GHANI 15 LTR",
+   "lp": 15.0
+  },
+  "FG0000136": {
+   "name": "SANO MUSTARD OIL 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000038": {
+   "name": "MUSTARD KACCHI GHANI 2 LTR 10 PCS",
+   "lp": 2.0
+  },
+  "FG0000009": {
+   "name": "EXTRA LIGHT OLIVE 5 LTR TIN 4 PCS",
+   "lp": 5.0
+  },
+  "FG0000178": {
+   "name": "MUSTARD KACHI GHANI 15 KGS",
+   "lp": 16.483516483516482
+  },
+  "FG0000112": {
+   "name": "EXTRA VIRGIN OLIVE 250 MLS 4 PCS",
+   "lp": 0.25
+  },
+  "FG0000187": {
+   "name": "ZANO EXTRA VIRGIN OLIVE1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000021": {
+   "name": "REFINED OIL 1 LTR POUCH 12 PCS",
+   "lp": 1.0
+  },
+  "FG0000157": {
+   "name": "EXTRA VIRGIN COCONUT OIL 500 MLS 24 PCS",
+   "lp": 0.5
+  },
+  "FG0000006": {
+   "name": "POMACE OLIVE 200 LTR 1 PCS",
+   "lp": 200.0
+  },
+  "FG0000349": {
+   "name": "EXTRA VIRGIN OLIVE 200 MLS 70 PCS",
+   "lp": 0.2
+  },
+  "FG0000082": {
+   "name": "DESI GHEE A2 500 MLS 16 PCS",
+   "lp": 0.5
+  },
+  "FG0000116": {
+   "name": "EXTRA VIRGIN COCONUT OIL 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000352": {
+   "name": "SESAME OIL (TOASTED) 500 MLS 12 PCS",
+   "lp": 0.5
+  },
+  "FG0000070": {
+   "name": "COLD PRESS 2 LTR 10 PCS HANDLE",
+   "lp": 2.0
+  },
+  "FG0000381": {
+   "name": "EXTRA VIRGIN OLIVE OIL 10ML",
+   "lp": 0.01
+  },
+  "FG0000282": {
+   "name": "EXTRA VIRGIN COCONUT OIL 200 MLS 6 PCS",
+   "lp": 0.2
+  },
+  "FG0000028": {
+   "name": "POMACE OLIVE 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000005": {
+   "name": "EXTRA LIGHT OLIVE 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000064": {
+   "name": "EXTRA LIGHT OIVE 2 LTR 10 PCS HANDLE",
+   "lp": 2.0
+  },
+  "FG0000041": {
+   "name": "EXTRA VIRGIN OLIVE GLASS BOTTLE 500 MLS 12 PCS",
+   "lp": 0.5
+  },
+  "FG0000039": {
+   "name": "EXTRA LIGHT OLIVE 500 MLS 24 PCS",
+   "lp": 0.5
+  },
+  "FG0000150": {
+   "name": "SANO POMACE OLIVE 1 LTR 16 PCS",
+   "lp": 1.0
+  },
+  "FG0000317": {
+   "name": "SOYABEAN OIL 15 KGS TIN IMP PCS",
+   "lp": 16.483516483516482
+  },
+  "FG0000142": {
+   "name": "COLD PRESS GROUNDNUT OIL 1 LTR 20 PCS",
+   "lp": 1.0
+  },
+  "FG0000464": {
+   "name": "SESAME OIL 1 LTR 20 PCS 52",
+   "lp": 1.0
+  },
+  "FG0000449": {
+   "name": "MUSTARD KACHI GHANI 200 ML 70 PCS",
+   "lp": 1.0
+  },
+  "__BH-BT": {
+   "name": "the rest of BH-BT",
+   "lp": 1.0
+  },
+  "__BH-PF": {
+   "name": "the rest of BH-PF",
+   "lp": 1.0
+  },
+  "FG0000468": {
+   "name": "RICE BRAN OIL 1 LTR 20 PCS 26",
+   "lp": 1.0
+  },
+  "FG0000465": {
+   "name": "EXTRA VIRGIN OLIVE 1 LTR 20 PCS",
+   "lp": 1.0
+  }
+ },
+ "made": {
+  "from": "2026-09-20",
+  "to": "2026-09-23",
+  "pcs": {
+   "FG0000004": 7068.0,
+   "FG0000011": 6192.0,
+   "FG0000030": 34440.0,
+   "FG0000053": 6880.0,
+   "FG0000081": 48620.0,
+   "FG0000136": 32600.0,
+   "FG0000009": 852.0,
+   "FG0000028": 56980.0,
+   "FG0000005": 46540.0,
+   "FG0000064": 8490.0,
+   "FG0000150": 11008.0,
+   "FG0000317": 1000.0000000000001,
+   "FG0000142": 12140.0,
+   "FG0000464": 11800.0,
+   "FG0000449": 868.0
+  }
+ },
+ "stock": {
+  "BH-BT": {
+   "FG0000030": 1.0,
+   "FG0000008": 1.0,
+   "FG0000143": 1.0,
+   "FG0000011": 1.0,
+   "FG0000306": 1.0,
+   "FG0000227": 1.0,
+   "FG0000187": 1.0,
+   "FG0000151": 1.0,
+   "__BH-BT": 480856.9043956044
+  },
+  "BH-PF": {
+   "FG0000194": 1.0,
+   "FG0000091": 1.0,
+   "FG0000226": 1.0,
+   "FG0000004": 1.0,
+   "FG0000090": 1.0,
+   "FG0000074": 1.0,
+   "FG0000009": 1.0,
+   "FG0000367": 1.0,
+   "__BH-PF": 275464.62637362635
+  }
+ },
+ "left_days": [
+  {
+   "date": "2026-09-15",
+   "left_l": 144349.25,
+   "truck_l": 7896.897142857143
+  },
+  {
+   "date": "2026-09-16",
+   "left_l": 127120.73626373627,
+   "truck_l": 7896.897142857143
+  },
+  {
+   "date": "2026-09-17",
+   "left_l": 49542.0,
+   "truck_l": 7896.897142857143
+  },
+  {
+   "date": "2026-09-18",
+   "left_l": 90524.51648351643,
+   "truck_l": 7896.897142857143
+  },
+  {
+   "date": "2026-09-19",
+   "left_l": 160866.0,
+   "truck_l": 7896.897142857143
+  },
+  {
+   "date": "2026-09-21",
+   "left_l": 41326.0,
+   "truck_l": 7896.897142857143
+  },
+  {
+   "date": "2026-09-22",
+   "left_l": 99042.51648351643,
+   "truck_l": 7896.897142857143
+  }
+ ],
+ "oil": [
+  {
+   "rm": "RM0000003",
+   "name": "MUSTARD LOOSE OIL",
+   "litres": 78000.0,
+   "as_of": "2026-09-22",
+   "set_by": "Gautam",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000025",
+   "name": "SOYABEAN REFINED LOOSE OIL",
+   "litres": 55000.0,
+   "as_of": "2026-09-22",
+   "set_by": "Gautam",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000011",
+   "name": "GROUNDNUT LOOSE OIL",
+   "litres": 48000.0,
+   "as_of": "2026-09-22",
+   "set_by": "Gautam",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000001",
+   "name": "LOOSE REFINED OLIVE OIL",
+   "litres": 39000.0,
+   "as_of": "2026-09-10",
+   "set_by": "IT Team",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000007",
+   "name": "RICE BRAN REFINED OIL",
+   "litres": 36000.0,
+   "as_of": "2026-09-22",
+   "set_by": "Gautam",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000002",
+   "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+   "litres": 30000.0,
+   "as_of": "2026-09-22",
+   "set_by": "Gautam",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000009",
+   "name": "REFINED SUNFLOWER OIL",
+   "litres": 20000.0,
+   "as_of": "2026-09-22",
+   "set_by": "Gautam",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000008",
+   "name": "LOOSE OIL EXTRA LIGHT OLIVE",
+   "litres": 15000.0,
+   "as_of": "2026-09-09",
+   "set_by": "Gurwinder SIngh",
+   "warehouse": "BH-LO"
+  },
+  {
+   "rm": "RM0000010",
+   "name": "POMACE OLIVE LOOSE OIL BOM",
+   "litres": 10000.0,
+   "as_of": "2026-09-09",
+   "set_by": "Gurwinder SIngh",
+   "warehouse": "BH-LO"
+  }
+ ],
+ "packaging": {
+  "PM0000851": {
+   "name": "PET BOTTLE 1 LTR 26 GM",
+   "have": 211332.0
+  },
+  "PM0000235": {
+   "name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+   "have": 596813.0
+  },
+  "PM0000020": {
+   "name": "LABEL 1 LTR KACHCHI GHANI FRONT",
+   "have": 391620.0
+  },
+  "PM0000019": {
+   "name": "LABEL 1 LTR KACHCHI GHANI BACK",
+   "have": 390354.0
+  },
+  "PM0000411": {
+   "name": "CARTON 1 LTR 20 PCS PET 26GM",
+   "have": 11580.0
+  },
+  "PM0000075": {
+   "name": "TAPE LOGO PRINTED",
+   "have": 209870.77599999998
+  },
+  "PM0000891": {
+   "name": "POUCH SOYABEAN MULTI  KGS",
+   "have": 6045.78
+  },
+  "PM0000005": {
+   "name": "CARTON 1 LTR 12 POUCHES",
+   "have": 11400.0
+  },
+  "PM0000194": {
+   "name": "PET BOTTLE 1 LTR 40 GMS",
+   "have": 227116.0
+  },
+  "PM0000085": {
+   "name": "CAPS 1 OR 2 LTR WHITE AND YELLOW WITH LOGO",
+   "have": 350837.0
+  },
+  "PM0000230": {
+   "name": "LABEL 1 LTR SUNFLOWER FRONT",
+   "have": 355918.0
+  },
+  "PM0000231": {
+   "name": "LABEL 1 LTR SUNFLOWER BACK",
+   "have": 360028.0
+  },
+  "PM0000006": {
+   "name": "CARTON 1 LTR 20 PCS PET 40 GM",
+   "have": 6011.35
+  },
+  "PM0000071": {
+   "name": "SHRINKS 1 LTR 235X310",
+   "have": 129505.0
+  },
+  "PM0000080": {
+   "name": "TIN 5 LTR POMACE OLIVE PRINTED",
+   "have": 11567.0
+  },
+  "PM0000082": {
+   "name": "CARTON 5 LTR OLIVE 4 PCS",
+   "have": 6429.005
+  },
+  "PM0000078": {
+   "name": "CAPS 5 LTR/15 LTR",
+   "have": 48237.6
+  },
+  "PM0000053": {
+   "name": "HDPE BOTTLE 5 LTR",
+   "have": 86378.0
+  },
+  "PM0000468": {
+   "name": "CAPS 5 LTR GREEN",
+   "have": 110909.0
+  },
+  "PM0000524": {
+   "name": "LABEL 5 LTR RICE BRAN OIL FRONT",
+   "have": 24500.0
+  },
+  "PM0000525": {
+   "name": "LABEL 5 LTR RICE BRAN OIL BACK",
+   "have": 25500.0
+  },
+  "PM0000094": {
+   "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+   "have": 46449.0
+  },
+  "PM0000013": {
+   "name": "CARTON 5 LTR 4 PCS",
+   "have": 8020.0
+  },
+  "PM0000046": {
+   "name": "LABEL 5 LTR COLD PRESS FRONT",
+   "have": 103020.0
+  },
+  "PM0000535": {
+   "name": "LABEL 5 LTR COLD PRESS BACK 994",
+   "have": 77359.0
+  },
+  "PM0000469": {
+   "name": "CAPS 5 LTR BROWN",
+   "have": 19192.0
+  },
+  "PM0000427": {
+   "name": "LABEL 5 LTR GROUNDNUT FRONT",
+   "have": 24542.0
+  },
+  "PM0000428": {
+   "name": "LABEL 5 LTR GROUNDNUT BACK",
+   "have": 23042.0
+  },
+  "PM0000048": {
+   "name": "LABEL 5 LTR KACHCHI GHANI FRONT",
+   "have": 34346.0
+  },
+  "PM0000047": {
+   "name": "LABEL 5 LTR KACHCHI GHANI BACK",
+   "have": 33990.0
+  },
+  "PM0000517": {
+   "name": "PET BOTTLE 1 LTR 75 GMS",
+   "have": 2512.0
+  },
+  "PM0000727": {
+   "name": "CAPS 1 & 2 LTR WHITE AND RED-ORANGE WITH LOGO YMO",
+   "have": 1476.0
+  },
+  "PM0000307": {
+   "name": "LABEL 1 LTR PRESSED YELLOW MUSTARD OIL BACK",
+   "have": 80962.0
+  },
+  "PM0000308": {
+   "name": "LABEL 1 LTR PRESSED YELLOW MUSTARD OIL FRONT",
+   "have": 80959.0
+  },
+  "PM0000722": {
+   "name": "CARTON 1 LTR 20 PCS PET 75 GM",
+   "have": 714.055
+  },
+  "PM0000054": {
+   "name": "PET BOTTLE 1 LTR 23.8 GMS ROUND",
+   "have": 1950.0
+  },
+  "PM0000121": {
+   "name": "PET BOTTLE 1 LTR 52 GMS POMACE",
+   "have": 102573.0
+  },
+  "PM0000079": {
+   "name": "CAPS 1 & 2 LTR FULL GREEN WITH LOGO",
+   "have": 180078.0
+  },
+  "PM0000522": {
+   "name": "LABEL 1 LTR RICE BRAN OIL FRONT",
+   "have": 40968.0
+  },
+  "PM0000523": {
+   "name": "LABEL 1 LTR RICE BRAN OIL BACK",
+   "have": 40968.0
+  },
+  "PM0000003": {
+   "name": "CARTON 1 LTR POMACE 16 PCS",
+   "have": 2.005
+  },
+  "PM0000195": {
+   "name": "PET BOTTLE 1 LTR 52 GMS GREEN",
+   "have": 36394.0
+  },
+  "PM0000408": {
+   "name": "CAPS 1 & 2 LTR WHITE AND GREEN PLAIN",
+   "have": 100666.0
+  },
+  "PM0000499": {
+   "name": "LABEL 1 LTR EXTRA VIRGIN FRONT ZANO",
+   "have": 3150.0
+  },
+  "PM0000500": {
+   "name": "LABEL 1 LTR EXTRA VIRGIN BACK ZANO",
+   "have": 3152.0
+  },
+  "PM0000409": {
+   "name": "CARTON 1 LTR POMACE 16 PCS PLAIN",
+   "have": 1202.008
+  },
+  "PM0000397": {
+   "name": "LABEL 1 LTR GOLD FRONT",
+   "have": 0.0
+  },
+  "PM0000396": {
+   "name": "LABEL 1 LTR GOLD BACK",
+   "have": 0.0
+  },
+  "PM0000726": {
+   "name": "CAPS 1 & 2 LTR WHITE AND MINT-GREEN WITH LOGO SO",
+   "have": 2633.0
+  },
+  "PM0000690": {
+   "name": "LABEL 1 LTR PRESSED SESAME OIL FRONT",
+   "have": 19878.0
+  },
+  "PM0000691": {
+   "name": "LABEL 1 LTR PRESSED SESAME OIL BACK",
+   "have": 20059.0
+  },
+  "PM0000309": {
+   "name": "POUCH 1 LTR MUSTARD ROLLS KGS",
+   "have": 0.0
+  },
+  "PM0000824": {
+   "name": "LABEL 1 LTR KACHI GHANI FULL",
+   "have": 541100.0
+  },
+  "PM0000825": {
+   "name": "CARTON 1 LTR 20 PCS NEW",
+   "have": 4190.15
+  },
+  "PM0000015": {
+   "name": "LABEL 1 LTR COLD PRESS FRONT",
+   "have": 231536.0
+  },
+  "PM0000014": {
+   "name": "LABEL 1 LTR COLD PRESS BACK 8181",
+   "have": 272450.0
+  },
+  "PM0000224": {
+   "name": "TIKKI 1+1 COMBO PACK 650",
+   "have": 35500.0
+  },
+  "PM0000159": {
+   "name": "LABEL 1 LTR EXTRA VIRGIN BACK",
+   "have": 39213.0
+  },
+  "PM0000158": {
+   "name": "LABEL 1 LTR EXTRA VIRGIN FRONT",
+   "have": 39145.0
+  },
+  "PM0000784": {
+   "name": "LABEL 1 LTR SO OLIVE BLENDED OLIVE OIL BACK",
+   "have": 42573.0
+  },
+  "PM0000785": {
+   "name": "LABEL 1 LTR SO OLIVE BLENDED OLIVE OIL FRONT",
+   "have": 42558.0
+  },
+  "PM0000074": {
+   "name": "TAPE CELLO",
+   "have": 202715.795
+  },
+  "PM0000286": {
+   "name": "LABEL 1 LTR SOYABEAN FRONT",
+   "have": 3600.0
+  },
+  "PM0000287": {
+   "name": "LABEL 1 LTR SOYABEAN BACK",
+   "have": 4000.0
+  },
+  "PM0000503": {
+   "name": "LABEL 1 LTR POMACE FRONT ZANO",
+   "have": 4150.0
+  },
+  "PM0000504": {
+   "name": "LABEL 1 LTR POMACE BACK ZANO",
+   "have": 0.0
+  },
+  "PM0000470": {
+   "name": "CAPS 5 LTR ORANGE",
+   "have": 16179.0
+  },
+  "PM0000233": {
+   "name": "LABEL 5 LTR SUNFLOWER FRONT",
+   "have": 32754.0
+  },
+  "PM0000232": {
+   "name": "LABEL 5 LTR SUNFLOWER BACK",
+   "have": 30869.0
+  },
+  "PM0000395": {
+   "name": "TIN 5 LTR POMACE OLIVE SANO",
+   "have": 4771.0
+  },
+  "PM0000632": {
+   "name": "CARTON 5 LTR TIN OLIVE 4 PCS SANO",
+   "have": 1778.0
+  },
+  "PM0000358": {
+   "name": "HDPE BOTTLE 5 LTR GOLD",
+   "have": 5132.0
+  },
+  "PM0000359": {
+   "name": "LABEL 5 LTR GOLD FRONT NEW",
+   "have": 27898.0
+  },
+  "PM0000360": {
+   "name": "LABEL 5 LTR GOLD BACK NEW",
+   "have": 27488.0
+  },
+  "PM0000113": {
+   "name": "HDPE BOTTLE 3 LTR",
+   "have": 24106.0
+  },
+  "PM0000118": {
+   "name": "LABEL 3 LTR COLD PRESS FRONT",
+   "have": 15725.0
+  },
+  "PM0000117": {
+   "name": "LABEL 3 LTR COLD PRESS BACK",
+   "have": 19573.0
+  },
+  "PM0000187": {
+   "name": "SHRINKS 3 LTR/4 LTR",
+   "have": 18050.0
+  },
+  "PM0000182": {
+   "name": "CARTON 3 LTR 6 PCS",
+   "have": 1062.002
+  },
+  "PM0000370": {
+   "name": "LABEL 1 LTR MUSTARD FRONT SANO",
+   "have": 32290.0
+  },
+  "PM0000369": {
+   "name": "LABEL 1 LTR MUSTARD BACK SANO",
+   "have": 32315.0
+  },
+  "PM0000819": {
+   "name": "CARTON 1 LTR 20 PCS PLAIN",
+   "have": 511.0
+  },
+  "PM0000076": {
+   "name": "TIN 15 LTR",
+   "have": 15556.6
+  },
+  "PM0000031": {
+   "name": "LABEL 15 LTR REFINED CANOLA",
+   "have": 19698.0
+  },
+  "PM0000008": {
+   "name": "CARTON 15 LTR 1 PCS",
+   "have": 1221.0
+  },
+  "PM0000259": {
+   "name": "TIN 5 LTR EXTRA VIRGIN OLIVE PRINTED IMPORTED",
+   "have": 2964.0
+  },
+  "PM0000260": {
+   "name": "TIN 5 LTR SO OLIVE PRINTED",
+   "have": 0.0
+  },
+  "PM0000245": {
+   "name": "CARTON 5 LTR 4 PCS PET",
+   "have": 2741.004
+  },
+  "PM0000186": {
+   "name": "HDPE BOTTLE 5 LTR OLIVE GREEN",
+   "have": 3003.0
+  },
+  "PM0000471": {
+   "name": "CAPS 5 LTR BLUE",
+   "have": 0.0
+  },
+  "PM0000289": {
+   "name": "LABEL 5 LTR SOYABEAN FRONT",
+   "have": 5273.0
+  },
+  "PM0000288": {
+   "name": "LABEL 5 LTR SOYABEAN BACK",
+   "have": 5258.0
+  },
+  "PM0000057": {
+   "name": "PET BOTTLE 2 LTR 66 GMS",
+   "have": 19105.0
+  },
+  "PM0000036": {
+   "name": "LABEL 2 LTR KACHCHI GHANI FRONT",
+   "have": 14850.0
+  },
+  "PM0000035": {
+   "name": "LABEL 2 LTR KACHCHI GHANI BACK",
+   "have": 14766.0
+  },
+  "PM0000009": {
+   "name": "CARTON 2 LTR 10 PCS",
+   "have": 1859.0
+  },
+  "PM0000835": {
+   "name": "TIN 5 LTR FP YELLOW MUSTARD OIL PRINTED",
+   "have": 6016.0
+  },
+  "PM0000130": {
+   "name": "POUCH REFINED MULTI ROLLS KGS",
+   "have": 1058.08
+  },
+  "PM0000346": {
+   "name": "LABEL 15 LTR SOYBEAN OIL",
+   "have": 0.0
+  },
+  "PM0000629": {
+   "name": "CARTON TIN TOP",
+   "have": 8951.0
+  },
+  "PM0000660": {
+   "name": "TIN STRIP",
+   "have": 922.137
+  },
+  "PM0000060": {
+   "name": "CAPS 1 & 2 LTR WHITE AND BLUE WITH LOGO",
+   "have": 17726.0
+  },
+  "PM0000344": {
+   "name": "LABEL 1 LTR EXTRA VIRGIN COCONUT FRONT",
+   "have": 38698.0
+  },
+  "PM0000345": {
+   "name": "LABEL 1 LTR EXTRA VIRGIN COCONUT BACK",
+   "have": 38698.0
+  },
+  "PM0000270": {
+   "name": "LABEL 15 LTR COLD PRESS SUNFLOWER OIL",
+   "have": 1127.0
+  },
+  "PM0000077": {
+   "name": "TIN 5 LTR EXTRA LIGHT OLIVE PRINTED",
+   "have": 11686.0
+  },
+  "PM0000430": {
+   "name": "LABEL 15 LTR REFINED COTTON SEED",
+   "have": 4070.0
+  },
+  "PM0000868": {
+   "name": "LABEL 15 LTR SANO POMACE",
+   "have": 799.0
+  },
+  "PM0000593": {
+   "name": "TIN 15 KGS/LTR MULTI CP KACCHI GHANI MUSTARD OIL  PRINTED",
+   "have": 3154.0
+  },
+  "PM0000560": {
+   "name": "PET BOTTLE 2 LTR 80 GRM (GREEN HANDLE)",
+   "have": 343.0
+  },
+  "PM0000266": {
+   "name": "LABEL 2 LTR CP CANOLA HANDLE BOTTLE FRONT",
+   "have": 3700.0
+  },
+  "PM0000265": {
+   "name": "LABEL 2 LTR CP CANOLA HANDLE BOTTLE BACK",
+   "have": 3969.0
+  },
+  "PM0000254": {
+   "name": "CARTON 2 LTR 10 PCS HANDLE BOTTLE",
+   "have": 2145.0
+  }
+ },
+ "bom": {
+  "FG0000030": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000851",
+    "name": "PET BOTTLE 1 LTR 26 GM",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000235",
+    "name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000020",
+    "name": "LABEL 1 LTR KACHCHI GHANI FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000019",
+    "name": "LABEL 1 LTR KACHCHI GHANI BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000411",
+    "name": "CARTON 1 LTR 20 PCS PET 26GM",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.0508,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000194": [
+   {
+    "code": "RM0000025",
+    "name": "SOYABEAN REFINED LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000891",
+    "name": "POUCH SOYABEAN MULTI  KGS",
+    "kind": "packaging",
+    "per_piece": 0.0081,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000005",
+    "name": "CARTON 1 LTR 12 POUCHES",
+    "kind": "packaging",
+    "per_piece": 0.08333333333333333,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.08466666666666667,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000091": [
+   {
+    "code": "RM0000009",
+    "name": "REFINED SUNFLOWER OIL",
+    "kind": "oil",
+    "per_piece": 2.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000194",
+    "name": "PET BOTTLE 1 LTR 40 GMS",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000085",
+    "name": "CAPS 1 OR 2 LTR WHITE AND YELLOW WITH LOGO",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000230",
+    "name": "LABEL 1 LTR SUNFLOWER FRONT",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000231",
+    "name": "LABEL 1 LTR SUNFLOWER BACK",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000006",
+    "name": "CARTON 1 LTR 20 PCS PET 40 GM",
+    "kind": "packaging",
+    "per_piece": 0.1,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.11,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000071",
+    "name": "SHRINKS 1 LTR 235X310",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000008": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 5.01,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000080",
+    "name": "TIN 5 LTR POMACE OLIVE PRINTED",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000082",
+    "name": "CARTON 5 LTR OLIVE 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2667,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000226": [
+   {
+    "code": "RM0000007",
+    "name": "RICE BRAN REFINED OIL",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000053",
+    "name": "HDPE BOTTLE 5 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000468",
+    "name": "CAPS 5 LTR GREEN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000524",
+    "name": "LABEL 5 LTR RICE BRAN OIL FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000525",
+    "name": "LABEL 5 LTR RICE BRAN OIL BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000094",
+    "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000013",
+    "name": "CARTON 5 LTR 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2794,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000004": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000053",
+    "name": "HDPE BOTTLE 5 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000468",
+    "name": "CAPS 5 LTR GREEN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000046",
+    "name": "LABEL 5 LTR COLD PRESS FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000535",
+    "name": "LABEL 5 LTR COLD PRESS BACK 994",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000094",
+    "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000013",
+    "name": "CARTON 5 LTR 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2794,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000143": [
+   {
+    "code": "RM0000011",
+    "name": "GROUNDNUT LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000053",
+    "name": "HDPE BOTTLE 5 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000469",
+    "name": "CAPS 5 LTR BROWN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000427",
+    "name": "LABEL 5 LTR GROUNDNUT FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000428",
+    "name": "LABEL 5 LTR GROUNDNUT BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000094",
+    "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000013",
+    "name": "CARTON 5 LTR 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2794,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000011": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000053",
+    "name": "HDPE BOTTLE 5 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000469",
+    "name": "CAPS 5 LTR BROWN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000048",
+    "name": "LABEL 5 LTR KACHCHI GHANI FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000047",
+    "name": "LABEL 5 LTR KACHCHI GHANI BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000094",
+    "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000013",
+    "name": "CARTON 5 LTR 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2794,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000306": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000517",
+    "name": "PET BOTTLE 1 LTR 75 GMS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000727",
+    "name": "CAPS 1 & 2 LTR WHITE AND RED-ORANGE WITH LOGO YMO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000307",
+    "name": "LABEL 1 LTR PRESSED YELLOW MUSTARD OIL BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000308",
+    "name": "LABEL 1 LTR PRESSED YELLOW MUSTARD OIL FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000722",
+    "name": "CARTON 1 LTR 20 PCS PET 75 GM",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.05588,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000090": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 2.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000054",
+    "name": "PET BOTTLE 1 LTR 23.8 GMS ROUND",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000235",
+    "name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000020",
+    "name": "LABEL 1 LTR KACHCHI GHANI FRONT",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000019",
+    "name": "LABEL 1 LTR KACHCHI GHANI BACK",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000006",
+    "name": "CARTON 1 LTR 20 PCS PET 40 GM",
+    "kind": "packaging",
+    "per_piece": 0.1,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.11,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000071",
+    "name": "SHRINKS 1 LTR 235X310",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000227": [
+   {
+    "code": "RM0000007",
+    "name": "RICE BRAN REFINED OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000121",
+    "name": "PET BOTTLE 1 LTR 52 GMS POMACE",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000079",
+    "name": "CAPS 1 & 2 LTR FULL GREEN WITH LOGO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000522",
+    "name": "LABEL 1 LTR RICE BRAN OIL FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000523",
+    "name": "LABEL 1 LTR RICE BRAN OIL BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000003",
+    "name": "CARTON 1 LTR POMACE 16 PCS",
+    "kind": "packaging",
+    "per_piece": 0.0625,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.060325,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000187": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 1.0022,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000195",
+    "name": "PET BOTTLE 1 LTR 52 GMS GREEN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000408",
+    "name": "CAPS 1 & 2 LTR WHITE AND GREEN PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000499",
+    "name": "LABEL 1 LTR EXTRA VIRGIN FRONT ZANO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000500",
+    "name": "LABEL 1 LTR EXTRA VIRGIN BACK ZANO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000409",
+    "name": "CARTON 1 LTR POMACE 16 PCS PLAIN",
+    "kind": "packaging",
+    "per_piece": 0.0625,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.06,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000149": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 0.555564,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000025",
+    "name": "SOYABEAN REFINED LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 0.145437,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000007",
+    "name": "RICE BRAN REFINED OIL",
+    "kind": "oil",
+    "per_piece": 0.136707,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000011",
+    "name": "GROUNDNUT LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 0.10612100000000001,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000015",
+    "name": "LOOSE OIL COLD PRESS/REFINED",
+    "kind": "oil",
+    "per_piece": 0.038162,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000030",
+    "name": "REFINED COTTON OIL",
+    "kind": "oil",
+    "per_piece": 0.009336,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000013",
+    "name": "POMACE OLIVE LOOSE OIL IMPORTED",
+    "kind": "oil",
+    "per_piece": 0.008669,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000851",
+    "name": "PET BOTTLE 1 LTR 26 GM",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000235",
+    "name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000397",
+    "name": "LABEL 1 LTR GOLD FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000396",
+    "name": "LABEL 1 LTR GOLD BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000411",
+    "name": "CARTON 1 LTR 20 PCS PET 26GM",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.0508,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000324": [
+   {
+    "code": "RM0000054",
+    "name": "SEASAME OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000517",
+    "name": "PET BOTTLE 1 LTR 75 GMS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000726",
+    "name": "CAPS 1 & 2 LTR WHITE AND MINT-GREEN WITH LOGO SO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000690",
+    "name": "LABEL 1 LTR PRESSED SESAME OIL FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000691",
+    "name": "LABEL 1 LTR PRESSED SESAME OIL BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000722",
+    "name": "CARTON 1 LTR 20 PCS PET 75 GM",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.05588,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000106": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000309",
+    "name": "POUCH 1 LTR MUSTARD ROLLS KGS",
+    "kind": "packaging",
+    "per_piece": 0.008333333333333333,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000005",
+    "name": "CARTON 1 LTR 12 POUCHES",
+    "kind": "packaging",
+    "per_piece": 0.08333333333333333,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.08466666666666667,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000379": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000054",
+    "name": "PET BOTTLE 1 LTR 23.8 GMS ROUND",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000235",
+    "name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000824",
+    "name": "LABEL 1 LTR KACHI GHANI FULL",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000825",
+    "name": "CARTON 1 LTR 20 PCS NEW",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.0508,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000033": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 2.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000194",
+    "name": "PET BOTTLE 1 LTR 40 GMS",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000079",
+    "name": "CAPS 1 & 2 LTR FULL GREEN WITH LOGO",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000015",
+    "name": "LABEL 1 LTR COLD PRESS FRONT",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000014",
+    "name": "LABEL 1 LTR COLD PRESS BACK 8181",
+    "kind": "packaging",
+    "per_piece": 2.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000006",
+    "name": "CARTON 1 LTR 20 PCS PET 40 GM",
+    "kind": "packaging",
+    "per_piece": 0.1,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.11176,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000071",
+    "name": "SHRINKS 1 LTR 235X310",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000224",
+    "name": "TIKKI 1+1 COMBO PACK 650",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000081": [
+   {
+    "code": "RM0000009",
+    "name": "REFINED SUNFLOWER OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000085",
+    "name": "CAPS 1 OR 2 LTR WHITE AND YELLOW WITH LOGO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000194",
+    "name": "PET BOTTLE 1 LTR 40 GMS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000230",
+    "name": "LABEL 1 LTR SUNFLOWER FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000231",
+    "name": "LABEL 1 LTR SUNFLOWER BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000006",
+    "name": "CARTON 1 LTR 20 PCS PET 40 GM",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.05588,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000042": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 1.0025,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000159",
+    "name": "LABEL 1 LTR EXTRA VIRGIN BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000003",
+    "name": "CARTON 1 LTR POMACE 16 PCS",
+    "kind": "packaging",
+    "per_piece": 0.0625,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000158",
+    "name": "LABEL 1 LTR EXTRA VIRGIN FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000079",
+    "name": "CAPS 1 & 2 LTR FULL GREEN WITH LOGO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000195",
+    "name": "PET BOTTLE 1 LTR 52 GMS GREEN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.060325,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000228": [
+   {
+    "code": "RM0000015",
+    "name": "LOOSE OIL COLD PRESS/REFINED",
+    "kind": "oil",
+    "per_piece": 0.645771,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 0.320785,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000013",
+    "name": "POMACE OLIVE LOOSE OIL IMPORTED",
+    "kind": "oil",
+    "per_piece": 0.033444,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000121",
+    "name": "PET BOTTLE 1 LTR 52 GMS POMACE",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000408",
+    "name": "CAPS 1 & 2 LTR WHITE AND GREEN PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000784",
+    "name": "LABEL 1 LTR SO OLIVE BLENDED OLIVE OIL BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000785",
+    "name": "LABEL 1 LTR SO OLIVE BLENDED OLIVE OIL FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000003",
+    "name": "CARTON 1 LTR POMACE 16 PCS",
+    "kind": "packaging",
+    "per_piece": 0.0625,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000074",
+    "name": "TAPE CELLO",
+    "kind": "packaging",
+    "per_piece": 0.060325,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000193": [
+   {
+    "code": "RM0000025",
+    "name": "SOYABEAN REFINED LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000851",
+    "name": "PET BOTTLE 1 LTR 26 GM",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000235",
+    "name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000286",
+    "name": "LABEL 1 LTR SOYABEAN FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000287",
+    "name": "LABEL 1 LTR SOYABEAN BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000411",
+    "name": "CARTON 1 LTR 20 PCS PET 26GM",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.0508,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000189": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000121",
+    "name": "PET BOTTLE 1 LTR 52 GMS POMACE",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000408",
+    "name": "CAPS 1 & 2 LTR WHITE AND GREEN PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000503",
+    "name": "LABEL 1 LTR POMACE FRONT ZANO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000504",
+    "name": "LABEL 1 LTR POMACE BACK ZANO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000409",
+    "name": "CARTON 1 LTR POMACE 16 PCS PLAIN",
+    "kind": "packaging",
+    "per_piece": 0.0625,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.06,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000053": [
+   {
+    "code": "RM0000009",
+    "name": "REFINED SUNFLOWER OIL",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000053",
+    "name": "HDPE BOTTLE 5 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000470",
+    "name": "CAPS 5 LTR ORANGE",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000233",
+    "name": "LABEL 5 LTR SUNFLOWER FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000232",
+    "name": "LABEL 5 LTR SUNFLOWER BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000094",
+    "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000013",
+    "name": "CARTON 5 LTR 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2794,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000151": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 5.01,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000395",
+    "name": "TIN 5 LTR POMACE OLIVE SANO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000632",
+    "name": "CARTON 5 LTR TIN OLIVE 4 PCS SANO",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000074",
+    "name": "TAPE CELLO",
+    "kind": "packaging",
+    "per_piece": 0.2667,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000128": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 2.7778199999999997,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000025",
+    "name": "SOYABEAN REFINED LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 0.7271850000000001,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000007",
+    "name": "RICE BRAN REFINED OIL",
+    "kind": "oil",
+    "per_piece": 0.683535,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000011",
+    "name": "GROUNDNUT LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 0.530605,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000015",
+    "name": "LOOSE OIL COLD PRESS/REFINED",
+    "kind": "oil",
+    "per_piece": 0.19081,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000030",
+    "name": "REFINED COTTON OIL",
+    "kind": "oil",
+    "per_piece": 0.04668,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000013",
+    "name": "POMACE OLIVE LOOSE OIL IMPORTED",
+    "kind": "oil",
+    "per_piece": 0.043344999999999995,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000358",
+    "name": "HDPE BOTTLE 5 LTR GOLD",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000469",
+    "name": "CAPS 5 LTR BROWN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000359",
+    "name": "LABEL 5 LTR GOLD FRONT NEW",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000360",
+    "name": "LABEL 5 LTR GOLD BACK NEW",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000013",
+    "name": "CARTON 5 LTR 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2794,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000094",
+    "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000043": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 3.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000113",
+    "name": "HDPE BOTTLE 3 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000468",
+    "name": "CAPS 5 LTR GREEN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000118",
+    "name": "LABEL 3 LTR COLD PRESS FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000117",
+    "name": "LABEL 3 LTR COLD PRESS BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000187",
+    "name": "SHRINKS 3 LTR/4 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000182",
+    "name": "CARTON 3 LTR 6 PCS",
+    "kind": "packaging",
+    "per_piece": 0.16666666666666666,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.19473333333333334,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000136": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000851",
+    "name": "PET BOTTLE 1 LTR 26 GM",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000235",
+    "name": "CAPS 1 LTR WHITE AND YELLOW SMALL PLAIN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000370",
+    "name": "LABEL 1 LTR MUSTARD FRONT SANO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000369",
+    "name": "LABEL 1 LTR MUSTARD BACK SANO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000819",
+    "name": "CARTON 1 LTR 20 PCS PLAIN",
+    "kind": "packaging",
+    "per_piece": 0.05,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000074",
+    "name": "TAPE CELLO",
+    "kind": "packaging",
+    "per_piece": 0.0508,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000015": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 15.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000076",
+    "name": "TIN 15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000031",
+    "name": "LABEL 15 LTR REFINED CANOLA",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000008",
+    "name": "CARTON 15 LTR 1 PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 1.524,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000074": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 5.011,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000259",
+    "name": "TIN 5 LTR EXTRA VIRGIN OLIVE PRINTED IMPORTED",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000082",
+    "name": "CARTON 5 LTR OLIVE 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2667,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000232": [
+   {
+    "code": "RM0000015",
+    "name": "LOOSE OIL COLD PRESS/REFINED",
+    "kind": "oil",
+    "per_piece": 3.228855,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 1.6039249999999998,
+    "uom": "LTR"
+   },
+   {
+    "code": "RM0000013",
+    "name": "POMACE OLIVE LOOSE OIL IMPORTED",
+    "kind": "oil",
+    "per_piece": 0.16722,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000260",
+    "name": "TIN 5 LTR SO OLIVE PRINTED",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000245",
+    "name": "CARTON 5 LTR 4 PCS PET",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000074",
+    "name": "TAPE CELLO",
+    "kind": "packaging",
+    "per_piece": 0.2413,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000192": [
+   {
+    "code": "RM0000025",
+    "name": "SOYABEAN REFINED LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000186",
+    "name": "HDPE BOTTLE 5 LTR OLIVE GREEN",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000471",
+    "name": "CAPS 5 LTR BLUE",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000289",
+    "name": "LABEL 5 LTR SOYABEAN FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000288",
+    "name": "LABEL 5 LTR SOYABEAN BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000094",
+    "name": "SHRINKS 5 LTR 340X415 5 LTR SINGAL PCS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000013",
+    "name": "CARTON 5 LTR 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2794,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000038": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 2.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000057",
+    "name": "PET BOTTLE 2 LTR 66 GMS",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000085",
+    "name": "CAPS 1 OR 2 LTR WHITE AND YELLOW WITH LOGO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000036",
+    "name": "LABEL 2 LTR KACHCHI GHANI FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000035",
+    "name": "LABEL 2 LTR KACHCHI GHANI BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000009",
+    "name": "CARTON 2 LTR 10 PCS",
+    "kind": "packaging",
+    "per_piece": 0.1,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.11684,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000374": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000835",
+    "name": "TIN 5 LTR FP YELLOW MUSTARD OIL PRINTED",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000082",
+    "name": "CARTON 5 LTR OLIVE 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2667,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000021": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000005",
+    "name": "CARTON 1 LTR 12 POUCHES",
+    "kind": "packaging",
+    "per_piece": 0.08333333333333333,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.08466666666666667,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000130",
+    "name": "POUCH REFINED MULTI ROLLS KGS",
+    "kind": "packaging",
+    "per_piece": 0.008333333333333333,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000191": [
+   {
+    "code": "RM0000025",
+    "name": "SOYABEAN REFINED LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 15.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000076",
+    "name": "TIN 15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000346",
+    "name": "LABEL 15 LTR SOYBEAN OIL",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000629",
+    "name": "CARTON TIN TOP",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000660",
+    "name": "TIN STRIP",
+    "kind": "packaging",
+    "per_piece": 0.008,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000116": [
+   {
+    "code": "RM0000037",
+    "name": "COCONUT EXTRA VIRGIN OIL",
+    "kind": "oil",
+    "per_piece": 1.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000060",
+    "name": "CAPS 1 & 2 LTR WHITE AND BLUE WITH LOGO",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000121",
+    "name": "PET BOTTLE 1 LTR 52 GMS POMACE",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000344",
+    "name": "LABEL 1 LTR EXTRA VIRGIN COCONUT FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000345",
+    "name": "LABEL 1 LTR EXTRA VIRGIN COCONUT BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000003",
+    "name": "CARTON 1 LTR POMACE 16 PCS",
+    "kind": "packaging",
+    "per_piece": 0.0625,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.060325,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000275": [
+   {
+    "code": "RM0000009",
+    "name": "REFINED SUNFLOWER OIL",
+    "kind": "oil",
+    "per_piece": 15.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000076",
+    "name": "TIN 15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000270",
+    "name": "LABEL 15 LTR COLD PRESS SUNFLOWER OIL",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000629",
+    "name": "CARTON TIN TOP",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000660",
+    "name": "TIN STRIP",
+    "kind": "packaging",
+    "per_piece": 0.01,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000009": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 5.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000082",
+    "name": "CARTON 5 LTR OLIVE 4 PCS",
+    "kind": "packaging",
+    "per_piece": 0.25,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.2667,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000077",
+    "name": "TIN 5 LTR EXTRA LIGHT OLIVE PRINTED",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000158": [
+   {
+    "code": "RM0000030",
+    "name": "REFINED COTTON OIL",
+    "kind": "oil",
+    "per_piece": 15.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000076",
+    "name": "TIN 15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000430",
+    "name": "LABEL 15 LTR REFINED COTTON SEED",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000629",
+    "name": "CARTON TIN TOP",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000660",
+    "name": "TIN STRIP",
+    "kind": "packaging",
+    "per_piece": 0.008,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000367": [
+   {
+    "code": "RM0000001",
+    "name": "LOOSE REFINED OLIVE OIL",
+    "kind": "oil",
+    "per_piece": 15.03,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000076",
+    "name": "TIN 15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000868",
+    "name": "LABEL 15 LTR SANO POMACE",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000660",
+    "name": "TIN STRIP",
+    "kind": "packaging",
+    "per_piece": 0.01,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000629",
+    "name": "CARTON TIN TOP",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000026": [
+   {
+    "code": "RM0000003",
+    "name": "MUSTARD LOOSE OIL",
+    "kind": "oil",
+    "per_piece": 15.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000593",
+    "name": "TIN 15 KGS/LTR MULTI CP KACCHI GHANI MUSTARD OIL  PRINTED",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000078",
+    "name": "CAPS 5 LTR/15 LTR",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000629",
+    "name": "CARTON TIN TOP",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000660",
+    "name": "TIN STRIP",
+    "kind": "packaging",
+    "per_piece": 0.01,
+    "uom": "PCS"
+   }
+  ],
+  "FG0000070": [
+   {
+    "code": "RM0000002",
+    "name": "CANOLA COLD PRESS LOOSE OIL OLD",
+    "kind": "oil",
+    "per_piece": 2.0,
+    "uom": "LTR"
+   },
+   {
+    "code": "PM0000560",
+    "name": "PET BOTTLE 2 LTR 80 GRM (GREEN HANDLE)",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000266",
+    "name": "LABEL 2 LTR CP CANOLA HANDLE BOTTLE FRONT",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000265",
+    "name": "LABEL 2 LTR CP CANOLA HANDLE BOTTLE BACK",
+    "kind": "packaging",
+    "per_piece": 1.0,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000254",
+    "name": "CARTON 2 LTR 10 PCS HANDLE BOTTLE",
+    "kind": "packaging",
+    "per_piece": 0.1,
+    "uom": "PCS"
+   },
+   {
+    "code": "PM0000075",
+    "name": "TAPE LOGO PRINTED",
+    "kind": "packaging",
+    "per_piece": 0.11684,
+    "uom": "PCS"
+   }
+  ]
+ },
+ "running_now": {
+  "JP": {
+   "code": "FG0000468",
+   "name": "RICE BRAN OIL 1 LTR 20 PCS 26",
+   "date": "2026-09-23",
+   "status": "IN_PROGRESS"
+  },
+  "Clear Pack": {
+   "code": "FG0000465",
+   "name": "EXTRA VIRGIN OLIVE 1 LTR 20 PCS",
+   "date": "2026-09-23",
+   "status": "IN_PROGRESS"
+  },
+  "10 Head": {
+   "code": "FG0000008",
+   "name": "POMACE OLIVE 5 LTR TIN 4 PCS",
+   "date": "2026-09-23",
+   "status": "IN_PROGRESS"
+  },
+  "6 Head": {
+   "code": "FG0000004",
+   "name": "COLD PRESS 5 LTR 4 PCS",
+   "date": "2026-09-23",
+   "status": "IN_PROGRESS"
+  },
+  "Tin": null,
+  "Hitech pouch": null,
+  "Samarpan pouch": null
+ },
+ "sources": []
+}

@@ -22,8 +22,11 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from django_apscheduler.jobstores import DjangoJobStore
 
+from apscheduler.triggers.cron import CronTrigger
+
 from maintenance.jobs import expire_lapsed_work_permits
 from returnable_items.jobs import run_returnable_checks
+from tomorrow_run.jobs import READ_HOUR, READ_MINUTES, nightly_read
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,14 @@ class Command(BaseCommand):
             run_returnable_checks,
             trigger=IntervalTrigger(minutes=returnable_interval),
             id="check_returnable_items",
+            max_instances=1,
+            replace_existing=True,
+        )
+        # Tomorrow's run: the 7 pm read (retries at 7:20 and 7:40 if SAP was down)
+        scheduler.add_job(
+            nightly_read,
+            trigger=CronTrigger(hour=READ_HOUR, minute=READ_MINUTES, timezone=settings.TIME_ZONE),
+            id="tomorrow_run_nightly_read",
             max_instances=1,
             replace_existing=True,
         )
