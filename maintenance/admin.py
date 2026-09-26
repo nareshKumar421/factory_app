@@ -12,6 +12,9 @@ from .models import (
     DailyWastageLog,
     ElectricityConsumer,
     ElectricityMeter,
+    ElectricityMeterDriver,
+    ElectricityMeterSetup,
+    ElectricityMeterShare,
     FireCategory,
     FireEquipmentIssue,
     FireEquipmentIssueItem,
@@ -622,6 +625,34 @@ class DailyElectricityReadingAdmin(admin.ModelAdmin):
     @admin.display(description="Attributed to")
     def attributed_to(self, obj):
         return ", ".join(obj.attribution_names()) or "—"
+
+
+class ElectricityMeterShareInline(admin.TabularInline):
+    model = ElectricityMeterShare
+    extra = 0
+    raw_id_fields = ("company", "consumer")
+
+
+class ElectricityMeterDriverInline(admin.TabularInline):
+    model = ElectricityMeterDriver
+    extra = 0
+    raw_id_fields = ("production_line", "blowing_machine", "meter", "company")
+
+
+@admin.register(ElectricityMeterSetup)
+class ElectricityMeterSetupAdmin(admin.ModelAdmin):
+    """Daily Electricity++'s tree: where each meter sits and who pays, by date.
+
+    For looking, and for a lockout. Change it on the Daily Electricity++ page:
+    that is where a version is checked for loops, orphans and shares that do
+    not add up to 100, and the admin checks none of it.
+    """
+
+    list_display = ("meter", "effective_from", "in_service", "parent", "basis", "is_active")
+    list_filter = ("basis", "in_service", "is_active")
+    search_fields = ("meter__name", "parent__name", "note")
+    raw_id_fields = ("meter", "parent")
+    inlines = (ElectricityMeterShareInline, ElectricityMeterDriverInline)
 
 
 @admin.register(DailyWastageLog)

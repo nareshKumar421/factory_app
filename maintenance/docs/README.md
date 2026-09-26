@@ -448,6 +448,44 @@ Without `--groups` the command rewrites the permission set of all 24 Maintenance
 and Fire role groups, discarding anything an admin added in Django admin.
 `--dry-run` reports the same work and rolls back.
 
+### Daily Electricity++ — the meter tree and who pays
+
+A second page over the **same meters and readings**, beside Daily Electricity,
+which it leaves exactly as it was. The page, its API and every board that reads
+electricity (admin board, Company Expense matrix, Factory Expense wall,
+Electricity dashboard) keep their old logic. Daily Electricity++ adds:
+
+- **The tree.** Each meter's dated setup (`ElectricityMeterSetup`) says which
+  meter it hangs off and who pays for its **own units** (its reading less its
+  sub-meters' readings): nobody yet, fixed shares, the run hours of the lines
+  and blowing machines it serves, or the ratio of other meters. A change is a
+  new version from a date; correcting a version re-works every day it covers.
+  Nothing is stored, and the split is worked out from the readings each time
+  (`maintenance/electricity/`).
+- **A reading chain.** A reading opens where the last one closed, unless
+  `meter_reset` says the dial was replaced. A reading after skipped days is
+  spread over them.
+- **Second registers.** `register_of` marks KVAH as KWH read a second way. It is
+  shown beside KWH and never counted.
+
+It never writes the old page's fields (`is_main`, `counts_as_supply`,
+`companies`, `consumers`). A meter created here gets the old page's main flag at
+birth and nothing more.
+
+| Endpoint | What |
+| --- | --- |
+| `electricity-tree-meters/` | Meters in tree order on `?date=`, each with its `tree` placement. |
+| `electricity-tree-readings/` | Readings, held to the chain. |
+| `electricity-meter-setups/` | Setup versions: add, correct or delete. |
+| `electricity-day-sheet/` | One day's round for every meter; `POST` saves all rows or none. |
+| `electricity-allocation/` | Who pays how much between `?date_from=&date_to=`, with issues. |
+| `electricity-run-sources/` | The lines and blowing machines a run-hours split can follow. |
+
+`can_manage_electricity_allocation` places meters and sets who pays. It is its
+own role (*Maint — Electricity Split Manager*) and is not scoped to kept meters.
+The first tree is seeded with `python manage.py seed_electricity_tree`, which is
+a dry run unless given `--apply`.
+
 Permission classes: `maintenance/permissions.py`, `returnable_items/permissions.py`,
 `maintenance_gatein/permissions.py`. Note the `CanGateMaintenanceLink` OR — gate
 "material-in" operators (holding only `maintenance_gatein.add_maintenancegateentry`)

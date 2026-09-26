@@ -172,6 +172,13 @@ ROLE_GROUPS: dict[str, list[str]] = {
         "can_view_maintenance_module", "can_view_daily_electricity", "can_manage_daily_electricity",
         "can_view_electricity_meter", "can_manage_electricity_meter",
         "can_add_daily_electricity", "can_edit_daily_electricity", "can_delete_daily_electricity",
+        "can_manage_electricity_allocation",
+    ],
+    # Places meters in the meter tree and decides who pays for each one's units
+    # — an accounts decision, so it is its own role and needs no meter keeping.
+    "Maint — Electricity Split Manager": [
+        "can_view_maintenance_module", "can_view_daily_electricity",
+        "can_view_electricity_meter", "can_manage_electricity_allocation",
     ],
     "Maint — Daily Electricity Viewer": [
         "can_view_maintenance_module", "can_view_daily_electricity",

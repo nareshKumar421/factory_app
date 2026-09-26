@@ -8,6 +8,15 @@ from .views_manager import (
     UserElectricityMeterListAPI,
 )
 
+from .views_electricity import (
+    ElectricityAllocationAPI,
+    ElectricityDaySheetAPI,
+    ElectricityMeterSetupViewSet,
+    ElectricityRunSourcesAPI,
+    ElectricityTreeMeterViewSet,
+    ElectricityTreeReadingViewSet,
+)
+
 from .views import (
     AssetCategoryViewSet,
     DailyElectricityReadingViewSet,
@@ -146,6 +155,22 @@ router.register(
     DailyElectricityReadingViewSet,
     basename="maintenance-daily-electricity-reading",
 )
+# Daily Electricity++: the same meters and readings, as a tree with a split.
+router.register(
+    "electricity-tree-meters",
+    ElectricityTreeMeterViewSet,
+    basename="maintenance-electricity-tree-meter",
+)
+router.register(
+    "electricity-tree-readings",
+    ElectricityTreeReadingViewSet,
+    basename="maintenance-electricity-tree-reading",
+)
+router.register(
+    "electricity-meter-setups",
+    ElectricityMeterSetupViewSet,
+    basename="maintenance-electricity-meter-setup",
+)
 router.register(
     "daily-wastage-logs",
     DailyWastageLogViewSet,
@@ -197,6 +222,21 @@ urlpatterns = [
         "user-electricity-meters/<int:pk>/",
         UserElectricityMeterDetailAPI.as_view(),
         name="user-electricity-meter-detail",
+    ),
+    path(
+        "electricity-day-sheet/",
+        ElectricityDaySheetAPI.as_view(),
+        name="maintenance-electricity-day-sheet",
+    ),
+    path(
+        "electricity-allocation/",
+        ElectricityAllocationAPI.as_view(),
+        name="maintenance-electricity-allocation",
+    ),
+    path(
+        "electricity-run-sources/",
+        ElectricityRunSourcesAPI.as_view(),
+        name="maintenance-electricity-run-sources",
     ),
 
     path("", include(router.urls)),

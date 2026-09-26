@@ -516,6 +516,19 @@ class CanDeleteDailyElectricity(AnyDjangoPermission):
     ]
 
 
+class CanManageElectricityAllocation(AnyDjangoPermission):
+    """Place meters in the tree and decide who pays for each one's units.
+
+    Not scoped to the meters a user keeps: whoever sets the split sets it for
+    the whole campus, and the keepers who read the dials need not hold it.
+    """
+
+    permissions = [
+        "maintenance.can_manage_electricity_allocation",
+        _MANAGE_DAILY_ELECTRICITY,
+    ]
+
+
 # --- Electricity meter managers (per-user meter scoping) --------------------
 # Separate from every permission above on purpose: deciding WHO keeps a meter is
 # an administrator's job, not something a meter keeper should be able to grant

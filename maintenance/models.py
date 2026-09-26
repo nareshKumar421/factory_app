@@ -128,6 +128,10 @@ class MaintenancePermission(models.Model):
             ("can_add_daily_electricity", "Can record Daily electricity readings"),
             ("can_edit_daily_electricity", "Can correct Daily electricity readings"),
             ("can_delete_daily_electricity", "Can delete Daily electricity readings"),
+            # Who pays for a meter's units is an accounts decision, not a meter
+            # keeper's: the boiler-house keeper records the boiler's dial but
+            # does not decide that Beverages pays for it.
+            ("can_manage_electricity_allocation", "Can set who pays for each electricity meter"),
             ("can_view_daily_wastage", "Can view Daily wastage register"),
             ("can_manage_daily_wastage", "Can manage Daily wastage register"),
         ]
@@ -2476,6 +2480,13 @@ class ElectricityMeter(BaseModel):
     measure the SAME supply — KVAH is the grid's KWH counted as apparent energy,
     not a second feed — so the duplicate is read and shown but left out of the
     day's total supply.
+
+    All of the above belongs to the Daily Electricity page and the boards that
+    read it. Daily Electricity++ keeps its own account of the same meters: where
+    each sits in the meter tree and who pays for its own units, in dated
+    :class:`ElectricityMeterSetup` versions, never touching these fields.
+    ``register_of`` is its one field here — a meter's second dial (KVAH on the
+    KWH meter), which the tree reads beside its meter and never counts.
     """
 
     name = models.CharField(max_length=150, unique=True)
@@ -2544,6 +2555,18 @@ class ElectricityMeter(BaseModel):
             "units. 1 means the dial is read as-is."
         ),
     )
+    register_of = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="registers",
+        help_text=(
+            "Daily Electricity++: set when this is a second register of another "
+            "meter — KVAH on the KWH meter. The meter tree shows it beside that "
+            "meter and never counts it."
+        ),
+    )
 
     class Meta:
         ordering = ["name"]
@@ -2567,6 +2590,247 @@ class ElectricityMeter(BaseModel):
         return self.name
 
 
+class ElectricityAllocationBasis(models.TextChoices):
+    """How a meter's own units are split. The engine's ``Basis`` mirrors this."""
+
+    UNASSIGNED = "UNASSIGNED", "Not decided yet"
+    FIXED = "FIXED", "Fixed shares"
+    RUN_HOURS = "RUN_HOURS", "By production run hours"
+    METER_RATIO = "METER_RATIO", "In proportion to other meters"
+
+
+class ElectricityMeterSetup(BaseModel):
+    """Where a meter sits in the tree, and who pays for its own units, from a date on.
+
+    A meter's *own* units are its reading less what its sub-meters read: the
+    ground floor's own units are the ground floor less the lab, the basement and
+    the Sidel. For a meter with no sub-meters that is simply its reading. The
+    setup says who pays for them (``basis``, with ``shares`` and ``drivers``),
+    and which meter this one is a sub-meter of (``parent``; none for a main).
+
+    Versions, not edits
+    -------------------
+    The factory changes who uses what — a line moves, a chiller starts serving
+    both plants — and a change made today must not rewrite last month's split.
+    So a change is a new version with its own ``effective_from``, and the
+    version in force on a day is the latest one on or before it. Correcting a
+    mistake is the other thing: edit the version itself, and every day it
+    covers is recomputed. The split is always computed from the readings, never
+    stored, so either is safe.
+
+    The first version's date is when the register starts counting the meter.
+    Before it, the meter is not in the tree at all and its load is simply part
+    of its parent's rest. A version with ``in_service`` off takes the meter out
+    of the tree from its date (removed, replaced, or disconnected).
+    """
+
+    meter = models.ForeignKey(
+        ElectricityMeter,
+        on_delete=models.CASCADE,
+        related_name="setups",
+    )
+    effective_from = models.DateField()
+    in_service = models.BooleanField(
+        default=True,
+        help_text="Off from this date: the meter is out of the tree (removed or disconnected).",
+    )
+    parent = models.ForeignKey(
+        ElectricityMeter,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="child_setups",
+        help_text="The meter this one is a sub-meter of. Empty for a main meter.",
+    )
+    basis = models.CharField(
+        max_length=20,
+        choices=ElectricityAllocationBasis.choices,
+        default=ElectricityAllocationBasis.UNASSIGNED,
+    )
+    note = models.TextField(
+        blank=True,
+        default="",
+        help_text="Why this version exists — what changed on the floor, or what was corrected.",
+    )
+
+    class Meta:
+        ordering = ["meter__name", "effective_from"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["meter", "effective_from"],
+                name="uniq_electricity_meter_setup_per_day",
+            ),
+        ]
+        verbose_name = "Electricity Meter Setup"
+        verbose_name_plural = "Electricity Meter Setups"
+
+    def __str__(self):
+        return f"{self.meter.name} from {self.effective_from}"
+
+
+class ElectricityMeterShare(models.Model):
+    """One party's fixed percentage of a meter's own units.
+
+    On a ``FIXED`` setup the shares are the split. On a proportional one they
+    are the fallback, used on a day the split has nothing to go on — nothing
+    ran, or the meters it follows were not read.
+
+    A party is a company, or one of the register's non-company consumers.
+    """
+
+    setup = models.ForeignKey(
+        ElectricityMeterSetup,
+        on_delete=models.CASCADE,
+        related_name="shares",
+    )
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    consumer = models.ForeignKey(
+        ElectricityConsumer,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    percent = models.DecimalField(
+        max_digits=7,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+
+    class Meta:
+        ordering = ["-percent", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(company__isnull=False, consumer__isnull=True)
+                    | models.Q(company__isnull=True, consumer__isnull=False)
+                ),
+                name="electricity_share_names_one_party",
+            ),
+            models.UniqueConstraint(
+                fields=["setup", "company"],
+                condition=models.Q(company__isnull=False),
+                name="uniq_electricity_share_company",
+            ),
+            models.UniqueConstraint(
+                fields=["setup", "consumer"],
+                condition=models.Q(consumer__isnull=False),
+                name="uniq_electricity_share_consumer",
+            ),
+        ]
+
+    def __str__(self):
+        party = self.company or self.consumer
+        return f"{party}: {self.percent}%"
+
+
+class ElectricityMeterDriver(models.Model):
+    """What a proportional split is measured against.
+
+    ``RUN_HOURS`` follows production lines and blowing machines: each one's
+    hours that day, times its ``weight``, count for the company that owns it.
+    ``METER_RATIO`` follows other meters: each one's units that day, times its
+    ``weight``, count for the company named on the row — a meter has no company
+    of its own, so the row says who it stands for.
+
+    ``weight`` lets a big load count for more than a small one on the same
+    meter; leave it at 1 when the lines draw about the same.
+    """
+
+    setup = models.ForeignKey(
+        ElectricityMeterSetup,
+        on_delete=models.CASCADE,
+        related_name="drivers",
+    )
+    production_line = models.ForeignKey(
+        "production_execution.ProductionLine",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    blowing_machine = models.ForeignKey(
+        "blowing.BlowingMachine",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    meter = models.ForeignKey(
+        ElectricityMeter,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="driven_setups",
+    )
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Who a followed meter stands for. Lines and machines carry their own company.",
+    )
+    weight = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        default=Decimal("1"),
+        validators=[MinValueValidator(Decimal("0.0001"))],
+    )
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        production_line__isnull=False,
+                        blowing_machine__isnull=True,
+                        meter__isnull=True,
+                    )
+                    | models.Q(
+                        production_line__isnull=True,
+                        blowing_machine__isnull=False,
+                        meter__isnull=True,
+                    )
+                    | models.Q(
+                        production_line__isnull=True,
+                        blowing_machine__isnull=True,
+                        meter__isnull=False,
+                        company__isnull=False,
+                    )
+                ),
+                name="electricity_driver_names_one_source",
+            ),
+        ]
+
+    @property
+    def source_key(self) -> str:
+        if self.production_line_id:
+            return f"line:{self.production_line_id}"
+        if self.blowing_machine_id:
+            return f"blowing:{self.blowing_machine_id}"
+        return f"meter:{self.meter_id}"
+
+    def party_company(self):
+        """The company this driver's hours or units count for."""
+        if self.production_line_id:
+            return self.production_line.company
+        if self.blowing_machine_id:
+            return self.blowing_machine.company
+        return self.company
+
+    def __str__(self):
+        source = self.production_line or self.blowing_machine or self.meter
+        return f"{source} × {self.weight}"
+
+
 class DailyElectricityReading(BaseModel):
     """One reading per meter per day; units and cost are derived on save.
 
@@ -2581,6 +2845,10 @@ class DailyElectricityReading(BaseModel):
     power can differ from one day to the next — a line run for Beverages this
     week, Sidle taken off the supply that month. A reading entered before this
     existed carries nothing and falls back to its meter's standing list.
+
+    ``meter_reset`` is Daily Electricity++'s: there an opening must follow on
+    from the previous closing, unless the dial was replaced or reset and the
+    reading says so. The Daily Electricity page never sets it.
     """
 
     meter = models.ForeignKey(
@@ -2619,6 +2887,13 @@ class DailyElectricityReading(BaseModel):
     )
     opening_reading = models.DecimalField(max_digits=14, decimal_places=2)
     closing_reading = models.DecimalField(max_digits=14, decimal_places=2)
+    meter_reset = models.BooleanField(
+        default=False,
+        help_text=(
+            "The meter was replaced or its dial reset, so this opening does not "
+            "follow on from the previous closing."
+        ),
+    )
     # Snapshot of the meter's grid MF; the dial difference is multiplied by it.
     multiplying_factor = models.DecimalField(
         max_digits=10,
