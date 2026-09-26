@@ -29,6 +29,7 @@ from production_execution.services.plan_check_service import (
     CONFLICT_MATERIAL_CONTENTION,
     STATUS_CONTESTED,
     STATUS_OK,
+    STATUS_PARTIAL,
     STATUS_SHORT,
     STATUS_TIGHT,
     STATUS_UNKNOWN,
@@ -1173,3 +1174,167 @@ class ApprovalScopeTests(PlanCheckBase):
         # fetched, and the raw material is always requested.
         self.assertEqual(result['materials']['summary']['approval_lines'], 2)
         self.assertEqual(result['materials']['summary']['register_missing_lines'], 1)
+
+
+class OilProductionConsumptionStockTests(PlanCheckBase):
+    """Oil plans on what is already at BH-PC, and shows nothing else.
+
+    No godown, no Raw Material register: a component partly at the line is
+    PARTIAL and plans as it stands; one with nothing there is SHORT and needs a
+    written reason. No warehouse request is proposed at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.company.code = 'JIVO_OIL'
+        self.company.save()
+
+    def oil(self, bom_rows, stock_rows):
+        return ProductionPlanCheckService(
+            'JIVO_OIL',
+            plan_reader=FakePlanReader(bom_rows, stock_rows),
+            item_reader=FakeItemReader(),
+        ).check(line_id=self.line.id, item_code='FG001', required_qty=100, date=self.day)
+
+    def register(self, qty=32000):
+        RawMaterialStock.objects.create(
+            company=self.company, warehouse_code='BH-LO', item_code='RM0000002',
+            item_name='Canola oil', uom='LTR', qty=Decimal(str(qty)),
+            as_of_date=self.day, is_active=True,
+        )
+
+    def test_nothing_at_the_line_is_short_and_needs_a_reason(self):
+        result = self.oil(
+            [bom_row('PM001', 'Caps', 20)],
+            [stock_row('PM001', 'BH-PM', 50000)],
+        )
+        row = result['materials']['rows'][0]
+        self.assertEqual(row['on_hand'], 0)
+        self.assertEqual(row['status'], STATUS_SHORT)
+        self.assertEqual(row['searched_warehouses'], ['BH-PC'])
+        self.assertEqual(row['stock_scope'], 'PRODUCTION_CONSUMPTION')
+        self.assertTrue(result['blocking']['has_shortage'])
+        self.assertTrue(result['blocking']['requires_remark'])
+
+    def test_no_other_godown_is_shown(self):
+        result = self.oil(
+            [bom_row('PM001', 'Caps', 20)],
+            [stock_row('PM001', 'BH-PC', 700), stock_row('PM001', 'BH-PM', 50000)],
+        )
+        row = result['materials']['rows'][0]
+        self.assertEqual([w['warehouse'] for w in row['warehouses']], ['BH-PC'])
+        self.assertIsNone(row['sap_on_hand'])
+        self.assertIsNone(row['sap_free'])
+        self.assertEqual(result['materials']['warehouses'], ['BH-PC'])
+        self.assertTrue(all(
+            scope == ['BH-PC'] for scope in result['materials']['warehouse_scope'].values()
+        ))
+
+    def test_partly_at_the_line_is_partial_and_needs_no_reason(self):
+        result = self.oil(
+            [bom_row('PM001', 'Caps', 20)],
+            [stock_row('PM001', 'BH-PC', 500)],
+        )
+        row = result['materials']['rows'][0]
+        self.assertEqual(row['status'], STATUS_PARTIAL)
+        self.assertEqual(row['shortfall'], 1500)
+        summary = result['materials']['summary']
+        self.assertEqual(summary['partial_lines'], 1)
+        self.assertEqual(summary['short_lines'], 0)
+        self.assertFalse(result['blocking']['has_shortage'])
+        self.assertFalse(result['blocking']['requires_remark'])
+
+    def test_one_empty_line_among_partial_ones_still_needs_a_reason(self):
+        result = self.oil(
+            [bom_row('PM001', 'Caps', 20), bom_row('PM002', 'Labels', 20)],
+            [stock_row('PM001', 'BH-PC', 500)],
+        )
+        statuses = {r['item_code']: r['status'] for r in result['materials']['rows']}
+        self.assertEqual(statuses, {'PM001': STATUS_PARTIAL, 'PM002': STATUS_SHORT})
+        self.assertTrue(result['blocking']['requires_remark'])
+
+    def test_packing_at_pc_is_ok(self):
+        row = self.oil(
+            [bom_row('PM001', 'Caps', 20)],
+            [stock_row('PM001', 'BH-PC', 2000), stock_row('PM001', 'BH-PM', 10)],
+        )['materials']['rows'][0]
+        self.assertEqual(row['on_hand'], 2000)
+        self.assertEqual(row['status'], STATUS_OK)
+
+    def test_raw_partly_at_pc_is_partial_whatever_the_register_says(self):
+        self.register()
+        row = self.oil(
+            [bom_row('RM0000002', 'Canola oil', 20, group='RAW MATERIAL', uom='LTR')],
+            [stock_row('RM0000002', 'BH-PC', 500, group='RAW MATERIAL')],
+        )['materials']['rows'][0]
+        self.assertEqual(row['stock_source'], 'SAP')
+        self.assertEqual(row['on_hand'], 500)
+        self.assertEqual(row['status'], STATUS_PARTIAL)
+        self.assertFalse(row['register_missing'])
+        self.assertIsNone(row['register_as_of'])
+
+    def test_raw_not_on_the_register_is_not_flagged_as_missing_from_it(self):
+        result = self.oil(
+            [bom_row('RM0000002', 'Canola oil', 20, group='RAW MATERIAL', uom='LTR')],
+            [stock_row('RM0000002', 'BH-PC', 2500, group='RAW MATERIAL')],
+        )
+        row = result['materials']['rows'][0]
+        self.assertEqual(row['status'], STATUS_OK)
+        self.assertFalse(row['register_missing'])
+        self.assertEqual(result['materials']['summary']['register_missing_lines'], 0)
+
+    def test_bh_pc_is_counted_whatever_the_bill_names(self):
+        """BH-PP is a Beverages godown; an Oil bill pointing at it still means BH-PC."""
+        row = self.oil(
+            [bom_row('PM001', 'Caps', 20, issue_warehouse='BH-PP')],
+            [stock_row('PM001', 'BH-PC', 1500), stock_row('PM001', 'BH-PP', 9000)],
+        )['materials']['rows'][0]
+        self.assertEqual(row['on_hand'], 1500)
+        self.assertEqual(row['searched_warehouses'], ['BH-PC'])
+        self.assertEqual(row['status'], STATUS_PARTIAL)
+
+    def test_raw_consumed_from_the_tank_still_counts_only_bh_pc(self):
+        """The register is on its way out, so it never stands in for BH-PC."""
+        self.register()
+        row = self.oil(
+            [bom_row('RM0000002', 'Canola oil', 20, group='RAW MATERIAL', uom='LTR',
+                     issue_warehouse='BH-LO')],
+            [stock_row('RM0000002', 'BH-LO', 32000, group='RAW MATERIAL')],
+        )['materials']['rows'][0]
+        self.assertEqual(row['on_hand'], 0)
+        self.assertEqual(row['status'], STATUS_SHORT)
+
+    def test_no_warehouse_request_is_proposed(self):
+        result = self.oil(
+            [bom_row('PM001', 'Caps', 20),
+             bom_row('RM0000002', 'Canola oil', 20, group='RAW MATERIAL', uom='LTR')],
+            [stock_row('PM001', 'BH-PM', 9000)],
+        )
+        self.assertFalse(any(r['approval_required'] for r in result['materials']['rows']))
+        self.assertEqual(result['materials']['summary']['approval_lines'], 0)
+
+    def test_another_plan_wanting_the_stock_needs_no_reason(self):
+        self.make_run(line=self.other_line, item_code='FG002', materials={'PM001': 1500})
+        result = self.oil(
+            [bom_row('PM001', 'Caps', 20)],
+            [stock_row('PM001', 'BH-PC', 2500)],
+        )
+        row = result['materials']['rows'][0]
+        self.assertEqual(row['status'], STATUS_CONTESTED)
+        self.assertEqual(row['other_plan_demand'], 1500)
+        self.assertFalse(result['blocking']['has_contention'])
+        self.assertFalse(result['blocking']['requires_remark'])
+        self.assertFalse([
+            c for c in result['conflicts'] if c['type'] == CONFLICT_MATERIAL_CONTENTION
+        ])
+
+    def test_other_companies_still_count_the_stores(self):
+        Company.objects.create(code='TEST_CO', name='Test Company')
+        row = self.service(
+            bom_rows=[bom_row('PM001', 'Caps', 20)],
+            stock_rows=[stock_row('PM001', 'BH-PM', 5000)],
+        ).check(
+            line_id=self.line.id, item_code='FG001', required_qty=100, date=self.day,
+        )['materials']['rows'][0]
+        self.assertEqual(row['status'], STATUS_OK)
+        self.assertEqual(row['stock_scope'], 'STORES')

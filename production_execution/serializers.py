@@ -18,7 +18,7 @@ from .models import (
     ProductionRunCost, ProductionRunCostLine, InProcessQCCheck, FinalQCCheck,
     FillingCostSheet, FillingCostSheetEntry,
 )
-from .services.production_service import start_checks_are_optional
+from .services.production_service import bom_request_required, start_checks_are_optional
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +385,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
     breakdowns = serializers.SerializerMethodField()
     machine_ids = serializers.SerializerMethodField()
     start_checks_optional = serializers.SerializerMethodField()
+    bom_request_required = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductionRun
@@ -402,6 +403,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
             'warehouse_approval_status',
             'status', 'created_by', 'created_at', 'updated_at',
             'segments', 'breakdowns', 'machine_ids', 'start_checks_optional',
+            'bom_request_required',
         ]
 
     def get_machine_ids(self, obj):
@@ -410,6 +412,10 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
     def get_start_checks_optional(self, obj):
         """The RM/PM request and line clearance gate a start only once sent."""
         return start_checks_are_optional(obj.company.code)
+
+    def get_bom_request_required(self, obj):
+        """False where no BOM request is sent — the run starts on BH-PC stock."""
+        return bom_request_required(obj.company.code)
 
     def get_segments(self, obj):
         return ProductionSegmentSerializer(obj.segments.all(), many=True).data

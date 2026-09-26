@@ -97,12 +97,15 @@ def make_box(company, barcode, *, item_code="ITM1", pallet=None, warehouse="WH-A
 
 
 class BOMReRequestTests(TestCase):
-    """Production re-requests the un-approved remainder of a partial/rejected BOM request."""
+    """Production re-requests the un-approved remainder of a partial/rejected BOM request.
+
+    Beverages, not Oil: Oil sends the warehouse no BOM request at all.
+    """
 
     def setUp(self):
         from production_execution.models import ProductionLine, ProductionRun
 
-        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.company = Company.objects.create(name="Jivo Beverages", code="JIVO_BEVERAGES")
         self.user = User.objects.create(
             email="prod@example.com", full_name="Prod User", employee_code="EMP-P",
         )

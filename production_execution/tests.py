@@ -2566,7 +2566,7 @@ class StartProductionGateTests(TestCase):
             date=run.date, status=clearance_status)
 
     def test_other_company_still_needs_both_checks(self):
-        run, service = self._run_for('JIVO_OIL')
+        run, service = self._run_for('JIVO_MART')
         with self.assertRaisesMessage(ValueError, 'submit the BOM request'):
             service.start_production(run.id)
         run.warehouse_approval_status = 'APPROVED'
@@ -2611,3 +2611,103 @@ class StartProductionGateTests(TestCase):
         oil, _ = self._run_for('JIVO_OIL')
         self.assertTrue(ProductionRunDetailSerializer(bev).data['start_checks_optional'])
         self.assertFalse(ProductionRunDetailSerializer(oil).data['start_checks_optional'])
+
+
+class OilSendsNoBOMRequestTests(TestCase):
+    """Oil plans on the stock at BH-PC and sends the warehouse nothing.
+
+    A run is created needing no approval and starts without a BOM request — a
+    request left over from before is not waited on either. Line clearance still
+    gates the start. Only a component with nothing at BH-PC needs a reason.
+    """
+
+    def _company(self, code):
+        from production_execution.models import ProductionLine
+        company, _ = Company.objects.get_or_create(code=code, defaults={'name': code})
+        line, _ = ProductionLine.objects.get_or_create(company=company, name='Line-1')
+        return company, line
+
+    def _run(self, code, **fields):
+        company, line = self._company(code)
+        run = ProductionRun.objects.create(
+            company=company, line=line, run_number=1, date=date.today(), **fields)
+        return run, ProductionExecutionService(code)
+
+    def _clear(self, run):
+        from production_execution.models import LineClearance
+        LineClearance.objects.create(
+            company=run.company, production_run=run, line=run.line,
+            date=run.date, status='CLEARED')
+
+    def _create(self, code):
+        from unittest.mock import patch
+        _, line = self._company(code)
+        service = ProductionExecutionService(code)
+        with patch.object(ProductionExecutionService, 'resolve_pieces_per_case', return_value=20), \
+             patch.object(ProductionExecutionService, 'resolve_litres_per_piece', return_value=None), \
+             patch.object(ProductionExecutionService, 'auto_populate_materials_from_bom', return_value=[]), \
+             patch('production_execution.services.cost_calculator.recalculate_run_cost'):
+            return service.create_run({
+                'line_id': line.id, 'date': date.today(), 'item_code': 'FG001',
+                'product': 'FG001', 'required_qty': Decimal('100'),
+                'planning_remark': 'test',
+            }, user=None)
+
+    def test_oil_run_is_created_needing_no_approval(self):
+        self.assertEqual(self._create('JIVO_OIL').warehouse_approval_status, 'NOT_REQUIRED')
+        self.assertEqual(self._create('JIVO_MART').warehouse_approval_status, 'NOT_REQUESTED')
+
+    def test_oil_starts_without_a_request_but_still_needs_clearance(self):
+        run, service = self._run('JIVO_OIL')
+        self.assertEqual(run.warehouse_approval_status, 'NOT_REQUESTED')
+        with self.assertRaisesMessage(ValueError, 'line clearance'):
+            service.start_production(run.id)
+        self._clear(run)
+        service.start_production(run.id)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'IN_PROGRESS')
+
+    def test_oil_does_not_wait_on_a_request_left_over(self):
+        company, line = self._company('JIVO_OIL')
+        service = ProductionExecutionService('JIVO_OIL')
+        for number, left_over in enumerate(('PENDING', 'REJECTED'), start=1):
+            run = ProductionRun.objects.create(
+                company=company, line=line, run_number=number, date=date.today(),
+                warehouse_approval_status=left_over)
+            self._clear(run)
+            service.start_production(run.id)
+
+    def test_detail_tells_the_page_no_request_is_sent(self):
+        from production_execution.serializers import ProductionRunDetailSerializer
+        oil, _ = self._run('JIVO_OIL')
+        bev, _ = self._run('JIVO_BEVERAGES')
+        self.assertFalse(ProductionRunDetailSerializer(oil).data['bom_request_required'])
+        self.assertTrue(ProductionRunDetailSerializer(bev).data['bom_request_required'])
+
+    def _guard(self, *, short=0, contested=0, scope='PRODUCTION_CONSUMPTION', remark=''):
+        from unittest.mock import patch
+        from production_execution.services.plan_check_service import ProductionPlanCheckService
+        self._company('JIVO_OIL')
+        result = {'materials': {
+            'available': True, 'stock_scope': scope,
+            'summary': {'short_lines': short, 'contested_lines': contested},
+        }}
+        with patch.object(ProductionPlanCheckService, 'check', return_value=result):
+            ProductionExecutionService('JIVO_OIL')._guard_material_readiness(
+                {'item_code': 'FG001', 'required_qty': 100, 'date': date.today()},
+                remark, 20,
+            )
+
+    def test_a_component_with_nothing_at_bh_pc_needs_a_reason(self):
+        with self.assertRaisesMessage(ValueError, 'nothing at the production consumption'):
+            self._guard(short=1)
+        self._guard(short=1, remark='GRN due at 05:00')
+
+    def test_partial_or_claimed_stock_needs_no_reason(self):
+        # Partial lines are not counted as short, and contention is not gated.
+        self._guard(short=0, contested=2)
+
+    def test_the_stores_rule_still_gates_contention_elsewhere(self):
+        with self.assertRaisesMessage(ValueError, 'claimed by another plan'):
+            self._guard(contested=1, scope='STORES')
+

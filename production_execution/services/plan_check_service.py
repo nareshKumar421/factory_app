@@ -109,6 +109,10 @@ STATUS_UNKNOWN = 'UNKNOWN'
 STATUS_NO_STOCK_RECORD = 'NO_STOCK_RECORD'
 STATUS_TIGHT = 'TIGHT'
 STATUS_CONTESTED = 'CONTESTED'
+# Some of the requirement is at the line, not all of it. Only where stock is
+# counted at the line alone (Oil): the run is planned on what is there, and
+# only a component with nothing at the line at all is SHORT.
+STATUS_PARTIAL = 'PARTIAL'
 STATUS_SHORT = 'SHORT'
 
 # `UNKNOWN` sits just above `OK` deliberately. It means the stock read failed,
@@ -119,14 +123,30 @@ STATUS_SEVERITY = {
     STATUS_UNKNOWN: 1,
     STATUS_TIGHT: 2,
     STATUS_CONTESTED: 3,
-    STATUS_NO_STOCK_RECORD: 4,
-    STATUS_SHORT: 5,
+    STATUS_PARTIAL: 4,
+    STATUS_NO_STOCK_RECORD: 5,
+    STATUS_SHORT: 6,
 }
 
 # Conflict kinds.
 CONFLICT_LINE_BUSY = 'LINE_BUSY'
 CONFLICT_DUPLICATE_SKU = 'DUPLICATE_SKU'
 CONFLICT_MATERIAL_CONTENTION = 'MATERIAL_CONTENTION'
+
+# Companies whose plans count only what is already at their production
+# consumption warehouse, for raw and packing material alike. For Oil that is
+# strictly `BH-PC`, whatever warehouse a bill line names — `BH-PP` is a
+# Beverages godown — and neither the other godowns nor the Raw Material
+# register are read into the row: the screen shows BH-PC and nothing else.
+# No warehouse request is raised either (see
+# `production_service.NO_BOM_REQUEST_COMPANY_CODES`). A component partly at the
+# line is PARTIAL and plans as it stands; one with nothing there is SHORT and
+# needs a written reason.
+PC_ONLY_STOCK_WAREHOUSES = {'JIVO_OIL': 'BH-PC'}
+
+# Where a row's `on_hand` was counted.
+STOCK_SCOPE_STORES = 'STORES'
+STOCK_SCOPE_PRODUCTION_CONSUMPTION = 'PRODUCTION_CONSUMPTION'
 
 # A run is a claim on the factory while it is planned or running. COMPLETED runs
 # have already consumed what they consumed and are out of the picture.
@@ -335,6 +355,14 @@ class ProductionPlanCheckService:
             material_rows=materials['rows'],
         )
 
+        # At the line only, what is there is what the run plans on: another
+        # plan wanting the same stock is shown, not something to justify.
+        at_line_only = materials.get('stock_scope') == STOCK_SCOPE_PRODUCTION_CONSUMPTION
+        has_shortage = materials['summary']['short_lines'] > 0
+        has_contention = (
+            materials['summary']['contested_lines'] > 0 and not at_line_only
+        )
+
         return {
             'timing': timing,
             'materials': materials,
@@ -342,14 +370,10 @@ class ProductionPlanCheckService:
             'blocking': {
                 # Not "blocking" in the sense of refusing the save — it is what
                 # the supervisor has to write a reason for.
-                'has_shortage': materials['summary']['short_lines'] > 0,
-                'has_contention': materials['summary']['contested_lines'] > 0,
+                'has_shortage': has_shortage,
+                'has_contention': has_contention,
                 'has_conflicts': len(conflicts) > 0,
-                'requires_remark': (
-                    materials['summary']['short_lines'] > 0
-                    or materials['summary']['contested_lines'] > 0
-                    or len(conflicts) > 0
-                ),
+                'requires_remark': has_shortage or has_contention or len(conflicts) > 0,
             },
             'meta': {
                 'company_code': self.company_code,
@@ -552,7 +576,8 @@ class ProductionPlanCheckService:
         """
         empty_summary = {
             'total_lines': 0, 'ok_lines': 0, 'tight_lines': 0,
-            'contested_lines': 0, 'short_lines': 0, 'no_record_lines': 0,
+            'contested_lines': 0, 'partial_lines': 0, 'short_lines': 0,
+            'no_record_lines': 0,
             'status': STATUS_OK, 'approval_lines': 0, 'register_missing_lines': 0,
         }
         if not item_code:
@@ -583,6 +608,10 @@ class ProductionPlanCheckService:
             approval_scope.consumption_warehouse_for_line(c['issue_warehouse'])
             for c in recipe
         }
+        pc_only_whs = PC_ONLY_STOCK_WAREHOUSES.get(self.company_code, '')
+        pc_only = bool(pc_only_whs)
+        if pc_only:
+            staging_warehouses.add(pc_only_whs)
 
         try:
             stock, warehouses, warehouse_scope, staged = self._stock(
@@ -596,7 +625,7 @@ class ProductionPlanCheckService:
 
         on_order = self._on_order(codes)
         other_demand = self._demand_by_code(competitors, codes)
-        register = self._register_stock(
+        register = {} if pc_only else self._register_stock(
             [c['item_code'] for c in recipe if c['material_type'] == scope_raw()]
         )
 
@@ -637,6 +666,24 @@ class ProductionPlanCheckService:
                 free = on_hand - committed
                 holdings = (entry or {}).get('warehouses', [])
 
+            pc_code = approval_scope.consumption_warehouse_for_line(
+                comp['issue_warehouse']
+            )
+            at_pc = staged.get(code, {}).get(pc_code, ZERO)
+            searched = warehouse_scope.get(comp['material_type'], [])
+            if pc_only:
+                at_line = staged.get(code, {}).get(pc_only_whs, ZERO)
+                source = SOURCE_SAP
+                on_hand = max(ZERO, at_line)
+                # `OITW` committed is not read for the staging warehouse, and a
+                # guessed one would flag TIGHT on nothing.
+                committed = free = None
+                holdings = (
+                    [{'warehouse': pc_only_whs, 'on_hand': at_line, 'committed': ZERO}]
+                    if at_line else []
+                )
+                searched = [pc_only_whs]
+
             claimed = other_demand.get(code, {}).get('qty', ZERO)
 
             # Shortfall is judged on physical stock: the material is in the
@@ -646,13 +693,22 @@ class ProductionPlanCheckService:
             shortfall = max(ZERO, required - on_hand)
             after_others = on_hand - claimed - required
 
-            if stock_error and not is_raw:
+            if stock_error and (not is_raw or pc_only):
                 # The stock read failed. Every figure below it is unknown, and
                 # saying "short" here would turn a HANA outage into a fake
                 # material crisis — and would demand a written override for it.
                 status = STATUS_UNKNOWN
                 on_hand = committed = free = shortfall = None
                 after_others = None
+            elif pc_only:
+                if required > ZERO and on_hand <= ZERO:
+                    status = STATUS_SHORT
+                elif shortfall > ZERO:
+                    status = STATUS_PARTIAL
+                elif claimed > ZERO and after_others < ZERO:
+                    status = STATUS_CONTESTED
+                else:
+                    status = STATUS_OK
             elif is_raw and reg is None and required > ZERO:
                 # Not on the register at all — nobody has said this oil is
                 # anywhere, which is a different fix from "the tank is low".
@@ -673,15 +729,21 @@ class ProductionPlanCheckService:
             # the oil stores only, so reading BH-PC off it would always say
             # nothing is staged and promise a request twenty times the size of
             # the one that will actually be raised.
-            pc_code = approval_scope.consumption_warehouse_for_line(
-                comp['issue_warehouse']
-            )
-            approval = approval_scope.line_approval(
-                comp['material_type'],
-                required,
-                staged.get(code, {}).get(pc_code, ZERO),
-                consumption_code=pc_code,
-            )
+            if pc_only:
+                # Nothing goes to the warehouse: the run draws what is at BH-PC.
+                approval = {
+                    'required': False,
+                    'qty': ZERO,
+                    'reason': f"No warehouse request — the run draws from {pc_only_whs}.",
+                    'from_production_consumption': min(max(ZERO, required), on_hand or ZERO),
+                }
+            else:
+                approval = approval_scope.line_approval(
+                    comp['material_type'],
+                    required,
+                    at_pc,
+                    consumption_code=pc_code,
+                )
 
             arriving = on_order.get(code) or {}
             rows.append({
@@ -691,7 +753,7 @@ class ProductionPlanCheckService:
                 'material_type': comp['material_type'],
                 'item_group': comp['item_group'],
                 'issue_warehouse': comp['issue_warehouse'],
-                'searched_warehouses': warehouse_scope.get(comp['material_type'], []),
+                'searched_warehouses': searched,
                 'has_own_bom': comp['has_own_bom'],
                 'qty_per_case': _num(comp['qty_per_case']),
                 'qty_per_piece': _num(comp['qty_per_piece']),
@@ -711,12 +773,21 @@ class ProductionPlanCheckService:
                 'shortfall': _num(shortfall),
                 'status': status,
                 'stock_source': source,
-                'register_missing': bool(is_raw and reg is None),
+                # The register is not read at all where the line's stock alone
+                # counts, so it cannot be missing from it.
+                'register_missing': bool(is_raw and reg is None and not pc_only),
+                'stock_scope': (
+                    STOCK_SCOPE_PRODUCTION_CONSUMPTION if pc_only
+                    else STOCK_SCOPE_STORES
+                ),
                 'register_as_of': (reg or {}).get('as_of_date'),
                 # SAP's own numbers travel even on a register-sourced row, so a
-                # register nobody has updated in a month is visible.
-                'sap_on_hand': _num(sap_on_hand) if entry else None,
-                'sap_free': _num(sap_on_hand - sap_committed) if entry else None,
+                # register nobody has updated in a month is visible. Not where
+                # only the line's stock is shown: they are other godowns' stock.
+                'sap_on_hand': _num(sap_on_hand) if entry and not pc_only else None,
+                'sap_free': (
+                    _num(sap_on_hand - sap_committed) if entry and not pc_only else None
+                ),
                 'approval_required': approval['required'],
                 'approval_qty': _num(approval['qty']),
                 'approval_reason': approval['reason'],
@@ -745,6 +816,7 @@ class ProductionPlanCheckService:
             'ok_lines': sum(1 for r in rows if r['status'] == STATUS_OK),
             'tight_lines': sum(1 for r in rows if r['status'] == STATUS_TIGHT),
             'contested_lines': sum(1 for r in rows if r['status'] == STATUS_CONTESTED),
+            'partial_lines': sum(1 for r in rows if r['status'] == STATUS_PARTIAL),
             'short_lines': sum(
                 1 for r in rows if r['status'] in (STATUS_SHORT, STATUS_NO_STOCK_RECORD)
             ),
@@ -763,9 +835,17 @@ class ProductionPlanCheckService:
             'resource_lines': resources,
             'available': not stock_error,
             'error': stock_error,
-            'warehouses': warehouses,
-            'warehouse_scope': warehouse_scope,
+            # Where the line's stock alone counts, that is the only warehouse
+            # the check is about.
+            'warehouses': [pc_only_whs] if pc_only else warehouses,
+            'warehouse_scope': (
+                {kind: [pc_only_whs] for kind in warehouse_scope} if pc_only
+                else warehouse_scope
+            ),
             'basis': basis,
+            'stock_scope': (
+                STOCK_SCOPE_PRODUCTION_CONSUMPTION if pc_only else STOCK_SCOPE_STORES
+            ),
         }
 
     def _recipe(self, item_code: str, pieces_per_case=None):
@@ -1094,6 +1174,10 @@ class ProductionPlanCheckService:
             if not row['competing_runs']:
                 continue
             if row['status'] not in (STATUS_CONTESTED, STATUS_SHORT):
+                continue
+            if row.get('stock_scope') == STOCK_SCOPE_PRODUCTION_CONSUMPTION:
+                # The run plans on what is at the line; the other plans stay on
+                # the row, but are nothing to acknowledge.
                 continue
             names = ', '.join(f"#{r['run_number']}" for r in row['competing_runs'][:3])
             more = len(row['competing_runs']) - 3

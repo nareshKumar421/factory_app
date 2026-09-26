@@ -41,6 +41,17 @@ def start_checks_are_optional(company_code: str) -> bool:
     return company_code in OPTIONAL_START_CHECK_COMPANY_CODES
 
 
+#: Companies that do not send a BOM request to the warehouse at all. Their plan
+#: is checked against what is already at the line (BH-PC — see
+#: ``plan_check_service.PC_ONLY_STOCK_WAREHOUSES``) and a run starts on that, so
+#: nothing is raised that somebody would have to approve.
+NO_BOM_REQUEST_COMPANY_CODES = frozenset({'JIVO_OIL'})
+
+
+def bom_request_required(company_code: str) -> bool:
+    return company_code not in NO_BOM_REQUEST_COMPANY_CODES
+
+
 class ProductionExecutionService:
 
     def __init__(self, company_code: str):
@@ -300,6 +311,11 @@ class ProductionExecutionService:
             other_manpower_count=data.get('other_manpower_count', 0),
             supervisor=data.get('supervisor', ''),
             operators=data.get('operators', ''),
+            # A company that sends no BOM request has nothing to wait for.
+            warehouse_approval_status=(
+                'NOT_REQUESTED' if bom_request_required(self.company_code)
+                else 'NOT_REQUIRED'
+            ),
             status=RunStatus.DRAFT,
             created_by=user,
         )
@@ -441,14 +457,26 @@ class ProductionExecutionService:
             )
             return
 
+        from .plan_check_service import STOCK_SCOPE_PRODUCTION_CONSUMPTION
+
         summary = materials['summary']
         short, contested = summary['short_lines'], summary['contested_lines']
+        at_line_only = materials.get('stock_scope') == STOCK_SCOPE_PRODUCTION_CONSUMPTION
+        if at_line_only:
+            # Only a component with nothing at the line needs a reason. One that
+            # is partly there, or that another plan also wants, is planned as it
+            # stands — `short_lines` already counts only the empty ones.
+            contested = 0
         if not (short or contested):
             return
 
         parts = []
         if short:
-            parts.append(f"{short} component(s) short in the warehouse")
+            parts.append(
+                f"{short} component(s) with nothing at the production consumption "
+                f"warehouse (BH-PC)" if at_line_only
+                else f"{short} component(s) short in the warehouse"
+            )
         if contested:
             parts.append(f"{contested} component(s) already claimed by another plan")
         raise ValueError(
@@ -779,13 +807,16 @@ class ProductionExecutionService:
         # same as NOT_REQUESTED, where nobody has submitted anything yet.
         # Where the checks are optional, NOT_REQUESTED passes too: the floor
         # chose not to send one, and only a request actually sent is waited on.
+        # Where no BOM request is sent at all, there is no warehouse gate — a
+        # request left over from before is not waited on either.
         optional = start_checks_are_optional(self.company_code)
-        if run.warehouse_approval_status == 'NOT_REQUESTED' and not optional:
-            raise ValueError("Cannot start production — submit the BOM request to warehouse first.")
-        if run.warehouse_approval_status == 'PENDING':
-            raise ValueError("Cannot start production — BOM request is pending warehouse approval.")
-        if run.warehouse_approval_status == 'REJECTED':
-            raise ValueError("Cannot start production — BOM request was rejected by warehouse.")
+        if bom_request_required(self.company_code):
+            if run.warehouse_approval_status == 'NOT_REQUESTED' and not optional:
+                raise ValueError("Cannot start production — submit the BOM request to warehouse first.")
+            if run.warehouse_approval_status == 'PENDING':
+                raise ValueError("Cannot start production — BOM request is pending warehouse approval.")
+            if run.warehouse_approval_status == 'REJECTED':
+                raise ValueError("Cannot start production — BOM request was rejected by warehouse.")
 
         # Line clearance gate — only allow start if QA has cleared. Where it is
         # optional, it applies once a clearance has been sent to QA; a draft

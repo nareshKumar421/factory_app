@@ -90,6 +90,8 @@ class WarehouseService:
         """
         from production_execution.models import ProductionRun
 
+        self._refuse_where_no_bom_request()
+
         run_id = data['production_run_id']
         required_qty = D(str(data['required_qty']))
 
@@ -167,6 +169,21 @@ class WarehouseService:
 
         self.recompute_run_approval_status(run)
         return raised
+
+    def _refuse_where_no_bom_request(self):
+        """A company whose runs start on the stock at the line sends nothing.
+
+        Refused rather than quietly skipped, so a stale screen that still offers
+        the button says why instead of appearing to have sent something.
+        Preform (blowing) requests are a different flow and are not affected.
+        """
+        from production_execution.services.production_service import bom_request_required
+
+        if not bom_request_required(self.company_code):
+            raise ValueError(
+                "No BOM request is sent to the warehouse here — the run is planned "
+                "against the stock at BH-PC and can start without one."
+            )
 
     def _raise_request(self, *, run, kind, lines, required_qty, remarks, user) -> BOMRequest:
         bom_request = BOMRequest.objects.create(
@@ -406,6 +423,8 @@ class WarehouseService:
         while the top-up is pending; warehouse approval of the follow-up updates it.
         """
         source = self.get_bom_request(request_id)
+        if source.production_run_id:
+            self._refuse_where_no_bom_request()
 
         if source.status not in [
             BOMRequestStatus.PARTIALLY_APPROVED, BOMRequestStatus.REJECTED

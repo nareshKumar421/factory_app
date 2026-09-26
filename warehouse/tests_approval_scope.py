@@ -564,3 +564,35 @@ class RawMaterialApprovalStockTests(TestCase):
         stock = self.service._get_stock_for_lines(self.request)
 
         self.assertEqual(stock['RM0000002']['OnHand'], Decimal('500'))
+
+
+class OilSendsNoBOMRequestTests(TestCase):
+    """Oil plans on the stock at BH-PC, so it raises no warehouse request."""
+
+    def setUp(self):
+        self.company = Company.objects.create(code='JIVO_OIL', name='Jivo Oil')
+        self.line = ProductionLine.objects.create(company=self.company, name='Line-1')
+        self.run = ProductionRun.objects.create(
+            company=self.company, run_number=1, date='2026-09-26',
+            line=self.line, product='FG001', item_code='FG001',
+            required_qty=Decimal('200'), status=RunStatus.DRAFT,
+        )
+        self.service = WarehouseService('JIVO_OIL')
+
+    def test_a_request_is_refused(self):
+        with self.assertRaisesMessage(ValueError, 'No BOM request is sent'):
+            self.service.create_bom_request(
+                {'production_run_id': self.run.id, 'required_qty': Decimal('200')},
+                user=None,
+            )
+        self.assertFalse(BOMRequest.objects.exists())
+
+    def test_a_shortfall_is_not_re_requested(self):
+        old = BOMRequest.objects.create(
+            company=self.company, production_run=self.run,
+            required_qty=Decimal('200'), status=BOMRequestStatus.PARTIALLY_APPROVED,
+        )
+        with self.assertRaisesMessage(ValueError, 'No BOM request is sent'):
+            self.service.re_request_bom_shortfall(old.id, user=None)
+        self.assertEqual(BOMRequest.objects.count(), 1)
+
