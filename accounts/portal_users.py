@@ -72,8 +72,40 @@ ROLE_MODULE_GROUPS = {
         "sap_adder": ["BOM Changes - SAP Pusher"],
         "admin": ["BOM Changes - Admin"],
     },
+    # Customer and vendor registration (server.js, routes/vendors.js): managers
+    # verified; sap_adder and admin also created the partner in SAP (and, like
+    # any login, could verify). "approvals" was the approver's screen for both.
+    "approvals": {
+        "manager": ["Customer Onboarding - Verifier", "Vendor Onboarding - Verifier"],
+        "sr_manager": ["Customer Onboarding - Verifier", "Vendor Onboarding - Verifier"],
+        "sap_adder": [
+            "Customer Onboarding - Verifier", "Customer Onboarding - SAP Approver",
+            "Vendor Onboarding - Verifier", "Vendor Onboarding - SAP Approver",
+        ],
+        "admin": [
+            "Customer Onboarding - Verifier", "Customer Onboarding - SAP Approver",
+            "Vendor Onboarding - Verifier", "Vendor Onboarding - SAP Approver",
+        ],
+    },
+    "customers": {
+        "manager": ["Customer Onboarding - Verifier"],
+        "sr_manager": ["Customer Onboarding - Verifier"],
+        "sap_adder": ["Customer Onboarding - Verifier", "Customer Onboarding - SAP Approver"],
+        "admin": ["Customer Onboarding - Verifier", "Customer Onboarding - SAP Approver"],
+    },
+    "vendors": {
+        "manager": ["Vendor Onboarding - Verifier"],
+        "sr_manager": ["Vendor Onboarding - Verifier"],
+        "sap_adder": ["Vendor Onboarding - Verifier", "Vendor Onboarding - SAP Approver"],
+        "admin": ["Vendor Onboarding - Verifier", "Vendor Onboarding - SAP Approver"],
+    },
 }
-ROLE_MODULE_DEFAULT = {"bom": ["BOM Changes - Requester"]}
+ROLE_MODULE_DEFAULT = {
+    "bom": ["BOM Changes - Requester"],
+    "approvals": ["Partner Onboarding - Viewer"],
+    "customers": ["Partner Onboarding - Viewer"],
+    "vendors": ["Partner Onboarding - Viewer"],
+}
 
 # Modules with nothing to grant, and why (shown in the report).
 NOT_GRANTED = {

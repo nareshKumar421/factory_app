@@ -165,6 +165,38 @@ class MappingTests(TestCase):
                             ("unknown", "BOM Changes - Requester")):
             self.assertEqual(portal_users.group_names_for(role, ["bom"])[0], [group])
 
+    def test_partner_registration_groups_follow_the_portal_role(self):
+        self.assertEqual(
+            portal_users.group_names_for("manager", ["approvals"])[0],
+            ["Customer Onboarding - Verifier", "Vendor Onboarding - Verifier"],
+        )
+        self.assertEqual(
+            portal_users.group_names_for("sap_adder", ["vendors"])[0],
+            ["Vendor Onboarding - Verifier", "Vendor Onboarding - SAP Approver"],
+        )
+        self.assertEqual(portal_users.group_names_for("unknown", ["customers"])[0], ["Partner Onboarding - Viewer"])
+
+    def test_every_mapped_group_is_one_a_setup_command_creates(self):
+        """A renamed group in any app would silently stop the importer granting it."""
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from accounts.management.commands.setup_dashboard_groups import ACTION_GROUPS, PAGE_GROUPS
+
+        for command in ("setup_sap_finance_groups", "setup_sap_documents_groups", "setup_sap_approvals_groups",
+                        "setup_bom_changes_groups", "setup_partner_onboarding_groups", "setup_production_groups",
+                        "setup_credit_note_approval_groups"):
+            call_command(command, stdout=StringIO())
+        # setup_dashboard_groups needs the board feed rights a migrated database
+        # has; its table is read instead ("SAP Reports" comes from there).
+        dashboard_groups = set(PAGE_GROUPS) | set(ACTION_GROUPS)
+        mapped = {g for groups in portal_users.MODULE_GROUPS.values() for g in groups}
+        mapped |= {g for by_role in portal_users.ROLE_MODULE_GROUPS.values() for groups in by_role.values() for g in groups}
+        mapped |= {g for groups in portal_users.ROLE_MODULE_DEFAULT.values() for g in groups}
+        created = set(Group.objects.values_list("name", flat=True)) | dashboard_groups
+        self.assertEqual(mapped - created, set())
+
     def test_unmapped_modules_are_explained(self):
         groups, notes = portal_users.group_names_for("manager", ["grpo", "mystery"])
         self.assertEqual(groups, [])
