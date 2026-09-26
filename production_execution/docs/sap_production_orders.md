@@ -53,7 +53,7 @@ holds for approval answers `{"pending_approval": true, "draft_entry": N}`.
 
 ## Setting it up on a live database
 
-1. `manage.py migrate production_execution` (0046 creates the action log and
+1. `manage.py migrate production_execution` (0047 creates the action log and
    the five rights).
 2. `manage.py setup_production_groups` creates *Production SAP Orders* (all
    five) and *Production SAP Orders Viewer*, leaving the other groups as they

@@ -43,6 +43,16 @@ without it. At minimum check `HANA_HOST`/`HANA_USER`/`HANA_PASSWORD`, `SL_URL` a
 the database settings — a stale one of these fails quietly rather than loudly: the
 app runs, and item names simply stop appearing.
 
+Added with the SAP Portal merge ([sap-portal-merge.md](sap-portal-merge.md)), all
+optional — the app boots without them:
+
+| Key | Default | Effect |
+|--|--|--|
+| `SAP_FILE_SERVICE_BASE_URL` | empty | SAP attachment downloads (the portal's `FILE_SERVICE_BASE`); empty = downloads refused with a clear message |
+| `SAP_FILE_SERVICE_TIMEOUT_SECONDS` | 60 | |
+| `SAP_FILE_SERVICE_COMPANY_ID_{JIVO_OIL,JIVO_BEVERAGES,JIVO_MART}` | 1, 2, 3 | the file service's own company ids |
+| `BOM_CHANGE_APPROVAL_LEVELS` | 3 | BOM change approval levels; anything but 2, 3 or 4 stops the app starting |
+
 ## Verified
 
 The backend pipeline was confirmed end to end on 21 Aug 2026, after the server

@@ -30,7 +30,6 @@ from sap_client.exceptions import SAPConnectionError, SAPValidationError
 
 from . import permissions as guards
 from . import services, workflow
-from .constants import BOMChangeStatus
 from .management.commands.setup_bom_changes_groups import BOM_CHANGES_GROUPS
 from .models import BOMChangeApproval, BOMChangeLine, BOMChangeRequest
 
