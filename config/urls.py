@@ -96,6 +96,8 @@ urlpatterns = [
     path("api/v1/universal-search/", include("universal_search.urls")),
     # Journal entries, ledgers, chart of accounts and the SAP budget UDO (from SAP Portal).
     path("api/v1/sap-finance/", include("sap_finance.urls")),
+    # SAP document browser, payment drafts and attachment downloads (from SAP Portal).
+    path("api/v1/sap-documents/", include("sap_documents.urls")),
     path("api/v1/etp/", include("etp.urls")),
     path(
         "api/v1/dashboards/factory-expense/",

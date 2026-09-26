@@ -204,6 +204,13 @@ INSTALLED_APPS = [
     # the record of who changed which budget from here (SAP stamps the
     # service account). Not budget_approvals: that is a read-only dashboard.
     'sap_finance.apps.SapFinanceConfig',
+    # SAP Portal's document browser, merged in: purchase and sales documents,
+    # transfers, journal entries, payments and drafts read live from SAP, with
+    # their attachments streamed from SAP's file service. Owns only the record
+    # of who downloaded which attachment (SAP sees the service account). Beside
+    # sap_finance, the other SAP Portal screen; not universal_search, which
+    # finds one number and opens nothing.
+    'sap_documents.apps.SapDocumentsConfig',
     'factory_expense',
     'cost_master',
     'org_chart.apps.OrgChartConfig',

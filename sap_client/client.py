@@ -704,6 +704,52 @@ class SAPClient:
         """POST InventoryGenEntries receiving a production order's finished product."""
         return ReceiptFromProductionWriter(self.context).create(payload)
 
+    # ---- SAP documents (ported from SAP Portal) ----
+    # The document browser: lists and detail through the Service Layer (the
+    # property lists SAP Portal proved live), names and journals from HANA on
+    # one connection per screen (sap_client/hana/document_reader.py).
+    def list_sap_documents(
+        self, entity: str, *, select: str, filter: str = "", orderby: str = "", top: int = 20, skip: int = 0
+    ) -> list[dict]:
+        """Up to ``top`` rows of a document collection, from row ``skip``.
+
+        The Service Layer pages at 20 rows whatever ``$top`` says, so this asks
+        page by page until it has ``top`` rows or SAP runs out.
+        """
+        client = ServiceLayerEntityClient(self.context)
+        top, skip = max(1, int(top)), max(0, int(skip))
+        rows: list[dict] = []
+        for _ in range(10):
+            page, _next = client.get_page(
+                entity, select=select, filter=filter, orderby=orderby, top=top - len(rows), skip=skip + len(rows)
+            )
+            rows.extend(page)
+            if not page or len(rows) >= top:
+                break
+        return rows[:top]
+
+    def get_sap_document(self, entity: str, key: int) -> dict | None:
+        """One document by its key (DocEntry; JdtNum for journal entries), or None."""
+        return ServiceLayerEntityClient(self.context).get(f"{entity}({int(key)})", not_found_ok=True)
+
+    def sap_document_lookups(self, **request) -> dict:
+        """Names, settlement, base documents and journals for one document screen."""
+        from .hana.document_reader import HanaDocumentReader
+
+        return HanaDocumentReader(self.context).document_lookups(**request)
+
+    def sap_attachment_lines(self, abs_entry: int) -> list[dict]:
+        """The files (ATC1 lines) of one attachment entry."""
+        from .hana.document_reader import HanaDocumentReader
+
+        return HanaDocumentReader(self.context).attachment_lines(abs_entry)
+
+    def sap_payment_draft(self, doc_entry: int) -> dict | None:
+        """One outgoing-payment draft (OPDF) assembled from HANA, or None."""
+        from .hana.document_reader import HanaDocumentReader
+
+        return HanaDocumentReader(self.context).payment_draft(doc_entry)
+
     # ---- WRITE ----
     def create_production_order(self, payload: dict) -> dict:
         writer = ProductionOrderWriter(self.context)
