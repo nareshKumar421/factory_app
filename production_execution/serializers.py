@@ -261,6 +261,7 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
         source='line_config.config_name', read_only=True, default=''
     )
     live_status = serializers.SerializerMethodField()
+    produced_cases = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductionRun
@@ -271,7 +272,8 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
             'pieces_per_case', 'litres_per_piece',
             'planned_start_at', 'planned_end_at', 'planned_end_is_manual',
             'planning_remark',
-            'total_production', 'total_running_minutes', 'total_breakdown_time',
+            'total_production', 'produced_cases',
+            'total_running_minutes', 'total_breakdown_time',
             'rejected_qty', 'reworked_qty',
             'sap_receipt_doc_entry', 'sap_sync_status', 'sap_sync_error',
             'warehouse_approval_status',
@@ -290,6 +292,21 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
         if obj.segments.filter(is_active=True).exists():
             return 'RUNNING'
         return 'STOPPED'
+
+    def get_produced_cases(self, obj):
+        """Cases made so far: the count entered at completion once the run is
+        complete, its running segments' until then — ``total_production`` stays
+        0 on a line that is still filling. Reconciliation counts it the same way.
+
+        The run list annotates ``segment_cases``; a lone run adds its own up.
+        """
+        if obj.status == 'COMPLETED':
+            cases = obj.total_production
+        elif hasattr(obj, 'segment_cases'):
+            cases = obj.segment_cases
+        else:
+            cases = obj.segments.aggregate(q=Sum('produced_cases'))['q']
+        return f"{Decimal(cases or 0):.1f}"
 
 
 class ProductionSegmentSerializer(serializers.ModelSerializer):

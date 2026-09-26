@@ -2,7 +2,7 @@ import logging
 from collections import defaultdict, deque
 
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.utils.dateparse import parse_date
 
 from rest_framework.views import APIView
@@ -360,7 +360,7 @@ class RunListCreateAPI(APIView):
             status=request.GET.get('status'),
             sap_doc_entry=request.GET.get('sap_doc_entry'),
             search=request.GET.get('search'),
-        )
+        ).annotate(segment_cases=Sum('segments__produced_cases'))
         return Response(ProductionRunListSerializer(runs, many=True).data)
 
     def post(self, request):
