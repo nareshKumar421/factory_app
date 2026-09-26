@@ -42,9 +42,10 @@ def start_checks_are_optional(company_code: str) -> bool:
 
 
 #: Companies that do not send a BOM request to the warehouse at all. Their plan
-#: is checked against what is already at the line (BH-PC — see
-#: ``plan_check_service.PC_ONLY_STOCK_WAREHOUSES``) and a run starts on that, so
-#: nothing is raised that somebody would have to approve.
+#: is checked against what is already at the line (the RM/PM warehouses in the
+#: production settings — see ``plan_check_service.LINE_STOCK_ONLY_COMPANY_CODES``)
+#: and a run starts on that, so nothing is raised that somebody would have to
+#: approve.
 NO_BOM_REQUEST_COMPANY_CODES = frozenset({'JIVO_OIL'})
 
 
@@ -472,9 +473,10 @@ class ProductionExecutionService:
 
         parts = []
         if short:
+            line_warehouses = ', '.join(materials.get('warehouses') or [])
             parts.append(
                 f"{short} component(s) with nothing at the production consumption "
-                f"warehouse (BH-PC)" if at_line_only
+                f"warehouse ({line_warehouses})" if at_line_only
                 else f"{short} component(s) short in the warehouse"
             )
         if contested:
@@ -1377,12 +1379,14 @@ class ProductionExecutionService:
         run.save(update_fields=['sap_sync_status', 'sap_sync_error'])
 
         try:
-            # Fetch ItemCode and Warehouse from SAP production order
+            # ItemCode from the SAP production order. The goods go into the FG
+            # warehouse in the production settings, not the one the order names.
+            from .settings_service import get_settings
             reader = ProductionOrderReader(self.company_code)
             order_detail = reader.get_production_order_detail(run.sap_doc_entry)
             header = order_detail.get('header', {})
             item_code = header.get('ItemCode')
-            warehouse = header.get('Warehouse')
+            warehouse = get_settings(self.company).fg_warehouse or header.get('Warehouse')
 
             if not item_code or not warehouse:
                 raise SAPWriteError(

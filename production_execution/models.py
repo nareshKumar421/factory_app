@@ -1494,3 +1494,65 @@ class FinalQCCheck(models.Model):
 
     def __str__(self):
         return f"Final QC for Run #{self.production_run.run_number} — {self.overall_result}"
+
+
+class ProductionSettings(models.Model):
+    """The production module's settings for one company.
+
+    Only the three warehouses for now. Raw and packing material are drawn from
+    ``rm_warehouse`` and ``pm_warehouse``: that is the stock a plan counts as
+    already at the line, whatever warehouse a bill line happens to name. Finished
+    goods go into ``fg_warehouse``.
+
+    A company without a row runs on the defaults in
+    ``services.settings_service`` — nothing has to be seeded before a plan can
+    be checked.
+    """
+    company = models.OneToOneField(
+        'company.Company', on_delete=models.CASCADE,
+        related_name='production_settings'
+    )
+    rm_warehouse = models.CharField(
+        max_length=20,
+        help_text="SAP warehouse raw material is drawn from for production."
+    )
+    pm_warehouse = models.CharField(
+        max_length=20,
+        help_text="SAP warehouse packing material is drawn from for production."
+    )
+    fg_warehouse = models.CharField(
+        max_length=20,
+        help_text="SAP warehouse finished goods are received into."
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='production_settings_updated'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Production Settings'
+        verbose_name_plural = 'Production Settings'
+        # Reading is open to anyone who sees production; only the write is gated.
+        default_permissions = ()
+        permissions = [
+            ('can_manage_production_settings', 'Can change production settings'),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.company_id}: RM {self.rm_warehouse}, PM {self.pm_warehouse}, "
+            f"FG {self.fg_warehouse}"
+        )
+
+    def material_warehouse(self, material_type: str) -> str:
+        """Where production draws a component of this SAP material type from.
+
+        Raw material from the RM warehouse; packing material — and anything SAP
+        classifies as neither, which is handled like packing everywhere — from
+        the PM warehouse.
+        """
+        if (material_type or '').upper() == 'RAW':
+            return self.rm_warehouse
+        return self.pm_warehouse

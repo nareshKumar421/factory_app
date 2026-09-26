@@ -130,6 +130,8 @@ PRODUCTION_GROUPS = {
         # Extra  ────────────────────────────────────────────
         "production_execution.can_manage_production_lines",
         "production_execution.can_approve_waste_hod",
+        # The RM / PM / FG warehouses on the Production Settings page.
+        "production_execution.can_manage_production_settings",
     ],
     # Read-only access to the Line Management page (a line's operating profile
     # and its SKU presets) and nothing else. The matching write permission,

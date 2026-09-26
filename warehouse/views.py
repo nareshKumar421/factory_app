@@ -45,13 +45,14 @@ class BOMRequestCreateAPI(APIView):
                 serializer.validated_data, request.user)
             if not requests_raised:
                 # Nothing needed approving — no raw material on the bill and all
-                # packing material already at BH-PC. The run is marked
+                # packing material already at the PM warehouse. The run is marked
                 # NOT_REQUIRED and can start, so this is a success, not a 400.
+                pm_warehouse = svc.line_settings().pm_warehouse
                 return Response(
                     {
                         'detail': 'No warehouse approval needed for this run — there '
                                   'is no raw material on the bill and all packing '
-                                  'material is already at BH-PC.',
+                                  f'material is already at {pm_warehouse}.',
                         'approval_required': False,
                         'warehouse_approval_status': 'NOT_REQUIRED',
                         'requests': [],

@@ -23,20 +23,15 @@ from sap_client.context import CompanyContext
 
 from ..models import ProductionMaterialUsage, ProductionRun, ProductionSegment, WasteLog
 from .reconciliation_reader import ReconciliationReader
+from .settings_service import get_settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FG_WAREHOUSE = "BH-PF"
-DEFAULT_MATERIAL_WAREHOUSE = "BH-PC"  # SAP-approved BOM lands here (TransType 67 InQty)
+# The FG warehouse and the material (RM/PM) warehouses the SAP-approved BOM
+# lands in come from the company's production settings (``settings_service``):
+# BH-PF for FG, and BH-PC for Oil's material, BH-PP ("Production Process") for
+# Beverages', out of the box. Wastage is the same everywhere.
 DEFAULT_WASTAGE_WAREHOUSE = "BH-WST"
-
-# The production/material warehouse where SAP-approved BOM lands differs per
-# company (Oil uses BH-PC; Beverages transfers material into BH-PP "Production
-# Process"). FG (BH-PF) and wastage (BH-WST) are the same across companies.
-MATERIAL_WAREHOUSE_BY_COMPANY = {
-    "JIVO_OIL": "BH-PC",
-    "JIVO_BEVERAGES": "BH-PP",
-}
 
 MATCH_TOLERANCE_PCT = 1.0
 
@@ -142,7 +137,7 @@ class ReconciliationService:
     ):
         d_to = _to_date(date_to, date.today())
         d_from = _to_date(date_from, d_to)
-        whs = warehouse or DEFAULT_FG_WAREHOUSE
+        whs = warehouse or get_settings(self.company).fg_warehouse
         line_id = _to_int(line)
         lag = max(0, _to_int(sap_lag_days) or 0)
         # SAP FG receipts are often posted a day after the app marks the run
@@ -195,9 +190,14 @@ class ReconciliationService:
             runs = runs.filter(line_id=line_id)
         produced = self._produced_by_run(runs)  # {run_id: FG produced (cases)}
 
-        whs = warehouse or MATERIAL_WAREHOUSE_BY_COMPANY.get(
-            self.company.code, DEFAULT_MATERIAL_WAREHOUSE
-        )
+        if warehouse:
+            material_warehouses = [warehouse]
+        else:
+            line_settings = get_settings(self.company)
+            material_warehouses = list(dict.fromkeys(
+                [line_settings.rm_warehouse, line_settings.pm_warehouse]
+            ))
+        whs = ", ".join(material_warehouses)
 
         # by item: should-use (FG × per-unit BOM) + app-issued (warehouse BOM issue)
         line_qs = BOMRequestLine.objects.filter(
@@ -247,18 +247,18 @@ class ReconciliationService:
             )
             by_item[code]["app"] += float(u["q"] or 0)
 
-        # SAP issued: BOM transferred into BH-PC (TransType 67 InQty), within a
-        # +/- lag window of the run date to catch early/late approvals.
+        # SAP issued: BOM transferred into the RM/PM warehouses (TransType 67
+        # InQty), within a +/- lag window of the run date to catch early/late
+        # approvals. Summed across both when the two are different warehouses.
         sap_from = d_from - timedelta(days=lag)
         sap_to = d_to + timedelta(days=lag)
-        sap_by_code = {
-            it["item_code"]: {
-                "name": it["item_name"],
-                "qty": float(it["sap_qty"]),
-                "uom": it.get("uom", ""),
-            }
-            for it in self.reader.material_issues_by_item(sap_from, sap_to, whs)
-        }
+        sap_by_code: Dict[str, Dict[str, Any]] = {}
+        for material_whs in material_warehouses:
+            for it in self.reader.material_issues_by_item(sap_from, sap_to, material_whs):
+                entry = sap_by_code.setdefault(it["item_code"], {
+                    "name": it["item_name"], "qty": 0.0, "uom": it.get("uom", ""),
+                })
+                entry["qty"] += float(it["sap_qty"])
 
         rows: List[Dict[str, Any]] = []
         for code, e in by_item.items():

@@ -20,6 +20,7 @@ from production_execution.models import (
     ProductionLine,
     ProductionMaterialUsage,
     ProductionRun,
+    ProductionSettings,
     RunStatus,
 )
 from warehouse.models_rm_stock import RawMaterialStock
@@ -1119,7 +1120,11 @@ class ApprovalScopeTests(PlanCheckBase):
         self.assertEqual(row['qty_at_production_consumption'], 2000)
 
     def test_the_register_s_own_warehouse_never_nets_a_request_away(self):
-        """A bill consuming out of BH-LO is asking for the tank itself."""
+        """An RM warehouse of BH-LO is asking for the tank itself."""
+        ProductionSettings.objects.create(
+            company=self.company, rm_warehouse='BH-LO', pm_warehouse='BH-PC',
+            fg_warehouse='BH-PF',
+        )
         row = self.oil_row(at_pc=50000, warehouse='BH-LO')
 
         self.assertTrue(row['approval_required'])

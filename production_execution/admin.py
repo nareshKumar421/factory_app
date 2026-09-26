@@ -7,6 +7,7 @@ from .models import (
     LineClearance, LineClearanceItem,
     MachineChecklistEntry, WasteLog,
     FillingCostSheet, FillingCostSheetEntry,
+    ProductionSettings,
 )
 
 
@@ -201,3 +202,10 @@ class FillingCostSheetAdmin(admin.ModelAdmin):
     list_filter = ['company', 'line']
     date_hierarchy = 'period'
     inlines = [FillingCostSheetEntryInline]
+
+
+@admin.register(ProductionSettings)
+class ProductionSettingsAdmin(admin.ModelAdmin):
+    list_display = ['company', 'rm_warehouse', 'pm_warehouse', 'fg_warehouse',
+                    'updated_by', 'updated_at']
+    readonly_fields = ['updated_by', 'created_at', 'updated_at']

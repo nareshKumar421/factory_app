@@ -67,6 +67,7 @@ from .views import (
     FillingCostSheetListCreateAPI, FillingCostSheetDetailAPI,
     # Cost Master
 )
+from .views_settings import ProductionSettingsAPI
 
 urlpatterns = [
     # ------------------------------------------------------------------
@@ -301,6 +302,11 @@ urlpatterns = [
     # ------------------------------------------------------------------
     path('filling-costs/', FillingCostSheetListCreateAPI.as_view(), name='pe-filling-cost-list-create'),
     path('filling-costs/<int:sheet_id>/', FillingCostSheetDetailAPI.as_view(), name='pe-filling-cost-detail'),
+
+    # ------------------------------------------------------------------
+    # Production settings — the RM / PM / FG warehouses
+    # ------------------------------------------------------------------
+    path('settings/', ProductionSettingsAPI.as_view(), name='pe-settings'),
 
     # ------------------------------------------------------------------
     # Cost Master — Cost Rates

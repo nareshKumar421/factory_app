@@ -79,8 +79,8 @@ class WarehouseService:
           availability is the store keeper's Raw Material register, so that is
           what the approval is checked against.
         * **Packing material** — only the part that must be fetched from a
-          godown other than BH-PC, checked against SAP stock. See
-          :mod:`warehouse.services.approval_scope`.
+          godown other than the PM warehouse in the production settings,
+          checked against SAP stock. See :mod:`warehouse.services.approval_scope`.
 
         Returns the list of requests raised, which may be empty when there is
         genuinely nothing to ask for (a bill with no RM lines whose packing
@@ -164,7 +164,7 @@ class WarehouseService:
             logger.info(
                 "No warehouse approval needed for run #%s — no raw material on "
                 "the bill and all packing material is already at %s",
-                run.id, approval_scope.production_consumption_warehouse(),
+                run.id, self.line_settings().pm_warehouse,
             )
 
         self.recompute_run_approval_status(run)
@@ -180,10 +180,20 @@ class WarehouseService:
         from production_execution.services.production_service import bom_request_required
 
         if not bom_request_required(self.company_code):
+            line_settings = self.line_settings()
+            at_line = ', '.join(dict.fromkeys(
+                [line_settings.rm_warehouse, line_settings.pm_warehouse]
+            ))
             raise ValueError(
                 "No BOM request is sent to the warehouse here — the run is planned "
-                "against the stock at BH-PC and can start without one."
+                f"against the stock at {at_line} and can start without one."
             )
+
+    def line_settings(self):
+        """The production settings: which RM, PM and FG warehouses the line uses."""
+        from production_execution.services.settings_service import get_settings
+
+        return get_settings(self.company)
 
     def _raise_request(self, *, run, kind, lines, required_qty, remarks, user) -> BOMRequest:
         bom_request = BOMRequest.objects.create(
@@ -262,9 +272,9 @@ class WarehouseService:
         Both halves are narrowed the same way — to the part that is not already
         standing at the line — and only then split by what settles them: raw
         material against the store keeper's register, packing against SAP. Oil
-        already staged at `BH-PC` is no more the store's business than caps
-        already staged there; asking for the lot put requests in front of the
-        register that it could never cover.
+        already staged at the RM warehouse is no more the store's business than
+        caps already staged at the PM warehouse; asking for the lot put requests
+        in front of the register that it could never cover.
 
         With SAP unreachable nothing can be classified, so everything is
         requested as packing material rather than dropped: asking for too much
@@ -296,6 +306,7 @@ class WarehouseService:
             return {BOMMaterialKind.PACKING: bom_lines}
 
         out = {BOMMaterialKind.RAW: [], BOMMaterialKind.PACKING: []}
+        line_settings = self.line_settings()
 
         for line in bom_lines:
             code = line.get('item_code') or ''
@@ -320,13 +331,10 @@ class WarehouseService:
                 else BOMMaterialKind.PACKING
             )
 
-            # What is "already at the line" is the warehouse this line's own
-            # bill consumes from — Oil mostly says BH-PC, but 253 of its lines
-            # and every Beverages line say BH-PP. A global code nets out the
-            # wrong godown in both directions.
-            pc_code = approval_scope.consumption_warehouse_for_line(
-                line.get('warehouse')
-            )
+            # What is "already at the line" is the company's RM or PM warehouse
+            # from the production settings — BH-PC for Oil, BH-PP for Beverages
+            # out of the box — whatever warehouse the bill line names.
+            pc_code = line_settings.material_warehouse(material_type)
             decision = approval_scope.line_approval(
                 material_type,
                 line['required_qty'],
@@ -1041,14 +1049,16 @@ class WarehouseService:
         # bill that consumes out of BH-LO, where the warehouse to exclude is the
         # register itself and every oil request would read zero.
         excludes_consumption = bom_request.material_kind != BOMMaterialKind.RAW
+        # The line's packing material stands in the PM warehouse of the
+        # production settings, whatever warehouse the bill line named.
+        consumption = (
+            self.line_settings().material_warehouse(approval_scope.MATERIAL_PACKAGING)
+            if excludes_consumption else ''
+        )
 
         out = {}
         for line in lines:
             code = _norm_item_code(line.item_code)
-            consumption = (
-                approval_scope.consumption_warehouse_for_line(line.warehouse)
-                if excludes_consumption else ''
-            )
             at_consumption = D('0')
             options = []
 
@@ -1412,7 +1422,10 @@ class WarehouseService:
         # Fetch item details from SAP if linked
         item_code = data.get('item_code', '')
         item_name = data.get('item_name', '')
-        warehouse = data.get('warehouse', '')
+        # Finished goods go into the FG warehouse in the production settings,
+        # unless the receipt names another. The SAP order's warehouse is not
+        # consulted: where FG goes is the company's setting, not the order's.
+        warehouse = data.get('warehouse') or self.line_settings().fg_warehouse
 
         if run.sap_doc_entry and not item_code:
             from production_execution.services.sap_reader import ProductionOrderReader
@@ -1422,7 +1435,6 @@ class WarehouseService:
                 header = detail.get('header', {})
                 item_code = header.get('ItemCode', '')
                 item_name = header.get('ProdName', '')
-                warehouse = warehouse or header.get('Warehouse', '')
             except Exception as e:
                 logger.warning(f"Could not fetch SAP order detail for FG receipt: {e}")
 
@@ -1608,12 +1620,15 @@ class WarehouseService:
         payload = {
             "DocDate": receipt.posting_date.isoformat(),
             "Comments": f"FG Receipt — Run #{receipt.production_run_id}, Receipt #{receipt.id}",
-            # When BaseType=202, SAP derives ItemCode/Warehouse from the order
+            # With BaseType=202 SAP derives the ItemCode from the order. The
+            # warehouse is sent so the goods land in the receipt's warehouse —
+            # the FG warehouse from the production settings — not the order's.
             "DocumentLines": [{
                 "Quantity": qty,
                 "BaseType": 202,
                 "BaseEntry": receipt.sap_doc_entry,
                 "BaseLine": 0,
+                "WarehouseCode": receipt.warehouse,
             }],
         }
 

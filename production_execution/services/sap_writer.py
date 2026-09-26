@@ -53,12 +53,15 @@ class GoodsReceiptWriter:
         payload = {
             "DocDate": posting_date.isoformat() if hasattr(posting_date, 'isoformat') else str(posting_date),
             "Comments": f"Production Execution — DocEntry {doc_entry}",
-            # When BaseType=202, SAP derives ItemCode/Warehouse from the production order
+            # With BaseType=202 SAP derives the ItemCode from the production
+            # order. The warehouse is sent so the goods land in the FG warehouse
+            # from the production settings rather than the order's own.
             "DocumentLines": [{
                 "Quantity": float(qty),
                 "BaseType": 202,
                 "BaseEntry": doc_entry,
                 "BaseLine": 0,
+                "WarehouseCode": warehouse,
             }],
         }
 

@@ -87,6 +87,7 @@ from django.utils import timezone
 
 from warehouse.services import approval_scope
 
+from . import settings_service
 from ..models import (
     ProductionLine,
     ProductionMaterialUsage,
@@ -133,16 +134,15 @@ CONFLICT_LINE_BUSY = 'LINE_BUSY'
 CONFLICT_DUPLICATE_SKU = 'DUPLICATE_SKU'
 CONFLICT_MATERIAL_CONTENTION = 'MATERIAL_CONTENTION'
 
-# Companies whose plans count only what is already at their production
-# consumption warehouse, for raw and packing material alike. For Oil that is
-# strictly `BH-PC`, whatever warehouse a bill line names — `BH-PP` is a
-# Beverages godown — and neither the other godowns nor the Raw Material
-# register are read into the row: the screen shows BH-PC and nothing else.
-# No warehouse request is raised either (see
+# Companies whose plans count only what is already at the line — the RM and PM
+# warehouses in their production settings (`BH-PC` for both, out of the box) —
+# whatever warehouse a bill line names. Neither the other godowns nor the Raw
+# Material register are read into the row: the screen shows the line's
+# warehouses and nothing else. No warehouse request is raised either (see
 # `production_service.NO_BOM_REQUEST_COMPANY_CODES`). A component partly at the
 # line is PARTIAL and plans as it stands; one with nothing there is SHORT and
 # needs a written reason.
-PC_ONLY_STOCK_WAREHOUSES = {'JIVO_OIL': 'BH-PC'}
+LINE_STOCK_ONLY_COMPANY_CODES = frozenset({'JIVO_OIL'})
 
 # Where a row's `on_hand` was counted.
 STOCK_SCOPE_STORES = 'STORES'
@@ -600,18 +600,16 @@ class ProductionPlanCheckService:
 
         codes = [c['item_code'] for c in recipe]
         material_types = {c['item_code']: c['material_type'] for c in recipe}
-        # The staging warehouses the bill itself names — BH-PC for Oil, BH-PP
-        # for Beverages. They are read alongside the scoped stock but never
-        # counted as it: what is staged at a line is not stock a new plan may
-        # spend, it is the reason the warehouse is asked for less.
+        # The line's own warehouses — the RM and PM warehouses in the company's
+        # production settings, BH-PC for Oil and BH-PP for Beverages out of the
+        # box. They are read alongside the scoped stock but never counted as
+        # it: what is staged at a line is not stock a new plan may spend, it is
+        # the reason the warehouse is asked for less.
+        line_settings = settings_service.get_settings(self.company)
         staging_warehouses = {
-            approval_scope.consumption_warehouse_for_line(c['issue_warehouse'])
-            for c in recipe
+            line_settings.material_warehouse(c['material_type']) for c in recipe
         }
-        pc_only_whs = PC_ONLY_STOCK_WAREHOUSES.get(self.company_code, '')
-        pc_only = bool(pc_only_whs)
-        if pc_only:
-            staging_warehouses.add(pc_only_whs)
+        pc_only = self.company_code in LINE_STOCK_ONLY_COMPANY_CODES
 
         try:
             stock, warehouses, warehouse_scope, staged = self._stock(
@@ -666,23 +664,20 @@ class ProductionPlanCheckService:
                 free = on_hand - committed
                 holdings = (entry or {}).get('warehouses', [])
 
-            pc_code = approval_scope.consumption_warehouse_for_line(
-                comp['issue_warehouse']
-            )
+            pc_code = line_settings.material_warehouse(comp['material_type'])
             at_pc = staged.get(code, {}).get(pc_code, ZERO)
             searched = warehouse_scope.get(comp['material_type'], [])
             if pc_only:
-                at_line = staged.get(code, {}).get(pc_only_whs, ZERO)
                 source = SOURCE_SAP
-                on_hand = max(ZERO, at_line)
+                on_hand = max(ZERO, at_pc)
                 # `OITW` committed is not read for the staging warehouse, and a
                 # guessed one would flag TIGHT on nothing.
                 committed = free = None
                 holdings = (
-                    [{'warehouse': pc_only_whs, 'on_hand': at_line, 'committed': ZERO}]
-                    if at_line else []
+                    [{'warehouse': pc_code, 'on_hand': at_pc, 'committed': ZERO}]
+                    if at_pc else []
                 )
-                searched = [pc_only_whs]
+                searched = [pc_code]
 
             claimed = other_demand.get(code, {}).get('qty', ZERO)
 
@@ -730,11 +725,11 @@ class ProductionPlanCheckService:
             # nothing is staged and promise a request twenty times the size of
             # the one that will actually be raised.
             if pc_only:
-                # Nothing goes to the warehouse: the run draws what is at BH-PC.
+                # Nothing goes to the warehouse: the run draws what is at the line.
                 approval = {
                     'required': False,
                     'qty': ZERO,
-                    'reason': f"No warehouse request — the run draws from {pc_only_whs}.",
+                    'reason': f"No warehouse request — the run draws from {pc_code}.",
                     'from_production_consumption': min(max(ZERO, required), on_hand or ZERO),
                 }
             else:
@@ -753,6 +748,11 @@ class ProductionPlanCheckService:
                 'material_type': comp['material_type'],
                 'item_group': comp['item_group'],
                 'issue_warehouse': comp['issue_warehouse'],
+                # The line's own warehouse for this component — the RM or PM
+                # warehouse in the production settings. What stands there is
+                # what the request is narrowed by (or, at the line only, all
+                # that is counted), whatever `issue_warehouse` the bill names.
+                'consumption_warehouse': pc_code,
                 'searched_warehouses': searched,
                 'has_own_bom': comp['has_own_bom'],
                 'qty_per_case': _num(comp['qty_per_case']),
@@ -835,11 +835,14 @@ class ProductionPlanCheckService:
             'resource_lines': resources,
             'available': not stock_error,
             'error': stock_error,
-            # Where the line's stock alone counts, that is the only warehouse
-            # the check is about.
-            'warehouses': [pc_only_whs] if pc_only else warehouses,
+            # Where the line's stock alone counts, the line's warehouses are the
+            # only ones the check is about.
+            'warehouses': sorted(staging_warehouses) if pc_only else warehouses,
             'warehouse_scope': (
-                {kind: [pc_only_whs] for kind in warehouse_scope} if pc_only
+                {
+                    kind: [line_settings.material_warehouse(kind)]
+                    for kind in warehouse_scope
+                } if pc_only
                 else warehouse_scope
             ),
             'basis': basis,

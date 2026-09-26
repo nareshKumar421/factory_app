@@ -53,6 +53,15 @@ class BOMSourceTestCase(TestCase):
         )
         self.service = WarehouseService('TEST_CO')
 
+    def line_warehouses(self, *, rm, pm):
+        """Set the RM/PM warehouses the production settings name for the line."""
+        from production_execution.models import ProductionSettings
+
+        ProductionSettings.objects.update_or_create(
+            company=self.company,
+            defaults={'rm_warehouse': rm, 'pm_warehouse': pm, 'fg_warehouse': 'BH-PF'},
+        )
+
     def make_request(self, *lines, kind=BOMMaterialKind.PACKING, run=None):
         request = BOMRequest.objects.create(
             company=self.company, production_run=run or self.run,
@@ -116,12 +125,13 @@ class ConsumptionWarehouseTests(BOMSourceTestCase):
         self.assertIn('1', str(caught.exception))
         self.assertIn('PM0000830', str(caught.exception))
 
-    def test_the_line_names_its_own_consumption_warehouse(self):
-        """Every Beverages line consumes at BH-PP, not the configured BH-PC.
+    def test_the_consumption_warehouse_is_the_settings_pm_warehouse(self):
+        """Beverages consumes at BH-PP — its production settings say so.
 
         Netting a global BH-PC off a BH-PP line subtracts a warehouse holding
         nothing and offers back the millions of pieces already at the line.
         """
+        self.line_warehouses(rm='BH-PP', pm='BH-PP')
         request = self.make_request(('PM0000654', 5000, 'BH-PP'))
         line = request.lines.first()
 
@@ -133,7 +143,7 @@ class ConsumptionWarehouseTests(BOMSourceTestCase):
         self.assertEqual(found['at_consumption'], Decimal('90000'))
         self.assertEqual([o['warehouse'] for o in found['options']], ['BH-PM'])
 
-    def test_a_line_naming_no_warehouse_falls_back_to_the_configured_one(self):
+    def test_a_company_that_never_saved_its_settings_uses_bh_pc(self):
         request = self.make_request(('PM0000276', 100, ''))
         line = request.lines.first()
 
@@ -414,6 +424,7 @@ class ConsumptionSplitTests(BOMSourceTestCase):
 
     def test_a_bh_pp_line_is_narrowed_by_bh_pp_not_by_bh_pc(self):
         """Beverages stages at BH-PP. The old rule asked for the lot regardless."""
+        self.line_warehouses(rm='BH-PP', pm='BH-PP')
         self.usage('PM0000654', 5000)
         raised = self.create(
             material_types={'PM0000654': 'PACKAGING'},
@@ -439,6 +450,7 @@ class ConsumptionSplitTests(BOMSourceTestCase):
         warehouse holding nothing, and the tank is asked for litres already
         standing at the filler.
         """
+        self.line_warehouses(rm='BH-PP', pm='BH-PP')
         self.usage('RM0000002', 20000)
         raised = self.create(
             material_types={'RM0000002': 'RAW'},

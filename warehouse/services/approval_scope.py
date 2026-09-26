@@ -30,14 +30,15 @@ consumption warehouse holds material already pulled to the line. What is sitting
 there needs nobody's permission to use. Only the part that must come out of a
 main godown (`BH-PM`, `BH-BS`, ...) is a real request on the store's time.
 
-**Which warehouse counts as "at the line" is the line's own, not a constant.**
-A bill names the warehouse production consumes that component from, and the
-plant does not use one: Oil's bills point mostly at `BH-PC`, but 253 of its
-lines and *every* Beverages line point at `BH-PP`. Netting a global `BH-PC` off
-a line consumed at `BH-PP` subtracts a warehouse that holds nothing and ignores
-the one holding millions of already-staged pieces, so the request goes out at
-full quantity and the store is asked to fetch what is already at the line. The
-configured code is only the fallback for a bill that names no warehouse at all.
+**Which warehouse counts as "at the line" is the company's own, not a constant.**
+It is the RM or PM warehouse in the company's production settings
+(`production_execution.services.settings_service`), whatever warehouse a bill
+line happens to name. The plant does not use one warehouse: Oil stages at
+`BH-PC`, and *every* Beverages line consumes from `BH-PP`. Netting a global
+`BH-PC` off a Beverages line subtracts a warehouse that holds nothing and
+ignores the one holding millions of already-staged pieces, so the request goes
+out at full quantity and the store is asked to fetch what is already at the
+line — which is why Beverages' settings start on `BH-PP`.
 
 **And only the shortfall of it.** If the line needs 4,000 caps and 3,000 are
 already at BH-PC, the request is for 1,000 — not 4,000. Requesting the full

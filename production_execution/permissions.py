@@ -28,6 +28,22 @@ class CanManageLineConfig(BasePermission):
         return request.user.has_perm('production_execution.can_manage_line_config')
 
 
+# Production settings (the RM/PM/FG warehouses). Anyone who sees production may
+# read them — the run screen needs the FG warehouse — but only the holder of
+# ``can_manage_production_settings`` (Production HOD) may change them.
+class CanViewProductionSettings(BasePermission):
+    def has_permission(self, request, view):
+        return (
+            request.user.has_perm('production_execution.can_view_production_run') or
+            request.user.has_perm('production_execution.can_manage_production_settings')
+        )
+
+
+class CanManageProductionSettings(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.has_perm('production_execution.can_manage_production_settings')
+
+
 class CanManageMachines(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm('production_execution.can_manage_machines')
