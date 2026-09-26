@@ -82,6 +82,47 @@ so scoping by warehouse would hide exactly the rows nobody can currently find.
 user the request waits on) plus `is_mine`, `credentials_configured` and
 `can_decide`, so a row the caller cannot act on is still listed with the reason.
 
+### From SAP Portal's credit-note screen
+
+Two extras ported from `backend_v1/routes/creditNotes.js`. The list, the count
+and the decision without the new field behave exactly as before.
+
+| Method | Path | Notes |
+|--|--|--|
+| `PATCH` | `credit-note-approvals/<wdd_code>/status/` | optional `"without_qty_posting": true \| false` on an approval (below) |
+| `GET` | `credit-note-approvals/<wdd_code>/actions/` | `{can_withdraw, withdraw_note, without_qty_posting: {current, item_lines, can_set}}` — read when a row is opened |
+| `POST` | `credit-note-approvals/<wdd_code>/withdraw/` | the originator cancels a pending request |
+
+**Without Qty Posting** (SAP's `WithoutInventoryMovement`, `DRF1.NoInvtryMv`):
+the approver may make a credit note credit the value only and move no stock — a
+rate difference, not a goods return. SAP posts the draft exactly as it stands on
+full approval, so the flag is written to the draft BEFORE the decision, as the
+portal did: only while `OWDD.IsDraft = 'Y'` (409 otherwise), only on item lines
+whose flag differs (a service credit note has none, so nothing is sent), the
+signer's login proved first so a refused password cannot leave a
+changed-but-unapproved draft, and if SAP refuses the change nothing is approved
+(400). `null`/absent leaves SAP's per-line settings alone; `true`/`false` sets
+every item line. It is an optional field on the existing decision rather than
+its own endpoint because it only makes sense as part of that approval: a
+separate call could change the draft and then have the approval refused by a
+guard. `actions/` reports `current` (all set / none set / mixed = `null`) and
+`can_set` (pending, still a draft, has item lines, the caller may approve this
+family and IS the stage's authorizer with a stored password).
+
+**Withdraw**: gated on the view permission for the document's family (read
+from SAP), then on BEING its originator in SAP (`OWDD.OwnerID` → `OUSR`,
+through `SapApproverIdentity`), signed as that account with its stored
+password — no new permission. Guards: pending by the draft-aware rule (409
+`STALE_REQUEST`), mapped (403), the originator (403), a stored password (400;
+the message points to SAP Approvals, where a password can be typed). Not
+written to `CreditNoteApprovalAudit` — its decision choices are approve/reject
+and changing them would need a migration; the withdraw is logged with the app
+user, and SAP records it against the originator's own account.
+
+Both read the request through the general approvals reader
+(`SAPClient.approval_inbox_stage`), which carries the originator, the
+draft-aware status and the draft's item lines.
+
 ## Permissions
 
 Scoped **per family**, because A/R (sales) and A/P (purchasing) are different

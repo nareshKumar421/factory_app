@@ -27,3 +27,23 @@ class SapApprovalDecisionSerializer(serializers.Serializer):
         if attrs["status"] == "APPROVED":
             attrs.pop("rejection_reason", None)
         return attrs
+
+
+class CreditNoteDecisionSerializer(SapApprovalDecisionSerializer):
+    """The credit-note queue's decision body: the shared one, plus SAP's
+    "Without Qty Posting" (ported from SAP Portal's credit-note screen).
+
+    ``without_qty_posting`` is optional and only read on an approval: absent or
+    null leaves the draft's lines exactly as SAP holds them (the queue's
+    behaviour before this field existed); ``true`` credits the value only and
+    moves no stock, ``false`` makes every item line move stock.
+    """
+
+    without_qty_posting = serializers.BooleanField(required=False, allow_null=True, default=None)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if attrs["status"] != "APPROVED":
+            # Nothing to write on a rejection: the draft is not going to post.
+            attrs["without_qty_posting"] = None
+        return attrs

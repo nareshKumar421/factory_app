@@ -70,9 +70,11 @@ from .views_sap_approval import (
     SapTransferApprovalListView,
 )
 from .views_credit_note_approval import (
+    CreditNoteApprovalActionsView,
     CreditNoteApprovalDecisionView,
     CreditNoteApprovalListView,
     CreditNoteApprovalPendingCountView,
+    CreditNoteApprovalWithdrawView,
     CreditNotePrintView,
 )
 from .views_sap_transfer_draft import (
@@ -212,6 +214,11 @@ urlpatterns = [
     path('credit-note-approvals/', CreditNoteApprovalListView.as_view(), name='credit-note-approval-list'),
     path('credit-note-approvals/pending-count/', CreditNoteApprovalPendingCountView.as_view(), name='credit-note-approval-pending-count'),
     path('credit-note-approvals/<int:wdd_code>/status/', CreditNoteApprovalDecisionView.as_view(), name='credit-note-approval-status'),
+    # From SAP Portal's credit-note screen: what this caller may also do on one
+    # request (withdraw it; set Without Qty Posting when approving), and the
+    # originator's withdraw.
+    path('credit-note-approvals/<int:wdd_code>/actions/', CreditNoteApprovalActionsView.as_view(), name='credit-note-approval-actions'),
+    path('credit-note-approvals/<int:wdd_code>/withdraw/', CreditNoteApprovalWithdrawView.as_view(), name='credit-note-approval-withdraw'),
 
     # The POSTED credit note behind an approved row, on SAP's own sheet. Its own
     # prefix because the id is the document's DocEntry, not an approval code —

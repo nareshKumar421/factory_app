@@ -11,6 +11,20 @@ The rules are SAP's, not this page's, and are enforced in
 are for the transfer queue: the authorizer is re-read from HANA at decision
 time, the caller must BE that authorizer, and that account's password must be
 configured. See that module for why each of those exists.
+
+Two extras came over from SAP Portal's credit-note screen
+(``backend_v1/routes/creditNotes.js``), both additive:
+
+* **Without Qty Posting** — an optional ``without_qty_posting`` on the existing
+  decision body. On an approval it is written to the draft's item lines before
+  the decision, exactly as the portal did, so the credit note posts value-only
+  (or moving stock). Absent, the decision behaves as it always has.
+* **Withdraw** — the person who raised a pending credit-note request cancels
+  it, signed as their own SAP account (stored password; the general SAP
+  Approvals inbox is where a password can be typed instead).
+
+``credit-note-approvals/<wdd_code>/actions/`` tells the page which of the two
+this caller may use on one request, so the list endpoint stays as it was.
 """
 
 import logging
@@ -23,7 +37,8 @@ from rest_framework.response import Response
 from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPValidationError
-from sap_client.hana.credit_note_approval_reader import OBJ_TYPE_AP_CREDIT_NOTE
+from sap_client.hana.approval_inbox_reader import stale_message
+from sap_client.hana.credit_note_approval_reader import OBJ_TYPE_AP_CREDIT_NOTE, OBJ_TYPES
 
 from .models_credit_note_approval import CreditNoteApprovalAudit
 from .permissions import (
@@ -33,7 +48,7 @@ from .permissions import (
     approvable_credit_note_families,
     visible_credit_note_families,
 )
-from .serializers_sap_approval import SapApprovalDecisionSerializer
+from .serializers_sap_approval import CreditNoteDecisionSerializer
 from .views_sap_approval_base import SapApprovalViewBase
 
 logger = logging.getLogger(__name__)
@@ -162,11 +177,12 @@ class CreditNoteApprovalDecisionView(_CreditNoteApprovalView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveCreditNote]
 
     def patch(self, request, wdd_code):
-        serializer = SapApprovalDecisionSerializer(data=request.data)
+        serializer = CreditNoteDecisionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         decision = serializer.validated_data["status"]
         reason = serializer.validated_data.get("rejection_reason", "")
         approved = decision == CreditNoteApprovalAudit.DECISION_APPROVED
+        without_qty = serializer.validated_data.get("without_qty_posting")
 
         client = self.client()
         # Re-read the stage from SAP: the authorizer is whoever SAP says it is
@@ -194,6 +210,13 @@ class CreditNoteApprovalDecisionView(_CreditNoteApprovalView):
             return refusal
         approver = stage["approver_code"].strip()
 
+        changed_lines = None
+        if approved and without_qty is not None:
+            outcome = self._apply_without_qty_posting(client, wdd_code, approver, without_qty)
+            if isinstance(outcome, Response):
+                return outcome
+            changed_lines = outcome
+
         result = client.decide_credit_note_approval(
             wdd_code,
             approve=approved,
@@ -202,7 +225,67 @@ class CreditNoteApprovalDecisionView(_CreditNoteApprovalView):
         )
 
         self._write_audit(stage, decision, reason, approver, result)
-        return Response({**result, "signed_as": approver})
+        payload = {**result, "signed_as": approver}
+        if changed_lines is not None:
+            payload["without_qty_posting_lines"] = changed_lines
+        return Response(payload)
+
+    def _apply_without_qty_posting(self, client, wdd_code, approver, want: bool):
+        """Write Without Qty Posting to the draft's item lines before approving.
+
+        Ported from SAP Portal (``creditNotes.js`` PATCH ``/:code``): only
+        while the credit note is still a draft, only the item lines whose flag
+        differs, and the signer is proved first — a refused login must not
+        leave a changed-but-unapproved draft behind. If SAP refuses the change,
+        nothing is approved. Returns how many lines changed, or the refusal.
+        """
+        state = client.approval_inbox_stage(wdd_code, with_item_lines=True)
+        if state is None or state.get("object_type") not in OBJ_TYPES:
+            return Response(
+                {"error": f"SAP no longer holds credit-note approval request {wdd_code}."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not state.get("is_draft"):
+            return Response(
+                {
+                    "error": (
+                        "This credit note has already been posted, so Without Qty Posting "
+                        "can no longer be changed. Correct it in SAP."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        if state.get("status") != "PENDING":
+            return Response(
+                {"error": stale_message(state), "code": "STALE_REQUEST"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        changed = [
+            line["line_num"]
+            for line in state.get("item_lines") or []
+            if line["without_qty_posting"] != want
+        ]
+        if not changed:
+            return 0
+        client.verify_approval_signer(wdd_code, approver)
+        try:
+            client.set_draft_lines_without_qty_posting(state["draft_entry"], changed, want)
+        except SAPValidationError as e:
+            return Response(
+                {
+                    "error": (
+                        "SAP would not update Without Qty Posting on this credit note, "
+                        f"so it was NOT approved: {e}"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        logger.info(
+            "Credit-note approval %s: Without Qty Posting %s on draft %s lines %s by user %s",
+            wdd_code, "set" if want else "cleared", state["draft_entry"],
+            ",".join(str(n) for n in changed), self.request.user.pk,
+        )
+        return len(changed)
 
     def _write_audit(self, stage, decision, reason, approver, result):
         """Never let a bookkeeping failure undo a decision SAP has accepted."""
@@ -228,6 +311,157 @@ class CreditNoteApprovalDecisionView(_CreditNoteApprovalView):
                 "Credit-note approval %s was %s in SAP but the local audit row failed",
                 stage["id"], decision,
             )
+
+
+class _CreditNoteRequestView(_CreditNoteApprovalView):
+    """One request read through the general approvals reader — it carries the
+    originator, the effective (draft-aware) status and the draft's item lines,
+    which the queue's own reader does not."""
+
+    def credit_note_state(self, wdd_code, **options):
+        """``(state, None)``, or ``(None, refusal)`` for a missing request, one
+        that is not a credit note, or a family the caller cannot see."""
+        state = self.client().approval_inbox_stage(wdd_code, **options)
+        if state is None or state.get("object_type") not in OBJ_TYPES:
+            return None, Response(
+                {"error": f"Credit-note approval request {wdd_code} was not found in SAP."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        family = "AP" if state["object_type"] == OBJ_TYPE_AP_CREDIT_NOTE else "AR"
+        state["family"] = family
+        if family not in visible_credit_note_families(self.request.user):
+            return None, Response(
+                {"error": "You are not permitted to see this credit-note family."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return state, None
+
+    def stored_password(self, code) -> bool:
+        return bool(code) and code.strip().upper() in self.configured_approvers()
+
+
+class CreditNoteApprovalActionsView(_CreditNoteRequestView):
+    """GET /api/v1/warehouse/credit-note-approvals/<wdd_code>/actions/
+
+    What this caller may additionally do on one request: withdraw it (they
+    raised it, it is pending, their password is stored) and set Without Qty
+    Posting when approving (it is still a draft with item lines, and they
+    could approve it). Read on demand when a row is opened, so the queue's
+    list endpoint is unchanged.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCreditNoteApproval]
+
+    def get(self, request, wdd_code):
+        state, refusal = self.credit_note_state(wdd_code, with_item_lines=True)
+        if refusal is not None:
+            return refusal
+        mine = (self.my_sap_code() or "").upper()
+        pending = state["status"] == "PENDING"
+        originator = (state.get("originator_code") or "").upper()
+        approver = (state.get("approver_code") or "").upper()
+
+        is_originator = bool(mine) and originator == mine
+        withdraw_note = None
+        if not pending:
+            withdraw_note = "Only a pending request can be withdrawn."
+        elif not is_originator:
+            withdraw_note = "Only the person who raised it can withdraw it."
+        elif not self.stored_password(mine):
+            withdraw_note = (
+                "Your SAP password is not stored on the server. Withdraw it from SAP "
+                "Approvals, where you can type it, or in SAP."
+            )
+
+        lines = state.get("item_lines") or []
+        flags = [line["without_qty_posting"] for line in lines]
+        current = (True if all(flags) else False if not any(flags) else None) if flags else None
+        can_set = bool(
+            pending
+            and state.get("is_draft")
+            and lines
+            and state["family"] in approvable_credit_note_families(request.user)
+            and mine
+            and approver == mine
+            and self.stored_password(approver)
+        )
+        return Response({
+            "wdd_code": state["wdd_code"],
+            "status": state["status"],
+            "is_originator": is_originator,
+            "can_withdraw": withdraw_note is None,
+            "withdraw_note": withdraw_note,
+            "without_qty_posting": {
+                # True: every item line credits value only; False: every one
+                # moves stock; None: mixed, or no item lines at all.
+                "current": current,
+                "item_lines": len(lines),
+                "can_set": can_set,
+            },
+        })
+
+
+class CreditNoteApprovalWithdrawView(_CreditNoteRequestView):
+    """POST /api/v1/warehouse/credit-note-approvals/<wdd_code>/withdraw/
+
+    The originator cancels their own pending credit-note request in SAP
+    (SAP Portal's ``POST /credit-notes/:code/cancel``). Gated on seeing the
+    document's family, then on BEING its originator in SAP; signed with the
+    originator's stored password. Guards: pending (409), mapped (403), the
+    originator (403), a stored password (400).
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCreditNoteApproval]
+
+    def post(self, request, wdd_code):
+        state, refusal = self.credit_note_state(wdd_code)
+        if refusal is not None:
+            return refusal
+        if state["status"] != "PENDING":
+            return Response(
+                {"error": stale_message(state), "code": "STALE_REQUEST"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        mine = self.my_sap_code()
+        if not mine:
+            return Response(
+                {
+                    "error": (
+                        f"Your account is not linked to a SAP user in {self.company.code}. "
+                        "Ask an administrator to map you on the SAP Identities page."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        originator = state.get("originator_code") or ""
+        if originator.upper() != mine.upper():
+            return Response(
+                {
+                    "error": (
+                        f"Only the person who raised this credit note ({originator or 'unknown'}) "
+                        f"can withdraw it. You act as {mine}."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if not self.stored_password(originator):
+            return Response(
+                {
+                    "error": (
+                        f"Your SAP password for {originator} is not stored on the server. "
+                        "Withdraw it from SAP Approvals, where you can type it, or in SAP."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = self.client().withdraw_approval_request(
+            wdd_code, originator=originator, subject="Credit note"
+        )
+        logger.info(
+            "Credit-note approval request %s withdrawn in SAP as %s by user %s",
+            wdd_code, originator, request.user.pk,
+        )
+        return Response({**result, "signed_as": result.get("signed_as") or originator})
 
 
 def _decimal(value):
