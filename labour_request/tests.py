@@ -53,7 +53,7 @@ class LabourRequestTestCase(APITestCase):
 
     # -- helpers -------------------------------------------------------------
 
-    def raise_request(self, department, count, shift="DAY", note="", date=WORK_DATE):
+    def raise_request(self, department, count, shift="DAY", note="Loading", date=WORK_DATE):
         return self.client.post(
             f"{BASE}raise/",
             {
@@ -103,6 +103,23 @@ class RaiseRequestTests(LabourRequestTestCase):
         response = self.raise_request(self.production, 0)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_a_reason_is_required(self):
+        for reason in ("", "   "):
+            response = self.raise_request(self.production, 12, note=reason)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                response.data["note"], ["Give a reason for this request."]
+            )
+
+        missing = self.client.post(
+            f"{BASE}raise/",
+            {"department": self.production.id, "work_date": WORK_DATE, "requested_count": 12},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(missing.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(LabourRequest.objects.count(), 0)
+
     def test_day_listing_returns_both_shifts(self):
         self.raise_request(self.production, 12, shift="DAY")
         self.raise_request(self.packing, 5, shift="NIGHT")
@@ -126,6 +143,20 @@ class EditAndDeleteTests(LabourRequestTestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["requested_count"], 20)
+        # Leaving the reason out of the PATCH keeps the one it was raised with.
+        self.assertEqual(response.data["note"], "Loading")
+
+    def test_patch_cannot_blank_the_reason(self):
+        created = self.raise_request(self.production, 12, note="Loading 2 trucks")
+        response = self.client.patch(
+            f"{BASE}{created.data['id']}/",
+            {"requested_count": 14, "note": " "},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        req = LabourRequest.objects.get(id=created.data["id"])
+        self.assertEqual((req.requested_count, req.note), (12, "Loading 2 trucks"))
 
     def test_delete_is_soft_and_restorable(self):
         created = self.raise_request(self.production, 12)

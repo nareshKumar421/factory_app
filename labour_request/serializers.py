@@ -13,6 +13,11 @@ from .models import (
 # How long after a request is deleted it can still be undone.
 UNDO_WINDOW_MINUTES = 10
 
+REASON_ERRORS = {
+    "required": "Give a reason for this request.",
+    "blank": "Give a reason for this request.",
+}
+
 
 class LabourRequestSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source="department.name", read_only=True)
@@ -108,16 +113,22 @@ class RaiseRequestSerializer(serializers.Serializer):
         choices=LabourShift.choices, required=False, default=LabourShift.DAY
     )
     requested_count = serializers.IntegerField(min_value=1)
-    note = serializers.CharField(
-        max_length=255, required=False, allow_blank=True, default=""
-    )
+    # The reason -- why the department needs these people. Required, because an
+    # approver deciding tomorrow's headcount has nothing to weigh without it.
+    note = serializers.CharField(max_length=255, error_messages=REASON_ERRORS)
 
 
 class UpdateRequestSerializer(serializers.Serializer):
-    """Edit an existing request in place."""
+    """Edit an existing request in place.
+
+    The reason may be left out (a count-only edit), but not blanked: an ask
+    raised with a reason keeps one.
+    """
 
     requested_count = serializers.IntegerField(min_value=1, required=False)
-    note = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    note = serializers.CharField(
+        max_length=255, required=False, error_messages=REASON_ERRORS
+    )
 
     def validate(self, attrs):
         if not attrs:

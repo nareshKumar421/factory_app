@@ -239,7 +239,7 @@ class LabourRequestDetailAPI(APIView):
             detail = (
                 f"Ask {old_count} -> {new_count}"
                 if old_count != new_count
-                else "Note updated"
+                else "Reason updated"
             )
             if was_decided and old_count != new_count:
                 detail += "; sent back for approval"
