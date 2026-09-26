@@ -25,6 +25,9 @@ used, ported into `sap_client` so the apps built for the merge
 | Attachment downloads | `service_layer/file_service_client.py` | `services/fileServiceClient.js` |
 | "Is this request really pending?" | `approval_status.py` | `effectiveOwddStatus` / `effectiveStatusSql` |
 | Sandbox settings | `config/sap_sandbox_settings.py` | `npm run start:test` + `.env.test` |
+| Finance reads (journal entries, ledger, chart of accounts) | `hana/finance_reader.py` | `/api/sap/journal-entries`, `/gl-ledger`, `/chart-of-accounts` |
+| Production orders of every status, with issued/received totals | `hana/production_order_reader.py` | `/api/sap/production-orders*` |
+| Issue for / receipt from production | `service_layer/production_movement_writer.py` | `/api/sap/issue-production`, `/receipt-production` |
 
 All of it goes through `SAPClient` (one method per read/write), so views patch
 `SAPClient` in their own module exactly as the existing queues do.
