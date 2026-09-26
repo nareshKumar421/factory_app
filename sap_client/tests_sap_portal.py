@@ -518,3 +518,79 @@ class LookupApiTests(TestCase):
     def test_batches_need_an_item_and_a_warehouse(self, sap_client):
         response = self.api.get("/api/v1/sap-lookups/batches/?item_code=RM1", HTTP_COMPANY_CODE="JIVO_OIL")
         self.assertEqual(response.status_code, 400)
+
+
+# ---------------------------------------------------------------------------
+# Finance reader
+# ---------------------------------------------------------------------------
+
+
+class FinanceReaderTests(SimpleTestCase):
+    def setUp(self):
+        from .hana.finance_reader import HanaFinanceReader
+
+        self.reader = HanaFinanceReader(_context())
+        self.cursor = MagicMock()
+        conn = MagicMock()
+        conn.cursor.return_value = self.cursor
+        patcher = patch.object(self.reader.connection, "connect", return_value=conn)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_chart_of_accounts_rolls_postable_balances_up_to_every_title(self):
+        self.cursor.fetchall.return_value = [
+            ("1000000", "ASSETS", None, 1, 1, "N", "N", "INR", 0, "N", ""),
+            ("1100000", "Current Assets", "1000000", 1, 2, "N", "N", "INR", 0, "N", ""),
+            ("1101001", "Debtors", "1100000", 1, 3, "Y", "N", "INR", 150.25, "N", ""),
+            ("1101002", "Cash", "1100000", 1, 3, "Y", "N", "INR", 49.75, "N", ""),
+            ("4000000", "REVENUES", None, 4, 1, "N", "I", "INR", 0, "N", ""),
+        ]
+        tree = self.reader.chart_of_accounts()
+        by_code = {a["code"]: a for a in tree["accounts"]}
+        self.assertEqual(by_code["1100000"]["rollup"], 200.0)
+        self.assertEqual(by_code["1000000"]["rollup"], 200.0)
+        self.assertEqual(by_code["1100000"]["children"], 2)
+        self.assertEqual(tree["drawers"][0]["total"], 200.0)
+        self.assertEqual(tree["postable"], 2)
+
+    def test_a_search_keeps_the_path_to_each_hit(self):
+        self.cursor.fetchall.return_value = [
+            ("1000000", "ASSETS", None, 1, 1, "N", "N", "INR", 0, "N", ""),
+            ("1100000", "Current Assets", "1000000", 1, 2, "N", "N", "INR", 0, "N", ""),
+            ("1101001", "Debtors", "1100000", 1, 3, "Y", "N", "INR", 1, "N", ""),
+            ("2000000", "LIABILITIES", None, 2, 1, "N", "N", "INR", 0, "N", ""),
+        ]
+        tree = self.reader.chart_of_accounts(search="debt")
+        self.assertEqual([a["code"] for a in tree["accounts"]], ["1000000", "1100000", "1101001"])
+        self.assertEqual([a["match"] for a in tree["accounts"]], [False, False, True])
+
+    def test_the_ledger_balance_is_anchored_below_postings_after_the_range(self):
+        """The portal walked back from today's balance even for a past range."""
+        from datetime import date
+
+        self.cursor.fetchall.side_effect = [
+            [("Debtors", 1000)],        # OACT: name + today's balance
+            [(2,)],                    # count in range
+            [(300,)],                  # debit - credit posted after date_to
+            [                          # the rows, newest first
+                (2, date(2026, 6, 20), None, None, 50, 0, "m2", "", "C1", "Cust", "", 13),
+                (1, date(2026, 6, 10), None, None, 0, 20, "m1", "", "C1", "Cust", "", 24),
+            ],
+        ]
+        ledger = self.reader.general_ledger("1101001", date_to=date(2026, 6, 30))
+        self.assertEqual(ledger["closing_balance"], 700.0)
+        self.assertEqual([line["balance"] for line in ledger["lines"]], [700.0, 650.0])
+        self.assertEqual(ledger["kind"], "G/L")
+
+    def test_an_unknown_ledger_account_is_refused(self):
+        self.cursor.fetchall.side_effect = [[], []]
+        with self.assertRaises(SAPValidationError):
+            self.reader.general_ledger("NOPE")
+
+    def test_journal_entry_filters_are_bound(self):
+        self.cursor.fetchall.return_value = []
+        self.reader.journal_entries(reference="inv'1", trans_type="13", limit=5)
+        sql, params = self.cursor.execute.call_args[0]
+        self.assertNotIn("inv'1", sql.lower())
+        self.assertEqual(params, ("%INV'1%",) * 4 + ("13",))
+        self.assertIn("TOP 5", sql)

@@ -11,6 +11,7 @@ from .hana.transfer_approval_reader import HanaTransferApprovalReader
 from .hana.transfer_draft_reader import HanaTransferDraftReader
 from .hana.customer_reader import HanaCustomerReader
 from .hana.fg_stock_reader import HanaFGStockReader
+from .hana.finance_reader import HanaFinanceReader
 from .hana.lookup_reader import HanaLookupReader
 from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
@@ -590,6 +591,25 @@ class SAPClient:
 
     def replace_product_tree(self, tree_code: str, payload: dict) -> dict:
         return ProductTreeWriter(self.context).replace(tree_code, payload)
+
+    # ---- Finance reads (journal entries, chart of accounts, ledgers) ----
+    def journal_entries(self, **filters) -> list[dict]:
+        """Newest journal entries matching the filters, each with its lines."""
+        return HanaFinanceReader(self.context).journal_entries(**filters)
+
+    def chart_of_accounts(self, search: str = "", drawer=None) -> dict:
+        """The OACT tree, title accounts rolled up."""
+        return HanaFinanceReader(self.context).chart_of_accounts(search=search, drawer=drawer)
+
+    def general_ledger(self, account: str, date_from=None, date_to=None, limit: int = 200) -> dict:
+        """Postings to one G/L account or partner, with a running balance."""
+        return HanaFinanceReader(self.context).general_ledger(
+            account, date_from=date_from, date_to=date_to, limit=limit
+        )
+
+    def ledger_account_search(self, search: str, limit: int = 20) -> list[dict]:
+        """G/L accounts and partners matching ``search``, for the ledger picker."""
+        return HanaFinanceReader(self.context).ledger_account_search(search, limit=limit)
 
     # ---- Budget UDO (ported from SAP Portal) ----
     def list_budgets(self) -> list[dict]:

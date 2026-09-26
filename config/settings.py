@@ -198,6 +198,12 @@ INSTALLED_APPS = [
     # One number, looked up in every company's SAP and in this app's own
     # records at once. Stores nothing; owns only its permission.
     'universal_search.apps.UniversalSearchConfig',
+    # SAP Portal's finance screens, merged in: journal entries, the ledger of
+    # one account and the chart of accounts read live from HANA, plus the
+    # budget screen, which writes SAP's BUDGET user-defined object. Owns only
+    # the record of who changed which budget from here (SAP stamps the
+    # service account). Not budget_approvals: that is a read-only dashboard.
+    'sap_finance.apps.SapFinanceConfig',
     'factory_expense',
     'cost_master',
     'org_chart.apps.OrgChartConfig',
