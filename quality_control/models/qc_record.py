@@ -21,6 +21,12 @@ and the *filled sheet* is another three:
 * :class:`RecordValue`      -- one cell: (time slot x parameter) -> value.
 
 Adding a new printed form is therefore a data change, not a migration.
+
+A form can also be uploaded as the Excel sheet QA already keeps. Such a form
+carries a ``layout`` (the sheet as drawn) and ``cell_fields`` (which cells are
+filled in, and how) instead of sections, and its filled sheets keep their
+values as ``cell_values`` keyed by cell -- see
+``quality_control.services.record_sheet``.
 Values are stored as text so a single cell can hold "Clear", "No off odour"
 or "7.63"; numeric parameters are additionally range-checked against their
 own specification via :meth:`RecordTemplateParameter.check_value`.
@@ -81,6 +87,27 @@ class RecordTemplate(BaseModel):
     classification = models.CharField(max_length=120, blank=True, default="")
     description = models.TextField(blank=True, default="")
 
+    # An Excel-uploaded form. Null for a form built from sections/parameters.
+    layout = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="The uploaded sheet as drawn: column widths, row heights, "
+        "cells with their text and style, merges and pictures. Produced only "
+        "by the Excel import, never typed.",
+    )
+    cell_fields = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Which cells of the layout are filled in, keyed by cell "
+        "(e.g. 'D10'): {type, label, min, max, options, ok, spec}.",
+    )
+    source_file_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Name of the Excel file the layout was read from.",
+    )
+
     class Meta:
         ordering = ["title"]
         constraints = [
@@ -102,6 +129,11 @@ class RecordTemplate(BaseModel):
 
     def __str__(self):
         return f"{self.document_code} - {self.title}"
+
+    @property
+    def is_sheet(self):
+        """True for a form uploaded as an Excel sheet."""
+        return self.layout is not None
 
     @property
     def revision_label(self):
@@ -250,6 +282,9 @@ class QCRecord(BaseModel):
     record_date = models.DateField()
     shift = models.CharField(max_length=8, blank=True, default="")
     remarks = models.TextField(blank=True, default="")
+    # The values of a sheet-form record, keyed by cell ('D10': '0.12'). A form
+    # built from parameters keeps its values as RecordValue rows instead.
+    cell_values = models.JSONField(default=dict, blank=True)
 
     status = models.CharField(
         max_length=10, choices=RecordStatus.choices, default=RecordStatus.DRAFT

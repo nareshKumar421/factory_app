@@ -180,6 +180,56 @@ submitted to the chemist, send-back is refused ("use inspection rejection instea
 5. **Approve / Reject** `.../approve/` or `.../reject/` (needs
    `can_approve_production_qc`; only from SUBMITTED; approve requires PASS/FAIL).
 
+### Flow E — Record forms uploaded as Excel sheets (QC → Documents)
+
+QA's daily record forms (e.g. QA-FRM-14-01-05-02 *Oil Plant On Line Monitoring
+Record*) live as `RecordTemplate`s; a day's filled sheet is a `QCRecord`. A form is
+one of two kinds: **GRID** — laid out as sections/parameters in the format builder,
+values in `RecordValue` rows — or **SHEET** — uploaded as the Excel workbook QA
+already keeps and drawn exactly as the sheet looks. SHEET is described here.
+
+1. **Upload.** `POST /record-templates/import-sheet/` (multipart `file`, optional
+   `sheet`; needs `can_approve_qc_records`). `services/record_sheet.py` reads the
+   print area (else the used range) into a **layout**: column widths / row heights
+   in px, every cell's text and style (fonts, borders, theme fills), merges, pictures
+   as data URLs, the print header/footer. Nothing is saved: the response carries the
+   layout, a **signed `layout_token`**, a first guess at the **cell fields**, and the
+   document code / revision / classification / title read off the footer and sheet.
+2. **Design.** The manager corrects which cells are filled in and how, sets the
+   document code and revision, and `POST /record-templates/` with `layout`,
+   `layout_token`, `cell_fields`. A layout is only accepted with the token issued for
+   it (a SHA-256 of the layout, signed, 24 h) — so a stored layout is always the
+   parser's own output. `cell_fields` are validated per cell (inside the range, not
+   inside a merge, known type, one REMARKS cell at most).
+3. **Fill.** `POST /qc-records/` opens the day's sheet as for any form;
+   `POST /qc-records/<id>/cells/` `{cells: {"D10": "0.12"}, remarks?}` saves only the
+   cells sent (blank clears one) into `QCRecord.cell_values`, under a row lock, so two
+   people filling different columns do not undo each other. TIME is normalised to
+   HH:MM and DATE to ISO; anything else invalid refuses the whole save.
+4. **Submit / approve / print** — the same endpoints and statuses as a GRID form.
+   The Q.A Chemist / Q.A.M signature cells show `submitted_by` / `approved_by`.
+
+**Cell field types:** value types `TEXT`, `NUMBER` (optional `min`/`max`), `TIME`,
+`DATE`, `CHOICE` (`options` offered, `ok` = the values that meet spec) are typed
+per record. Bound types `RECORD_DATE`, `SHIFT`, `REMARKS`, `SIGN_SUBMITTED`,
+`SIGN_APPROVED` are shown from the record and never stored as cells.
+`QCRecord.cell_checks` (serializer) judges NUMBER/CHOICE cells exactly like
+`RecordTemplateParameter.check_value`.
+
+**Detection heuristics** (only a starting point): empty boxed cells in columns that
+are otherwise blank are readings, while a column with text in >30% of its boxes (Sr
+No, Parameters, UOM) is a label column. A reading's type comes from its row — a UOM
+means NUMBER, "Absent" / "Present / Absent" means CHOICE, a spec like "6.5 - 8.5"
+sets limits — or, for a row with no label of its own (the row under a "Time"
+header), from the heading directly above. Loose labels `Date:`, `Shift:`,
+`Remarks:`, `…Chemist` / `Prepared by`, `Q.A.M` / `Approved by` bind the cell to their
+right (or below, at the right edge).
+
+**Lock:** once any record of the form has a value, its layout and cell fields
+cannot change (they would re-label readings); the header still can. A revised
+sheet is uploaded as a new form after retiring the old one (codes are unique among
+active forms).
+
 ---
 
 ## Business rules & invariants
@@ -390,6 +440,10 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
 - `enums.py` — arrival-slip/inspection/decision/workflow/parameter enums.
 - `services/rules.py` — gate-status computation + QC-completed notification.
 - `services/spec_evaluation.py` — free-text spec → `is_within_spec`.
+- `services/record_sheet.py` — Excel form → layout, field detection, layout
+  signing, cell validation and spec checks (Flow E).
+- `models/qc_record.py`, `views_qc_record.py`, `serializers_qc_record.py` — the
+  Documents record forms, GRID and SHEET.
 - `views.py` — master data, arrival slips, inspections, approvals, status-based lists.
 - `views_production_qc.py` — production QC session lifecycle.
 - `serializers.py` — all read/write serializers (incl. `_safe_related` FK guard).

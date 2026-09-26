@@ -2,10 +2,11 @@
 """APIs for the QC "Documents" screen -- fillable record forms."""
 
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import BooleanField, Count, ExpressionWrapper, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -23,10 +24,12 @@ from .models import (
 from .serializers_qc_record import (
     QCRecordListSerializer,
     QCRecordSerializer,
+    RecordCellsWriteSerializer,
     RecordTemplateListSerializer,
     RecordTemplateSerializer,
     RecordValuesWriteSerializer,
 )
+from .services import record_sheet
 
 
 class CanViewRecords(BasePermission):
@@ -73,10 +76,15 @@ class RecordTemplateListCreateAPI(APIView):
     def get(self, request):
         queryset = (
             _templates(_company(request))
+            # A sheet form's layout is tens of kB; the list never shows it.
+            .defer("layout")
             .annotate(
                 parameter_count=Count("sections__parameters", distinct=True),
                 record_count=Count(
                     "records", filter=Q(records__is_active=True), distinct=True
+                ),
+                sheet=ExpressionWrapper(
+                    Q(layout__isnull=False), output_field=BooleanField()
                 ),
             )
             .order_by("title")
@@ -145,11 +153,20 @@ class QCRecordListCreateAPI(APIView):
         return [IsAuthenticated(), HasCompanyContext(), CanViewRecords()]
 
     def get(self, request):
-        queryset = _records(_company(request)).annotate(
-            slot_count=Count("time_slots", distinct=True),
-            filled_count=Count(
-                "values", filter=~Q(values__value=""), distinct=True
-            ),
+        queryset = (
+            _records(_company(request))
+            .select_related("template")
+            # Every row would otherwise carry its form's whole sheet layout.
+            .defer("template__layout")
+            .annotate(
+                slot_count=Count("time_slots", distinct=True),
+                filled_count=Count(
+                    "values", filter=~Q(values__value=""), distinct=True
+                ),
+                template_is_sheet=ExpressionWrapper(
+                    Q(template__layout__isnull=False), output_field=BooleanField()
+                ),
+            )
         )
 
         template_id = request.query_params.get("template")
@@ -255,10 +272,17 @@ class QCRecordValuesAPI(APIView):
 
     @transaction.atomic
     def post(self, request, record_id):
-        record = get_object_or_404(_records(_company(request)), id=record_id)
+        record = get_object_or_404(
+            _records(_company(request)).select_related("template"), id=record_id
+        )
         if record.status == RecordStatus.APPROVED:
             return Response(
                 {"detail": "An approved record cannot be edited."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if record.template.is_sheet:
+            return Response(
+                {"detail": "This record is a sheet form; save its cells instead."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -304,6 +328,111 @@ class QCRecordValuesAPI(APIView):
         record.updated_by = request.user
         record.save(update_fields=["updated_by", "updated_at"])
         record.refresh_from_db()
+        return Response(QCRecordSerializer(record).data)
+
+
+class RecordSheetImportAPI(APIView):
+    """Read an uploaded Excel form into a layout for the designer.
+
+    Nothing is saved here. The response carries the sheet, a signed token for
+    it, a first guess at the fillable cells, and the header read off the
+    sheet; the designer sends them back to the template endpoints once the
+    manager has checked them and set the document code.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveRecords]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response(
+                {"detail": "Attach the Excel file as 'file'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if upload.size > record_sheet.MAX_UPLOAD_BYTES:
+            return Response(
+                {"detail": "The file is over 5 MB; a record form is far smaller."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = record_sheet.read_sheet(
+                upload,
+                filename=upload.name,
+                sheet_name=(request.data.get("sheet") or "").strip() or None,
+            )
+        except record_sheet.SheetImportError as error:
+            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+        result["source_file_name"] = upload.name[:255]
+        return Response(result)
+
+
+class QCRecordCellsAPI(APIView):
+    """Save the cells of a sheet-form record.
+
+    Only the cells sent are touched -- blank clears one -- so two people
+    filling different columns of the same sheet do not undo each other.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanFillRecords]
+
+    @transaction.atomic
+    def post(self, request, record_id):
+        record = get_object_or_404(
+            _records(_company(request))
+            .select_related("template")
+            .select_for_update(of=("self",)),
+            id=record_id,
+        )
+        if not record.template.is_sheet:
+            return Response(
+                {"detail": "This record's form has parameters, not a sheet; save its values instead."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if record.status == RecordStatus.APPROVED:
+            return Response(
+                {"detail": "An approved record cannot be edited."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = RecordCellsWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        cells = serializer.validated_data.get("cells", {})
+
+        fields = record.template.cell_fields or {}
+        errors = {}
+        cleaned = {}
+        for cell, raw in cells.items():
+            field = fields.get(cell)
+            if field is None or field.get("type") not in record_sheet.VALUE_TYPES:
+                errors[cell] = f"{cell} is not a cell filled in on this form."
+                continue
+            try:
+                cleaned[cell] = record_sheet.clean_cell_value(field, raw)
+            except ValueError as error:
+                label = field.get("label") or cell
+                errors[cell] = f"{label} ({cell}) {error}"
+        if errors:
+            messages = list(errors.values())
+            detail = " ".join(messages[:3])
+            if len(messages) > 3:
+                detail += f" ...and {len(messages) - 3} more."
+            return Response(
+                {"detail": f"Nothing was saved. {detail}", "cells": errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        values = dict(record.cell_values or {})
+        for cell, value in cleaned.items():
+            if value == "":
+                values.pop(cell, None)
+            else:
+                values[cell] = value
+        record.cell_values = values
+        if "remarks" in serializer.validated_data:
+            record.remarks = serializer.validated_data["remarks"]
+        record.updated_by = request.user
+        record.save(update_fields=["cell_values", "remarks", "updated_by", "updated_at"])
         return Response(QCRecordSerializer(record).data)
 
 

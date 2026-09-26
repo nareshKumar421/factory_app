@@ -88,8 +88,10 @@ from .views_qc_record import (
     QCRecordListCreateAPI,
     QCRecordDetailAPI,
     QCRecordValuesAPI,
+    QCRecordCellsAPI,
     QCRecordSubmitAPI,
     QCRecordApproveAPI,
+    RecordSheetImportAPI,
 )
 
 from .views_qc_document_file import (
@@ -146,6 +148,11 @@ urlpatterns = [
         name="record-template-list-create"
     ),
     path(
+        "record-templates/import-sheet/",
+        RecordSheetImportAPI.as_view(),
+        name="record-template-import-sheet"
+    ),
+    path(
         "record-templates/<int:template_id>/",
         RecordTemplateDetailAPI.as_view(),
         name="record-template-detail"
@@ -164,6 +171,11 @@ urlpatterns = [
         "qc-records/<int:record_id>/values/",
         QCRecordValuesAPI.as_view(),
         name="qc-record-values"
+    ),
+    path(
+        "qc-records/<int:record_id>/cells/",
+        QCRecordCellsAPI.as_view(),
+        name="qc-record-cells"
     ),
     path(
         "qc-records/<int:record_id>/submit/",
