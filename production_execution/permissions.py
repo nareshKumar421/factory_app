@@ -275,3 +275,50 @@ class CanViewFillingCost(BasePermission):
 class CanManageFillingCost(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm('production_execution.can_manage_filling_cost')
+
+
+# SAP production orders (screens ported from SAP Portal). Each write implies
+# viewing: nobody should post to an order they cannot open.
+SAP_ORDER_VIEW = 'production_execution.can_view_sap_production_orders'
+SAP_ORDER_CREATE = 'production_execution.can_create_sap_production_orders'
+SAP_ORDER_RELEASE_CLOSE = 'production_execution.can_release_close_sap_production_orders'
+SAP_ORDER_ISSUE = 'production_execution.can_issue_for_sap_production_orders'
+SAP_ORDER_RECEIVE = 'production_execution.can_receive_from_sap_production_orders'
+SAP_ORDER_RIGHTS = (
+    SAP_ORDER_VIEW, SAP_ORDER_CREATE, SAP_ORDER_RELEASE_CLOSE, SAP_ORDER_ISSUE, SAP_ORDER_RECEIVE,
+)
+
+
+class CanViewSapProductionOrders(BasePermission):
+    message = 'You do not have permission to view SAP production orders.'
+
+    def has_permission(self, request, view):
+        return any(request.user.has_perm(right) for right in SAP_ORDER_RIGHTS)
+
+
+class CanCreateSapProductionOrders(BasePermission):
+    message = 'You do not have permission to create SAP production orders.'
+
+    def has_permission(self, request, view):
+        return request.user.has_perm(SAP_ORDER_CREATE)
+
+
+class CanReleaseCloseSapProductionOrders(BasePermission):
+    message = 'You do not have permission to release or close SAP production orders.'
+
+    def has_permission(self, request, view):
+        return request.user.has_perm(SAP_ORDER_RELEASE_CLOSE)
+
+
+class CanIssueForSapProductionOrders(BasePermission):
+    message = 'You do not have permission to issue materials to SAP production orders.'
+
+    def has_permission(self, request, view):
+        return request.user.has_perm(SAP_ORDER_ISSUE)
+
+
+class CanReceiveFromSapProductionOrders(BasePermission):
+    message = 'You do not have permission to receive from SAP production orders.'
+
+    def has_permission(self, request, view):
+        return request.user.has_perm(SAP_ORDER_RECEIVE)

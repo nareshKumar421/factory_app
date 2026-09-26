@@ -1,4 +1,13 @@
 from django.urls import path
+
+from .views_sap_orders import (
+    SapOrderCloseAPI,
+    SapOrderDetailAPI,
+    SapOrderIssueAPI,
+    SapOrderListCreateAPI,
+    SapOrderReceiptAPI,
+    SapOrderReleaseAPI,
+)
 from .views import (
     # Master Data
     LineListCreateAPI, LineDetailAPI,
@@ -211,6 +220,16 @@ urlpatterns = [
     path('sap/orders/<int:doc_entry>/', SAPProductionOrderDetailAPI.as_view(), name='pe-sap-order-detail'),
     path('sap/items/', SAPItemSearchAPI.as_view(), name='pe-sap-items'),
     path('sap/bom/', SAPItemBOMAPI.as_view(), name='pe-sap-item-bom'),
+
+    # SAP production orders of every status, and the actions on them (screens
+    # ported from SAP Portal). Separate from sap/orders/ above, which the run
+    # screens and the procurement report read.
+    path('sap-orders/', SapOrderListCreateAPI.as_view(), name='pe-sap-order-list'),
+    path('sap-orders/<int:doc_entry>/', SapOrderDetailAPI.as_view(), name='pe-sap-order-view'),
+    path('sap-orders/<int:doc_entry>/release/', SapOrderReleaseAPI.as_view(), name='pe-sap-order-release'),
+    path('sap-orders/<int:doc_entry>/close/', SapOrderCloseAPI.as_view(), name='pe-sap-order-close'),
+    path('sap-orders/<int:doc_entry>/issue/', SapOrderIssueAPI.as_view(), name='pe-sap-order-issue'),
+    path('sap-orders/<int:doc_entry>/receipt/', SapOrderReceiptAPI.as_view(), name='pe-sap-order-receipt'),
 
     # ------------------------------------------------------------------
     # Resource Tracking — Electricity

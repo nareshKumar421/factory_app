@@ -156,6 +156,20 @@ PRODUCTION_GROUPS = {
         "production_execution.can_view_waste_log",
         "production_execution.can_approve_waste_am",
     ],
+    # The SAP production-order screens that came over from SAP Portal: create,
+    # release, close, issue to and receive from orders in SAP directly. Its own
+    # group because it posts to SAP outside the run flow, which none of the
+    # roles above do.
+    "Production SAP Orders": [
+        "production_execution.can_view_sap_production_orders",
+        "production_execution.can_create_sap_production_orders",
+        "production_execution.can_release_close_sap_production_orders",
+        "production_execution.can_issue_for_sap_production_orders",
+        "production_execution.can_receive_from_sap_production_orders",
+    ],
+    "Production SAP Orders Viewer": [
+        "production_execution.can_view_sap_production_orders",
+    ],
 }
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from .hana.grpo_print_reader import HanaGRPOPrintReader
 from .hana.grpo_reader import HanaGRPOReader
 from .hana.po_print_reader import HanaPOPrintReader
 from .hana.po_reader import HanaPOReader
+from .hana.production_order_reader import HanaProductionOrderReader
 from .hana.service_grpo_options_reader import HanaServiceGRPOOptionsReader
 from .hana.batch_stock_reader import HanaBatchStockReader
 from .hana.returns_reader import HanaReturnsReader
@@ -37,6 +38,10 @@ from .service_layer.delivery_note_writer import DeliveryNoteWriter, GoodsIssueWr
 from .service_layer.grpo_writer import GRPOWriter
 from .service_layer.attachment_writer import AttachmentWriter
 from .service_layer.itr_writer import InventoryTransferRequestWriter
+from .service_layer.production_movement_writer import (
+    IssueForProductionWriter,
+    ReceiptFromProductionWriter,
+)
 from .service_layer.production_order_writer import ProductionOrderWriter
 from .service_layer.stock_transfer_writer import StockTransferWriter
 from .dtos import PODTO, POAdditionalExpenseDTO, WarehouseDTO, VendorDTO
@@ -677,6 +682,27 @@ class SAPClient:
             if not file_name:
                 raise
             return client.fetch_by_name(file_name)
+
+    # ---- SAP production orders (ported from SAP Portal) ----
+    def list_sap_production_orders(
+        self, status: str | None = None, search: str = "", limit: int = 50, offset: int = 0
+    ) -> dict:
+        """Orders of every status with issued/received totals: ``{count, results}``."""
+        return HanaProductionOrderReader(self.context).list_orders(
+            status=status, search=search, limit=limit, offset=offset
+        )
+
+    def sap_production_order(self, doc_entry: int) -> dict | None:
+        """One order with its component lines, issues and receipts."""
+        return HanaProductionOrderReader(self.context).order_detail(doc_entry)
+
+    def issue_for_production(self, payload: dict) -> dict:
+        """POST InventoryGenExits whose lines consume a production order's components."""
+        return IssueForProductionWriter(self.context).create(payload)
+
+    def receipt_from_production(self, payload: dict) -> dict:
+        """POST InventoryGenEntries receiving a production order's finished product."""
+        return ReceiptFromProductionWriter(self.context).create(payload)
 
     # ---- WRITE ----
     def create_production_order(self, payload: dict) -> dict:

@@ -1554,3 +1554,8 @@ class ProductionSettings(models.Model):
         if (material_type or '').upper() == 'RAW':
             return self.rm_warehouse
         return self.pm_warehouse
+
+
+# SAP production-order screens (ported from SAP Portal): the audit of actions
+# taken against SAP orders, and the rights those screens check.
+from .models_sap_orders import SapProductionOrderAction  # noqa: E402,F401
