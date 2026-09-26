@@ -68,6 +68,27 @@ class HanaSapUserReader:
             for code, name, locked, templates in rows
         ]
 
+    def user_codes_by_id(self, user_ids) -> dict[int, dict]:
+        """``{OUSR.USERID: {"user_code", "user_name"}}`` for these numeric ids.
+
+        SAP Portal stored each person's SAP account as the numeric ``USERID``;
+        JI maps people by ``USER_CODE`` (sap_identities.md). The portal-user
+        importer uses this to translate one into the other, per company, since
+        the same person's ``USERID`` can differ between company databases.
+        """
+        ids = sorted({int(i) for i in user_ids if i is not None})
+        if not ids:
+            return {}
+        marks = ", ".join("?" for _ in ids)
+        rows = self._query(
+            f'SELECT "USERID", "USER_CODE", "U_NAME" FROM "{{schema}}"."OUSR" WHERE "USERID" IN ({marks})',
+            tuple(ids),
+        )
+        return {
+            int(user_id): {"user_code": (code or "").strip(), "user_name": (name or "").strip()}
+            for user_id, code, name in rows
+        }
+
     def _query(self, sql: str, params: tuple) -> list:
         conn = None
         cursor = None

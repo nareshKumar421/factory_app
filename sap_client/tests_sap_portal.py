@@ -594,3 +594,30 @@ class FinanceReaderTests(SimpleTestCase):
         self.assertNotIn("inv'1", sql.lower())
         self.assertEqual(params, ("%INV'1%",) * 4 + ("13",))
         self.assertIn("TOP 5", sql)
+
+
+class SapUserCodesByIdTests(SimpleTestCase):
+    """OUSR.USERID -> USER_CODE, which the portal-user importer needs."""
+
+    def test_ids_are_bound_and_mapped_to_codes(self):
+        from .hana.sap_user_reader import HanaSapUserReader
+
+        reader = HanaSapUserReader(_context())
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(12, "user12 ", "Asha"), (30, "USER30", None)]
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        with patch.object(reader.connection, "connect", return_value=conn):
+            codes = reader.user_codes_by_id([30, "12", None, 12])
+        sql, params = cursor.execute.call_args[0]
+        self.assertEqual(params, (12, 30))
+        self.assertIn('"SCHEMA"."OUSR"', sql)
+        self.assertEqual(codes, {12: {"user_code": "user12", "user_name": "Asha"}, 30: {"user_code": "USER30", "user_name": ""}})
+
+    def test_no_ids_asks_nothing(self):
+        from .hana.sap_user_reader import HanaSapUserReader
+
+        reader = HanaSapUserReader(_context())
+        with patch.object(reader.connection, "connect") as connect:
+            self.assertEqual(reader.user_codes_by_id([None]), {})
+        connect.assert_not_called()

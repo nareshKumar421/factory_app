@@ -232,6 +232,10 @@ class SAPClient:
         """SAP B1 user accounts, with how many active templates they authorize."""
         return HanaSapUserReader(self.context).list_users(include_locked=include_locked)
 
+    def sap_user_codes_by_id(self, user_ids) -> dict[int, dict]:
+        """``{OUSR.USERID: {user_code, user_name}}`` — translates SAP Portal's numeric ids."""
+        return HanaSapUserReader(self.context).user_codes_by_id(user_ids)
+
     def transfer_approval_stage(self, wdd_code: int) -> dict:
         """The stage a transfer approval waits on, and the user who must sign it."""
         return HanaTransferApprovalReader(self.context).current_stage(wdd_code)
