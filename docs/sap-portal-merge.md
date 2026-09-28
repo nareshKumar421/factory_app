@@ -49,9 +49,11 @@ commands on the server that also hosts JI.
 
 In order; each step is safe to repeat.
 
-1. **Deploy the backend** (`/deploy`). New migrations, all of which only create tables:
-   `sap_finance 0001`, `sap_documents 0001`, `sap_approvals 0001`,
-   `bom_changes 0001`, `partner_onboarding 0001`, `production_execution 0048`.
+1. **Deploy the backend** (`/deploy`). New migrations: `sap_finance 0001`,
+   `sap_documents 0001`, `sap_approvals 0001`, `bom_changes 0001`,
+   `partner_onboarding 0001` and `production_execution 0048` create tables;
+   `accounts 0008` adds `User.must_change_password` with a database default, so
+   the previous release still runs on the migrated schema.
 2. **Server `.env`** (nothing here is required to boot; see DEPLOYMENT.md):
    - `SAP_FILE_SERVICE_BASE_URL` = the portal's `FILE_SERVICE_BASE` value, to switch
      attachment downloads on. Company ids default to Oil 1, Beverages 2, Mart 3.
@@ -64,6 +66,7 @@ In order; each step is safe to repeat.
    manage.py setup_bom_changes_groups
    manage.py setup_partner_onboarding_groups
    manage.py setup_production_groups        # adds "Production SAP Orders" (+ Viewer); others unchanged
+   manage.py seed_local_sap_reports         # the Inventory Audit report, in every company
    ```
 4. **Deploy the frontend.**
 5. **Prove the SAP writes on the sandbox** before anyone uses them live
@@ -79,15 +82,26 @@ In order; each step is safe to repeat.
    manage.py import_portal_vendors      --from-file zvendor_portal.json --dry-run
    manage.py import_portal_bom_requests --from-file zbom_requests.json  --dry-run              # then --yes
    ```
-   Users are matched by email and created without a usable password (they set
-   one through the normal reset). Portal roles and modules become the groups
-   above, and each portal SAP user id becomes a `SapApproverIdentity` per company.
-   Review the report's "unrestricted" users (portal admins, `sap_adder`s, users
-   with no module list) by hand, or rerun with `--grant-unrestricted`.
-7. **Approvers.** The general inbox lets approvers type their own SAP password
-   for each decision (never stored). JI's older queues still use
-   `SAP_APPROVER_CREDENTIALS`. Either way each approver must be mapped on
-   `/admin/sap-identities`; the users importer does most of it.
+   Users are matched by email and created without a usable password. JI sends
+   no email, so give them one: `manage.py issue_temporary_passwords
+   --without-password --output <new file>` writes a temporary password per user
+   to a file only its owner can read (or use the Django admin action for a few);
+   hand each over, delete the file, and JI makes each user choose their own at
+   first login. Portal users with no usable email are skipped — add them by
+   hand. Portal roles and modules become the groups above, and each portal SAP
+   user id becomes a `SapApproverIdentity` per company. Review the report's
+   "unrestricted" users (portal admins, `sap_adder`s, users with no module
+   list) by hand, or rerun with `--grant-unrestricted`. Then:
+   - give each user the companies they work in (`UserCompany`) — the portal let
+     everyone act on every company, JI shows one company at a time;
+   - assign the Inventory Audit report on `/admin/sap-report-access` to each
+     user who had the portal's `reports` module: in JI no assignment means no
+     reports.
+7. **Approvers.** The general inbox and the credit-note queue let approvers
+   type their own SAP password for each decision or withdrawal (never stored);
+   the transfer queue still needs `SAP_APPROVER_CREDENTIALS`. Either way each
+   approver must be mapped on `/admin/sap-identities`; the users importer does
+   most of it.
 8. **Run both, then cut over** (merge plan phases 6–7). Pause new work in the
    portal, run the importers once more (idempotent; `--update` for partners
    refreshes rows nobody has touched in JI), point the portal's pages at the JI
@@ -130,12 +144,24 @@ with SAP mocked.
 - **Duplicate protection** where the portal had none:
   - business partners: row lock, GSTIN/PAN check, card code reserved before posting;
   - BOMs: existing-tree check;
-  - production orders: a two-minute repeat guard;
-  - approvals: stale and already-posted guards.
+  - production orders: a create, issue or receipt is claimed before SAP is asked
+    (one in flight per payload), and one SAP did not answer is not sent again
+    until the operator has checked SAP and confirms;
+  - approvals and credit notes: draft-aware stale guards, and an approval over a
+    credit note SAP already posted is refused unless confirmed.
 - **Workflow bugs fixed:** an approved registration can no longer be rejected;
   verify and edit need the verify right; a closed BOM request cannot be re-pushed.
 - **Approval visibility is strict identity** (`SapApproverIdentity`), not the
   portal's name matching.
+- **Approvers see what they sign on their queue's own right:** the approvals
+  inbox and the credit-note queue show the draft in full (lines, TDS, journal
+  preview, base documents) and its attachments, limited to that request's files.
+- **A customer whose documents cannot be sent to SAP is not created** (the
+  portal created it anyway); a vendor's documents are still a warning.
+- **Imported users get a temporary password** (`issue_temporary_passwords`) and
+  must choose their own at first login; JI sends no email.
+- **`/api/v1/po/grpo/` needs the GRPO posting right** (it checked only login
+  and company).
 - **The ledger's running balance is right for any date range.**
 - **Not ported:**
   - direct GRPO without a PO (decision D4);
@@ -147,9 +173,27 @@ with SAP mocked.
   - the portal's report file-share listing (use `sap_reports`);
   - Service Layer fallbacks when HANA is down.
 
+## Decisions taken
+
+The code cites the merge plan's decisions by number; the plan itself was never
+saved, so they are recorded here.
+
+- **D1** — the general approvals inbox (and the credit-note queue) let an
+  approver type their own SAP password for a decision; it is never stored.
+- **D2** — the registration forms stay public, with no login; submissions are
+  throttled, except for staff working the queue.
+- **D3** — portal users become JI users matched by email, created without a
+  password; roles and modules become groups; the portal's SAP user id becomes
+  a `SapApproverIdentity` per company.
+- **D4** — direct GRPO without a PO is not merged (still open, below).
+
 ## Open business decisions
 
+- GRPO without a PO (D4): not available in JI; decide once its use is measured.
 - Re-deciding an approval that is already decided: the portal allowed it, JI refuses.
+- Receiving a rejected quantity from production: the portal wrote SAP's `IGN1`
+  directly; JI does not, so rejects go through the SAP client unless the
+  Service Layer proves to accept a transaction type on the receipt line.
 - BOM: the portal admin could approve any request straight to SAP; JI keeps the ladder.
 - Customer approval levels: live was 2 (verify, approve); the portal's 3-level
   screen had no backend behind it.
@@ -157,10 +201,13 @@ with SAP mocked.
 ## Rollback
 
 - Code: `factory_deploy.sh rollback` / `factoryflow_deploy.sh rollback`. The new
-  migrations only add tables, so the previous release runs on the migrated schema.
+  migrations only add tables and one column with a database default, so the
+  previous release runs on the migrated schema.
 - Until cutover the portal keeps running. Moving a group of users back means
   removing their JI group and sending them to the portal page.
-- The merge branch sits on `origin/main` at `5ecda37` (backend) and `075c7835`
-  (frontend); that is the state to return to before it lands. The local tag
-  `pre-sap-portal-merge` marks where the work started (`978845d`, `e7301c66`).
+- The merge branch was rebased onto `origin/main` at `ba6bf26` (backend) and
+  `292360ae` (frontend) on 2026-09-28, and is rebased again when it lands: the
+  commit before the first SAP Portal commit on main is the state to return to.
+  The local tag `pre-sap-portal-merge` marks where the work started (`978845d`,
+  `e7301c66`).
 - Anything already posted to SAP stays in SAP; a code rollback does not undo it.

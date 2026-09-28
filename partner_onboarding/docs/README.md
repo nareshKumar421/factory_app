@@ -131,8 +131,9 @@ Verifying or approving implies viewing. `setup_partner_onboarding_groups` mints:
    asked**, so a lost answer leaves a trace and a retry reuses the same code
    (SAP refuses a second partner under one code).
 6. Upload the documents to one Attachments2 entry (resumable: each landed file
-   is marked). A customer's failure stops the approval; a vendor's is a
-   warning, as in the portal. Aadhaar is never sent to SAP.
+   is marked). A customer's failure stops the approval — a change from the
+   portal, which swallowed every upload error and created the customer anyway;
+   a vendor's is a warning, as in the portal. Aadhaar is never sent to SAP.
 7. Locked again, build the payload and call `create_business_partner` **last**;
    mark APPROVED with SAP's code.
 
