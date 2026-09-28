@@ -526,8 +526,9 @@ CACHES = {
         }
     ),
 }
-# Told when SAP has been down for five minutes, and again when it is back. A
-# Django auth group; members are added in the admin. No group, no alert.
+# Told when SAP has been down for five minutes, and again when it is back, on
+# top of every active superuser (the managers all are). A Django auth group for
+# anyone else who should hear; members are added in the admin.
 SAP_HEALTH_ALERT_GROUP = config('SAP_HEALTH_ALERT_GROUP', default='SAP Health Alerts')
 
 # Invoice-approval decisions are recorded in SAP's approval workflow, which

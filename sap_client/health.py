@@ -20,7 +20,9 @@ the moment anything succeeds.
 ``RETRY_AFTER`` seconds, a call fails at once instead of waiting out its timeout
 to learn the same thing. After that window calls go through again, so a stale
 "down" can never hold off an SAP that has come back. Down for ``ALERT_AFTER``
-seconds, the ``SAP_HEALTH_ALERT_GROUP`` is told, and told again when it is back.
+seconds, every active superuser is told -- every manager here is one -- along
+with the ``SAP_HEALTH_ALERT_GROUP``, which is for anyone else who should hear;
+and all of them again when it is back.
 
 Probes are driven by :func:`snapshot`, which the health endpoint calls: every
 open FactoryFlow tab polls it, so while anyone is using the app SAP is asked
@@ -52,7 +54,7 @@ UNKNOWN = "unknown"
 PROBE_INTERVAL = 30
 #: While down, calls fail fast for this long after the last probe.
 RETRY_AFTER = 30
-#: Down this long, and the alert group hears about it.
+#: Down this long, and the superusers and the alert group hear about it.
 ALERT_AFTER = 300
 #: (connect, read) for the Service Layer probe; HANA's in milliseconds.
 SL_PROBE_TIMEOUT = (3, 5)
@@ -147,7 +149,7 @@ def record_success(component, state=None, *, probed=False):
     status = state.get("status")
     if status == UP and not probed:
         return state
-    # The group was told it went down, so it is owed "it's back". Only a probe
+    # They were told it went down, so they are owed "it's back". Only a probe
     # sends that: a real call may be inside a transaction that rolls back, and
     # should not wait on a push either. A real call just leaves it owed.
     owed = (status == DOWN and state.get("alerted")) or state.get("recovery_pending")
@@ -323,11 +325,24 @@ def _render(states):
     }
 
 
-def _alert(component, *, recovered, state):
-    """Tell the alert group. Never the reason a probe fails."""
+def _alert_recipients():
+    """Every active superuser, and anyone put in the alert group.
+
+    Superusers are the managers, so they hear without being added to anything;
+    the group is only for the people who should hear and are not superusers.
+    """
+    from django.contrib.auth import get_user_model
+    from django.db.models import Q
+
+    who = Q(is_superuser=True)
     group = getattr(settings, "SAP_HEALTH_ALERT_GROUP", "")
-    if not group:
-        return
+    if group:
+        who |= Q(groups__name=group)
+    return get_user_model().objects.filter(who, is_active=True).distinct()
+
+
+def _alert(component, *, recovered, state):
+    """Tell the people who answer for SAP. Never the reason a probe fails."""
     label = LABELS[component]
     if recovered:
         title = f"SAP {label} is answering again"
@@ -344,8 +359,8 @@ def _alert(component, *, recovered, state):
     try:
         from notifications.services import NotificationService
 
-        NotificationService.send_notification_by_auth_group(
-            group_name=group,
+        NotificationService.send_notification_to_group(
+            users=list(_alert_recipients()),
             title=title,
             body=body,
             reference_type="sap_health",

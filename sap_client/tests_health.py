@@ -227,3 +227,28 @@ class HealthEndpointTests(TestCase):
         from rest_framework.test import APIClient
 
         self.assertEqual(APIClient().get("/api/v1/sap-health/").status_code, 401)
+
+
+class AlertRecipientTests(TestCase):
+    """Superusers hear without being added to anything; the group is for the rest."""
+
+    def test_superusers_and_the_group_hear_and_nobody_else(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.models import Group
+
+        User = get_user_model()
+        manager = User.objects.create(email="manager@example.com", full_name="M", is_superuser=True)
+        User.objects.create(email="gone@example.com", full_name="G", is_superuser=True, is_active=False)
+        storekeeper = User.objects.create(email="store@example.com", full_name="S")
+        User.objects.create(email="clerk@example.com", full_name="C")
+        Group.objects.create(name="SAP Health Alerts").user_set.add(storekeeper, manager)
+
+        with override_settings(SAP_HEALTH_ALERT_GROUP="SAP Health Alerts"), mock.patch(
+            "notifications.services.NotificationService.send_notification_to_group"
+        ) as send:
+            health._alert(health.SERVICE_LAYER, recovered=False, state={"since": 0, "error": "x"})
+
+        told = sorted(u.email for u in send.call_args.kwargs["users"])
+        # Once each, though the manager is in the group too; no inactive account.
+        self.assertEqual(told, ["manager@example.com", "store@example.com"])
+        self.assertEqual(send.call_args.kwargs["title"], "SAP Service Layer is down")
