@@ -236,6 +236,97 @@ class WarehouseTests(SimpleTestCase):
         self.assertTrue(alerts[0]["title"].startswith("PM stores"), alerts[0]["title"])
         self.assertIn("oil tanks", alerts[0]["title"])
 
+    def test_an_unrated_fg_store_is_named_by_store_in_the_same_alert(self):
+        # Named "BH-PTD", not "FG stores": BH-BT and Gupta ARE rated, and the
+        # alert must send somebody to the one store that is not.
+        data = board()
+        data["storage"]["fg"].update(
+            {
+                "used_pct": None,
+                "no_rating": ["BH-PTD"],
+                "no_capacity_reason": "BH-PTD has no rated tonnage.",
+            }
+        )
+        alert = find(build_alerts(data, today=date(2026, 9, 15)), "storage.unrated")
+        self.assertEqual(alert["title"], "BH-PTD shows no % used")
+        self.assertIn("BH-PTD has no rated tonnage.", alert["detail"])
+
+        data["storage"]["oil"] = {"used_pct": None, "no_capacity_reason": "No rating exists."}
+        alerts = [a for a in build_alerts(data, today=date(2026, 9, 15)) if a["key"] == "storage.unrated"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["title"], "BH-PTD and oil tanks show no % used")
+
+    def test_a_fully_rated_fg_tile_raises_no_rating_alert(self):
+        data = board()
+        data["storage"]["fg"].update({"used_pct": 59.8, "no_rating": [], "no_capacity_reason": None})
+        self.assertNotIn("storage.unrated", keys(build_alerts(data, today=date(2026, 9, 15))))
+
+
+class FgStoresTests(TestCase):
+    """BH-PTD on the FG tile: counted in the total, and in the % once rated."""
+
+    TONNES = {"BH-BT": 514.8, "GP-FGM": 555.5, "BH-PTD": 36.7, "GP-FG": 8.6}
+
+    def setUp(self):
+        from stock_dashboard.models import WarehouseBoardSettings
+
+        WarehouseBoardSettings.objects.create(
+            company_code="JIVO_OIL", warehouse="BH-BT", capacity_tonnes=Decimal("502")
+        )
+        WarehouseBoardSettings.objects.create(
+            company_code="JIVO_MART", warehouse="GP-FGM", capacity_tonnes=Decimal("1120")
+        )
+
+    def _fg(self):
+        service = AdminBoardService("JIVO_OIL", today=date(2026, 9, 28))
+        # Each store's rows stand in as just its code, so the stubbed roll-up
+        # can hand back that store's tonnage.
+        with mock.patch.object(
+            AdminBoardService, "_occupancy", lambda self, company, warehouse, **kw: warehouse
+        ), mock.patch(
+            "admin_board.services.roll_up",
+            lambda warehouse: {
+                "tonnes": self.TONNES[warehouse],
+                "unweighed_items": 0,
+                "non_piece_items": 0,
+            },
+        ):
+            return service._fg_storage()
+
+    def test_bh_ptd_is_a_row_of_its_own_under_oil(self):
+        fg = self._fg()
+        self.assertEqual([row["warehouse"] for row in fg["rows"]], ["BH-BT", "GP-FGM", "BH-PTD"])
+        ptd = fg["rows"][2]
+        self.assertEqual((ptd["label"], ptd["company_code"], ptd["tons"]), ("BH-PTD", "JIVO_OIL", 36.7))
+
+    def test_its_stock_is_in_the_total_but_an_unrated_store_withholds_the_percentage(self):
+        fg = self._fg()
+        self.assertEqual(fg["total_tons"], 1107.0)
+        # 1,107 T over the 1,622 T that covers only two of the three stores
+        # would be a percentage of nothing in particular.
+        self.assertIsNone(fg["capacity_tons"])
+        self.assertIsNone(fg["used_pct"])
+        self.assertIsNone(fg["rows"][2]["used_pct"])
+        self.assertEqual(fg["no_rating"], ["BH-PTD"])
+        self.assertIn("BH-PTD has no rated tonnage", fg["no_capacity_reason"])
+
+    def test_rating_bh_ptd_brings_the_percentage_back_over_all_three(self):
+        from stock_dashboard.models import WarehouseBoardSettings
+
+        WarehouseBoardSettings.objects.create(
+            company_code="JIVO_OIL", warehouse="BH-PTD", capacity_tonnes=Decimal("100")
+        )
+        fg = self._fg()
+        self.assertEqual(fg["capacity_tons"], 1722.0)
+        self.assertEqual(fg["used_pct"], round(1107.0 / 1722.0 * 100, 1))
+        self.assertEqual(fg["no_rating"], [])
+        self.assertIsNone(fg["no_capacity_reason"])
+
+    def test_gp_fg_stays_outside_the_total(self):
+        fg = self._fg()
+        self.assertEqual([row["warehouse"] for row in fg["unrated"]], ["GP-FG"])
+        self.assertNotIn("GP-FG", [row["warehouse"] for row in fg["rows"]])
+
 
 class CostTests(SimpleTestCase):
     def test_a_line_that_is_genuinely_nil_is_not_an_alert(self):

@@ -712,7 +712,7 @@ class AdminBoardService:
         return row.isoformat() if row else None
 
     def _fg_storage(self) -> Dict[str, Any]:
-        """Finished goods on site: BH-BT and the Gupta godown.
+        """Finished goods on site: BH-BT, the Gupta godown and BH-PTD.
 
         WEIGHED THE WAY THE LOGISTICS BOARD WEIGHS THEM, and scoped the way it
         scopes them. Both halves matter and both were wrong in the first cut of
@@ -775,6 +775,10 @@ class AdminBoardService:
                     }
                 )
 
+        # Named, because the combined % goes blank for want of one store's
+        # rating and a blank with no reason reads as a fault.
+        no_rating = [row["label"] for row in rows if row["capacity_tons"] is None]
+
         return {
             "unit": "tonnes",
             "total_tons": round(total_tons, 2),
@@ -785,6 +789,13 @@ class AdminBoardService:
             ),
             "rows": rows,
             "unrated": unrated,
+            "no_rating": no_rating,
+            "no_capacity_reason": (
+                f"{' and '.join(no_rating)} {'has' if len(no_rating) == 1 else 'have'} "
+                "no rated tonnage, so the finished-goods stores show no combined % used."
+                if no_rating
+                else None
+            ),
             # A tonnage is only as complete as the item master behind it. A
             # confident total over a half-weighed warehouse is the failure mode
             # here, and it looks identical to a correct one.

@@ -192,8 +192,11 @@ def _storage_alerts(board: Dict[str, Any], today: date) -> List[Dict[str, Any]]:
 
     # One combined alert for every store nobody has rated, rather than one each:
     # they all need the same thing done in the same place, and three separate
-    # rows pushes a real problem off the bottom of the list.
-    unrated = [
+    # rows pushes a real problem off the bottom of the list. A finished-goods
+    # store with no rating is named by store: the rest of that tile is rated,
+    # and "FG stores" would send somebody to rate BH-BT again.
+    fg_unrated = list((fg or {}).get("no_rating") or [])
+    unrated = fg_unrated + [
         name
         for name, section in (("PM stores", storage.get("pm")), ("oil tanks", storage.get("oil")))
         if section and section.get("used_pct") is None
@@ -201,7 +204,7 @@ def _storage_alerts(board: Dict[str, Any], today: date) -> List[Dict[str, Any]]:
     if unrated:
         reasons = [
             section.get("no_capacity_reason")
-            for section in (storage.get("pm"), storage.get("oil"))
+            for section in (fg, storage.get("pm"), storage.get("oil"))
             if section and section.get("used_pct") is None and section.get("no_capacity_reason")
         ]
         # Sentence-cased by hand, not `.capitalize()` — that lowercases the rest
@@ -211,7 +214,8 @@ def _storage_alerts(board: Dict[str, Any], today: date) -> List[Dict[str, Any]]:
             _alert(
                 "storage.unrated",
                 SEVERITY_WARNING,
-                f"{subject[0].upper()}{subject[1:]} show no % used",
+                f"{subject[0].upper()}{subject[1:]} "
+                f"{'shows' if unrated == fg_unrated[:1] else 'show'} no % used",
                 " ".join(reasons) or "No rated capacity has been entered.",
                 "Rate them",
             )

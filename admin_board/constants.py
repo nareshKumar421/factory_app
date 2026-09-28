@@ -59,9 +59,16 @@ PRODUCTION_FLOOR = "BH-PF"
 #: Oil's (a genuine split, not a tagging error). A reader asking "how much
 #: finished goods is on site" means both, so the tile sums across the company
 #: boundary and the rows name which company each came from.
+#:
+#: BH-PTD — Oil's "Bhakarpur Pouch Tin Drum" godown — was added on 28 September
+#: 2026 at the user's request. It holds the pouches, tins and drums (all item
+#: group 102, every SKU weighed; 36.7 T that day). It had no rated tonnage when
+#: added, so until somebody rates it the tile reports its stock and withholds
+#: the combined % used, as it would for any store in the total with no rating.
 FG_STORES = [
     {"warehouse": "BH-BT", "company": "JIVO_OIL", "label": "BH-BT"},
     {"warehouse": "GP-FGM", "company": "JIVO_MART", "label": "Gupta"},
+    {"warehouse": "BH-PTD", "company": "JIVO_OIL", "label": "BH-PTD"},
 ]
 
 #: Finished goods standing in a warehouse nobody has rated.
