@@ -905,6 +905,28 @@ def attachment_lines(company_code: str, abs_entry: int) -> list[dict]:
     return SAPClient(company_code=company_code).sap_attachment_lines(abs_entry)
 
 
+def attachment_sources(doc: dict, own_label: str = "This document") -> list[dict]:
+    """``[{label, abs_entry}]`` for one shaped document: its own attachment entry
+    first, then each base document's, each entry once.
+
+    A screen that serves attachments on a narrower right than the document
+    browser's (an approval queue) serves only these, so that right cannot open
+    every file in SAP.
+    """
+    sources, seen = [], set()
+    own = doc.get("attachment_entry")
+    if own:
+        seen.add(own)
+        sources.append({"label": own_label, "abs_entry": own})
+    for base in doc.get("base_documents") or []:
+        entry = base.get("attachment_entry")
+        if entry and entry not in seen:
+            seen.add(entry)
+            number = base.get("doc_num") or base.get("base_entry")
+            sources.append({"label": f"{base.get('type_label') or 'Document'} #{number}", "abs_entry": entry})
+    return sources
+
+
 def inline_content_type(content_type: str, file_name: str) -> str | None:
     """The type to show a file under in a browser tab, or None to download it.
 

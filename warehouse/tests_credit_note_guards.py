@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 from django.test import override_settings
 
+from sap_documents.services import attachment_sources
 from warehouse.tests_credit_note_extras import BASE, CN_STAGE, _CreditNoteExtrasTestCase, inbox_state
 
 POSTED = [{"doc_entry": 41202, "doc_num": 626092650, "doc_date": "2026-09-16"}]
@@ -151,6 +152,7 @@ class AttachmentTests(_CreditNoteExtrasTestCase):
     def test_lists_this_credit_notes_files_and_its_base_documents(self, sap, docs):
         sap.return_value.approval_inbox_stage.return_value = inbox_state()
         docs.document_detail.return_value = DRAFT_DETAIL
+        docs.attachment_sources.side_effect = attachment_sources
         docs.attachment_lines.return_value = FILES
         response = self.client.get(f"{BASE}75424/attachments/")
         self.assertEqual(response.status_code, 200)
@@ -165,6 +167,7 @@ class AttachmentTests(_CreditNoteExtrasTestCase):
     def test_downloads_a_file_of_this_credit_note(self, sap, docs):
         sap.return_value.approval_inbox_stage.return_value = inbox_state()
         docs.document_detail.return_value = DRAFT_DETAIL
+        docs.attachment_sources.side_effect = attachment_sources
         docs.fetch_attachment.return_value = {"data": b"%PDF", "file_name": "invoice.pdf", "content_type": "application/pdf"}
         from django.http import HttpResponse
 
@@ -177,6 +180,7 @@ class AttachmentTests(_CreditNoteExtrasTestCase):
         """The queue's view right must not become a key to every file in SAP."""
         sap.return_value.approval_inbox_stage.return_value = inbox_state()
         docs.document_detail.return_value = DRAFT_DETAIL
+        docs.attachment_sources.side_effect = attachment_sources
         response = self.client.get(f"{BASE}75424/attachments/1234/1/download/")
         self.assertEqual(response.status_code, 404)
         docs.fetch_attachment.assert_not_called()

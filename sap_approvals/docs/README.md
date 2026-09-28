@@ -31,6 +31,9 @@ overridden. It never holds a password.
 | GET | `requests/<wdd_code>/` | `can_view_sap_approval_inbox` |
 | POST | `requests/<wdd_code>/decision/` `{approve, remarks, sap_password?, confirm_duplicate?}` | `can_decide_sap_approvals` |
 | POST | `requests/<wdd_code>/withdraw/` `{sap_password?}` | `can_withdraw_own_sap_approvals` |
+| GET | `requests/<wdd_code>/document/` → `{type, document, attachment_sources}`: the draft as the document browser shapes it (lines with UDFs, TDS, journal preview, base documents), ODRF or, for object types 24/46, OPDF | `can_view_sap_approval_inbox` + on the request |
+| GET | `requests/<wdd_code>/attachments/<abs_entry>/` → the files of one of this request's attachment entries | `can_view_sap_approval_inbox` + on the request |
+| GET | `requests/<wdd_code>/attachments/<abs_entry>/<line>/download/` → one file; any entry not this request's (or its base documents') is 404 | `can_view_sap_approval_inbox` + on the request |
 | GET | `pending-count/` → `{"total": n}` (waiting on me) | `can_view_sap_approval_inbox` |
 
 Deciding and withdrawing each imply viewing. Every view: login, the
@@ -134,9 +137,12 @@ Two rules together (`approval_inbox_reader.inbox_status` /
   swapped); `1470000113`, which matches no request, is gone; 24 is labelled.
 * **Not ported**: the Service Layer fallback list when HANA is down (the list
   answers 503 instead); the `originatorId` filter (replaced by the "raised by
-  me" scope); payment-draft lines, TDS, GL and attachment tabs in the detail;
-  a company-wide listing of other people's requests (the warehouse queues are
-  that, per family).
+  me" scope); a company-wide listing of other people's requests (the
+  warehouse queues are that, per family).
+* **The Document, TDS, GL and Attachments tabs** are the document browser's
+  own view of the draft (`document/`), served on the inbox's right and
+  visibility rule, so an approver needs no document-browser right to see what
+  they sign; files are limited to this request's attachment entries.
 
 ## Open business decision
 

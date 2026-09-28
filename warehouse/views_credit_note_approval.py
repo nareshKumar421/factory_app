@@ -602,18 +602,7 @@ class CreditNoteApprovalAttachmentsView(_CreditNoteRequestView):
         )
         if doc is None:
             return []
-        sources, seen = [], set()
-        own = doc.get("attachment_entry")
-        if own:
-            seen.add(own)
-            sources.append({"label": state.get("object_type_label") or "Credit note", "abs_entry": own})
-        for base in doc.get("base_documents") or []:
-            entry = base.get("attachment_entry")
-            if entry and entry not in seen:
-                seen.add(entry)
-                number = base.get("doc_num") or base.get("base_entry")
-                sources.append({"label": f"{base.get('type_label') or 'Document'} #{number}", "abs_entry": entry})
-        return sources
+        return document_services.attachment_sources(doc, state.get("object_type_label") or "Credit note")
 
 
 class CreditNoteApprovalAttachmentDownloadView(CreditNoteApprovalAttachmentsView):

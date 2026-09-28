@@ -41,6 +41,8 @@ from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 from sap_client.hana.approval_inbox_reader import OBJECT_TYPE_LABELS, stale_message
+from sap_documents import services as document_services
+from sap_documents.constants import DOCUMENT_TYPES
 from warehouse.views_sap_approval_base import SapApprovalViewBase
 
 from .constants import DecisionAction
@@ -232,6 +234,115 @@ class ApprovalRequestDetailAPI(_InboxView):
                 return True
         return False
 
+
+
+# Payment drafts live in OPDF, every other draft in ODRF (approval_inbox_reader).
+PAYMENT_OBJECT_TYPES = ("24", "46")
+
+
+class _VisibleRequestView(_InboxView):
+    """One request the caller may open (the detail's own rule), and its draft."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewSapApprovalInbox]
+
+    def visible_request(self, wdd_code):
+        """``(request, None)``, or ``(None, refusal)``."""
+        mine = self.my_sap_code()
+        if not mine:
+            return None, Response({"error": self.unmapped_message()}, status=status.HTTP_403_FORBIDDEN)
+        data = self.client().approval_inbox_detail(wdd_code, mine)
+        if data is None:
+            return None, self.not_found(wdd_code)
+        if not ApprovalRequestDetailAPI._visible(data, mine):
+            return None, Response(
+                {"error": "You are not on this SAP approval request, so you cannot open it."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return data, None
+
+    def draft_document(self, data) -> tuple[str, dict | None]:
+        """``(document type key, the draft as the document browser shapes it)``."""
+        key = "PaymentDrafts" if str(data.get("object_type")) in PAYMENT_OBJECT_TYPES else "Drafts"
+        entry = data.get("draft_entry")
+        if not entry:
+            return key, None
+        return key, document_services.document_detail(self.company.code, DOCUMENT_TYPES[key], int(entry))
+
+    def sources(self, data, doc) -> list[dict]:
+        return document_services.attachment_sources(doc, data.get("object_type_label") or "This document")
+
+
+class ApprovalRequestDocumentAPI(_VisibleRequestView):
+    """GET requests/<wdd_code>/document/ — the draft in full, as the document
+    browser shows it: every line with its UDFs, TDS, the journal preview, base
+    documents and the attachment entries (SAP Portal's Document, TDS, GL and
+    Attachments tabs). The inbox's own right and visibility rule are enough —
+    an approver must not need the document browser to see what they sign."""
+
+    def get(self, request, wdd_code):
+        data, refusal = self.visible_request(wdd_code)
+        if refusal is not None:
+            return refusal
+        key, doc = self.draft_document(data)
+        if doc is None:
+            return Response(
+                {"error": f"SAP no longer holds the draft of approval request {wdd_code}."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response({
+            "type": {"key": key, "label": DOCUMENT_TYPES[key].label},
+            "document": doc,
+            "attachment_sources": self.sources(data, doc),
+        })
+
+
+class ApprovalRequestAttachmentLinesAPI(_VisibleRequestView):
+    """GET requests/<wdd_code>/attachments/<abs_entry>/ — the files of one of
+    this request's attachment entries (its own, or a base document's)."""
+
+    def get(self, request, wdd_code, abs_entry):
+        data, refusal = self.visible_request(wdd_code)
+        if refusal is not None:
+            return refusal
+        _, doc = self.draft_document(data)
+        if doc is None or abs_entry not in {s["abs_entry"] for s in self.sources(data, doc)}:
+            return Response(
+                {"detail": f"Attachment {abs_entry} does not belong to this approval request."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response({
+            "abs_entry": abs_entry,
+            "lines": document_services.attachment_lines(self.company.code, abs_entry),
+        })
+
+
+class ApprovalRequestAttachmentDownloadAPI(_VisibleRequestView):
+    """GET requests/<wdd_code>/attachments/<abs_entry>/<line>/download/ — one
+    file of this request's attachments, served and recorded as the document
+    browser serves one. Any other entry is refused."""
+
+    def get(self, request, wdd_code, abs_entry, line):
+        data, refusal = self.visible_request(wdd_code)
+        if refusal is not None:
+            return refusal
+        _, doc = self.draft_document(data)
+        if doc is None or abs_entry not in {s["abs_entry"] for s in self.sources(data, doc)}:
+            return Response(
+                {"detail": f"Attachment {abs_entry} does not belong to this approval request."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        try:
+            served = document_services.fetch_attachment(self.company, request.user, abs_entry, line)
+        except document_services.AttachmentNotFound as e:
+            return Response({"detail": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        except SAPValidationError as e:
+            if getattr(e, "status", None) == 404:
+                return Response(
+                    {"detail": f"The attachment file service has no copy of this file. {e}"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            raise
+        return document_services.served_file_response(served)
 
 class ApprovalRequestDecisionAPI(_InboxView):
     """POST {approve, remarks, sap_password?, confirm_duplicate?} — approve or reject,
