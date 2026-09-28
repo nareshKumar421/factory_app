@@ -12,6 +12,7 @@ Layer posts, so there is no second queue anywhere and no draft to chase.
 
 from __future__ import annotations
 
+import functools
 import logging
 from datetime import date
 from decimal import Decimal
@@ -50,6 +51,32 @@ logger = logging.getLogger(__name__)
 class TransferRequestError(ValueError):
     """A request the app itself refuses — bad state, not a SAP rejection."""
 
+
+
+def _keeps_posting_failure(method):
+    """Keep SAP's refusal on the request once the posting has rolled back.
+
+    `_post_and_record` writes FAILED and the error as it re-raises, but it runs
+    inside the posting's atomic block, so that write rolls back with the rest
+    and the request looks as if nobody tried. This sits outside the block and
+    writes it again once the rollback is done: a timeout in particular may mean
+    SAP committed anyway, and the operator needs the message before retrying.
+    """
+    @functools.wraps(method)
+    def wrapper(self, request_id, *args, **kwargs):
+        try:
+            return method(self, request_id, *args, **kwargs)
+        except (SAPValidationError, SAPDataError, SAPConnectionError) as exc:
+            # Only a failure of the post itself; a read that failed before it
+            # (series, stock) leaves the request as it was, which is the truth.
+            if getattr(exc, "failed_transfer_request_id", None) == request_id:
+                WarehouseTransferRequest.objects.filter(pk=request_id).update(
+                    posting_status=TransferPostingStatus.FAILED,
+                    posting_error=str(exc),
+                    updated_at=timezone.now(),
+                )
+            raise
+    return wrapper
 
 class TransferRequestService:
     """Everything a warehouse transfer request does, for one company."""
@@ -480,6 +507,7 @@ class TransferRequestService:
             "lines": lines,
         }
 
+    @_keeps_posting_failure
     @transaction.atomic
     def post_transfer(
         self, request_id: int, allocations: dict[int, list[dict]] | None = None
@@ -822,6 +850,7 @@ class TransferRequestService:
     # 05 — the second leg
     # ------------------------------------------------------------------
 
+    @_keeps_posting_failure
     @transaction.atomic
     def post_second_leg(
         self, request_id: int, received: dict[int, Decimal] | None = None
@@ -935,6 +964,9 @@ class TransferRequestService:
             request.save(update_fields=[
                 'posting_status', 'posting_error', 'updated_at',
             ])
+            # The save above rolls back with the posting's transaction;
+            # `_keeps_posting_failure` writes it again once it has.
+            exc.failed_transfer_request_id = request.pk
             raise
 
         doc_entry = created.get('DocEntry')

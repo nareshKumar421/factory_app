@@ -1,3 +1,4 @@
+import functools
 import logging
 from collections import defaultdict, deque
 from decimal import Decimal as D
@@ -48,6 +49,38 @@ def _claim_note(option: dict) -> str:
         f" ({option['on_hand']} on hand, {claimed} already approved "
         f"for another run)"
     )
+
+
+def _unreachable_login(exc):
+    """A Service Layer login that got no answer: nothing was posted."""
+    from sap_client.exceptions import SAPUnavailable
+    return SAPUnavailable(f"SAP Service Layer did not answer the login ({exc}).")
+
+
+def _keeps_fg_receipt_failure(method):
+    """Keep FAILED and SAP's reason on an FG receipt after the rollback.
+
+    `post_fg_receipt_to_sap` marks the receipt FAILED as it raises, but inside
+    its own atomic block, so the mark rolled back and the receipt came back
+    RECEIVED with no trace of the attempt. Failures that should stick carry
+    ``fg_receipt_sap_error``; this writes it again once the block has unwound.
+    """
+    @functools.wraps(method)
+    def wrapper(self, receipt_id, *args, **kwargs):
+        try:
+            return method(self, receipt_id, *args, **kwargs)
+        except Exception as exc:
+            error = getattr(exc, 'fg_receipt_sap_error', None)
+            if error is not None:
+                FinishedGoodsReceipt.objects.filter(
+                    id=receipt_id, company=self.company,
+                ).update(
+                    status=FGReceiptStatus.FAILED,
+                    sap_error=error,
+                    updated_at=timezone.now(),
+                )
+            raise
+    return wrapper
 
 
 class WarehouseService:
@@ -1286,18 +1319,25 @@ class WarehouseService:
         sl_config = client.context.service_layer
         base_url = sl_config['base_url']
 
+        from sap_client import health
+        health.guard_service_layer()
         session = http_requests.Session()
-        login_resp = session.post(
-            f"{base_url}/b1s/v2/Login",
-            json={
-                "CompanyDB": sl_config['company_db'],
-                "UserName": sl_config['username'],
-                "Password": sl_config['password'],
-            },
-            timeout=10,
-            verify=False,
-        )
+        try:
+            login_resp = session.post(
+                f"{base_url}/b1s/v2/Login",
+                json={
+                    "CompanyDB": sl_config['company_db'],
+                    "UserName": sl_config['username'],
+                    "Password": sl_config['password'],
+                },
+                timeout=10,
+                verify=False,
+            )
+        except http_requests.RequestException as e:
+            raise _unreachable_login(e) from e
         if not login_resp.ok:
+            if login_resp.status_code >= 500:
+                raise _unreachable_login(login_resp.status_code)
             raise ValueError(f"SAP login failed: {login_resp.text}")
 
         posting_date = data.get('posting_date', timezone.now().date().isoformat())
@@ -1326,12 +1366,22 @@ class WarehouseService:
         if branch_id is not None:
             payload["BPL_IDAssignedToInvoice"] = branch_id
 
-        response = session.post(
-            f"{base_url}/b1s/v2/InventoryGenExits",
-            json=payload,
-            timeout=30,
-            verify=False,
-        )
+        try:
+            response = session.post(
+                f"{base_url}/b1s/v2/InventoryGenExits",
+                json=payload,
+                timeout=30,
+                verify=False,
+            )
+        except http_requests.RequestException as e:
+            # issued_qty moves only on success, so a retry after a timeout would
+            # issue the same materials again if SAP did take the first one.
+            from sap_client.service_layer.errors import unanswered
+            raise unanswered(
+                e,
+                "SAP did not answer while issuing the materials; the issue may "
+                "still have been posted — check SAP before issuing again.",
+            ) from e
 
         if not response.ok:
             try:
@@ -1557,6 +1607,7 @@ class WarehouseService:
         logger.info(f"FG receipt #{receipt_id} received by {user}")
         return receipt
 
+    @_keeps_fg_receipt_failure
     @transaction.atomic
     def post_fg_receipt_to_sap(self, receipt_id: int) -> FinishedGoodsReceipt:
         """Post finished goods receipt to SAP InventoryGenEntries."""
@@ -1600,22 +1651,34 @@ class WarehouseService:
         sl_config = client.context.service_layer
         base_url = sl_config['base_url']
 
+        from sap_client import health
+        health.guard_service_layer()
         session = http_requests.Session()
-        login_resp = session.post(
-            f"{base_url}/b1s/v2/Login",
-            json={
-                "CompanyDB": sl_config['company_db'],
-                "UserName": sl_config['username'],
-                "Password": sl_config['password'],
-            },
-            timeout=10,
-            verify=False,
-        )
+        try:
+            login_resp = session.post(
+                f"{base_url}/b1s/v2/Login",
+                json={
+                    "CompanyDB": sl_config['company_db'],
+                    "UserName": sl_config['username'],
+                    "Password": sl_config['password'],
+                },
+                timeout=10,
+                verify=False,
+            )
+        except http_requests.RequestException as e:
+            exc = _unreachable_login(e)
+            exc.fg_receipt_sap_error = str(exc)
+            raise exc from e
         if not login_resp.ok:
             receipt.status = FGReceiptStatus.FAILED
             receipt.sap_error = f"SAP login failed: {login_resp.text}"
             receipt.save()
-            raise ValueError(receipt.sap_error)
+            exc = (
+                _unreachable_login(login_resp.status_code)
+                if login_resp.status_code >= 500 else ValueError(receipt.sap_error)
+            )
+            exc.fg_receipt_sap_error = receipt.sap_error
+            raise exc
 
         payload = {
             "DocDate": receipt.posting_date.isoformat(),
@@ -1637,12 +1700,22 @@ class WarehouseService:
         if branch_id is not None:
             payload["BPL_IDAssignedToInvoice"] = branch_id
 
-        response = session.post(
-            f"{base_url}/b1s/v2/InventoryGenEntries",
-            json=payload,
-            timeout=30,
-            verify=False,
-        )
+        try:
+            response = session.post(
+                f"{base_url}/b1s/v2/InventoryGenEntries",
+                json=payload,
+                timeout=30,
+                verify=False,
+            )
+        except http_requests.RequestException as e:
+            from sap_client.service_layer.errors import unanswered
+            exc = unanswered(
+                e,
+                "SAP did not answer while posting the FG receipt; it may still "
+                "have been posted — check SAP before posting again.",
+            )
+            exc.fg_receipt_sap_error = str(exc)
+            raise exc from e
 
         if not response.ok:
             try:
@@ -1652,7 +1725,10 @@ class WarehouseService:
             receipt.status = FGReceiptStatus.FAILED
             receipt.sap_error = err
             receipt.save()
-            raise ValueError(f"SAP posting failed: {err}")
+            exc = ValueError(f"SAP posting failed: {err}")
+            # The save above rolls back with the block; the decorator re-writes it.
+            exc.fg_receipt_sap_error = err
+            raise exc
 
         result = response.json()
         receipt.sap_receipt_doc_entry = result.get('DocEntry')

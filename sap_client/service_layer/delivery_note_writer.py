@@ -10,7 +10,8 @@ import logging
 import requests
 from decimal import Decimal
 
-from ..exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from ..exceptions import SAPConnectionError, SAPDataError, SAPUnavailable, SAPValidationError
+from .errors import unanswered
 from .auth import ServiceLayerSession
 
 logger = logging.getLogger(__name__)
@@ -46,13 +47,13 @@ class _ServiceLayerDocWriter:
             return session.login()
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Failed to connect to SAP Service Layer: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise SAPUnavailable("Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"SAP Service Layer connection timeout: {e}")
-            raise SAPConnectionError("SAP Service Layer connection timeout")
+            raise SAPUnavailable("SAP Service Layer connection timeout")
         except requests.exceptions.HTTPError as e:
             logger.error(f"SAP Service Layer authentication failed: {e}")
-            raise SAPConnectionError("SAP Service Layer authentication failed")
+            raise SAPUnavailable("SAP Service Layer authentication failed")
 
     def create(self, payload: dict) -> dict:
         cookies = self._get_session_cookies()
@@ -84,16 +85,16 @@ class _ServiceLayerDocWriter:
                 raise SAPValidationError(error_msg)
             if response.status_code in (401, 403):
                 logger.error("SAP authentication/authorization error")
-                raise SAPConnectionError("SAP authentication failed")
+                raise SAPUnavailable("SAP authentication failed")
             error_msg = self._extract_error_message(response)
             logger.error(f"SAP error creating {self.label}: {error_msg}")
             raise SAPDataError(f"Failed to create {self.label}: {error_msg}")
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Connection error while creating {self.label}: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise unanswered(e, "Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout while creating {self.label}: {e}")
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise unanswered(e, "SAP Service Layer request timeout")
         except (SAPConnectionError, SAPDataError, SAPValidationError):
             raise
         except Exception as e:
@@ -131,10 +132,10 @@ class _ServiceLayerDocWriter:
             )
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Connection error posting {self.label} draft {draft_entry}: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise unanswered(e, "Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout posting {self.label} draft {draft_entry}: {e}")
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise unanswered(e, "SAP Service Layer request timeout")
 
         if response.status_code in (200, 204):
             logger.info(f"{self.label} draft {draft_entry} posted as a document")
@@ -146,7 +147,7 @@ class _ServiceLayerDocWriter:
             raise SAPValidationError(error_msg)
         if response.status_code in (401, 403):
             logger.error(f"SAP auth error posting {self.label} draft {draft_entry}")
-            raise SAPConnectionError("SAP authentication failed")
+            raise SAPUnavailable("SAP authentication failed")
         logger.error(f"SAP error posting {self.label} draft {draft_entry}: {error_msg}")
         raise SAPDataError(
             f"Failed to post {self.label} draft {draft_entry}: {error_msg}"
@@ -167,10 +168,10 @@ class _ServiceLayerDocWriter:
             )
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Connection error updating draft {draft_entry}: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise unanswered(e, "Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout updating draft {draft_entry}: {e}")
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise unanswered(e, "SAP Service Layer request timeout")
 
         if response.status_code in (200, 204):
             return
@@ -179,7 +180,7 @@ class _ServiceLayerDocWriter:
             logger.error(f"SAP refused updating draft {draft_entry}: {error_msg}")
             raise SAPValidationError(error_msg)
         if response.status_code in (401, 403):
-            raise SAPConnectionError("SAP authentication failed")
+            raise SAPUnavailable("SAP authentication failed")
         logger.error(f"SAP error updating draft {draft_entry}: {error_msg}")
         raise SAPDataError(f"Failed to update draft {draft_entry}: {error_msg}")
 

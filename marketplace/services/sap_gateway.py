@@ -26,6 +26,7 @@ def oitw_onhand(company_code, item_codes, warehouse_code):
         return {}
     try:
         from hdbcli import dbapi
+        from sap_client.hana.connection import HANA_TIMEOUTS
         from sap_client.context import CompanyContext
         h = CompanyContext(company_code).hana
     except Exception as e:  # pragma: no cover - env specific
@@ -39,7 +40,8 @@ def oitw_onhand(company_code, item_codes, warehouse_code):
     out, conn = {}, None
     try:
         conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
-                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+                             password=h["password"], encrypt=True, sslValidateCertificate=False,
+                             **HANA_TIMEOUTS)
         cur = conn.cursor()
         cur.execute(sql, [warehouse_code, *codes])
         for item, onhand in cur.fetchall():
@@ -75,6 +77,7 @@ def oitm_names(company_code, item_codes):
         return {}
     try:
         from hdbcli import dbapi
+        from sap_client.hana.connection import HANA_TIMEOUTS
         from sap_client.context import CompanyContext
         h = CompanyContext(company_code).hana
     except Exception as e:  # pragma: no cover - env specific
@@ -88,7 +91,8 @@ def oitm_names(company_code, item_codes):
     out, conn = {}, None
     try:
         conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
-                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+                             password=h["password"], encrypt=True, sslValidateCertificate=False,
+                             **HANA_TIMEOUTS)
         cur = conn.cursor()
         cur.execute(sql, codes)
         for item, name in cur.fetchall():
@@ -394,6 +398,7 @@ class MarketplaceSapGateway:
             return {}
         try:
             from hdbcli import dbapi
+            from sap_client.hana.connection import HANA_TIMEOUTS
             from sap_client.context import CompanyContext
             h = CompanyContext(self.company_code).hana
         except Exception as e:  # pragma: no cover - env specific
@@ -411,7 +416,8 @@ class MarketplaceSapGateway:
         out, conn = {}, None
         try:
             conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
-                                 password=h["password"], encrypt=True, sslValidateCertificate=False)
+                                 password=h["password"], encrypt=True, sslValidateCertificate=False,
+                                 **HANA_TIMEOUTS)
             cur = conn.cursor()
             cur.execute(sql, [*codes, *codes])
             for item, ocr, _cnt in cur.fetchall():
@@ -436,6 +442,7 @@ class MarketplaceSapGateway:
             return {}
         try:
             from hdbcli import dbapi
+            from sap_client.hana.connection import HANA_TIMEOUTS
             from sap_client.context import CompanyContext
             h = CompanyContext(self.company_code).hana
         except Exception as e:  # pragma: no cover - env specific
@@ -451,7 +458,8 @@ class MarketplaceSapGateway:
         conn = None
         try:
             conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
-                                 password=h["password"], encrypt=True, sslValidateCertificate=False)
+                                 password=h["password"], encrypt=True, sslValidateCertificate=False,
+                                 **HANA_TIMEOUTS)
             cur = conn.cursor()
             cur.execute(sql, [warehouse_code, *codes])
             for item, batch, qty in cur.fetchall():

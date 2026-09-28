@@ -2,7 +2,6 @@ import logging
 import os
 import re
 import tempfile
-from functools import lru_cache
 from typing import List, Dict, Any, Optional
 from decimal import Decimal
 from datetime import date
@@ -21,6 +20,7 @@ from raw_material_gatein.services.validations import (
     over_receipt_ceiling,
 )
 from quality_control.enums import InspectionStatus
+from sap_client.lookup_cache import NotCached, cache_answers
 from sap_client.client import SAPClient
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
@@ -157,7 +157,7 @@ class GRPOService:
         return fetched
 
     @staticmethod
-    @lru_cache(maxsize=32)
+    @cache_answers(maxsize=32)
     def _get_sap_table_columns(
         company_code: str,
         table_name: str,
@@ -185,7 +185,7 @@ class GRPOService:
                 table_name,
                 exc,
             )
-            return None
+            raise NotCached(None)
         finally:
             if cursor:
                 try:
@@ -292,7 +292,7 @@ class GRPOService:
         return (product_variety or "").strip() or "Transport"
 
     @staticmethod
-    @lru_cache(maxsize=32)
+    @cache_answers(maxsize=32)
     def _get_sap_tax_codes(company_code: str) -> Dict[str, Dict[str, Any]]:
         context = CompanyContext(company_code)
         connection = HanaConnection(context.hana)
@@ -320,7 +320,7 @@ class GRPOService:
             return codes
         except Exception as exc:
             logger.warning("Could not read SAP tax codes for %s: %s", company_code, exc)
-            return {}
+            raise NotCached({})
         finally:
             if cursor:
                 try:
@@ -334,7 +334,7 @@ class GRPOService:
                     pass
 
     @staticmethod
-    @lru_cache(maxsize=32)
+    @cache_answers(maxsize=32)
     def _get_sap_branch_states(company_code: str) -> Dict[int, str]:
         context = CompanyContext(company_code)
         connection = HanaConnection(context.hana)
@@ -357,7 +357,7 @@ class GRPOService:
             }
         except Exception as exc:
             logger.warning("Could not read SAP branch states for %s: %s", company_code, exc)
-            return {}
+            raise NotCached({})
         finally:
             if cursor:
                 try:
@@ -377,7 +377,7 @@ class GRPOService:
     SAP_ATTACHMENT_EXEMPT_BP_GROUP_CODE = 101
 
     @staticmethod
-    @lru_cache(maxsize=256)
+    @cache_answers(maxsize=256)
     def _get_sap_bp_group_code(company_code: str, bp_code: str) -> Optional[int]:
         """BP GroupCode for a vendor, or None when it cannot be read."""
         bp_code = (bp_code or "").strip()
@@ -405,7 +405,7 @@ class GRPOService:
             # Never block a posting because this lookup failed — fall through and let
             # SAP be the authority, same as before this check existed.
             logger.warning("Could not read BP GroupCode for %s: %s", bp_code, exc)
-            return None
+            raise NotCached(None)
         finally:
             if cursor:
                 try:
@@ -419,7 +419,7 @@ class GRPOService:
                     pass
 
     @staticmethod
-    @lru_cache(maxsize=256)
+    @cache_answers(maxsize=256)
     def _get_sap_bp_state(company_code: str, bp_code: str) -> str:
         bp_code = (bp_code or "").strip()
         if not bp_code:
@@ -475,7 +475,7 @@ class GRPOService:
                 bp_code,
                 exc,
             )
-            return ""
+            raise NotCached("")
         finally:
             if cursor:
                 try:
@@ -624,7 +624,7 @@ class GRPOService:
         return self._first_available_tax_code(tax_codes, candidates) or requested_tax_code
 
     @staticmethod
-    @lru_cache(maxsize=32)
+    @cache_answers(maxsize=32)
     def _get_active_dimension_codes(
         company_code: str,
         dim_code: int,
@@ -657,7 +657,7 @@ class GRPOService:
                 company_code,
                 exc,
             )
-            return None
+            raise NotCached(None)
         finally:
             if cursor:
                 try:

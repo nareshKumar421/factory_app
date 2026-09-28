@@ -15,7 +15,8 @@ import logging
 
 import requests
 
-from ..exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from ..exceptions import SAPDataError, SAPUnavailable, SAPValidationError
+from .errors import unanswered
 from .auth import ServiceLayerSession
 
 logger = logging.getLogger(__name__)
@@ -123,10 +124,10 @@ class ApprovalRequestWriter:
             )
         except requests.exceptions.ConnectionError as e:
             logger.error("Connection error deciding approval request %s: %s", wdd_code, e)
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise unanswered(e, "Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error("Timeout deciding approval request %s: %s", wdd_code, e)
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise unanswered(e, "SAP Service Layer request timeout")
 
         if response.status_code in (200, 204):
             action = "approved" if approve else "rejected"
@@ -165,10 +166,10 @@ class ApprovalRequestWriter:
             response = requests.get(url, cookies=cookies, timeout=30, verify=False)
         except requests.exceptions.ConnectionError as e:
             logger.error("Connection error reading approval request %s: %s", wdd_code, e)
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise SAPUnavailable("Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error("Timeout reading approval request %s: %s", wdd_code, e)
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise SAPUnavailable("SAP Service Layer request timeout")
 
         if response.status_code == 404:
             raise SAPValidationError(f"Approval request {wdd_code} was not found in SAP.")
@@ -194,10 +195,10 @@ class ApprovalRequestWriter:
             return ServiceLayerSession(session_config or self.sl_config).login()
         except requests.exceptions.ConnectionError as e:
             logger.error("Failed to connect to SAP Service Layer: %s", e)
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise SAPUnavailable("Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error("SAP Service Layer connection timeout: %s", e)
-            raise SAPConnectionError("SAP Service Layer connection timeout")
+            raise SAPUnavailable("SAP Service Layer connection timeout")
         except requests.exceptions.HTTPError as e:
             # A login SAP itself answered ("bad credentials", "no licence") is a
             # configuration fault, not an outage — name the user it refused.

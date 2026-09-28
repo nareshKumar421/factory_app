@@ -12,6 +12,7 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from control_boards.permissions import CanReadBoard
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
+from sap_client.drf import SAP_UNAVAILABLE
 
 from . import analytics, services
 from .permissions import (
@@ -39,7 +40,7 @@ from .serializers import (
     InvoiceRefAddSerializer,
     ReturnWarehouseSerializer,
 )
-from .services import GoodsReturnService
+from .services import GoodsReturnService, NothingPostedError
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +353,16 @@ class GoodsReturnReceiveAPI(APIView):
                 _allowed_ids(request),
                 grouping=serializer.validated_data.get("groups"),
             )
+        except NothingPostedError as exc:
+            # The receive rolled back, so write back what SAP said about each bill
+            # now: otherwise the return shows no trace of having been tried.
+            GoodsReturnService.record_posting_errors(exc.refused, request.user)
+            if exc.unreachable:
+                return Response(
+                    {"detail": str(exc), "code": SAP_UNAVAILABLE},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 

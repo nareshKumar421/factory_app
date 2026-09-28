@@ -557,3 +557,142 @@ class MixedCustomerTests(PostingTestCase):
         gr = self.build_return([(5001, "1500", [("FG0000151", 10)])])
         self.receive(gr)
         self.assertEqual(self.writer.posted[0]["CardCode"], "CUST001")
+
+
+class UnreachableWriter:
+    """A Service Layer that never answers, the way it did on 2026-09-28."""
+
+    def __init__(self, exc):
+        self.exc = exc
+        self.posted = []
+
+    def create(self, payload):
+        raise self.exc
+
+
+class NothingPostedTests(PostingTestCase):
+    """A receive SAP took none of: rolled back, but not without a trace."""
+
+    def setUp(self):
+        super().setUp()
+        self.gr = self.build_return(
+            [(5001, "1500", [("FG0000151", 10)]), (5002, "1501", [("FG0000329", 4)])]
+        )
+
+    def test_sap_not_answering_is_not_called_a_rejection(self):
+        from sap_client.exceptions import SAPUnavailable
+
+        from .services import NothingPostedError
+
+        with self.assertRaises(NothingPostedError) as caught:
+            self.receive(
+                self.gr, UnreachableWriter(SAPUnavailable("SAP Service Layer connection timeout"))
+            )
+
+        self.assertTrue(caught.exception.unreachable)
+        self.assertIn("could not be reached", str(caught.exception))
+        self.assertNotIn("rejected", str(caught.exception))
+
+    def test_a_timeout_after_sending_says_a_retry_is_safe(self):
+        from sap_client.exceptions import SAPOutcomeUnknown
+
+        from .services import NothingPostedError
+
+        with self.assertRaises(NothingPostedError) as caught:
+            self.receive(
+                self.gr, UnreachableWriter(SAPOutcomeUnknown("SAP Service Layer request timeout"))
+            )
+
+        # Still SAP's silence, not the operator's mistake: a 503, not a 400.
+        self.assertTrue(caught.exception.unreachable)
+        self.assertIn("not posted twice", str(caught.exception))
+
+    def test_a_refusal_is_not_unreachable(self):
+        from .services import NothingPostedError
+
+        with self.assertRaises(NothingPostedError) as caught:
+            self.receive(self.gr, FakeWriter(refuse=["1500", "1501"]))
+
+        self.assertFalse(caught.exception.unreachable)
+        self.assertIn("SAP rejected the return", str(caught.exception))
+
+    def test_the_refusals_come_out_on_the_error_and_can_be_written_back(self):
+        from .services import NothingPostedError
+
+        with self.assertRaises(NothingPostedError) as caught:
+            self.receive(self.gr, FakeWriter(refuse=["1500", "1501"]))
+
+        # The receive's own writes rolled back with it...
+        self.assertEqual(
+            list(self.gr.invoice_refs.values_list("sap_post_error", flat=True)), ["", ""]
+        )
+        # ...and the error carries enough to put them back.
+        GoodsReturnService.record_posting_errors(caught.exception.refused, self.user)
+        first, second = self.gr.invoice_refs.order_by("id")
+        self.assertIn("-5002 refused", first.sap_post_error)
+        self.assertIn("-5002 refused", second.sap_post_error)
+        self.gr.refresh_from_db()
+        self.assertEqual(self.gr.status, GoodsReturnStatus.ARRIVED)
+
+
+class ReceiveEndpointWhenSAPIsDownTests(PostingTestCase):
+    """What the Confirm Receipt button gets back while SAP is not answering."""
+
+    def setUp(self):
+        from django.contrib.auth.models import Permission
+        from django.contrib.contenttypes.models import ContentType
+        from rest_framework.test import APIClient
+
+        from company.models import UserCompany, UserRole
+
+        super().setUp()
+        UserCompany.objects.create(
+            user=self.user,
+            company=self.company,
+            role=UserRole.objects.create(name="Returns"),
+            is_active=True,
+        )
+        self.user.user_permissions.add(
+            Permission.objects.get(
+                codename="can_receive_goods_return",
+                content_type=ContentType.objects.get_for_model(GoodsReturn),
+            )
+        )
+        self.user = get_user_model().objects.get(pk=self.user.pk)
+        self.api = APIClient()
+        self.api.force_authenticate(self.user)
+        self.gr = self.build_return([(5001, "1500", [("FG0000151", 10)])])
+
+    def post(self, writer):
+        with mock.patch("sap_client.client.SAPClient", return_value=self.client_stub), \
+             mock.patch("sap_client.context.CompanyContext", return_value=object()), \
+             mock.patch(
+                 "sap_client.service_layer.returns_writer.ReturnsWriter",
+                 return_value=writer,
+             ):
+            return self.api.post(
+                f"/api/v1/goods-return/{self.gr.id}/receive/",
+                {"warehouse_code": WAREHOUSE},
+                format="json",
+                HTTP_COMPANY_CODE="OIL",
+            )
+
+    def test_unreachable_sap_is_a_503_and_the_invoice_keeps_the_error(self):
+        from sap_client.exceptions import SAPUnavailable
+
+        response = self.post(
+            UnreachableWriter(SAPUnavailable("SAP Service Layer connection timeout"))
+        )
+
+        self.assertEqual(response.status_code, 503, response.content)
+        self.assertEqual(response.json()["code"], "SAP_UNAVAILABLE")
+        ref = self.gr.invoice_refs.get()
+        self.assertIn("connection timeout", ref.sap_post_error)
+        self.gr.refresh_from_db()
+        self.assertEqual(self.gr.status, GoodsReturnStatus.ARRIVED)
+
+    def test_a_refusal_is_still_a_400_and_is_kept_too(self):
+        response = self.post(FakeWriter(refuse=["1500"]))
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("-5002 refused", self.gr.invoice_refs.get().sap_post_error)

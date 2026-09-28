@@ -1809,6 +1809,7 @@ def _sap_delivery_note_lines(company, doc_entry):
         return []
     try:
         from hdbcli import dbapi
+        from sap_client.hana.connection import HANA_TIMEOUTS
         from sap_client.context import CompanyContext
         h = CompanyContext(company.code).hana
     except Exception as e:  # pragma: no cover - env specific
@@ -1817,7 +1818,8 @@ def _sap_delivery_note_lines(company, doc_entry):
     conn = None
     try:
         conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
-                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+                             password=h["password"], encrypt=True, sslValidateCertificate=False,
+                             **HANA_TIMEOUTS)
         cur = conn.cursor()
         cur.execute(
             f'SELECT "ItemCode","Dscription","Quantity","WhsCode" '
@@ -1844,6 +1846,7 @@ def _attach_sap_metadata(company, notes):
         return
     try:
         from hdbcli import dbapi
+        from sap_client.hana.connection import HANA_TIMEOUTS
         from sap_client.context import CompanyContext
         h = CompanyContext(company.code).hana
     except Exception as e:  # pragma: no cover - env specific
@@ -1853,7 +1856,8 @@ def _attach_sap_metadata(company, notes):
     conn = None
     try:
         conn = dbapi.connect(address=h["host"], port=int(h["port"]), user=h["user"],
-                             password=h["password"], encrypt=True, sslValidateCertificate=False)
+                             password=h["password"], encrypt=True, sslValidateCertificate=False,
+                             **HANA_TIMEOUTS)
         cur = conn.cursor()
         cur.execute(
             f'SELECT "DocEntry","DocNum","DocDate","CardCode","CardName","NumAtCard",'

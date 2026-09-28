@@ -5,13 +5,14 @@ import re
 import shutil
 import subprocess
 import uuid
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 import requests
 from django.conf import settings
 
-from ..exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from ..exceptions import SAPConnectionError, SAPDataError, SAPUnavailable, SAPValidationError
+from ..lookup_cache import NotCached, cache_answers
+from .errors import unanswered
 from ..hana.connection import HanaConnection
 from .auth import ServiceLayerSession
 from .file_uploader_client import FileUploaderClient
@@ -33,13 +34,13 @@ class AttachmentWriter:
             return session.login()
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Failed to connect to SAP Service Layer: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise SAPUnavailable("Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"SAP Service Layer connection timeout: {e}")
-            raise SAPConnectionError("SAP Service Layer connection timeout")
+            raise SAPUnavailable("SAP Service Layer connection timeout")
         except requests.exceptions.HTTPError as e:
             logger.error(f"SAP Service Layer authentication failed: {e}")
-            raise SAPConnectionError("SAP Service Layer authentication failed")
+            raise SAPUnavailable("SAP Service Layer authentication failed")
 
     def _get_attachment_source_path(self, cookies=None) -> str:
         """
@@ -150,7 +151,7 @@ class AttachmentWriter:
         return file_stem, file_extension
 
     @staticmethod
-    @lru_cache(maxsize=16)
+    @cache_answers(maxsize=16)
     def _get_attachment_udf_columns(company_code: str) -> frozenset[str]:
         fallback_columns = {
             "JIVO_OIL": frozenset({"U_CHK", "U_CHK2"}),
@@ -191,7 +192,7 @@ class AttachmentWriter:
                 company_code,
                 exc,
             )
-            return fallback_columns.get(company_code, frozenset())
+            raise NotCached(fallback_columns.get(company_code, frozenset()))
 
     def _attachment_approval_fields(self) -> dict:
         company_code = getattr(self.context, "company_code", "").upper()
@@ -1061,7 +1062,7 @@ class AttachmentWriter:
 
             if response.status_code in (401, 403):
                 logger.error("SAP authentication/authorization error during attachment upload")
-                raise SAPConnectionError("SAP authentication failed")
+                raise SAPUnavailable("SAP authentication failed")
 
             error_msg = self._extract_error_message(response)
             logger.error(f"SAP error uploading attachment: {error_msg}")
@@ -1069,10 +1070,10 @@ class AttachmentWriter:
 
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Connection error uploading attachment: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise unanswered(e, "Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout uploading attachment: {e}")
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise unanswered(e, "SAP Service Layer request timeout")
         except (SAPConnectionError, SAPDataError, SAPValidationError):
             raise
         except Exception as e:
@@ -1258,7 +1259,7 @@ class AttachmentWriter:
 
             if response.status_code in (401, 403):
                 logger.error("SAP auth error linking attachment")
-                raise SAPConnectionError("SAP authentication failed")
+                raise SAPUnavailable("SAP authentication failed")
 
             error_msg = self._extract_error_message(response)
             logger.error(f"SAP error linking attachment: {error_msg}")
@@ -1266,10 +1267,10 @@ class AttachmentWriter:
 
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Connection error linking attachment: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise unanswered(e, "Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout linking attachment: {e}")
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise unanswered(e, "SAP Service Layer request timeout")
         except (SAPConnectionError, SAPDataError, SAPValidationError):
             raise
         except Exception as e:

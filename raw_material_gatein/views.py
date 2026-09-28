@@ -5,7 +5,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -15,6 +15,7 @@ from driver_management.models import VehicleEntry
 from gate_core.enums import GATE_PHASE_STATUSES, GateEntryStatus
 from quality_control.enums import ArrivalSlipStatus, InspectionWorkflowStatus
 from sap_client.client import SAPClient
+from sap_client.drf import SAPBadGatewayAPIException, SAPUnavailableAPIException
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .models import POItemReceipt, POReceipt, POReplacementLog
@@ -184,16 +185,12 @@ def _get_sap_po_details(company_code, supplier_code, po_number):
         sap_pos = client.get_open_pos(supplier_code)
     except SAPConnectionError as e:
         logger.error("SAP connection error in ReceivePOAPI: %s", e)
-        raise APIException(
-            detail="SAP system is currently unavailable. Please try again later.",
-            code=503
+        raise SAPUnavailableAPIException(
+            detail="SAP system is currently unavailable. Please try again later."
         )
     except SAPDataError as e:
         logger.error("SAP data error in ReceivePOAPI: %s", e)
-        raise APIException(
-            detail="Failed to retrieve PO data from SAP.",
-            code=502
-        )
+        raise SAPBadGatewayAPIException(detail="Failed to retrieve PO data from SAP.")
 
     sap_items_map = {}
     sap_header = {

@@ -2,7 +2,8 @@ import logging
 import requests
 from decimal import Decimal
 
-from ..exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from ..exceptions import SAPConnectionError, SAPDataError, SAPUnavailable, SAPValidationError
+from .errors import unanswered
 from .auth import ServiceLayerSession
 
 logger = logging.getLogger(__name__)
@@ -33,13 +34,13 @@ class GRPOWriter:
             return session.login()
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Failed to connect to SAP Service Layer: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise SAPUnavailable("Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"SAP Service Layer connection timeout: {e}")
-            raise SAPConnectionError("SAP Service Layer connection timeout")
+            raise SAPUnavailable("SAP Service Layer connection timeout")
         except requests.exceptions.HTTPError as e:
             logger.error(f"SAP Service Layer authentication failed: {e}")
-            raise SAPConnectionError("SAP Service Layer authentication failed")
+            raise SAPUnavailable("SAP Service Layer authentication failed")
 
     def create(self, payload: dict) -> dict:
         """
@@ -97,7 +98,7 @@ class GRPOWriter:
 
             if response.status_code in (401, 403):
                 logger.error("SAP authentication/authorization error")
-                raise SAPConnectionError("SAP authentication failed")
+                raise SAPUnavailable("SAP authentication failed")
 
             # Other errors
             error_msg = self._extract_error_message(response)
@@ -106,10 +107,10 @@ class GRPOWriter:
 
         except requests.exceptions.ConnectionError as e:
             logger.error(f"Connection error while creating GRPO: {e}")
-            raise SAPConnectionError("Unable to connect to SAP Service Layer")
+            raise unanswered(e, "Unable to connect to SAP Service Layer")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout while creating GRPO: {e}")
-            raise SAPConnectionError("SAP Service Layer request timeout")
+            raise unanswered(e, "SAP Service Layer request timeout")
         except (SAPConnectionError, SAPDataError, SAPValidationError):
             raise
         except Exception as e:

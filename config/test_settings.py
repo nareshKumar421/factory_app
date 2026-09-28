@@ -17,3 +17,10 @@ class _DisableMigrations:
 
 
 MIGRATION_MODULES = _DisableMigrations()
+
+# No test inherits another's "SAP is down": sap_client.health keeps its state in
+# `shared`, so here it keeps none. Tests of health itself override this.
+CACHES = {
+    **CACHES,  # noqa: F405
+    'shared': {'BACKEND': 'django.core.cache.backends.dummy.DummyCache'},
+}

@@ -14,7 +14,13 @@ import logging
 
 import requests
 
-from ..exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from ..exceptions import (
+    SAPDataError,
+    SAPOutcomeUnknown,
+    SAPUnavailable,
+    SAPValidationError,
+)
+from .errors import never_sent, unanswered
 from .auth import ServiceLayerSession
 
 logger = logging.getLogger(__name__)
@@ -47,13 +53,13 @@ class PurchaseOrderWriter:
             return ServiceLayerSession(self.sl_config).login()
         except requests.exceptions.ConnectionError as e:
             logger.error("SAP Service Layer unreachable: %s", e)
-            raise SAPConnectionError("Unable to connect to SAP Service Layer") from e
+            raise SAPUnavailable("Unable to connect to SAP Service Layer") from e
         except requests.exceptions.Timeout as e:
             logger.error("SAP Service Layer login timed out: %s", e)
-            raise SAPConnectionError("SAP Service Layer connection timeout") from e
+            raise SAPUnavailable("SAP Service Layer connection timeout") from e
         except requests.exceptions.HTTPError as e:
             logger.error("SAP Service Layer authentication failed: %s", e)
-            raise SAPConnectionError("SAP Service Layer authentication failed") from e
+            raise SAPUnavailable("SAP Service Layer authentication failed") from e
 
     def create(self, payload: dict) -> dict:
         """Create a purchase order and return the SAP identifiers.
@@ -88,18 +94,21 @@ class PurchaseOrderWriter:
                 verify=False,
             )
         except requests.exceptions.Timeout as e:
+            if never_sent(e):
+                logger.error("Could not reach SAP to post purchase order: %s", e)
+                raise SAPUnavailable("Unable to reach SAP Service Layer") from e
             # A timeout is the dangerous case: SAP may have created the document
             # anyway. Surfaced as a connection error so the caller leaves the
             # order un-posted and a human reconciles, rather than auto-retrying
             # into a duplicate commitment.
             logger.error("Timed out posting purchase order to SAP: %s", e)
-            raise SAPConnectionError(
+            raise SAPOutcomeUnknown(
                 "SAP did not answer in time. The purchase order may or may not "
                 "have been created — check SAP before retrying."
             ) from e
         except requests.exceptions.RequestException as e:
             logger.error("Failed to post purchase order to SAP: %s", e)
-            raise SAPConnectionError("Unable to reach SAP Service Layer") from e
+            raise unanswered(e, "Unable to reach SAP Service Layer") from e
 
         if response.status_code == 201:
             data = response.json()

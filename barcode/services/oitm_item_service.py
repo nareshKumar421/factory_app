@@ -248,12 +248,14 @@ class OitmItemService:
         try:
             conn = self.client.context.hana
             from hdbcli import dbapi
+            from sap_client.hana.connection import HANA_TIMEOUTS
 
             connection = dbapi.connect(
                 address=conn['host'],
                 port=conn['port'],
                 user=conn['user'],
                 password=conn['password'],
+                **HANA_TIMEOUTS,
             )
             cursor = connection.cursor()
             if params is None:

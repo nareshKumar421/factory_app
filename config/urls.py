@@ -42,6 +42,8 @@ urlpatterns = [
     # Who each app user is inside SAP — the mapping approval decisions are
     # signed against. Separate prefix; "po/" above is legacy.
     path("api/v1/sap-identity/", include("sap_client.urls_identity")),
+    # Whether SAP is answering, for the app-wide "SAP is down" banner.
+    path("api/v1/sap-health/", include("sap_client.urls_health")),
     path("api/v1/raw-material-gatein/", include("raw_material_gatein.urls")),
     path("api/v1/finished-goods-gatein/", include("finished_goods_gatein.urls")),
     path("api/v1/weighment/", include("weighment.urls")),

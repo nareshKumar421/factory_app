@@ -430,6 +430,8 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
+    # An SAP error a view did not catch is a 503/502 with a `code`, not a 500.
+    "EXCEPTION_HANDLER": "sap_client.drf.exception_handler",
     # 'DEFAULT_THROTTLE_CLASSES': [
     #     'rest_framework.throttling.AnonRateThrottle',
     #     'rest_framework.throttling.UserRateThrottle',
@@ -499,6 +501,34 @@ HANA_PASSWORD = config('HANA_PASSWORD')
 SL_URL = config('SL_URL')
 SL_USER = config('SL_USER')
 SL_PASSWORD = config('SL_PASSWORD')
+
+# Whether SAP is answering (sap_client/health.py) lives in the `shared` cache,
+# so one probe's answer reaches every gunicorn worker and a dead SAP costs one
+# timeout, not one per request. Point SHARED_CACHE_URL at Redis in production
+# (117 runs redis-server; e.g. redis://127.0.0.1:6379/5). Unset, each worker
+# keeps its own answer: slower to learn an outage, never wrong. `default` is
+# Django's own default, spelled out only because naming `shared` needs CACHES.
+SHARED_CACHE_URL = config('SHARED_CACHE_URL', default='')
+CACHES = {
+    'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'},
+    'shared': (
+        {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': SHARED_CACHE_URL,
+            'KEY_PREFIX': 'factory',
+            # A Redis that stalls must not become the outage it reports on.
+            'OPTIONS': {'socket_connect_timeout': 0.5, 'socket_timeout': 0.5},
+        }
+        if SHARED_CACHE_URL
+        else {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'shared',
+        }
+    ),
+}
+# Told when SAP has been down for five minutes, and again when it is back. A
+# Django auth group; members are added in the admin. No group, no alert.
+SAP_HEALTH_ALERT_GROUP = config('SAP_HEALTH_ALERT_GROUP', default='SAP Health Alerts')
 
 # Invoice-approval decisions are recorded in SAP's approval workflow, which
 # authenticates the deciding user — the Service Layer integration account (SL_USER)
@@ -722,8 +752,10 @@ SAP_FILE_UPLOADER_API_KEY = config(
 # Per-attempt timeout, not the whole operation: the uploader writes into a
 # Windows share that stalls intermittently, so a failed attempt is retried
 # rather than surfaced, and SAP_FILE_UPLOADER_TOTAL_BUDGET_SECONDS caps the
-# lot. Keep the budget clear of nginx's proxy_read_timeout (120s) - the SAP
-# Service Layer calls after the upload share the same browser request.
+# lot. Keep the budget clear of nginx's proxy_read_timeout - the SAP Service
+# Layer calls after the upload share the same browser request. On 117 the
+# factory.jivo.in server block sets none, so it is nginx's default 60s (checked
+# 2026-09-28), not the 120s the other sites there use.
 SAP_FILE_UPLOADER_TIMEOUT_SECONDS = config(
     "SAP_FILE_UPLOADER_TIMEOUT_SECONDS",
     default=30,

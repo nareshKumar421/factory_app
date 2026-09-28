@@ -14,6 +14,8 @@ from django.db.models import Q
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 
+from sap_client.exceptions import SAPConnectionError, SAPOutcomeUnknown
+
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
 from gate_core.enums import GateEntryStatus
@@ -53,6 +55,23 @@ SUBMITTABLE_STATUSES = (
 # Receiving posts the SAP documents. PARTIALLY_POSTED is receivable again on
 # purpose: a run where SAP took one invoice's return and refused another's leaves
 # the refused ones to post, and receiving again picks up exactly those.
+class NothingPostedError(ValueError):
+    """A receive where SAP took none of the return's documents.
+
+    Raised so the transaction rolls back, as a return nothing reached SAP for
+    always has. What SAP said about each bill rolls back with it, though, so the
+    error carries it out: ``refused`` is ``[(invoice_ref_id, error)]`` for the
+    view to write back with :meth:`GoodsReturnService.record_posting_errors`,
+    and ``unreachable`` says every failure was SAP not answering rather than
+    SAP refusing, which is a 503 and not the operator's to fix.
+    """
+
+    def __init__(self, message, *, refused=(), unreachable=False):
+        super().__init__(message)
+        self.refused = list(refused)
+        self.unreachable = unreachable
+
+
 RECEIVABLE_STATUSES = (
     GoodsReturnStatus.ARRIVED,
     GoodsReturnStatus.PARTIALLY_POSTED,
@@ -609,10 +628,15 @@ class GoodsReturnService:
 
         posted, failures = self._post_sap_returns(gr, lines, warehouse_code, user, grouping)
         if not posted:
-            # Nothing reached SAP, so there is nothing to preserve: raise and let
-            # the transaction roll back, which is what a single-document return
-            # has always done.
-            raise ValueError(self._posting_failure_message(failures))
+            # Nothing reached SAP, so there is no document to preserve: raise and
+            # let the transaction roll back, which is what a single-document return
+            # has always done. The refusals go out on the error, for the view to
+            # keep once the rollback is done.
+            raise NothingPostedError(
+                self._posting_failure_message(failures),
+                refused=gr.refused_refs,
+                unreachable=bool(failures) and gr.sap_unreachable,
+            )
 
         gr.sap_return_warehouse = warehouse_code
         gr.status = (
@@ -936,6 +960,11 @@ class GoodsReturnService:
 
         writer = ReturnsWriter(CompanyContext(gr.company.code))
         posted, failures = [], []
+        # What each refused bill was told, kept here as well as on its row: a run
+        # that posts nothing is rolled back, rows and all (see NothingPostedError).
+        gr.refused_refs = []
+        # Stays True only while every failure is SAP not answering.
+        gr.sap_unreachable = True
         for refs, payload in prepared:
             label = ", ".join(guards._invoice_label(ref) for ref in refs)
             # Asked before every post, not only after a crash: the reference is
@@ -963,11 +992,14 @@ class GoodsReturnService:
                         label or "-",
                         exc,
                     )
-                    failures.append((label, f"SAP rejected the return: {exc}"))
+                    failures.append((label, self._posting_error_text(exc)))
+                    if not isinstance(exc, SAPConnectionError):
+                        gr.sap_unreachable = False
                     # Every bill on the refused note is still owing a document, so
                     # each carries the refusal and each comes back on a retry.
                     for ref in refs:
                         self._record_posting_error(ref, user, exc)
+                        gr.refused_refs.append((ref.pk, str(exc)))
                     continue
 
             self._record_posted(gr, refs, result, warehouse_code, user)
@@ -1014,6 +1046,35 @@ class GoodsReturnService:
         ref.sap_post_error = str(error)[:2000]
         ref.updated_by = user
         ref.save(update_fields=["sap_post_error", "updated_by", "updated_at"])
+
+    @staticmethod
+    def record_posting_errors(refused, user) -> None:
+        """Write back what SAP told each bill, after a receive that posted nothing.
+
+        That receive raised, so its own writes of these were rolled back; this runs
+        after, in the caller's transaction, so the page can still say why.
+        """
+        now = timezone.now()
+        for ref_id, error in refused:
+            GoodsReturnInvoiceRef.objects.filter(pk=ref_id).update(
+                sap_post_error=str(error)[:2000], updated_by=user, updated_at=now
+            )
+
+    @staticmethod
+    def _posting_error_text(exc) -> str:
+        """What a failed post is called, by whether SAP ever saw it.
+
+        "Rejected" only for a refusal: a timeout is not SAP saying no, and telling
+        the operator it was sends them looking for a fault in the return.
+        """
+        if isinstance(exc, SAPOutcomeUnknown):
+            return (
+                f"SAP did not answer in time ({exc}); receive again -- a return SAP "
+                f"did save is found and kept, not posted twice"
+            )
+        if isinstance(exc, SAPConnectionError):
+            return f"SAP could not be reached ({exc}); nothing was posted"
+        return f"SAP rejected the return: {exc}"
 
     def _sap_payload(
         self,

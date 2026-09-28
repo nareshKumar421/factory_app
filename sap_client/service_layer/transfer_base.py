@@ -23,7 +23,13 @@ from typing import Optional
 import requests
 
 from .auth import ServiceLayerSession
-from ..exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from ..exceptions import (
+    SAPDataError,
+    SAPOutcomeUnknown,
+    SAPUnavailable,
+    SAPValidationError,
+)
+from .errors import never_sent, unanswered
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +76,13 @@ class TransferDocumentWriter:
             return ServiceLayerSession(self.sl_config).login()
         except requests.exceptions.ConnectionError as e:
             logger.error("SAP Service Layer unreachable: %s", e)
-            raise SAPConnectionError("Unable to connect to SAP Service Layer.") from e
+            raise SAPUnavailable("Unable to connect to SAP Service Layer.") from e
         except requests.exceptions.Timeout as e:
             logger.error("SAP Service Layer login timed out: %s", e)
-            raise SAPConnectionError("SAP Service Layer login timed out.") from e
+            raise SAPUnavailable("SAP Service Layer login timed out.") from e
         except requests.exceptions.HTTPError as e:
             logger.error("SAP Service Layer login rejected: %s", e)
-            raise SAPConnectionError(
+            raise SAPUnavailable(
                 "SAP Service Layer login failed — check SL_USER and the "
                 "configured company database."
             ) from e
@@ -103,17 +109,20 @@ class TransferDocumentWriter:
                 verify=False,
             )
         except requests.exceptions.Timeout as e:
+            if never_sent(e):
+                logger.error("Could not reach SAP to post %s: %s", self.label, e)
+                raise SAPUnavailable("Unable to connect to SAP Service Layer.") from e
             # Deliberately a distinct message: the caller must read back before
             # retrying, because SAP may well have committed the document.
             logger.error("Timed out posting %s to SAP: %s", self.label, e)
-            raise SAPConnectionError(
+            raise SAPOutcomeUnknown(
                 f"SAP did not answer within {POST_TIMEOUT_SECONDS}s while posting "
                 f"the {self.label}. The document may still have been created — "
                 f"check SAP before posting again."
             ) from e
         except requests.exceptions.ConnectionError as e:
             logger.error("Connection error posting %s to SAP: %s", self.label, e)
-            raise SAPConnectionError("Unable to connect to SAP Service Layer.") from e
+            raise unanswered(e, "Unable to connect to SAP Service Layer.") from e
 
         if response.status_code == 201:
             created = response.json()
@@ -130,7 +139,7 @@ class TransferDocumentWriter:
             raise SAPValidationError(message)
         if response.status_code in (401, 403):
             logger.error("SAP authorisation failure posting %s: %s", self.label, message)
-            raise SAPConnectionError("SAP authentication failed.")
+            raise SAPUnavailable("SAP authentication failed.")
 
         logger.error("SAP error posting %s: %s", self.label, message)
         raise SAPDataError(f"Failed to create the {self.label} in SAP: {message}")
@@ -185,15 +194,18 @@ class TransferDocumentWriter:
                 verify=False,
             )
         except requests.exceptions.Timeout as e:
+            if never_sent(e):
+                logger.error("Could not reach SAP to add %s draft %s: %s", self.label, draft_entry, e)
+                raise SAPUnavailable("Unable to connect to SAP Service Layer.") from e
             logger.error("Timed out adding %s draft %s: %s", self.label, draft_entry, e)
-            raise SAPConnectionError(
+            raise SAPOutcomeUnknown(
                 f"SAP did not answer within {POST_TIMEOUT_SECONDS}s while adding "
                 f"the {self.label} draft. It may still have been added — check "
                 f"SAP before trying again."
             ) from e
         except requests.exceptions.ConnectionError as e:
             logger.error("Connection error adding %s draft %s: %s", self.label, draft_entry, e)
-            raise SAPConnectionError("Unable to connect to SAP Service Layer.") from e
+            raise unanswered(e, "Unable to connect to SAP Service Layer.") from e
 
         if response.status_code in (200, 204):
             logger.info("SAP %s draft %s added as a document", self.label, draft_entry)
@@ -205,7 +217,7 @@ class TransferDocumentWriter:
             raise SAPValidationError(message)
         if response.status_code in (401, 403):
             logger.error("SAP authorisation failure adding %s draft %s", self.label, draft_entry)
-            raise SAPConnectionError("SAP authentication failed.")
+            raise SAPUnavailable("SAP authentication failed.")
         logger.error("SAP error adding %s draft %s: %s", self.label, draft_entry, message)
         raise SAPDataError(
             f"Failed to add the {self.label} draft {draft_entry} in SAP: {message}"
@@ -233,12 +245,14 @@ class TransferDocumentWriter:
                 verify=False,
             )
         except requests.exceptions.Timeout as e:
-            raise SAPConnectionError(
+            if never_sent(e):
+                raise SAPUnavailable("Unable to connect to SAP Service Layer.") from e
+            raise SAPOutcomeUnknown(
                 f"SAP did not answer while running {action} on {self.label} "
                 f"{doc_entry}. Check SAP before retrying."
             ) from e
         except requests.exceptions.ConnectionError as e:
-            raise SAPConnectionError("Unable to connect to SAP Service Layer.") from e
+            raise unanswered(e, "Unable to connect to SAP Service Layer.") from e
 
         if response.status_code in (200, 204):
             logger.info("SAP %s %s on DocEntry=%s", self.label, action, doc_entry)
