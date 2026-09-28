@@ -7,6 +7,7 @@ A line's ``quantity_returned`` is the running sum of every return-event line tha
 points at it, so partial and multi-trip returns fall out naturally.
 """
 
+import os
 from decimal import Decimal
 
 from django.conf import settings
@@ -17,6 +18,7 @@ from django.utils import timezone
 from gate_core.models.base import BaseModel
 
 from .constants import (
+    PHOTO_EXTENSIONS,
     AttachmentDocType,
     ItemConditionOut,
     ItemReturnCondition,
@@ -26,6 +28,11 @@ from .constants import (
 )
 
 ZERO = Decimal("0.000")
+
+
+def is_photo_file(name):
+    """Whether a file name is a picture the gate can look at, judged by extension."""
+    return os.path.splitext(name or "")[1].lower() in PHOTO_EXTENSIONS
 
 
 class ReturnablePermission(models.Model):
@@ -323,6 +330,17 @@ class ReturnableGatePass(BaseModel):
         return bool(items) and all(item.is_fully_returned for item in items)
 
     @property
+    def has_photo(self):
+        """Whether the department attached a photo of the material.
+
+        The gate cannot tell one motor or gauge from another off an item name,
+        so a pass carries a picture of what is leaving before it may go for
+        approval -- and the gate matches the material against it on the way out
+        and on the way back.
+        """
+        return any(attachment.is_photo for attachment in self.attachments.all())
+
+    @property
     def days_overdue(self):
         """Whole days past the expected return date, 0 if not yet due or settled.
 
@@ -602,6 +620,8 @@ class ReturnableReturnEventItem(BaseModel):
 
 
 class ReturnableGatePassAttachment(BaseModel):
+    """A file the department uploads with the pass: photos, challan, quotation."""
+
     company = models.ForeignKey(
         "company.Company",
         on_delete=models.PROTECT,
@@ -627,6 +647,40 @@ class ReturnableGatePassAttachment(BaseModel):
 
     def __str__(self):
         return self.caption or f"attachment {self.pk}"
+
+    @property
+    def is_photo(self):
+        return is_photo_file(self.file.name)
+
+
+class ReturnableReturnEventAttachment(BaseModel):
+    """A photo the gate took of the material on one return trip.
+
+    Kept apart from :class:`ReturnableGatePassAttachment`: those are what the
+    department sent out, these are what actually came back, and the screens
+    show the two side by side rather than as one pile of files.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="returnable_return_attachments",
+    )
+    event = models.ForeignKey(
+        ReturnableReturnEvent,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to="returnable-items/returns/")
+    caption = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ["id"]
+        verbose_name = "Returnable Return Event Attachment"
+        verbose_name_plural = "Returnable Return Event Attachments"
+
+    def __str__(self):
+        return self.caption or f"return photo {self.pk}"
 
 
 class ReturnableGatePassLog(models.Model):

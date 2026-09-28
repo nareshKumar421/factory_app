@@ -95,6 +95,14 @@ class AttachmentDocType(models.TextChoices):
     OTHER = "OTHER", "Other"
 
 
+#: File extensions that count as a photo of the material. Judged by the file,
+#: not by ``doc_type``: most photos on record were uploaded under the form's
+#: default type, "Delivery Challan".
+PHOTO_EXTENSIONS = frozenset(
+    {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
+)
+
+
 #: Permission codenames, grouped by the auth group that should hold them.
 RETURNABLE_ROLE_PERMISSIONS = {
     "returnable_admin": "__all__",
@@ -111,6 +119,7 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "view_returnablegatepassitem",
         "view_returnablereturnevent",
         "view_returnablereturneventitem",
+        "view_returnablereturneventattachment",
         "view_returnablegatepassattachment",
         "view_returnablegatepasslog",
     ],
@@ -132,6 +141,7 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "delete_returnablegatepassitem",
         "view_returnablereturnevent",
         "view_returnablereturneventitem",
+        "view_returnablereturneventattachment",
         "add_returnablegatepassattachment",
         "view_returnablegatepassattachment",
         "delete_returnablegatepassattachment",
@@ -156,6 +166,7 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "delete_returnablegatepassitem",
         "view_returnablereturnevent",
         "view_returnablereturneventitem",
+        "view_returnablereturneventattachment",
         "add_returnablegatepassattachment",
         "view_returnablegatepassattachment",
         "delete_returnablegatepassattachment",
@@ -171,6 +182,7 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "view_returnablegatepassitem",
         "view_returnablereturnevent",
         "view_returnablereturneventitem",
+        "view_returnablereturneventattachment",
         "view_returnablegatepassattachment",
         "view_returnablegatepasslog",
     ],
@@ -193,6 +205,7 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "delete_returnablegatepassitem",
         "view_returnablereturnevent",
         "view_returnablereturneventitem",
+        "view_returnablereturneventattachment",
         "add_returnablegatepassattachment",
         "view_returnablegatepassattachment",
         "delete_returnablegatepassattachment",
@@ -209,7 +222,9 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "add_returnablereturnevent",
         "view_returnablereturnevent",
         "add_returnablereturneventitem",
+        "add_returnablereturneventattachment",
         "view_returnablereturneventitem",
+        "view_returnablereturneventattachment",
         "view_returnablegatepassattachment",
         "view_returnablegatepasslog",
     ],
@@ -221,6 +236,7 @@ RETURNABLE_ROLE_PERMISSIONS = {
         "view_returnablegatepassitem",
         "view_returnablereturnevent",
         "view_returnablereturneventitem",
+        "view_returnablereturneventattachment",
         "view_returnablegatepassattachment",
         "view_returnablegatepasslog",
     ],

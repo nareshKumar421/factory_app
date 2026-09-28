@@ -7,6 +7,7 @@ from .models import (
     ReturnableGatePassLog,
     ReturnableGatePassSequence,
     ReturnableReturnEvent,
+    ReturnableReturnEventAttachment,
     ReturnableReturnEventItem,
 )
 
@@ -47,12 +48,17 @@ class ReturnableReturnEventItemInline(admin.TabularInline):
     extra = 0
 
 
+class ReturnableReturnEventAttachmentInline(admin.TabularInline):
+    model = ReturnableReturnEventAttachment
+    extra = 0
+
+
 @admin.register(ReturnableReturnEvent)
 class ReturnableReturnEventAdmin(admin.ModelAdmin):
     list_display = ("event_ref", "gate_pass", "returned_at", "verified_by", "acknowledged_at")
     list_filter = ("company",)
     search_fields = ("event_ref", "gate_pass__pass_no")
-    inlines = [ReturnableReturnEventItemInline]
+    inlines = [ReturnableReturnEventItemInline, ReturnableReturnEventAttachmentInline]
 
 
 @admin.register(ReturnableGatePassLog)

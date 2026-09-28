@@ -12,6 +12,7 @@ and notifies the other side of the handoff:
 """
 
 import csv
+import json
 import logging
 from datetime import timedelta
 
@@ -44,7 +45,9 @@ from .models import (
     ReturnableGatePassAttachment,
     ReturnableGatePassItem,
     ReturnableReturnEvent,
+    ReturnableReturnEventAttachment,
     ReturnableReturnEventItem,
+    is_photo_file,
 )
 from .permissions import (
     CanAcknowledgeReturnable,
@@ -77,6 +80,16 @@ logger = logging.getLogger(__name__)
 
 TRUE_VALUES = {"1", "true", "yes"}
 
+#: Why a pass cannot move on without a photo, in the words the screens show.
+NO_PHOTO_OUT = (
+    "Attach a photo of the material before this pass goes for approval. "
+    "The gate identifies what is leaving by its photo."
+)
+NO_PHOTO_BACK = (
+    "Take a photo of the material that came back. "
+    "The department checks what was returned against it."
+)
+
 
 def _company(request):
     return request.company.company
@@ -84,6 +97,20 @@ def _company(request):
 
 def _is_true(value):
     return str(value).lower() in TRUE_VALUES
+
+
+def _split_multipart(request):
+    """``(data, files)`` from a request that may carry files.
+
+    Multipart: the JSON body in a "data" part, the files in "attachments" parts
+    -- the shape GRPO and AR invoices already use. A plain JSON body carries no
+    files. Raises ``json.JSONDecodeError`` on a malformed "data" part.
+    """
+    if request.content_type and "multipart" in request.content_type:
+        raw = request.data.get("data", "{}")
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return data, request.FILES.getlist("attachments")
+    return request.data, []
 
 
 class CompanyScopedViewSet(viewsets.ModelViewSet):
@@ -151,7 +178,11 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
                 "updated_by",
             )
             .prefetch_related(
-                "items", "attachments", "return_events__lines", "source_material_indents"
+                "items",
+                "attachments",
+                "return_events__lines",
+                "return_events__attachments",
+                "source_material_indents",
             )
             .annotate(item_count=Count("items", distinct=True))
             # Newest first. Explicit, because a DISTINCT + GROUP BY query does not
@@ -231,6 +262,8 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
             return self._reject("Only a draft gate pass can be submitted.")
         if not gate_pass.items.exists():
             return self._reject("Add at least one item before submitting.")
+        if not gate_pass.has_photo:
+            return self._reject(NO_PHOTO_OUT)
 
         gate_pass.status = ReturnableStatus.PENDING_APPROVAL
         gate_pass.submitted_by = request.user
@@ -261,6 +294,10 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
             return self._reject("Only a pass awaiting approval can be approved.")
         if gate_pass.submitted_by_id == request.user.id:
             return self._reject("You cannot approve a gate pass you submitted yourself.")
+        # Passes submitted before a photo was required can still be waiting here.
+        # The approver may edit the pass, so they can add the photo themselves.
+        if not gate_pass.has_photo:
+            return self._reject(NO_PHOTO_OUT)
 
         remarks = (request.data.get("remarks") or "").strip()
 
@@ -406,12 +443,25 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         if gate_pass.status not in OUTSTANDING_STATUSES:
             return self._reject("Only items that are out can be returned.")
 
+        try:
+            data, photos = _split_multipart(request)
+        except json.JSONDecodeError:
+            return self._reject("The 'data' part is not valid JSON.")
+
         serializer = RecordReturnInputSerializer(
-            data=request.data,
+            data=data,
             context={**self.get_serializer_context(), "gate_pass": gate_pass},
         )
         serializer.is_valid(raise_exception=True)
         payload = serializer.validated_data
+
+        if not photos:
+            return self._reject(NO_PHOTO_BACK)
+        not_photos = [photo.name for photo in photos if not is_photo_file(photo.name)]
+        if not_photos:
+            return self._reject(
+                f"Only photos can be attached to a return. Not a photo: {', '.join(not_photos)}."
+            )
 
         next_event_no = (gate_pass.return_events.count() or 0) + 1
         event = ReturnableReturnEvent.objects.create(
@@ -449,6 +499,15 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
             )
             pass_item.recalculate_returned()
 
+        for photo in photos:
+            ReturnableReturnEventAttachment.objects.create(
+                company=gate_pass.company,
+                event=event,
+                file=photo,
+                created_by=request.user,
+                updated_by=request.user,
+            )
+
         gate_pass.last_return_at = event.returned_at
         gate_pass.refresh_status()
         gate_pass.updated_by = request.user
@@ -459,8 +518,8 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         gate_pass.log(
             ReturnableLogAction.RETURN_RECORDED,
             actor=request.user,
-            note=f"{event.event_ref}: {len(payload['lines'])} line(s) returned",
-            meta={"event_id": event.id, "event_no": event.event_no},
+            note=f"{event.event_ref}: {len(payload['lines'])} line(s) returned, {len(photos)} photo(s)",
+            meta={"event_id": event.id, "event_no": event.event_no, "photos": len(photos)},
         )
         notify.notify_return_recorded(gate_pass, event, actor=request.user)
         return self._detail_response(gate_pass)
@@ -666,7 +725,7 @@ class ReturnableReturnEventViewSet(viewsets.ReadOnlyModelViewSet):
         if gate_pass:
             queryset = queryset.filter(gate_pass_id=gate_pass)
         return queryset.select_related("vehicle", "driver", "verified_by", "acknowledged_by").prefetch_related(
-            "lines__pass_item"
+            "lines__pass_item", "attachments"
         )
 
 

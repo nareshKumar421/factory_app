@@ -5,12 +5,16 @@ requires. Notifications are patched out — they are fire-and-forget and hitting
 Firebase from a test run is neither possible nor useful.
 """
 
+import json
+import tempfile
 from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -22,6 +26,9 @@ from .constants import ReturnableStatus
 from .models import ReturnableGatePass, ReturnableGatePassItem, ReturnableGatePassSequence
 
 User = get_user_model()
+
+#: Uploads land here, never in the repo's shared media/ folder.
+TEMP_MEDIA = tempfile.mkdtemp(prefix="returnable-test-media-")
 
 ALL_PERMS = [
     "can_view_returnable_module",
@@ -40,6 +47,13 @@ ALL_PERMS = [
 ]
 
 
+def _upload(name):
+    """A small file under ``name``. The server judges a photo by its file name."""
+    content_type = "application/pdf" if name.lower().endswith(".pdf") else "image/jpeg"
+    return SimpleUploadedFile(name, b"not really an image", content_type=content_type)
+
+
+@override_settings(MEDIA_ROOT=TEMP_MEDIA)
 @patch("returnable_items.views.notify", autospec=True)
 class ReturnableGatePassFlowTests(APITestCase):
     maxDiff = None
@@ -89,11 +103,32 @@ class ReturnableGatePassFlowTests(APITestCase):
         payload.update(overrides)
         return payload
 
-    def _create_pass(self):
+    def _create_pass(self, photo=True):
         url = reverse("returnable-gatepass-list")
         response = self.client.post(url, self._payload(), format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        return ReturnableGatePass.objects.get(pk=response.data["id"])
+        gate_pass = ReturnableGatePass.objects.get(pk=response.data["id"])
+        if photo:
+            self._attach(gate_pass)
+        return gate_pass
+
+    def _attach(self, gate_pass, name="gear-motor.jpg", doc_type="PHOTO"):
+        """Upload a file to the pass the way the form does, right after saving it."""
+        response = self.client.post(
+            reverse("returnable-attachment-list"),
+            {"gate_pass": gate_pass.pk, "file": _upload(name), "doc_type": doc_type},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response
+
+    def _record_return(self, gate_pass, body, photos=("back-at-gate.jpg",)):
+        """Record a return trip the way the gate screen does: JSON in "data", photos beside it."""
+        return self.client.post(
+            self._action_url(gate_pass, "record-return"),
+            {"data": json.dumps(body), "attachments": [_upload(name) for name in photos]},
+            format="multipart",
+        )
 
     def _action_url(self, gate_pass, name):
         return reverse(f"returnable-gatepass-{name}", args=[gate_pass.pk])
@@ -117,7 +152,6 @@ class ReturnableGatePassFlowTests(APITestCase):
         return self.client.post(
             self._action_url(gate_pass, "gate-out"),
             {"vehicle_number_manual": "GJ01AB1234", "driver_name_manual": "Ramesh"},
-            format="json",
         )
 
     # -- creation ---------------------------------------------------------
@@ -170,10 +204,9 @@ class ReturnableGatePassFlowTests(APITestCase):
             {"pass_item": item.id, "quantity_returned": str(item.quantity_out)}
             for item in gate_pass.items.all()
         ]
-        response = self.client.post(
-            self._action_url(gate_pass, "record-return"),
+        response = self._record_return(
+            gate_pass,
             {"vehicle_number_manual": "GJ05XY9999", "lines": lines},
-            format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         gate_pass.refresh_from_db()
@@ -203,10 +236,9 @@ class ReturnableGatePassFlowTests(APITestCase):
         motor = gate_pass.items.get(item_name="Gear Motor 3HP")
         bearing = gate_pass.items.get(item_name="Bearing 6205")
 
-        first = self.client.post(
-            self._action_url(gate_pass, "record-return"),
+        first = self._record_return(
+            gate_pass,
             {"lines": [{"pass_item": motor.id, "quantity_returned": "1.000"}]},
-            format="json",
         )
         self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
         gate_pass.refresh_from_db()
@@ -215,15 +247,14 @@ class ReturnableGatePassFlowTests(APITestCase):
         self.assertEqual(motor.quantity_returned, Decimal("1.000"))
         self.assertEqual(motor.pending_return_qty, Decimal("1.000"))
 
-        second = self.client.post(
-            self._action_url(gate_pass, "record-return"),
+        second = self._record_return(
+            gate_pass,
             {
                 "lines": [
                     {"pass_item": motor.id, "quantity_returned": "1.000"},
                     {"pass_item": bearing.id, "quantity_returned": "4.000"},
                 ]
             },
-            format="json",
         )
         self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
         gate_pass.refresh_from_db()
@@ -237,10 +268,9 @@ class ReturnableGatePassFlowTests(APITestCase):
         self._gate_out(gate_pass)
         motor = gate_pass.items.get(item_name="Gear Motor 3HP")
 
-        response = self.client.post(
-            self._action_url(gate_pass, "record-return"),
+        response = self._record_return(
+            gate_pass,
             {"lines": [{"pass_item": motor.id, "quantity_returned": "3.000"}]},
-            format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         motor.refresh_from_db()
@@ -315,6 +345,114 @@ class ReturnableGatePassFlowTests(APITestCase):
         self._as(self.approver)
         response = self.client.post(self._action_url(gate_pass, "approve"), {}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # -- photos: the gate identifies the material by its picture ----------
+
+    def _out_pass(self):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+        self._gate_out(gate_pass)
+        return gate_pass
+
+    def test_submit_requires_a_photo_of_the_material(self, notify):
+        gate_pass = self._create_pass(photo=False)
+
+        response = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("photo", response.data["detail"])
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.status, ReturnableStatus.DRAFT)
+        notify.notify_submitted.assert_not_called()
+
+    def test_a_non_returnable_pass_needs_a_photo_too(self, _notify):
+        gate_pass = self._create_non_returnable(photo=False)
+
+        response = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_challan_on_its_own_is_not_a_photo(self, _notify):
+        gate_pass = self._create_pass(photo=False)
+        self._attach(gate_pass, "challan.pdf", doc_type="CHALLAN")
+
+        response = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_photo_filed_as_a_challan_still_counts(self, _notify):
+        """The form files everything as "Delivery Challan" by default; the file decides."""
+        gate_pass = self._create_pass(photo=False)
+        self._attach(gate_pass, "IMG_2041.JPG", doc_type="CHALLAN")
+
+        response = self.client.post(self._action_url(gate_pass, "submit"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_approver_cannot_sign_off_a_pass_without_a_photo(self, _notify):
+        """A pass submitted before photos were required can still be in the queue."""
+        gate_pass = self._create_pass()
+        self.client.post(self._action_url(gate_pass, "submit"))
+        gate_pass.attachments.all().delete()
+
+        self.assertEqual(self._approve(gate_pass).status_code, status.HTTP_400_BAD_REQUEST)
+        gate_pass.refresh_from_db()
+        self.assertEqual(gate_pass.status, ReturnableStatus.PENDING_APPROVAL)
+
+        # The approver may edit a pass waiting on them, so they can add it themselves.
+        self._as(self.approver)
+        self._attach(gate_pass)
+        self.assertEqual(self._approve(gate_pass).status_code, status.HTTP_200_OK)
+
+    def test_recording_a_return_requires_a_photo(self, notify):
+        gate_pass = self._out_pass()
+        motor = gate_pass.items.get(item_name="Gear Motor 3HP")
+        lines = [{"pass_item": motor.id, "quantity_returned": "1.000"}]
+
+        for response in (
+            self._record_return(gate_pass, {"lines": lines}, photos=()),
+            # What the gate screen sent before photos were required.
+            self.client.post(
+                self._action_url(gate_pass, "record-return"), {"lines": lines}, format="json"
+            ),
+        ):
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("photo", response.data["detail"])
+
+        motor.refresh_from_db()
+        self.assertEqual(motor.quantity_returned, Decimal("0.000"))
+        self.assertFalse(gate_pass.return_events.exists())
+        notify.notify_return_recorded.assert_not_called()
+
+    def test_a_return_takes_photos_only(self, _notify):
+        gate_pass = self._out_pass()
+        motor = gate_pass.items.get(item_name="Gear Motor 3HP")
+
+        response = self._record_return(
+            gate_pass,
+            {"lines": [{"pass_item": motor.id, "quantity_returned": "1.000"}]},
+            photos=("back-at-gate.jpg", "vendor-challan.pdf"),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("vendor-challan.pdf", response.data["detail"])
+        self.assertFalse(gate_pass.return_events.exists())
+
+    def test_return_photos_are_kept_on_their_trip(self, _notify):
+        gate_pass = self._out_pass()
+        motor = gate_pass.items.get(item_name="Gear Motor 3HP")
+
+        response = self._record_return(
+            gate_pass,
+            {"lines": [{"pass_item": motor.id, "quantity_returned": "1.000"}]},
+            photos=("front.jpg", "nameplate.png"),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        event = gate_pass.return_events.get()
+        self.assertEqual(event.attachments.count(), 2)
+        trip = response.data["return_events"][0]
+        self.assertEqual(len(trip["attachments"]), 2)
+        self.assertTrue(trip["attachments"][0]["file"].startswith("http://testserver/media/"))
+        self.assertIn("/returnable-items/returns/", trip["attachments"][0]["file"])
+        # The department's photo of what went out stays separate from these.
+        self.assertEqual(len(response.data["attachments"]), 1)
+        self.assertIn("2 photo(s)", gate_pass.logs.get(action="RETURN_RECORDED").note)
 
     # -- hand-carried gate out --------------------------------------------
 
@@ -497,6 +635,8 @@ class ReturnableGatePassFlowTests(APITestCase):
         self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
         gate_pass = ReturnableGatePass.objects.get(pk=created.data["id"])
         self.assertFalse(gate_pass.is_returnable)
+        # The drafter attaches the photo; the sender cannot, but needs it there.
+        self._attach(gate_pass)
         self.assertEqual(
             self.client.post(self._action_url(gate_pass, "submit")).status_code,
             status.HTTP_403_FORBIDDEN,
@@ -515,6 +655,7 @@ class ReturnableGatePassFlowTests(APITestCase):
         created = self.client.post(reverse("returnable-gatepass-list"), self._payload(), format="json")
         self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
         gate_pass = ReturnableGatePass.objects.get(pk=created.data["id"])
+        self._attach(gate_pass)
 
         submit = self.client.post(self._action_url(gate_pass, "submit"))
         self.assertEqual(submit.status_code, status.HTTP_200_OK, submit.data)
@@ -675,10 +816,9 @@ class ReturnableGatePassFlowTests(APITestCase):
         self._submit_and_approve(gate_pass)
         self._gate_out(gate_pass)
         motor = gate_pass.items.get(item_name="Gear Motor 3HP")
-        self.client.post(
-            self._action_url(gate_pass, "record-return"),
+        self._record_return(
+            gate_pass,
             {"lines": [{"pass_item": motor.id, "quantity_returned": "1.000"}]},
-            format="json",
         )
 
         response = self.client.post(
@@ -725,12 +865,15 @@ class ReturnableGatePassFlowTests(APITestCase):
         payload.update(overrides)
         return payload
 
-    def _create_non_returnable(self):
+    def _create_non_returnable(self, photo=True):
         response = self.client.post(
             reverse("returnable-gatepass-list"), self._non_returnable_payload(), format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
-        return ReturnableGatePass.objects.get(pk=response.data["id"])
+        gate_pass = ReturnableGatePass.objects.get(pk=response.data["id"])
+        if photo:
+            self._attach(gate_pass)
+        return gate_pass
 
     def test_non_returnable_gets_its_own_number_series(self, _notify):
         non_returnable = self._create_non_returnable()
@@ -799,10 +942,9 @@ class ReturnableGatePassFlowTests(APITestCase):
         self._gate_out(gate_pass)
         item = gate_pass.items.first()
 
-        recorded = self.client.post(
-            self._action_url(gate_pass, "record-return"),
+        recorded = self._record_return(
+            gate_pass,
             {"lines": [{"pass_item": item.id, "quantity_returned": "1.000"}]},
-            format="json",
         )
         self.assertEqual(recorded.status_code, status.HTTP_400_BAD_REQUEST)
 

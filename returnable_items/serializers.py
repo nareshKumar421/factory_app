@@ -15,6 +15,7 @@ from .models import (
     ReturnableGatePassLog,
     ReturnableGatePassSequence,
     ReturnableReturnEvent,
+    ReturnableReturnEventAttachment,
     ReturnableReturnEventItem,
 )
 
@@ -117,8 +118,16 @@ class ReturnableReturnEventItemSerializer(CompanyScopedModelSerializer):
         ]
 
 
+class ReturnableReturnEventAttachmentSerializer(CompanyScopedModelSerializer):
+    class Meta:
+        model = ReturnableReturnEventAttachment
+        fields = ["id", "event", "file", "caption", "created_at", "created_by_name"]
+
+
 class ReturnableReturnEventSerializer(CompanyScopedModelSerializer):
     lines = ReturnableReturnEventItemSerializer(many=True, read_only=True)
+    #: The gate's photos of what came back on this trip.
+    attachments = ReturnableReturnEventAttachmentSerializer(many=True, read_only=True)
     vehicle_number = serializers.CharField(read_only=True)
     verified_by_name = serializers.CharField(source="verified_by.full_name", read_only=True, default="")
     acknowledged_by_name = serializers.CharField(
@@ -152,6 +161,7 @@ class ReturnableReturnEventSerializer(CompanyScopedModelSerializer):
             "is_acknowledged",
             "remarks",
             "lines",
+            "attachments",
             "created_at",
         ]
 
