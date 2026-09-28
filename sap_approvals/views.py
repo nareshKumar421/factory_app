@@ -166,7 +166,8 @@ class _InboxView(SapApprovalViewBase):
 
 class ApprovalRequestListAPI(_InboxView):
     """GET ?scope=waiting_on_me|raised_by_me|all ?status ?object_type ?date_from
-    ?date_to ?search ?limit — requests that involve the caller, newest first."""
+    ?date_to ?search ?limit ?offset — requests that involve the caller, newest
+    first, a page at a time."""
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewSapApprovalInbox]
 
@@ -182,7 +183,7 @@ class ApprovalRequestListAPI(_InboxView):
             # Not an error: the page explains the missing mapping instead.
             return Response({
                 "results": [], "count": 0, "limit": reader_filters["limit"],
-                "truncated": False, "identity": None,
+                "offset": reader_filters["offset"], "truncated": False, "identity": None,
                 "message": self.unmapped_message(), "object_types": object_types,
             })
         rows = self.client().list_approval_inbox(mine, **reader_filters)
@@ -191,7 +192,8 @@ class ApprovalRequestListAPI(_InboxView):
             "results": rows,
             "count": len(rows),
             "limit": reader_filters["limit"],
-            # A full page means there may be more: narrow the filters.
+            "offset": reader_filters["offset"],
+            # A full page means there may be more: ask for the next offset.
             "truncated": len(rows) >= reader_filters["limit"],
             "identity": self.identity(mine),
             "object_types": object_types,

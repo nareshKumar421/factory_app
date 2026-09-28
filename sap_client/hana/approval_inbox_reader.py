@@ -389,8 +389,9 @@ class HanaApprovalInboxReader:
         date_to=None,
         search: str = "",
         limit: int = 200,
+        offset: int = 0,
     ) -> list[dict]:
-        """Requests involving ``sap_user_code``, newest first.
+        """Requests involving ``sap_user_code``, newest first; ``offset`` pages on.
 
         ``scope``: ``waiting_on_me`` (pending at a stage of theirs — the status
         filter does not apply), ``raised_by_me`` (``OWDD.OwnerID``) or ``all``
@@ -404,6 +405,7 @@ class HanaApprovalInboxReader:
         if status is not None and status not in STATUSES:
             raise SAPValidationError(f"Unknown approval status: {status}")
         limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
 
         with self._session() as session:
             user_id = self._user_id(session, sap_user_code)
@@ -459,7 +461,7 @@ class HanaApprovalInboxReader:
                 ) x
                 {('WHERE ' + ' AND '.join(outer)) if outer else ''}
                 ORDER BY x."WddCode" DESC
-                LIMIT {limit}
+                LIMIT {limit} OFFSET {offset}
             """
             raw = session.rows(sql, [user_id, *inner_params, *outer_params])
             rows = [self._row(r) for r in raw]

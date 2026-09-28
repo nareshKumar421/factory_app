@@ -768,7 +768,8 @@ class SAPClient:
         """Approval requests of every type that involve ``sap_user_code``.
 
         Filters: ``scope`` (waiting_on_me / raised_by_me / all), ``status``,
-        ``object_type``, ``date_from``, ``date_to``, ``search``, ``limit``.
+        ``object_type``, ``date_from``, ``date_to``, ``search``, ``limit``,
+        ``offset``.
         """
         from .hana.approval_inbox_reader import HanaApprovalInboxReader
 

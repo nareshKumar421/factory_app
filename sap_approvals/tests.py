@@ -236,6 +236,16 @@ class ListApiTests(SapApprovalsTestCase):
         data = self.client.get(f"{BASE}requests/?limit=2", **self.headers).data
         self.assertTrue(data["truncated"])
 
+    def test_the_next_page_is_asked_for_by_offset(self, sap):
+        sap.return_value.list_approval_inbox.return_value = []
+        data = self.client.get(f"{BASE}requests/?limit=200&offset=400", **self.headers).data
+        self.assertEqual(sap.return_value.list_approval_inbox.call_args.kwargs["offset"], 400)
+        self.assertEqual(data["offset"], 400)
+        self.assertEqual(
+            self.client.get(f"{BASE}requests/?offset=-1", **self.headers).status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
     def test_an_unmapped_user_gets_an_explanation_not_someone_elses_list(self, sap):
         self.unmap()
         response = self.client.get(f"{BASE}requests/", **self.headers)

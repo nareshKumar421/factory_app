@@ -31,6 +31,7 @@ class RequestFilterSerializer(serializers.Serializer):
         required=False, allow_blank=True, default="", max_length=100
     )
     limit = serializers.IntegerField(required=False, min_value=1, max_value=500, default=200)
+    offset = serializers.IntegerField(required=False, min_value=0, default=0)
 
     def validate(self, attrs):
         if attrs["date_from"] and attrs["date_to"] and attrs["date_from"] > attrs["date_to"]:
@@ -47,6 +48,7 @@ class RequestFilterSerializer(serializers.Serializer):
             "date_to": data["date_to"],
             "search": data["search"],
             "limit": data["limit"],
+            "offset": data["offset"],
         }
 
 
