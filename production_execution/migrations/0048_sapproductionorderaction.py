@@ -9,7 +9,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('company', '0003_alter_usercompany_role'),
-        ('production_execution', '0046_production_settings'),
+        ('production_execution', '0047_filling_cost_sheet_per_day'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

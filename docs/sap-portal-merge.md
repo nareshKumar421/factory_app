@@ -51,7 +51,7 @@ In order; each step is safe to repeat.
 
 1. **Deploy the backend** (`/deploy`). New migrations, all of which only create tables:
    `sap_finance 0001`, `sap_documents 0001`, `sap_approvals 0001`,
-   `bom_changes 0001`, `partner_onboarding 0001`, `production_execution 0047`.
+   `bom_changes 0001`, `partner_onboarding 0001`, `production_execution 0048`.
 2. **Server `.env`** (nothing here is required to boot; see DEPLOYMENT.md):
    - `SAP_FILE_SERVICE_BASE_URL` = the portal's `FILE_SERVICE_BASE` value, to switch
      attachment downloads on. Company ids default to Oil 1, Beverages 2, Mart 3.
