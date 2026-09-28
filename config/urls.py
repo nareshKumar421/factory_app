@@ -22,7 +22,7 @@ from django.urls import path,include,re_path
 from django.conf.urls.static import static
 from django.utils.html import mark_safe
 from django.views.static import serve
-from .view import RootApiView
+from .view import HealthView, RootApiView
 
 # Configure admin site branding from settings
 admin.site.site_header = mark_safe(settings.ADMIN_SITE_HEADER)
@@ -32,6 +32,8 @@ admin.site.index_title = settings.ADMIN_INDEX_TITLE
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('',RootApiView.as_view(),name='root-api'),
+    # Monitoring: up, and its own database reachable (no login, no SAP).
+    path('api/v1/health/', HealthView.as_view(), name='health'),
     path('api/v1/accounts/', include('accounts.urls')),
     path("api/v1/company/", include("company.urls")),
     path("api/v1/driver-management/", include("driver_management.urls")),
