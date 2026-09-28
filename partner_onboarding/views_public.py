@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 #: How long SAP's state list is served from memory. States change about never.
 STATES_CACHE_SECONDS = 6 * 60 * 60
+# How long the last list SAP gave stands in for SAP while it is unreachable.
+STATES_LAST_GOOD_SECONDS = 30 * 24 * 60 * 60
 
 
 def public_companies():
@@ -81,6 +83,13 @@ class PublicStatesAPI(_PublicView):
             try:
                 states = SAPClient(company_code=code).lookup_states("IN")
             except (SAPConnectionError, SAPDataError, SAPValidationError) as exc:
+                # The form needs SAP's own state codes (they go on the partner's
+                # addresses), so rather than a guessed list it falls back to the
+                # last one SAP gave — an outage then costs nobody the form.
+                last_good = cache.get(f"{key}:last-good")
+                if last_good is not None:
+                    logger.warning("Public state list for %s served from the last good copy: %s", code, exc)
+                    return Response(last_good)
                 logger.error("Public state list for %s could not be read: %s", code, exc)
                 return Response(
                     {"detail": "The state list is unavailable right now. Please try again shortly."},
@@ -88,6 +97,7 @@ class PublicStatesAPI(_PublicView):
                 )
             states = [{"code": row["code"], "name": row["name"]} for row in states]
             cache.set(key, states, STATES_CACHE_SECONDS)
+            cache.set(f"{key}:last-good", states, STATES_LAST_GOOD_SECONDS)
         return Response(states)
 
 

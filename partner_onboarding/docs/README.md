@@ -49,7 +49,7 @@ the partner is created in that registration's company's SAP.
 | Method | Path | Who |
 |--|--|--|
 | GET | `public/companies/` | anyone (throttled): `[{code, name}]` of the three SAP companies active here |
-| GET | `public/states/?company=` | anyone (throttled): SAP's Indian states for that company, cached 6 h |
+| GET | `public/states/?company=` | anyone (throttled): SAP's Indian states for that company, cached 6 h (the last good list while SAP is down) |
 | POST | `public/customers/` | anyone (throttled): multipart — `payload` (JSON) + files `pan`, `aadhaar`, `cheque`, `msme`, `other`… |
 | POST | `public/vendors/` | anyone (throttled): multipart — `payload` + files `pan`, `cheque`, `gst`, `msme`, `fssai`, `other`… |
 | GET | `customers/` `?status=PENDING,VERIFIED ?search= ?limit ?offset` | any customer right |
@@ -90,7 +90,16 @@ Verifying or approving implies viewing. `setup_partner_onboarding_groups` mints:
   120 reads an hour (`throttles.py`). The client address is the right-most
   `X-Forwarded-For` entry — the one our own nginx appended — so a forged prefix
   buys no new allowance. Counters live in Django's default cache (per worker
-  unless `CACHES` points at Redis).
+  unless `CACHES` points at Redis). **Staff are not counted**: a submission
+  carrying a valid login token of someone holding a partner-onboarding right
+  (they open the form from the queue, often many times a day, and an office
+  shares one address) passes the submit throttle. The token is read quietly —
+  a missing, expired or forged one is simply the public, still throttled,
+  never a 401.
+* The state list is SAP's (its codes go on the partner's addresses), cached 6 h;
+  when SAP cannot be reached the last list it gave is served (kept 30 days in
+  the cache), so a short outage costs nobody the form. A 503 only if SAP has
+  never answered since the worker started.
 * Files: at most 15 MB each, PDF / JPG / PNG only, checked by their first bytes
   (a renamed file is refused), stored as files under names that say nothing
   about whose they are. Twelve files at most per registration.

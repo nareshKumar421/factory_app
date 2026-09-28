@@ -90,6 +90,16 @@ class PublicStatesTests(PublicTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         sap_client.assert_not_called()
 
+    def test_sap_down_serves_the_last_list_sap_gave(self, sap_client):
+        fake = FakeSAP()
+        sap_client.return_value = fake
+        first = self.client.get(f"{BASE}public/states/?company=JIVO_OIL")
+        cache.delete("partner_onboarding:states:JIVO_OIL")  # the six-hour copy has run out
+        fake.lookup_error = SAPConnectionError("down")
+        response = self.client.get(f"{BASE}public/states/?company=JIVO_OIL")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, first.data)
+
     def test_sap_down_is_a_plain_503(self, sap_client):
         fake = FakeSAP()
         fake.lookup_error = SAPConnectionError("hana://secret-host refused")
@@ -334,6 +344,35 @@ class ThrottleTests(PublicTestCase):
             other_client = self.submit_customer(HTTP_X_FORWARDED_FOR="198.51.100.4")
         self.assertEqual(answers[-1], status.HTTP_429_TOO_MANY_REQUESTS)
         self.assertEqual(other_client.status_code, status.HTTP_201_CREATED)
+
+    def _token_for(self, *codenames):
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.models import Permission
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        user = get_user_model().objects.create_user(
+            email=f"staff{len(codenames)}@jivo.in", password="x", full_name="Staff", employee_code=f"ST{len(codenames)}"
+        )
+        for codename in codenames:
+            user.user_permissions.add(Permission.objects.get(content_type__app_label="partner_onboarding", codename=codename))
+        return f"Bearer {AccessToken.for_user(user)}"
+
+    def test_staff_working_the_queue_are_not_counted(self):
+        token = self._token_for("can_view_customer_registrations")
+        with patch.object(PublicSubmitThrottle, "rate", "1/hour"):
+            answers = [self.submit_customer(HTTP_AUTHORIZATION=token).status_code for _ in range(3)]
+        self.assertEqual(answers, [status.HTTP_201_CREATED] * 3)
+
+    def test_a_login_without_partner_rights_is_counted_like_anyone(self):
+        token = self._token_for()
+        with patch.object(PublicSubmitThrottle, "rate", "1/hour"):
+            answers = [self.submit_customer(HTTP_AUTHORIZATION=token).status_code for _ in range(2)]
+        self.assertEqual(answers, [status.HTTP_201_CREATED, status.HTTP_429_TOO_MANY_REQUESTS])
+
+    def test_a_bad_token_is_the_public_not_a_401(self):
+        with patch.object(PublicSubmitThrottle, "rate", "1/hour"):
+            answers = [self.submit_customer(HTTP_AUTHORIZATION="Bearer not-a-token").status_code for _ in range(2)]
+        self.assertEqual(answers, [status.HTTP_201_CREATED, status.HTTP_429_TOO_MANY_REQUESTS])
 
     def test_the_forms_reads_have_their_own_limit(self):
         with patch.object(PublicReadThrottle, "rate", "1/hour"):
