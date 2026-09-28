@@ -91,6 +91,7 @@ Ported from `backend_v1/routes/creditNotes.js`.
 | `PATCH` | `credit-note-approvals/<wdd_code>/status/` | also takes `without_qty_posting` (below), `sap_password`, `approval_comment` (≤150) and `confirm_duplicate` |
 | `GET` | `credit-note-approvals/<wdd_code>/actions/` | `{can_withdraw, withdraw_note, password_stored, posted_duplicates, duplicate_check_failed, without_qty_posting: {current, item_lines, can_set}}` — read when a row is opened |
 | `POST` | `credit-note-approvals/<wdd_code>/withdraw/` | the originator cancels a pending request; optional `sap_password` |
+| `GET` | `credit-note-approvals/<wdd_code>/document/` | `{document}` — the credit note in full: its draft as the document browser shapes it (header dates, every line with UoM and tax, journal preview, base documents) |
 | `GET` | `credit-note-approvals/<wdd_code>/attachments/` | `{sources: [{label, abs_entry, lines}]}` — this credit note's files, then each base document's |
 | `GET` | `credit-note-approvals/<wdd_code>/attachments/<abs_entry>/<line>/download/` | one file, only if it belongs to one of those sources (404 otherwise) |
 

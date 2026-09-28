@@ -605,6 +605,35 @@ class CreditNoteApprovalAttachmentsView(_CreditNoteRequestView):
         return document_services.attachment_sources(doc, state.get("object_type_label") or "Credit note")
 
 
+
+class CreditNoteApprovalDocumentView(_CreditNoteRequestView):
+    """GET /api/v1/warehouse/credit-note-approvals/<wdd_code>/document/
+
+    The credit note in full, as the document browser shows its draft: header
+    dates (document and due), every line with its UoM, tax code and tax, the
+    journal preview and what it was copied from. On the queue's view right for
+    the document's family, like the attachments.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewCreditNoteApproval]
+
+    def get(self, request, wdd_code):
+        state, refusal = self.credit_note_state(wdd_code)
+        if refusal is not None:
+            return refusal
+        draft_entry = state.get("draft_entry")
+        doc = (
+            document_services.document_detail(self.company.code, DOCUMENT_TYPES["Drafts"], int(draft_entry))
+            if draft_entry
+            else None
+        )
+        if doc is None:
+            return Response(
+                {"error": f"SAP no longer holds the draft of credit-note request {wdd_code}."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response({"document": doc})
+
 class CreditNoteApprovalAttachmentDownloadView(CreditNoteApprovalAttachmentsView):
     """GET .../<wdd_code>/attachments/<abs_entry>/<line>/download/
 

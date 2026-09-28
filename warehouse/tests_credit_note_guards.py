@@ -258,3 +258,35 @@ class ReaderFilterTests(_CreditNoteExtrasTestCase):
         sql, params = self._sql()
         self.assertEqual(params, ())
         self.assertIn("OFFSET 0", sql)
+
+
+@patch("warehouse.views_credit_note_approval.document_services")
+@patch("warehouse.views_credit_note_approval.SAPClient")
+class DocumentTests(_CreditNoteExtrasTestCase):
+    def test_the_credit_note_in_full_is_its_draft_through_the_document_browser(self, sap, docs):
+        sap.return_value.approval_inbox_stage.return_value = inbox_state()
+        docs.document_detail.return_value = {"kind": "marketing", "lines": [{"uom": "PCS", "tax_code": "IGST18"}]}
+        response = self.client.get(f"{BASE}75424/document/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["document"]["lines"][0]["uom"], "PCS")
+        args = docs.document_detail.call_args.args
+        self.assertEqual((args[0], args[2]), ("JIVO_OIL", 57198))
+
+    def test_a_family_you_cannot_see_is_refused(self, sap, docs):
+        from django.contrib.auth.models import Permission
+
+        from accounts.models import User
+
+        for codename in ("can_view_ap_credit_note_approval", "can_approve_ap_credit_note"):
+            self.user.user_permissions.remove(
+                Permission.objects.get(content_type__app_label="warehouse", codename=codename)
+            )
+        self.client.force_authenticate(user=User.objects.get(pk=self.user.pk))
+        sap.return_value.approval_inbox_stage.return_value = inbox_state(object_type="19")
+        self.assertEqual(self.client.get(f"{BASE}75424/document/").status_code, 403)
+        docs.document_detail.assert_not_called()
+
+    def test_a_draft_sap_no_longer_holds_is_404(self, sap, docs):
+        sap.return_value.approval_inbox_stage.return_value = inbox_state()
+        docs.document_detail.return_value = None
+        self.assertEqual(self.client.get(f"{BASE}75424/document/").status_code, 404)

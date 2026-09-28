@@ -74,6 +74,7 @@ from .views_credit_note_approval import (
     CreditNoteApprovalAttachmentDownloadView,
     CreditNoteApprovalAttachmentsView,
     CreditNoteApprovalDecisionView,
+    CreditNoteApprovalDocumentView,
     CreditNoteApprovalListView,
     CreditNoteApprovalPendingCountView,
     CreditNoteApprovalWithdrawView,
@@ -221,6 +222,8 @@ urlpatterns = [
     # originator's withdraw.
     path('credit-note-approvals/<int:wdd_code>/actions/', CreditNoteApprovalActionsView.as_view(), name='credit-note-approval-actions'),
     path('credit-note-approvals/<int:wdd_code>/withdraw/', CreditNoteApprovalWithdrawView.as_view(), name='credit-note-approval-withdraw'),
+    # The credit note in full (the document browser's view of its draft).
+    path('credit-note-approvals/<int:wdd_code>/document/', CreditNoteApprovalDocumentView.as_view(), name='credit-note-approval-document'),
     # The scans an approver checks: this credit note's files and its base documents'.
     path('credit-note-approvals/<int:wdd_code>/attachments/', CreditNoteApprovalAttachmentsView.as_view(), name='credit-note-approval-attachments'),
     path(
