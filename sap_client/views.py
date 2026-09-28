@@ -6,6 +6,7 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 
 from company.permissions import HasCompanyContext
+from grpo.permissions import CanCreateGRPOPosting
 from raw_material_gatein.services.validations import is_over_receipt_enforced
 from .client import SAPClient
 from .exceptions import SAPConnectionError, SAPDataError, SAPValidationError
@@ -163,7 +164,9 @@ class CreateGRPOAPI(APIView):
         ]
     }
     """
-    permission_classes = [IsAuthenticated, HasCompanyContext]
+    # Posting a GRPO is a SAP write: the same right JI's own GRPO posting needs.
+    # It was login + company only, so any user with a company could post one.
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateGRPOPosting]
 
     def post(self, request):
         # Validate request payload

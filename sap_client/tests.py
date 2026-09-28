@@ -777,8 +777,30 @@ class GRPOAPITests(APITestCase):
             is_active=True
         )
 
+        # Posting a GRPO needs the GRPO posting right.
+        from django.contrib.auth.models import Permission
+
+        self.user.user_permissions.add(
+            Permission.objects.get(content_type__app_label="grpo", codename="add_grpoposting")
+        )
+        self.user = User.objects.get(pk=self.user.pk)
+
         # Authenticate
         self.client.force_authenticate(user=self.user)
+
+    def test_grpo_api_needs_the_grpo_posting_right(self):
+        """A login with a company is not enough to post a GRPO to SAP."""
+        self.user.user_permissions.clear()
+        self.client.force_authenticate(user=User.objects.get(pk=self.user.pk))
+        with patch("sap_client.views.SAPClient") as sap:
+            response = self.client.post(
+                "/api/v1/po/grpo/",
+                {"CardCode": "V001", "DocumentLines": [{"ItemCode": "ITEM001", "Quantity": "100"}]},
+                format="json",
+                HTTP_COMPANY_CODE="JIVO_OIL",
+            )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        sap.return_value.create_grpo.assert_not_called()
 
     def test_grpo_api_missing_company_header(self):
         """Test GRPO API without Company-Code header"""
