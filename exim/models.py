@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 
 from .access import PERMISSIONS
+from .models_licence import Licence, LicenceLine  # noqa: F401
 
 
 class EximPermission(models.Model):

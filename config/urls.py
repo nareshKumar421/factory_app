@@ -148,6 +148,8 @@ urlpatterns = [
     # Construction projects: the budget, the approval, and the daily record
     # of what was done and what it cost.
     path("api/v1/construction/", include("construction_projects.urls")),
+    # Import / Export: EXIM's screens, brought across one module at a time.
+    path("api/v1/exim/", include("exim.urls")),
 
 ]
 
