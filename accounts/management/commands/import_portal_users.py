@@ -69,6 +69,12 @@ class Command(BaseCommand):
         for message in messages:
             self.stdout.write(self.style.WARNING(f"    {message}"))
         self.stdout.write(self.style.SUCCESS(", ".join(f"{k}: {v}" for k, v in counts.items())))
+        if counts.get("created"):
+            # They have no usable password yet, and JI sends no email.
+            self.stdout.write(self.style.NOTICE(
+                f"{counts['created']} new user(s) cannot log in until they have a password: run "
+                "manage.py issue_temporary_passwords --without-password --output <file>"
+            ))
 
     def _rows(self, path):
         try:

@@ -33,6 +33,8 @@ class ChangePasswordView(APIView):
             )
 
         user.set_password(serializer.validated_data["new_password"])
+        # A temporary password is spent once the user has chosen their own.
+        user.must_change_password = False
         user.save()
 
         return Response({"message": "Password changed successfully"})

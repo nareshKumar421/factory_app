@@ -6,8 +6,10 @@ one numeric SAP user id. JI has none of those shapes (sap-portal-merge plan,
 decision D3), so a portal user becomes:
 
 * a JI login, matched to an existing one by email or created without a usable
-  password — portal password hashes are never carried over, so a new user sets
-  a password through the normal reset;
+  password — portal password hashes are never carried over. JI sends no email,
+  so an administrator then issues each new user a temporary password
+  (``manage.py issue_temporary_passwords --without-password``), which the app
+  makes them change at first login;
 * ``UserCompany`` rows for the companies they worked in (portal users could act
   on every company; which ones to grant is the operator's choice);
 * membership of the groups that correspond to their portal modules and role
@@ -33,7 +35,7 @@ from sap_client.models import SapApproverIdentity
 
 # The portal's seed logins (backend_v1/services/hanaUsers.js:113-124) — never people.
 SEED_USERNAMES = ("admin", "manager1", "srmanager1")
-# Addresses the portal seeded or that cannot receive a reset link.
+# Addresses the portal seeded, or that belong to nobody who could log in with them.
 _PLACEHOLDER_EMAIL = re.compile(r"@(company\.com|example\.(com|org)|test)$", re.IGNORECASE)
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 

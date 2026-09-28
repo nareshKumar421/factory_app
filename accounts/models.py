@@ -29,6 +29,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(default=timezone.now)
+    # Set when an administrator issued a temporary password (JI sends no email,
+    # so imported SAP Portal users start this way); the app then asks for a new
+    # one before anything else, and changing it clears the flag.
+    # db_default: the previous release, which does not know this column, must
+    # still be able to create users after a rollback (the schema stays migrated).
+    must_change_password = models.BooleanField(default=False, db_default=False)
 
 
     USERNAME_FIELD = "email"

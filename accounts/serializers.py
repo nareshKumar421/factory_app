@@ -39,6 +39,7 @@ class LoginSerializer(TokenObtainPairSerializer):
             "email": self.user.email,
             "full_name": self.user.full_name,
             "companies": list(companies),
+            "must_change_password": self.user.must_change_password,
         }
         return data
 
@@ -82,6 +83,7 @@ class MeSerializer(serializers.ModelSerializer):
             "is_staff",
             "is_superuser",
             "date_joined",
+            "must_change_password",
             "companies",
             "permissions",
         ]

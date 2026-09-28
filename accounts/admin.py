@@ -9,6 +9,7 @@ from django.utils.html import format_html
 from django.utils import timezone
 from .models import User
 from .models import Department
+from .temporary_passwords import issue as issue_temporary_passwords
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
@@ -33,6 +34,7 @@ class UserAdmin(BaseUserAdmin):
 
     list_filter = (
         "is_active",
+        "must_change_password",
         "is_staff",
         "is_superuser",
         "date_joined",
@@ -65,6 +67,7 @@ class UserAdmin(BaseUserAdmin):
         ("Permissions", {
             "fields": (
                 "is_active",
+                "must_change_password",
                 "is_staff",
                 "is_superuser",
                 "groups",
@@ -144,7 +147,24 @@ class UserAdmin(BaseUserAdmin):
         updated = queryset.update(is_staff=False)
         self.message_user(request, f"{updated} user(s) removed from staff.")
 
-    actions = ["activate_users", "deactivate_users", "make_staff", "remove_staff"]
+    @admin.action(description="Issue a temporary password (changed at first login)")
+    def issue_temporary_password(self, request, queryset):
+        """JI sends no email, so an administrator hands the password over. Shown
+        once, here; for many users at once use ``manage.py issue_temporary_passwords``."""
+        if queryset.count() > 20:
+            self.message_user(
+                request,
+                "Choose 20 users or fewer here; for more, run manage.py issue_temporary_passwords.",
+                level="warning",
+            )
+            return
+        for user, password in issue_temporary_passwords(list(queryset)):
+            self.message_user(
+                request,
+                f"{user.email}: temporary password {password} — they must change it when they log in.",
+            )
+
+    actions = ["activate_users", "deactivate_users", "make_staff", "remove_staff", "issue_temporary_password"]
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related()
