@@ -62,6 +62,14 @@ LOCAL_CATEGORY_NAME = "Factory App"
 # The split still applies only to finished goods (item group 102, "FINISHED"
 # in every company database) with a pieces-per-box factor, as the procedure
 # had it.
+#
+# Ltr is the row's quantity in litres: OITM."SalPackUn" is the litres in one
+# sales unit and "NumInSale" the stock units in one sales unit, the same
+# source the rest of the app reads volume from. "U_IsLitre" gates it, since
+# caps, cartons and preforms carry a SalPackUn too; anything else reads 0.
+#
+# DocDate, DocTime and DocNum still order the rows (opening balance first,
+# then each document in time order) but are not shown on the sheet.
 INVENTORY_AUDIT_SQL = """\
 WITH "SCOPE" AS (
     -- item/godown pairs whose stock actually changed inside the period
@@ -82,7 +90,9 @@ WITH "SCOPE" AS (
       AND (N."Warehouse" = '[%3]' OR '[%3]' = '')
     GROUP BY N."ItemCode", N."Warehouse"
 )
-SELECT * FROM (
+SELECT R."Godown", R."ItemCode", R."ItemName", R."Variety", R."UOM",
+       R."Quantity", R."Ltr", R."Box", R."Loose Qty"
+FROM (
     -- every document that moved stock inside the period
     SELECT
         M."Warehouse" AS "Godown",
@@ -99,6 +109,10 @@ SELECT * FROM (
         END || '-' || IFNULL(M."BASE_REF", '') AS "DocNum",
         I."SalPackMsr" AS "UOM",
         CAST(SUM(M."InQty" - M."OutQty") AS DECIMAL(19,2)) AS "Quantity",
+        CAST(SUM((M."InQty" - M."OutQty") * CASE WHEN UPPER(IFNULL(I."U_IsLitre", 'N')) = 'Y'
+                  THEN IFNULL(I."SalPackUn", 0)
+                       / CASE WHEN IFNULL(I."NumInSale", 0) > 0 THEN I."NumInSale" ELSE 1 END
+                  ELSE 0 END) AS DECIMAL(19,2)) AS "Ltr",
         CASE WHEN I."ItmsGrpCod" = 102 AND IFNULL(I."SalFactor2", 0) > 0
              THEN CAST(FLOOR(A."OnHand" / I."SalFactor2") AS INTEGER) ELSE 0 END AS "Box",
         CASE WHEN I."ItmsGrpCod" = 102 AND IFNULL(I."SalFactor2", 0) > 0
@@ -125,6 +139,10 @@ SELECT * FROM (
         'OB' AS "DocNum",
         I."SalPackMsr" AS "UOM",
         CAST(SUM(N."InQty" - N."OutQty") AS DECIMAL(19,2)) AS "Quantity",
+        CAST(SUM((N."InQty" - N."OutQty") * CASE WHEN UPPER(IFNULL(I."U_IsLitre", 'N')) = 'Y'
+                  THEN IFNULL(I."SalPackUn", 0)
+                       / CASE WHEN IFNULL(I."NumInSale", 0) > 0 THEN I."NumInSale" ELSE 1 END
+                  ELSE 0 END) AS DECIMAL(19,2)) AS "Ltr",
         CASE WHEN I."ItmsGrpCod" = 102 AND IFNULL(I."SalFactor2", 0) > 0
              THEN CAST(FLOOR(A."OnHand" / I."SalFactor2") AS INTEGER) ELSE 0 END AS "Box",
         CASE WHEN I."ItmsGrpCod" = 102 AND IFNULL(I."SalFactor2", 0) > 0
@@ -162,8 +180,9 @@ LOCAL_REPORTS = [
         sap_name="Inventory Audit Report",
         description=(
             "Stock audit sheet per godown and item: the opening balance as on "
-            "the From date, every document that moved stock in the period, and "
-            "the box / loose split of finished-goods stock as on the To date. "
+            "the From date, every document that moved stock in the period, each "
+            "in litres too, and the box / loose split of finished-goods stock "
+            "as on the To date. "
             "A rebuild of SAP's \"Inventory Audit Report Manual\" with the box "
             "arithmetic corrected. Run it for one day (From = To) to audit "
             "today's stock."
