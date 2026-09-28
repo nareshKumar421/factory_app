@@ -700,3 +700,23 @@ class GroupCommandTests(TestCase):
         call_command("setup_sap_documents_groups", stdout=StringIO())
         after = {g.name: set(g.permissions.values_list("codename", flat=True)) for g in Group.objects.all()}
         self.assertEqual(before, after)
+
+
+class LineFieldTests(SimpleTestCase):
+    """What SAP Portal's approval lines showed beyond the document browser's:
+    whether a line is liable to withholding tax, and the bilty's date."""
+
+    def _line(self, line, row=None):
+        from sap_documents.services import _empty_lookups, shape_line
+
+        return shape_line(line, row, _empty_lookups())
+
+    def test_wtax_liable_reads_sap_and_hana_spellings(self):
+        self.assertTrue(self._line({"WTLiable": "tYES"})["wtax_liable"])
+        self.assertFalse(self._line({}, {"WtLiable": "N"})["wtax_liable"])
+        self.assertIsNone(self._line({})["wtax_liable"])
+
+    def test_the_bilty_date_comes_from_its_udf(self):
+        self.assertEqual(self._line({"U_BiltyDate": "2026-09-14T00:00:00Z"})["bilty_date"], "2026-09-14")
+        self.assertEqual(self._line({"U_Bilty_Date": "2026-09-15"})["bilty_date"], "2026-09-15")
+        self.assertIsNone(self._line({})["bilty_date"])

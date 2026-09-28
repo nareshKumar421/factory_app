@@ -419,8 +419,25 @@ def shape_line(line: dict, row: dict | None, lookups: dict) -> dict:
         ),
         "udf_card_code": clean(_pick(sources, ["U_CardCode", "U_CustomerCode"], [["card", "code"], ["customer", "code"]])),
         "purpose": clean(_pick(sources, ["U_Purpose"], [["purpose"]])),
+        # SAP Portal's approval lines showed both (sap-approvals.html:896,907).
+        "wtax_liable": _yes_no(_pick(sources, ["WTLiable", "WtLiable", "U_WTLiable"], udf_only=False)),
+        "bilty_date": iso_date(
+            _pick(sources, ["U_BiltyDate", "U_BilltyDate", "U_Bilty_Date"], [["bilty", "date"], ["billty", "date"]])
+        ),
         "remarks": clean(_pick(sources, ["U_Remarks", "FreeText", "FreeTxt", "Remarks"])),
     }
+
+
+def _yes_no(value):
+    """SAP's tYES/tNO (Service Layer) or Y/N (HANA) as True/False; None when absent."""
+    if _missing(value):
+        return None
+    text = str(value).strip().upper()
+    if text in ("TYES", "Y", "YES", "TRUE", "1"):
+        return True
+    if text in ("TNO", "N", "NO", "FALSE", "0"):
+        return False
+    return None
 
 
 def _match_rows(lines: list, rows: list) -> list:
