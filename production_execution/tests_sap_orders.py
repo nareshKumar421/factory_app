@@ -263,6 +263,127 @@ class IssueAndReceiptTests(SapOrderApiTestCase):
         )
 
 
+
+class DoublePostTests(SapOrderApiTestCase):
+    """SAP has no idempotency key: a posting is claimed before SAP is asked, and
+    one SAP may have taken without answering is not sent again unconfirmed."""
+
+    ISSUE = {"lines": [{"line_num": 1, "quantity": "40"}]}
+
+    def issue(self, **extra):
+        return self.post("77/issue/", dict(self.ISSUE, **extra))
+
+    def test_a_posting_ends_done_with_what_sap_created(self):
+        self.service_sap.issue_for_production.return_value = {"DocEntry": 601, "DocNum": 9601}
+        self.assertEqual(self.issue().status_code, status.HTTP_201_CREATED)
+        row = SapProductionOrderAction.objects.get()
+        self.assertEqual((row.outcome, row.sap_doc_entry, row.sap_doc_num), ("DONE", 601, 9601))
+        self.assertEqual(len(row.fingerprint), 64)
+
+    def test_a_timed_out_posting_is_not_sent_again_until_confirmed(self):
+        self.service_sap.issue_for_production.side_effect = SAPConnectionError(
+            "SAP took too long to answer; it may have posted."
+        )
+        self.assertEqual(self.issue().status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(SapProductionOrderAction.objects.get().outcome, "UNKNOWN")
+
+        self.service_sap.issue_for_production.side_effect = None
+        self.service_sap.issue_for_production.return_value = {"DocEntry": 602, "DocNum": 9602}
+        again = self.issue()
+        self.assertEqual(again.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(again.data["code"], "UNCERTAIN_POST")
+        self.assertEqual(self.service_sap.issue_for_production.call_count, 1)
+
+        confirmed = self.issue(confirm_repeat=True)
+        self.assertEqual(confirmed.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.service_sap.issue_for_production.call_count, 2)
+
+    def test_the_uncertain_guard_covers_every_operator(self):
+        """Somebody else retrying the same posting after a timeout is just as risky."""
+        SapProductionOrderAction.objects.create(
+            company=self.company, action="ISSUE", order_doc_entry=77, outcome="UNKNOWN",
+            fingerprint=self._fingerprint_of_issue(),
+        )
+        self.assertEqual(self.issue().data["code"], "UNCERTAIN_POST")
+        self.service_sap.issue_for_production.assert_not_called()
+
+    def test_a_refused_posting_can_be_fixed_and_sent_again(self):
+        self.service_sap.issue_for_production.side_effect = SAPValidationError("Batch B1 has no stock")
+        self.assertEqual(self.issue().status_code, status.HTTP_400_BAD_REQUEST)
+        row = SapProductionOrderAction.objects.get()
+        self.assertEqual(row.outcome, "FAILED")
+        self.assertIn("no stock", row.error)
+        self.service_sap.issue_for_production.side_effect = None
+        self.service_sap.issue_for_production.return_value = {"DocEntry": 603, "DocNum": 9603}
+        # Nothing was posted, so this is not a repeat.
+        self.assertEqual(self.issue().status_code, status.HTTP_201_CREATED)
+
+    def test_the_same_posting_in_flight_is_refused_without_asking_sap(self):
+        """The second tab, or the second operator, while the first is still waiting on SAP."""
+        other = get_user_model().objects.create_user(
+            email="second@example.com", password="x", full_name="Second", employee_code="PLN2"
+        )
+        SapProductionOrderAction.objects.create(
+            company=self.company, action="ISSUE", order_doc_entry=77, outcome="POSTING",
+            fingerprint=self._fingerprint_of_issue(), created_by=other,
+        )
+        response = self.issue(confirm_repeat=True)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data["code"], "POSTING_IN_PROGRESS")
+        self.service_sap.issue_for_production.assert_not_called()
+
+    def test_a_posting_left_by_a_dead_process_is_retired_not_blocking_for_ever(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        stuck = SapProductionOrderAction.objects.create(
+            company=self.company, action="ISSUE", order_doc_entry=77, outcome="POSTING",
+            fingerprint=self._fingerprint_of_issue(),
+        )
+        SapProductionOrderAction.objects.filter(pk=stuck.pk).update(
+            created_at=timezone.now() - timedelta(minutes=6)
+        )
+        response = self.issue()
+        # SAP may have posted it, so it is uncertain — not "in progress" any more.
+        self.assertEqual(response.data["code"], "UNCERTAIN_POST")
+        stuck.refresh_from_db()
+        self.assertEqual(stuck.outcome, "UNKNOWN")
+
+    def test_the_database_holds_one_posting_per_payload(self):
+        from django.db import IntegrityError, transaction
+
+        SapProductionOrderAction.objects.create(
+            company=self.company, action="ISSUE", outcome="POSTING", fingerprint="f" * 64
+        )
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            SapProductionOrderAction.objects.create(
+                company=self.company, action="ISSUE", outcome="POSTING", fingerprint="f" * 64
+            )
+        # Finished rows with the same payload are fine: that is the log.
+        SapProductionOrderAction.objects.create(
+            company=self.company, action="ISSUE", outcome="DONE", fingerprint="f" * 64
+        )
+
+    def test_the_detail_shows_how_each_posting_ended(self):
+        SapProductionOrderAction.objects.create(
+            company=self.company, action="ISSUE", order_doc_entry=77, outcome="UNKNOWN", error="timed out"
+        )
+        self.view_sap.sap_production_order.return_value = dict(RELEASED_ORDER)
+        data = self.client.get(f"{BASE}77/", **self.headers).data
+        self.assertEqual(data["actions"][0]["outcome"], "UNKNOWN")
+        self.assertEqual(data["actions"][0]["outcome_label"], "SAP did not answer")
+        self.assertEqual(data["actions"][0]["error"], "timed out")
+
+    def _fingerprint_of_issue(self) -> str:
+        """The fingerprint the service computes for ISSUE, by posting it once against a stub."""
+        from production_execution.services import sap_order_service
+
+        captured = {}
+        with patch.object(sap_order_service, "_post_once", side_effect=lambda *a, **k: captured.update(payload=a[3]) or {}):
+            self.issue()
+        return sap_order_service._fingerprint(captured["payload"])
+
 class ReadTests(SapOrderApiTestCase):
     def test_the_list_passes_filters_and_sap_outage_is_503(self):
         self.view_sap.list_sap_production_orders.return_value = {"count": 0, "results": []}

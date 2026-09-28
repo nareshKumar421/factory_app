@@ -81,13 +81,15 @@ class ReceiptSerializer(serializers.Serializer):
 
 class SapProductionOrderActionSerializer(serializers.ModelSerializer):
     action_label = serializers.CharField(source="get_action_display", read_only=True)
+    outcome_label = serializers.CharField(source="get_outcome_display", read_only=True)
     taken_by = serializers.SerializerMethodField()
 
     class Meta:
         model = SapProductionOrderAction
         fields = [
             "id", "action", "action_label", "order_doc_entry", "item_code", "quantity",
-            "sap_doc_entry", "sap_doc_num", "pending_approval_draft", "taken_by", "created_at",
+            "sap_doc_entry", "sap_doc_num", "pending_approval_draft", "outcome", "outcome_label",
+            "error", "taken_by", "created_at",
         ]
         read_only_fields = fields
 

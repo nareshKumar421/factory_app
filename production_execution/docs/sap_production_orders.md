@@ -44,10 +44,26 @@ holds for approval answers `{"pending_approval": true, "draft_entry": N}`.
 * **Close** sends `ProductionOrderStatus: boposClosed`; the portal sent the
   database code `'L'`. Prove it on the sandbox company.
 * **Double posts.** SAP has no idempotency key and a production order has no
-  reference to look it up by, so the dedupe is here: the same request from the
-  same person within two minutes is refused (409 `REPEAT_POST`) unless they
-  confirm it. Every accepted action is recorded in `SapProductionOrderAction`
-  with who took it, since SAP stamps only the shared service account.
+  reference to look it up by, so the dedupe is here. A create, issue or receipt
+  is **claimed before SAP is asked**: a `SapProductionOrderAction` row with
+  outcome `POSTING` and the payload's SHA-256, committed, and a partial unique
+  constraint allows one `POSTING` row per payload. So:
+  * the same posting while the first is still waiting on SAP (two tabs, two
+    operators) is refused without reaching SAP (409 `POSTING_IN_PROGRESS`);
+  * SAP refusing it ends the row `FAILED` — nothing was posted, so fixing it and
+    sending again is not a repeat;
+  * SAP not answering (the 120 s write timeout, a dropped connection) ends it
+    `UNKNOWN`, because the write may still have committed. The same payload is
+    then refused for 30 minutes, for anybody (409 `UNCERTAIN_POST`), until the
+    operator has checked SAP and confirms (`confirm_repeat`);
+  * the same person posting the same thing within two minutes of a `DONE` one
+    is refused (409 `REPEAT_POST`) unless they confirm;
+  * a `POSTING` row older than five minutes (the process died mid-call) is
+    retired to `UNKNOWN` rather than blocking that payload for ever.
+
+  Every action is recorded with who took it and how it ended (`outcome`,
+  `error`), since SAP stamps only the shared service account; the order's page
+  shows the log.
 * **Rights are checked by the server.** The portal hid the pages from users
   without the `production` module but its API accepted any login.
 

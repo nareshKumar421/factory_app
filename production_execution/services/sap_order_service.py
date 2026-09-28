@@ -2,14 +2,26 @@
 
 Ported from SAP Portal (``backend_v1/routes/sap.js`` ~997–1315). The portal
 forwarded whatever the page built; this checks up front what SAP would refuse,
-calls SAP last, and records the action after SAP accepted it
-(``SapProductionOrderAction``).
+calls SAP last, and records every action (``SapProductionOrderAction``).
 
 SAP has no idempotency key on any of these, and a slow answer leaves the
-operator unsure whether it went through. Beyond the confirmation on the screen,
-an identical request from the same person within ``REPEAT_WINDOW`` is refused
-unless they confirm it (``confirm_repeat``) — the double-click the portal had
-no guard against.
+operator unsure whether it went through. So a create, issue or receipt
+(:func:`_post_once`):
+
+* is **claimed before SAP is asked** — a ``POSTING`` row, committed, which a
+  partial unique constraint allows once per payload. A second identical
+  posting while the first is in flight (two tabs, two operators) is refused
+  (409 ``POSTING_IN_PROGRESS``) without reaching SAP;
+* ends ``DONE``, ``FAILED`` when SAP refused it (nothing was posted, so it does
+  not count as a repeat) or ``UNKNOWN`` when SAP did not answer — a timed-out
+  write may still have committed;
+* is refused (409) when it repeats a ``DONE`` posting of the same person within
+  ``REPEAT_WINDOW`` (``REPEAT_POST``) or an ``UNKNOWN`` one of anybody within
+  ``UNCERTAIN_WINDOW`` (``UNCERTAIN_POST``), unless the operator confirms
+  (``confirm_repeat``) after checking SAP.
+
+A ``POSTING`` row older than ``POSTING_STALE_AFTER`` (the process died
+mid-call) is retired to ``UNKNOWN`` so it cannot block that payload for ever.
 
 Two portal behaviours are deliberately not ported:
 
@@ -27,16 +39,25 @@ import logging
 from datetime import timedelta
 from decimal import Decimal
 
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from sap_client.client import SAPClient
+from sap_client.exceptions import SAPValidationError
 
 from ..models_sap_orders import SapProductionOrderAction
 
 logger = logging.getLogger(__name__)
 
 REPEAT_WINDOW = timedelta(minutes=2)
+# Long enough to cover checking SAP after a timeout, short enough not to block
+# a genuine second posting of the same quantity later in the shift.
+UNCERTAIN_WINDOW = timedelta(minutes=30)
+# Past the Service Layer's 120 s write timeout (entity_client.WRITE_TIMEOUT_SECONDS).
+POSTING_STALE_AFTER = timedelta(minutes=5)
 QUANTITY_TOLERANCE = Decimal("0.000001")
+
+Outcome = SapProductionOrderAction.Outcome
 
 
 class SapOrderError(Exception):
@@ -52,25 +73,86 @@ def _fingerprint(payload: dict) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def _refuse_repeat(company, user, action: str, order_doc_entry, payload: dict, confirm_repeat: bool):
+def _retire_stale_postings(company) -> None:
+    """A POSTING row older than any SAP call can take was left by a dead process:
+    SAP may or may not have posted it, which is exactly UNKNOWN."""
+    SapProductionOrderAction.objects.filter(
+        company=company, outcome=Outcome.POSTING,
+        created_at__lt=timezone.now() - POSTING_STALE_AFTER,
+    ).update(outcome=Outcome.UNKNOWN, error="The app stopped before SAP answered.")
+
+
+def _refuse_repeat(company, user, action: str, fingerprint: str, confirm_repeat: bool):
+    same = SapProductionOrderAction.objects.filter(company=company, action=action, fingerprint=fingerprint)
+    if same.filter(outcome=Outcome.POSTING).exists():
+        raise SapOrderError(
+            "This exact posting is being sent to SAP right now. Wait for it to finish, then "
+            "check the order before posting again.",
+            status=409,
+            code="POSTING_IN_PROGRESS",
+        )
     if confirm_repeat:
         return
-    since = timezone.now() - REPEAT_WINDOW
-    fingerprint = _fingerprint(payload)
-    recent = SapProductionOrderAction.objects.filter(
-        company=company, action=action, created_by=user, created_at__gte=since,
-    )
-    # A create has no order yet (SAP assigns it), so it matches on the payload alone.
-    if order_doc_entry is not None:
-        recent = recent.filter(order_doc_entry=order_doc_entry)
-    recent = recent.values_list("payload", flat=True)
-    if any(_fingerprint(previous) == fingerprint for previous in recent):
+    now = timezone.now()
+    unanswered = same.filter(outcome=Outcome.UNKNOWN, created_at__gte=now - UNCERTAIN_WINDOW).first()
+    if unanswered is not None:
+        at = timezone.localtime(unanswered.created_at).strftime("%H:%M")
+        raise SapOrderError(
+            f"This exact posting was sent to SAP at {at} and SAP did not answer, so it may have "
+            "gone through. Check the order in SAP, then confirm to post it again.",
+            status=409,
+            code="UNCERTAIN_POST",
+        )
+    if same.filter(outcome=Outcome.DONE, created_by=user, created_at__gte=now - REPEAT_WINDOW).exists():
         raise SapOrderError(
             "You posted exactly this to SAP less than two minutes ago. Check SAP before posting "
             "it again, or confirm that you mean to post it twice.",
             status=409,
             code="REPEAT_POST",
         )
+
+
+def _post_once(company, user, action, payload: dict, send, *, order_doc_entry=None, item_code="",
+               quantity=None, confirm_repeat=False) -> dict:
+    """Claim the payload, send it to SAP, record how it ended; returns SAP's answer."""
+    fingerprint = _fingerprint(payload)
+    _retire_stale_postings(company)
+    _refuse_repeat(company, user, action, fingerprint, confirm_repeat)
+    try:
+        with transaction.atomic():
+            row = SapProductionOrderAction.objects.create(
+                company=company, action=action, order_doc_entry=order_doc_entry,
+                item_code=item_code or "", quantity=quantity, payload=payload,
+                fingerprint=fingerprint, outcome=Outcome.POSTING, created_by=user,
+            )
+    except IntegrityError:
+        # Another request claimed the same payload between the check and here.
+        raise SapOrderError(
+            "This exact posting is being sent to SAP right now. Wait for it to finish, then "
+            "check the order before posting again.",
+            status=409,
+            code="POSTING_IN_PROGRESS",
+        )
+    try:
+        result = send(payload) or {}
+    except SAPValidationError as e:
+        # SAP answered, and refused: nothing was posted.
+        row.outcome, row.error = Outcome.FAILED, str(e)[:500]
+        row.save(update_fields=["outcome", "error", "updated_at"])
+        raise
+    except Exception as e:
+        # No answer (timeout, lost connection) or an answer we could not read:
+        # SAP may have posted it.
+        row.outcome, row.error = Outcome.UNKNOWN, str(e)[:500] or type(e).__name__
+        row.save(update_fields=["outcome", "error", "updated_at"])
+        raise
+    row.outcome = Outcome.DONE
+    row.order_doc_entry = order_doc_entry or result.get("DocEntry") or None
+    row.sap_doc_entry = result.get("DocEntry") or None
+    row.sap_doc_num = int(result["DocNum"]) if str(result.get("DocNum") or "").isdigit() else None
+    row.pending_approval_draft = result.get("draft_entry") if result.get("pending_approval") else None
+    row.save()
+    return result
 
 
 def _record(company, user, action, *, order_doc_entry=None, item_code="", quantity=None, result=None, payload=None):
@@ -131,12 +213,10 @@ def create_order(company, user, data: dict, confirm_repeat: bool = False) -> dic
             }
             for index, line in enumerate(lines)
         ]
-    _refuse_repeat(company, user, SapProductionOrderAction.Action.CREATE, None, payload, confirm_repeat)
-    result = SAPClient(company_code=company.code).create_production_order(payload)
-    _record(
-        company, user, SapProductionOrderAction.Action.CREATE,
-        order_doc_entry=result.get("DocEntry"), item_code=data["item_code"],
-        quantity=data["planned_quantity"], result=result, payload=payload,
+    client = SAPClient(company_code=company.code)
+    result = _post_once(
+        company, user, SapProductionOrderAction.Action.CREATE, payload, client.create_production_order,
+        item_code=data["item_code"], quantity=data["planned_quantity"], confirm_repeat=confirm_repeat,
     )
     return {"doc_entry": result.get("DocEntry"), "doc_num": result.get("DocNum")}
 
@@ -206,15 +286,12 @@ def issue(company, user, doc_entry: int, data: dict, confirm_repeat: bool = Fals
         payload["DocDate"] = _date(data["posting_date"])
     if data.get("remarks"):
         payload["Comments"] = data["remarks"]
-    _refuse_repeat(company, user, SapProductionOrderAction.Action.ISSUE, doc_entry, payload, confirm_repeat)
-    result = client.issue_for_production(payload)
-    _record(
-        company, user, SapProductionOrderAction.Action.ISSUE, order_doc_entry=doc_entry,
-        item_code=order["item_code"],
+    return _post_once(
+        company, user, SapProductionOrderAction.Action.ISSUE, payload, client.issue_for_production,
+        order_doc_entry=doc_entry, item_code=order["item_code"],
         quantity=sum((Decimal(str(line["quantity"])) for line in data["lines"]), Decimal("0")),
-        result=result, payload=payload,
+        confirm_repeat=confirm_repeat,
     )
-    return result
 
 
 def receipt(company, user, doc_entry: int, data: dict, confirm_repeat: bool = False) -> dict:
@@ -239,10 +316,8 @@ def receipt(company, user, doc_entry: int, data: dict, confirm_repeat: bool = Fa
         payload["DocDate"] = _date(data["posting_date"])
     if data.get("remarks"):
         payload["Comments"] = data["remarks"]
-    _refuse_repeat(company, user, SapProductionOrderAction.Action.RECEIPT, doc_entry, payload, confirm_repeat)
-    result = client.receipt_from_production(payload)
-    _record(
-        company, user, SapProductionOrderAction.Action.RECEIPT, order_doc_entry=doc_entry,
-        item_code=order["item_code"], quantity=quantity, result=result, payload=payload,
+    return _post_once(
+        company, user, SapProductionOrderAction.Action.RECEIPT, payload, client.receipt_from_production,
+        order_doc_entry=doc_entry, item_code=order["item_code"], quantity=quantity,
+        confirm_repeat=confirm_repeat,
     )
-    return result
