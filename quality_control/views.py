@@ -1780,14 +1780,54 @@ def _get_slip_list_queryset(company):
     )
 
 
-def _apply_date_filters(qs, request):
-    """Apply from_date/to_date filters on submitted_at."""
+#: What the list's search box matches: every column the list shows, so anything
+#: QC can read in a row is something they can type to find it. The vehicle is
+#: matched both ways because the list falls back to the number the chemist typed
+#: when the gate entry has none.
+_SLIP_SEARCH_FIELDS = (
+    "po_item_receipt__po_receipt__vehicle_entry__entry_no",
+    "po_item_receipt__po_receipt__vehicle_entry__vehicle__vehicle_number",
+    "inspection__vehicle_no",
+    "party_name",
+    "po_item_receipt__po_item_code",
+    "po_item_receipt__item_name",
+    "inspection__report_no",
+    "inspection__internal_lot_no",
+    "inspection__material_type__name",
+)
+
+
+def _date_range_q(request):
+    """The from_date/to_date range, on the date the slip was sent to QC."""
+    q = Q()
     from_date = request.query_params.get("from_date")
     to_date = request.query_params.get("to_date")
     if from_date:
-        qs = qs.filter(submitted_at__date__gte=from_date)
+        q &= Q(submitted_at__date__gte=from_date)
     if to_date:
-        qs = qs.filter(submitted_at__date__lte=to_date)
+        q &= Q(submitted_at__date__lte=to_date)
+    return q
+
+
+def _apply_list_filters(qs, request, *, dated=True):
+    """Apply the list's search box and date range.
+
+    A search looks across every date. QC look an item up by its entry, lot or
+    report number precisely because they do not know when it came in, so a
+    search held to the picked range hides the very item they are after.
+
+    ``dated=False`` is for the tabs of unfinished work (pending, draft,
+    actionable): a slip still waiting on QC must stay on the list however long
+    ago it arrived, not drop off once it is older than the range.
+    """
+    search = (request.query_params.get("search") or "").strip()
+    if search:
+        match = Q()
+        for field in _SLIP_SEARCH_FIELDS:
+            match |= Q(**{f"{field}__icontains": search})
+        return qs.filter(match)
+    if dated:
+        qs = qs.filter(_date_range_q(request))
     return qs
 
 
@@ -1797,7 +1837,7 @@ class InspectionListAPI(APIView):
 
     def get(self, request):
         qs = _get_slip_list_queryset(request.company.company)
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
@@ -1809,7 +1849,7 @@ class InspectionPendingListAPI(APIView):
         qs = _get_slip_list_queryset(request.company.company).filter(
             inspection__isnull=True
         )
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request, dated=False)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
@@ -1821,7 +1861,7 @@ class InspectionDraftListAPI(APIView):
         qs = _get_slip_list_queryset(request.company.company).filter(
             inspection__workflow_status=InspectionWorkflowStatus.DRAFT
         )
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request, dated=False)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
@@ -1838,7 +1878,7 @@ class InspectionActionableListAPI(APIView):
                 InspectionWorkflowStatus.QA_CHEMIST_APPROVED,
             ])
         )
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request, dated=False)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
@@ -1877,7 +1917,7 @@ class InspectionCompletedAPI(APIView):
         final_status_param = request.query_params.get("final_status")
         if final_status_param:
             qs = qs.filter(inspection__final_status=final_status_param)
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
@@ -1889,7 +1929,7 @@ class InspectionRejectedAPI(APIView):
         qs = _get_slip_list_queryset(request.company.company).filter(
             inspection__final_status=InspectionStatus.REJECTED
         )
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
@@ -1902,7 +1942,7 @@ class InspectionReturnToVendorAPI(APIView):
             inspection__final_status=InspectionStatus.REJECTED,
             inspection__rejected_qc_return_item__isnull=True,
         )
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
@@ -1926,29 +1966,34 @@ class InspectionDecisionChangedAPI(APIView):
             )
             .filter(manager_decision_count__gte=2)
         )
-        qs = _apply_date_filters(qs, request)
+        qs = _apply_list_filters(qs, request)
         return Response(InspectionListItemSerializer(qs, many=True).data)
 
 
 class InspectionCountsAPI(APIView):
-    """Dashboard counts — single DB query using conditional aggregation"""
+    """Dashboard counts — single DB query using conditional aggregation.
+
+    The date range applies to finished work only (completed, rejected, hold).
+    The unfinished counts cover every date, matching the pending, draft and
+    actionable lists they link to.
+    """
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewInspection]
 
     def get(self, request):
         base = _get_slip_list_queryset(request.company.company)
-        base = _apply_date_filters(base, request)
+        dated = _date_range_q(request)
 
         counts = base.aggregate(
             not_started=Count("id", filter=Q(inspection__isnull=True)),
             draft=Count("id", filter=Q(inspection__workflow_status="DRAFT")),
             awaiting_chemist=Count("id", filter=Q(inspection__workflow_status="SUBMITTED")),
             awaiting_qam=Count("id", filter=Q(inspection__workflow_status="QA_CHEMIST_APPROVED")),
-            completed=Count("id", filter=Q(
+            completed=Count("id", filter=dated & Q(
                 inspection__workflow_status="QAM_APPROVED",
                 inspection__final_status="ACCEPTED",
             )),
-            rejected=Count("id", filter=Q(inspection__final_status="REJECTED")),
-            hold=Count("id", filter=Q(
+            rejected=Count("id", filter=dated & Q(inspection__final_status="REJECTED")),
+            hold=Count("id", filter=dated & Q(
                 inspection__workflow_status="QAM_APPROVED",
                 inspection__final_status="HOLD",
             )),

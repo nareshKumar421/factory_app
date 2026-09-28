@@ -1115,3 +1115,144 @@ class InspectionSubmitRemarkGateTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.inspection.refresh_from_db()
         self.assertEqual(self.inspection.workflow_status, InspectionWorkflowStatus.SUBMITTED)
+
+
+class InspectionListSearchAndDateRangeTests(APITestCase):
+    """The QC list's search looks across every date, and unfinished work ignores
+    the date range.
+
+    Issue #28: QC could not find an item without knowing when it arrived,
+    because the search only filtered the rows already loaded for the picked
+    range, and a slip still waiting on QC dropped off the list once it was
+    older than the range.
+    """
+
+    RANGE = {"from_date": "2026-09-01", "to_date": "2026-09-30"}
+
+    def setUp(self):
+        self.company = Company.objects.create(name="List Co", code="LIST_CO")
+        self.user = User.objects.create_user(
+            email="qc-list@example.com",
+            password="password",
+            full_name="QC List User",
+            employee_code="QCLIST001",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company,
+            role=UserRole.objects.create(name="QC Viewer"),
+            is_default=True, is_active=True,
+        )
+        self.user.user_permissions.add(Permission.objects.get(
+            content_type__app_label="quality_control",
+            codename="view_rawmaterialinspection",
+        ))
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        self.material_type = MaterialType.objects.create(
+            company=self.company, code="OIL", name="Crude Oil",
+        )
+
+        # Sent to QC in February, never inspected: well outside the range.
+        self.old_pending = self._slip("OLD-PEND", "2026-02-20")
+        # Sent to QC in February and finished: the range should hide it.
+        self.old_done = self._slip(
+            "OLD-DONE", "2026-02-21",
+            inspection=dict(
+                report_no="RPT-FEB-7", internal_lot_no="LOT-FEB-7",
+                workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+                final_status=InspectionStatus.ACCEPTED,
+            ),
+        )
+        # Sent to QC inside the range and finished.
+        self.new_done = self._slip(
+            "NEW-DONE", "2026-09-10",
+            inspection=dict(
+                report_no="RPT-SEP-1", internal_lot_no="LOT-SEP-1",
+                workflow_status=InspectionWorkflowStatus.QAM_APPROVED,
+                final_status=InspectionStatus.ACCEPTED,
+            ),
+        )
+
+    def _slip(self, tag, submitted_on, inspection=None):
+        submitted_at = timezone.make_aware(
+            timezone.datetime.fromisoformat(f"{submitted_on}T11:00:00")
+        )
+        vehicle = Vehicle.objects.create(vehicle_number=f"HR55{tag}")
+        driver = Driver.objects.create(
+            name="Driver", mobile_no="9800000000", license_no=f"DL-{tag}",
+        )
+        entry = VehicleEntry.objects.create(
+            entry_no=f"GE-{tag}", company=self.company, vehicle=vehicle, driver=driver,
+            entry_type="RAW_MATERIAL", status=GateEntryStatus.IN_PROGRESS,
+            created_by=self.user, updated_by=self.user,
+        )
+        po_receipt = POReceipt.objects.create(
+            vehicle_entry=entry, po_number=f"PO-{tag}",
+            supplier_code="SUP", supplier_name=f"Vendor {tag}", created_by=self.user,
+        )
+        item = POItemReceipt.objects.create(
+            po_receipt=po_receipt, po_item_code=f"RM-{tag}", item_name=f"Item {tag}",
+            sap_line_num=1, ordered_qty=Decimal("10.000"), received_qty=Decimal("10.000"),
+            uom="KG", created_by=self.user,
+        )
+        slip = MaterialArrivalSlip.objects.create(
+            po_item_receipt=item, particulars="Item", arrival_datetime=submitted_at,
+            weighing_required=False, party_name=f"Vendor {tag}",
+            billing_qty=Decimal("10.000"), billing_uom="KG",
+            truck_no_as_per_bill=vehicle.vehicle_number,
+            status=ArrivalSlipStatus.SUBMITTED, is_submitted=True,
+            submitted_at=submitted_at, submitted_by=self.user, created_by=self.user,
+        )
+        if inspection:
+            RawMaterialInspection.objects.create(
+                arrival_slip=slip, inspection_date=submitted_at.date(),
+                description_of_material="Item", supplier_name=f"Vendor {tag}",
+                material_type=self.material_type, created_by=self.user, **inspection,
+            )
+        return slip
+
+    def _ids(self, path, **params):
+        response = self.client.get(f"/api/v1/quality-control/{path}", params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        return {row["arrival_slip_id"] for row in response.data}
+
+    def test_dated_tabs_keep_the_range(self):
+        self.assertEqual(self._ids("inspections/", **self.RANGE), {self.new_done.id})
+        self.assertEqual(
+            self._ids("inspections/completed/", **self.RANGE), {self.new_done.id}
+        )
+
+    def test_unfinished_work_ignores_the_range(self):
+        self.assertEqual(
+            self._ids("inspections/pending/", **self.RANGE), {self.old_pending.id}
+        )
+        self.assertEqual(
+            self._ids("inspections/actionable/", **self.RANGE), {self.old_pending.id}
+        )
+
+    def test_search_finds_an_item_outside_the_range(self):
+        for term in ("RPT-FEB-7", "lot-feb", "GE-OLD-DONE", "HR55OLD-DONE",
+                     "vendor old-done", "RM-OLD-DONE", "item old-done"):
+            with self.subTest(term=term):
+                self.assertEqual(
+                    self._ids("inspections/", search=term, **self.RANGE),
+                    {self.old_done.id},
+                )
+
+    def test_search_stays_within_the_tab(self):
+        self.assertEqual(
+            self._ids("inspections/pending/", search="OLD-DONE", **self.RANGE), set()
+        )
+        self.assertEqual(
+            self._ids("inspections/completed/", search="crude", **self.RANGE),
+            {self.old_done.id, self.new_done.id},
+        )
+
+    def test_counts_date_only_the_finished_work(self):
+        response = self.client.get(
+            "/api/v1/quality-control/inspections/counts/", self.RANGE
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["not_started"], 1)
+        self.assertEqual(response.data["actionable"], 1)
+        self.assertEqual(response.data["completed"], 1)
