@@ -152,6 +152,18 @@ DECIDED_ROW = {
 }
 
 
+def pending_inbox(**overrides):
+    """The same request through the general approvals reader, which the decision
+    re-reads for the draft's own status and SAP's posted duplicates."""
+    state = {
+        "wdd_code": 75424, "object_type": "14", "object_type_label": "A/R Credit Note",
+        "draft_entry": 57198, "is_draft": True, "status": "PENDING",
+        "posted_duplicates": [],
+    }
+    state.update(overrides)
+    return state
+
+
 @override_settings(SAP_APPROVER_CREDENTIALS={"JIVO_OIL": {"USER37": "...."}})
 class CreditNoteApprovalAPITests(TestCase):
     def setUp(self):
@@ -297,6 +309,7 @@ class CreditNoteApprovalAPITests(TestCase):
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_approve_signs_as_the_stage_authorizer_sap_reports(self, sap):
         client = sap.return_value
+        client.approval_inbox_stage.return_value = pending_inbox()
         client.credit_note_approval_stage.return_value = dict(PENDING_ROW)
         client.decide_credit_note_approval.return_value = {
             "message": "Credit note approved in SAP.", "signed_as": "USER37",
@@ -317,6 +330,7 @@ class CreditNoteApprovalAPITests(TestCase):
     def test_the_body_cannot_choose_who_signs(self, sap):
         """A crafted request must not borrow another authorizer's credentials."""
         client = sap.return_value
+        client.approval_inbox_stage.return_value = pending_inbox()
         client.credit_note_approval_stage.return_value = dict(PENDING_ROW)
         client.decide_credit_note_approval.return_value = {
             "message": "ok", "signed_as": "USER37",
@@ -333,6 +347,7 @@ class CreditNoteApprovalAPITests(TestCase):
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_approve_records_the_party_the_amount_and_who_clicked(self, sap):
         client = sap.return_value
+        client.approval_inbox_stage.return_value = pending_inbox()
         client.credit_note_approval_stage.return_value = dict(PENDING_ROW)
         client.decide_credit_note_approval.return_value = {
             "message": "Credit note approved in SAP.", "signed_as": "USER37",
@@ -353,6 +368,7 @@ class CreditNoteApprovalAPITests(TestCase):
     def test_an_unparseable_total_still_records_the_decision(self, sap):
         """SAP has taken the decision; bookkeeping must not pretend it has not."""
         client = sap.return_value
+        client.approval_inbox_stage.return_value = pending_inbox()
         client.credit_note_approval_stage.return_value = {
             **PENDING_ROW, "total_amount": "n/a",
         }
@@ -444,6 +460,7 @@ class CreditNoteApprovalAPITests(TestCase):
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_reject_carries_the_reason_into_sap_and_the_audit(self, sap):
         client = sap.return_value
+        client.approval_inbox_stage.return_value = pending_inbox()
         client.credit_note_approval_stage.return_value = dict(PENDING_ROW)
         client.decide_credit_note_approval.return_value = {
             "message": "Credit note rejected in SAP.", "signed_as": "USER37",
@@ -545,6 +562,7 @@ class CreditNoteApprovalAPITests(TestCase):
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_holding_both_families_decides_both(self, sap):
         client = sap.return_value
+        client.approval_inbox_stage.return_value = pending_inbox(object_type="19")
         client.credit_note_approval_stage.return_value = dict(AP_ROW)
         client.decide_credit_note_approval.return_value = {
             "message": "Credit note approved in SAP.", "signed_as": "USER37",
@@ -560,6 +578,7 @@ class CreditNoteApprovalAPITests(TestCase):
     @patch("warehouse.views_credit_note_approval.SAPClient")
     def test_a_failed_audit_write_never_undoes_a_sap_decision(self, sap):
         client = sap.return_value
+        client.approval_inbox_stage.return_value = pending_inbox()
         client.credit_note_approval_stage.return_value = dict(PENDING_ROW)
         client.decide_credit_note_approval.return_value = {
             "message": "Credit note approved in SAP.", "signed_as": "USER37",

@@ -71,6 +71,8 @@ from .views_sap_approval import (
 )
 from .views_credit_note_approval import (
     CreditNoteApprovalActionsView,
+    CreditNoteApprovalAttachmentDownloadView,
+    CreditNoteApprovalAttachmentsView,
     CreditNoteApprovalDecisionView,
     CreditNoteApprovalListView,
     CreditNoteApprovalPendingCountView,
@@ -219,6 +221,13 @@ urlpatterns = [
     # originator's withdraw.
     path('credit-note-approvals/<int:wdd_code>/actions/', CreditNoteApprovalActionsView.as_view(), name='credit-note-approval-actions'),
     path('credit-note-approvals/<int:wdd_code>/withdraw/', CreditNoteApprovalWithdrawView.as_view(), name='credit-note-approval-withdraw'),
+    # The scans an approver checks: this credit note's files and its base documents'.
+    path('credit-note-approvals/<int:wdd_code>/attachments/', CreditNoteApprovalAttachmentsView.as_view(), name='credit-note-approval-attachments'),
+    path(
+        'credit-note-approvals/<int:wdd_code>/attachments/<int:abs_entry>/<int:line>/download/',
+        CreditNoteApprovalAttachmentDownloadView.as_view(),
+        name='credit-note-approval-attachment-download',
+    ),
 
     # The POSTED credit note behind an approved row, on SAP's own sheet. Its own
     # prefix because the id is the document's DocEntry, not an approval code —

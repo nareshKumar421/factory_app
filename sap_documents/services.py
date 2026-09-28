@@ -960,3 +960,21 @@ def fetch_attachment(company, user, abs_entry: int, line: int) -> dict:
         created_by=user,
     )
     return {"data": data, "file_name": file_name, "content_type": content_type}
+
+
+def served_file_response(served: dict):
+    """The HTTP response for a file :func:`fetch_attachment` returned.
+
+    PDFs, pictures and plain text go inline; everything else as a download of
+    ``application/octet-stream``, never sniffed and never cached. Every screen
+    that serves a SAP attachment answers through here, so the rules stay one.
+    """
+    from django.http import HttpResponse
+
+    inline_type = inline_content_type(served["content_type"], served["file_name"])
+    response = HttpResponse(served["data"], content_type=inline_type or "application/octet-stream")
+    response["Content-Disposition"] = content_disposition(served["file_name"], bool(inline_type))
+    response["Content-Length"] = str(len(served["data"]))
+    response["X-Content-Type-Options"] = "nosniff"
+    response["Cache-Control"] = "private, no-store"
+    return response

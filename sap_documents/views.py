@@ -12,7 +12,6 @@ empty one.
 
 import logging
 
-from django.http import HttpResponse
 from rest_framework import status
 from rest_framework.exceptions import APIException, NotFound
 from rest_framework.permissions import IsAuthenticated
@@ -138,10 +137,4 @@ class AttachmentDownloadAPI(_SapDocumentsView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
             raise
-        inline_type = services.inline_content_type(served["content_type"], served["file_name"])
-        response = HttpResponse(served["data"], content_type=inline_type or "application/octet-stream")
-        response["Content-Disposition"] = services.content_disposition(served["file_name"], bool(inline_type))
-        response["Content-Length"] = str(len(served["data"]))
-        response["X-Content-Type-Options"] = "nosniff"
-        response["Cache-Control"] = "private, no-store"
-        return response
+        return services.served_file_response(served)

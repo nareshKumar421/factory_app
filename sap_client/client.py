@@ -259,14 +259,17 @@ class SAPClient:
         status: str | None = "PENDING",
         family: str | None = None,
         limit: int = 100,
+        **filters,
     ) -> list[dict]:
         """SAP approval requests on A/R and A/P credit-note drafts.
 
         ``family`` narrows to one side: ``'AR'`` customer credit notes,
-        ``'AP'`` vendor ones, ``'ALL'`` (the default) both.
+        ``'AP'`` vendor ones, ``'ALL'`` (the default) both. ``filters`` are the
+        reader's search and paging keywords (party, doc_num, code, date_from,
+        date_to, offset).
         """
         reader = HanaCreditNoteApprovalReader(self.context)
-        return reader.list_approvals(status=status, family=family, limit=limit)
+        return reader.list_approvals(status=status, family=family, limit=limit, **filters)
 
     def count_pending_credit_note_approvals(self, family: str | None = None) -> int:
         return HanaCreditNoteApprovalReader(self.context).pending_count(family=family)
@@ -281,11 +284,16 @@ class SAPClient:
         approve: bool,
         remarks: str = "",
         approver: str | None = None,
+        password: str | None = None,
     ) -> dict:
-        """Approve or reject one credit-note approval, signed as ``approver``."""
+        """Approve or reject one credit-note approval, signed as ``approver``.
+
+        ``password`` is the approver's own SAP password when they typed it;
+        without it the stored ``SAP_APPROVER_CREDENTIALS`` entry is used.
+        """
         writer = ApprovalRequestWriter(self.context)
         return writer.decide(
-            wdd_code, approve, remarks, approver=approver, subject="Credit note"
+            wdd_code, approve, remarks, approver=approver, subject="Credit note", password=password
         )
 
     # ---- Transfer drafts (approved in SAP, but never added) ----

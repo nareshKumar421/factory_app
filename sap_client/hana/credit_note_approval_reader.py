@@ -232,6 +232,13 @@ class HanaCreditNoteApprovalReader:
         status: str | None = "PENDING",
         family: str | None = None,
         limit: int = 100,
+        *,
+        party: str = "",
+        doc_num: str = "",
+        code: int | None = None,
+        date_from=None,
+        date_to=None,
+        offset: int = 0,
     ) -> list[dict]:
         """Credit-note approval requests, newest first, with their draft lines.
 
@@ -240,14 +247,37 @@ class HanaCreditNoteApprovalReader:
         note names no warehouse at all, and hiding rows by warehouse would
         leave a stalled credit note that nobody can then find. The queue is
         company-wide and every row names its authorizer.
+
+        The filters are SAP Portal's (``creditNotes.js`` GET ``/``), all bound:
+        ``party`` matches part of the card code or name, ``doc_num`` part of the
+        draft's number, ``code`` the request exactly, and ``date_from`` /
+        ``date_to`` the day the request was raised (both inclusive).
+        ``offset`` pages past ``limit``.
         """
         if status and status not in STATUS_FILTERS:
             raise SAPValidationError(f"Unknown approval status: {status}")
         obj_types = self._obj_types(family)
 
         clauses = [_LATEST_REQUEST]
+        params: list = []
         if status:
             clauses.append(STATUS_FILTERS[status])
+        if party.strip():
+            like = f"%{party.strip()[:100].upper()}%"
+            clauses.append('(UPPER(D."CardCode") LIKE ? OR UPPER(D."CardName") LIKE ?)')
+            params += [like, like]
+        if doc_num.strip():
+            clauses.append('TO_VARCHAR(D."DocNum") LIKE ?')
+            params.append(f"%{doc_num.strip()[:20]}%")
+        if code is not None:
+            clauses.append('W."WddCode" = ?')
+            params.append(int(code))
+        if date_from:
+            clauses.append('W."CreateDate" >= ?')
+            params.append(date_from)
+        if date_to:
+            clauses.append('W."CreateDate" < ADD_DAYS(?, 1)')
+            params.append(date_to)
         where = " AND ".join(clauses)
         obj_type_list = ", ".join(f"'{t}'" for t in obj_types)
 
@@ -282,9 +312,9 @@ class HanaCreditNoteApprovalReader:
             WHERE W."ObjType" IN ({obj_type_list})
               AND {where}
             ORDER BY W."WddCode" DESC
-            LIMIT {int(limit)}
+            LIMIT {int(limit)} OFFSET {max(0, int(offset))}
             """,
-            (),
+            tuple(params),
         )
         if not headers:
             return []

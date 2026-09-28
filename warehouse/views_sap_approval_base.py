@@ -10,7 +10,9 @@ safe are identical, because they are SAP's rules rather than either document's:
   ``-6006``, so the authorizer is read fresh from HANA at decision time and
   never taken from the request body.
 * That account's password must be configured (``SAP_APPROVER_CREDENTIALS``) or
-  the app cannot authenticate as them at all.
+  the app cannot authenticate as them at all — unless the queue lets the
+  approver type it for the one decision (the credit-note queue does, as SAP
+  Portal did; the transfer queue does not).
 * The caller must BE that authorizer (:class:`sap_client.models.SapApproverIdentity`),
   so a decision SAP records against ``USER37`` was genuinely taken by the person
   who is ``USER37`` rather than by whoever reached a page holding her password.
@@ -80,11 +82,15 @@ class SapApprovalViewBase(APIView):
     # The decision guards, in the order they must run
     # ------------------------------------------------------------------
 
-    def refuse_decision(self, stage: dict, subject: str) -> Response | None:
+    def refuse_decision(
+        self, stage: dict, subject: str, *, typed_password: bool = False
+    ) -> Response | None:
         """``None`` if the caller may sign ``stage``, else the refusal to return.
 
         ``subject`` names the document in the error text ("transfer approval",
         "credit note"), which is all that differs between the two queues.
+        ``typed_password`` means the caller typed their SAP password for this
+        decision, so no stored one is needed; SAP checks the typed one itself.
         """
         if stage["status"] != "PENDING":
             return Response(
@@ -138,7 +144,7 @@ class SapApprovalViewBase(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        if approver.upper() not in self.configured_approvers():
+        if not typed_password and approver.upper() not in self.configured_approvers():
             return Response(
                 {
                     "error": (
@@ -151,17 +157,25 @@ class SapApprovalViewBase(APIView):
             )
         return None
 
-    def decision_remarks(self, approved: bool, reason: str) -> str:
-        """SAP stamps the authorizer; carry the real actor in the remarks."""
+    def decision_remarks(self, approved: bool, reason: str, comment: str = "") -> str:
+        """SAP stamps the authorizer; carry the real actor in the remarks.
+
+        ``comment`` is the approver's own note on an approval, when the queue
+        takes one; a rejection's note is its ``reason``.
+        """
         if approved:
+            if comment:
+                return f"{comment} — approved by {self.acting_name()} (Factory app)"
             return f"Approved by {self.acting_name()} (Factory app)"
         return f"{reason} — {self.acting_name()} (Factory app)"
 
-    def annotate_rows(self, rows: list, can_approve: bool) -> list:
+    def annotate_rows(self, rows: list, can_approve: bool, *, typed_password_allowed: bool = False) -> list:
         """Flag each listed row with what this caller can do about it.
 
         Rows the caller cannot act on are still listed — seeing that a document
         is stuck, and on whom, is the point of surfacing SAP's queue at all.
+        With ``typed_password_allowed`` a row is decidable without a stored
+        password; ``credentials_configured`` then tells the page to ask for one.
         """
         available = self.configured_approvers()
         mine = (self.my_sap_code() or "").upper()
@@ -172,7 +186,7 @@ class SapApprovalViewBase(APIView):
             row["can_decide"] = bool(
                 can_approve
                 and row["is_mine"]
-                and row["credentials_configured"]
+                and (row["credentials_configured"] or typed_password_allowed)
                 and row.get("status") == "PENDING"
             )
         return rows

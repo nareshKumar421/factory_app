@@ -99,7 +99,7 @@ class WithoutQtyPostingTests(_CreditNoteExtrasTestCase):
         names = [c[0] for c in client.method_calls]
         self.assertLess(names.index("verify_approval_signer"), names.index("set_draft_lines_without_qty_posting"))
         self.assertLess(names.index("set_draft_lines_without_qty_posting"), names.index("decide_credit_note_approval"))
-        self.assertEqual(client.verify_approval_signer.call_args, call(75424, "USER37"))
+        self.assertEqual(client.verify_approval_signer.call_args, call(75424, "USER37", password=None))
 
     def test_moving_stock_again_clears_the_flag(self, sap):
         sap.return_value.approval_inbox_stage.return_value = inbox_state()
@@ -116,14 +116,18 @@ class WithoutQtyPostingTests(_CreditNoteExtrasTestCase):
         sap.return_value.set_draft_lines_without_qty_posting.assert_not_called()
         sap.return_value.decide_credit_note_approval.assert_called_once()
 
-    def test_leaving_it_out_is_the_queue_exactly_as_before(self, sap):
+    def test_leaving_it_out_leaves_the_lines_alone(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = inbox_state()
         response = self._approve(sap)
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("without_qty_posting_lines", response.data)
-        sap.return_value.approval_inbox_stage.assert_not_called()
+        # Read for the draft's status and duplicates only, not its lines.
+        self.assertFalse(sap.return_value.approval_inbox_stage.call_args.kwargs["with_item_lines"])
+        sap.return_value.set_draft_lines_without_qty_posting.assert_not_called()
 
     def test_a_rejection_ignores_it(self, sap):
         client = sap.return_value
+        client.approval_inbox_stage.return_value = inbox_state()
         client.credit_note_approval_stage.return_value = dict(CN_STAGE)
         client.decide_credit_note_approval.return_value = {"message": "ok", "signed_as": "USER37"}
         response = self.client.patch(
@@ -132,7 +136,11 @@ class WithoutQtyPostingTests(_CreditNoteExtrasTestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
-        client.approval_inbox_stage.assert_not_called()
+        # A rejection posts nothing, so it neither checks duplicates nor reads lines.
+        kwargs = client.approval_inbox_stage.call_args.kwargs
+        self.assertFalse(kwargs["with_duplicates"])
+        self.assertFalse(kwargs["with_item_lines"])
+        client.set_draft_lines_without_qty_posting.assert_not_called()
 
     def test_a_posted_credit_note_can_no_longer_change_it(self, sap):
         sap.return_value.approval_inbox_stage.return_value = inbox_state(is_draft=False)
@@ -202,11 +210,34 @@ class ActionsTests(_CreditNoteExtrasTestCase):
         self.assertFalse(data["without_qty_posting"]["can_set"])
 
     @override_settings(SAP_APPROVER_CREDENTIALS={})
-    def test_without_a_stored_password_the_page_says_where_to_go(self, sap):
+    def test_without_a_stored_password_the_page_asks_for_one(self, sap):
         sap.return_value.approval_inbox_stage.return_value = inbox_state(originator_code="USER37")
         data = self.client.get(f"{BASE}75424/actions/").data
-        self.assertFalse(data["can_withdraw"])
-        self.assertIn("SAP Approvals", data["withdraw_note"])
+        # Typing it is enough now, as in SAP Portal.
+        self.assertTrue(data["can_withdraw"])
+        self.assertFalse(data["password_stored"])
+
+    @override_settings(SAP_APPROVER_CREDENTIALS={})
+    def test_without_a_stored_password_the_authorizer_may_still_set_it(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = inbox_state()
+        self.assertTrue(self.client.get(f"{BASE}75424/actions/").data["without_qty_posting"]["can_set"])
+
+    def test_a_posted_duplicate_is_shown_before_anyone_approves(self, sap):
+        posted = [{"doc_entry": 41202, "doc_num": 626092650, "doc_date": "2026-09-16"}]
+        sap.return_value.approval_inbox_stage.return_value = inbox_state(posted_duplicates=posted)
+        data = self.client.get(f"{BASE}75424/actions/").data
+        self.assertEqual(data["posted_duplicates"], posted)
+        self.assertFalse(data["duplicate_check_failed"])
+        self.assertTrue(sap.return_value.approval_inbox_stage.call_args.kwargs["with_duplicates"])
+
+    def test_a_failed_duplicate_check_still_shows_the_panel(self, sap):
+        from sap_client.exceptions import SAPConnectionError
+
+        sap.return_value.approval_inbox_stage.side_effect = [SAPConnectionError("HANA down"), inbox_state()]
+        response = self.client.get(f"{BASE}75424/actions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["duplicate_check_failed"])
+        self.assertEqual(response.data["posted_duplicates"], [])
 
     def test_a_service_credit_note_has_nothing_to_set(self, sap):
         sap.return_value.approval_inbox_stage.return_value = inbox_state(item_lines=[])
@@ -249,7 +280,7 @@ class WithdrawTests(_CreditNoteExtrasTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["signed_as"], "USER37")
         sap.return_value.withdraw_approval_request.assert_called_once_with(
-            75424, originator="USER37", subject="Credit note"
+            75424, originator="USER37", password=None, subject="Credit note"
         )
 
     def test_only_the_originator_can(self, sap):
@@ -271,12 +302,22 @@ class WithdrawTests(_CreditNoteExtrasTestCase):
         self.assertEqual(response.data["code"], "STALE_REQUEST")
 
     @override_settings(SAP_APPROVER_CREDENTIALS={})
-    def test_no_stored_password_points_to_the_inbox(self, sap):
+    def test_no_stored_password_asks_for_one(self, sap):
         sap.return_value.approval_inbox_stage.return_value = inbox_state(originator_code="USER37")
         response = self._post()
         self.assertEqual(response.status_code, 400)
-        self.assertIn("SAP Approvals", response.data["error"])
+        self.assertIn("Type your SAP password", response.data["error"])
         sap.return_value.withdraw_approval_request.assert_not_called()
+
+    @override_settings(SAP_APPROVER_CREDENTIALS={})
+    def test_a_typed_password_signs_the_withdraw(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = inbox_state(originator_code="USER37")
+        sap.return_value.withdraw_approval_request.return_value = {"message": "ok", "signed_as": "USER37"}
+        response = self.client.post(f"{BASE}75424/withdraw/", {"sap_password": " s3cret "}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("s3cret", str(response.data))
+        # Exactly as typed: a password is never trimmed.
+        self.assertEqual(sap.return_value.withdraw_approval_request.call_args.kwargs["password"], " s3cret ")
 
     def test_not_a_credit_note_is_404(self, sap):
         sap.return_value.approval_inbox_stage.return_value = inbox_state(object_type="22")

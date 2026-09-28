@@ -74,7 +74,7 @@ so scoping by warehouse would hide exactly the rows nobody can currently find.
 
 | Method | Path | Notes |
 |--|--|--|
-| `GET` | `credit-note-approvals/` | `?status=PENDING` (default), `APPROVED`, `REJECTED`, `ALL`; `?family=AR\|AP\|ALL`; `?limit=` (clamped 1–500) |
+| `GET` | `credit-note-approvals/` | `?status=PENDING` (default), `APPROVED`, `REJECTED`, `ALL`; `?family=AR\|AP\|ALL`; searched in SAP: `?party=` (part of the card code or name), `?doc_num=` (part of the draft number), `?code=` (the request), `?date_from=` / `?date_to=` (the day it was raised, inclusive); `?limit=` (1–500) and `?offset=` to page on |
 | `GET` | `credit-note-approvals/pending-count/` | `{"total": n}` — the sidebar badge |
 | `PATCH` | `credit-note-approvals/<wdd_code>/status/` | `{"status": "APPROVED"}` or `{"status": "REJECTED", "rejection_reason": "…"}` |
 
@@ -84,14 +84,45 @@ user the request waits on) plus `is_mine`, `credentials_configured` and
 
 ### From SAP Portal's credit-note screen
 
-Two extras ported from `backend_v1/routes/creditNotes.js`. The list, the count
-and the decision without the new field behave exactly as before.
+Ported from `backend_v1/routes/creditNotes.js`.
 
 | Method | Path | Notes |
 |--|--|--|
-| `PATCH` | `credit-note-approvals/<wdd_code>/status/` | optional `"without_qty_posting": true \| false` on an approval (below) |
-| `GET` | `credit-note-approvals/<wdd_code>/actions/` | `{can_withdraw, withdraw_note, without_qty_posting: {current, item_lines, can_set}}` — read when a row is opened |
-| `POST` | `credit-note-approvals/<wdd_code>/withdraw/` | the originator cancels a pending request |
+| `PATCH` | `credit-note-approvals/<wdd_code>/status/` | also takes `without_qty_posting` (below), `sap_password`, `approval_comment` (≤150) and `confirm_duplicate` |
+| `GET` | `credit-note-approvals/<wdd_code>/actions/` | `{can_withdraw, withdraw_note, password_stored, posted_duplicates, duplicate_check_failed, without_qty_posting: {current, item_lines, can_set}}` — read when a row is opened |
+| `POST` | `credit-note-approvals/<wdd_code>/withdraw/` | the originator cancels a pending request; optional `sap_password` |
+| `GET` | `credit-note-approvals/<wdd_code>/attachments/` | `{sources: [{label, abs_entry, lines}]}` — this credit note's files, then each base document's |
+| `GET` | `credit-note-approvals/<wdd_code>/attachments/<abs_entry>/<line>/download/` | one file, only if it belongs to one of those sources (404 otherwise) |
+
+**The decision's guards**, in order: the family's approve right (read from
+SAP); the shared identity guards (the caller IS the stage's authorizer, with a
+password stored *or typed now*); still pending **by the draft's say** — a
+second template's request can keep `OWDD.Status = 'W'` after its draft was
+decided, and the queue's own reader sees only OWDD (409 `STALE_REQUEST`); and,
+on an approval, **no posted duplicate**: when SAP already holds a posted credit
+note for the same party and amount (`SAPClient.approval_inbox_stage(...,
+with_duplicates=True)`, which fails closed), the approval is refused with 409
+`DUPLICATE_CREDIT_NOTE` and `duplicate_of`, unless the body says
+`confirm_duplicate: true`. Approving one credits the party twice; the portal
+refused it the same way, and an override is logged.
+
+**A typed SAP password** (`sap_password`) signs a decision, a Without Qty
+change or a withdraw for an approver with no stored password, exactly as SAP
+Portal asked for it. It is used for that one Service Layer login, never stored,
+logged or echoed (`sensitive_variables`), and never trimmed. It does not let
+anyone act as another SAP user: the identity guard still requires the caller to
+BE the authorizer (or the originator).
+
+**The approver's comment** (`approval_comment`) goes into SAP's remarks ahead of
+"approved by <name> (Factory app)"; without one the remarks are as before.
+
+**Attachments**: the files an approver checks — the credit note's own
+attachment entry and those of the documents it was copied from — read through
+the draft (`sap_documents.services.document_detail`) and served by the same
+code as the document browser (inline for PDFs and pictures, recorded in
+`SapAttachmentDownload`). The queue's view right for the document's family is
+enough; the download refuses any entry that is not one of this credit note's
+sources, so that right is not a key to every file in SAP.
 
 **Without Qty Posting** (SAP's `WithoutInventoryMovement`, `DRF1.NoInvtryMv`):
 the approver may make a credit note credit the value only and move no stock — a
@@ -107,14 +138,15 @@ its own endpoint because it only makes sense as part of that approval: a
 separate call could change the draft and then have the approval refused by a
 guard. `actions/` reports `current` (all set / none set / mixed = `null`) and
 `can_set` (pending, still a draft, has item lines, the caller may approve this
-family and IS the stage's authorizer with a stored password).
+family and IS the stage's authorizer; `password_stored` says whether the page
+must ask for a password).
 
 **Withdraw**: gated on the view permission for the document's family (read
 from SAP), then on BEING its originator in SAP (`OWDD.OwnerID` → `OUSR`,
-through `SapApproverIdentity`), signed as that account with its stored
-password — no new permission. Guards: pending by the draft-aware rule (409
-`STALE_REQUEST`), mapped (403), the originator (403), a stored password (400;
-the message points to SAP Approvals, where a password can be typed). Not
+through `SapApproverIdentity`), signed as that account with the password they
+type or, failing that, their stored one — no new permission. Guards: pending by
+the draft-aware rule (409 `STALE_REQUEST`), mapped (403), the originator (403),
+something to sign with (400). Not
 written to `CreditNoteApprovalAudit` — its decision choices are approve/reject
 and changing them would need a migration; the withdraw is logged with the app
 user, and SAP records it against the originator's own account.
@@ -155,9 +187,9 @@ would be a hole:
 Either view permission opens the page; the queue is then filtered. And as ever,
 the permission is **necessary but not sufficient**: the caller must also be
 mapped to the SAP account SAP named (`SapApproverIdentity`, Admin → SAP
-Identities) with that account's password in `SAP_APPROVER_CREDENTIALS`.
-Granting a group alone is safe — such a user reads their queue and decides
-nothing.
+Identities), and sign with that account's password — stored in
+`SAP_APPROVER_CREDENTIALS` or typed on the page. Granting a group alone is
+safe — such a user reads their queue and decides nothing.
 
 ## Audit
 
@@ -193,4 +225,5 @@ accepted; it is logged and the response still succeeds.
   equivalent, which is warehouse-scoped where this one is company-wide.
 - **Reader:** `sap_client/hana/credit_note_approval_reader.py` ·
   **Views:** `warehouse/views_credit_note_approval.py` ·
-  **Tests:** `warehouse/tests_credit_note_approval.py`.
+  **Tests:** `warehouse/tests_credit_note_approval.py`,
+  `tests_credit_note_extras.py`, `tests_credit_note_guards.py`.
