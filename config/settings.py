@@ -253,6 +253,12 @@ INSTALLED_APPS = [
     # each approved before it counts. Deliberately not vehicle_management,
     # which is the gate's register of the outside trucks that arrive.
     'company_vehicle.apps.CompanyVehicleConfig',
+    # Import / export: EXIM, the system on its own server, brought in one
+    # module at a time. For now it holds EXIM's rights (every one of them, under
+    # the `exim` label) and the link from each EXIM account to its login here,
+    # written by `import_exim_users`. Not the `exim` DATABASE alias further
+    # down, which is how EXIM itself is read.
+    'exim.apps.EximConfig',
 ]
 
 MIDDLEWARE = [
