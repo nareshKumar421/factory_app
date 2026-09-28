@@ -243,6 +243,23 @@ class CustomerApproveTests(ApproveTestCase):
         # only the first attempt asked about tax IDs.
         self.assertEqual([call[0] for call in self.sap.calls].count("partners_with_tax_ids"), 1)
 
+    def test_a_lost_answer_is_adopted_even_after_the_name_was_corrected(self):
+        """SAP created the partner, the app never heard, and a verifier then fixed
+        the name. The partner under the reserved code still carries this
+        registration's GSTIN, so it is adopted, not created a second time."""
+        registration = make_customer(
+            self.company, status=RegistrationStatus.VERIFIED, card_code="CUSTA000124",
+            card_name="ACME TRADERS", gstin="03AAACA1234A1Z5",
+        )
+        self.sap.partners["CUSTA000124"] = {"card_code": "CUSTA000124", "card_name": "ACME TRADRES", "card_type": "C"}
+        self.sap.tax_matches = [{"card_code": "CUSTA000124", "card_name": "ACME TRADRES", "matched_on": ["GSTIN"]}]
+        response = self.approve(registration)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        registration.refresh_from_db()
+        self.assertEqual((registration.status, registration.sap_card_code), (RegistrationStatus.APPROVED, "CUSTA000124"))
+        self.assertEqual(self.sap.created, [])
+        self.assertTrue(registration.events.get(kind=EventKind.SAP_CREATED).data["adopted"])
+
     def test_a_reserved_code_now_held_by_someone_else_is_replaced(self):
         registration = make_customer(self.company, status=RegistrationStatus.VERIFIED, card_code="CUSTA000124")
         self.sap.partners["CUSTA000124"] = {"card_code": "CUSTA000124", "card_name": "SOMEBODY ELSE", "card_type": "C"}

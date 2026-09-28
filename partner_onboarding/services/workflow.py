@@ -336,11 +336,23 @@ def _free_card_code(sap, registration, family) -> str:
     raise WorkflowError(f"No free card code found after {prefix}; check the prefix in SAP.")
 
 
-def _is_ours(existing: dict, registration, family) -> bool:
-    return (
-        existing.get("card_type") == family.card_type
-        and (existing.get("card_name") or "").strip().upper() == registration.card_name.strip().upper()
-    )
+def _is_ours(existing: dict, registration, family, sap) -> bool:
+    """Whether the partner SAP holds under the reserved code is this registration's.
+
+    It is when the type matches and either the name still does or SAP holds
+    this registration's GSTIN or PAN on that very code. The tax ids matter
+    because a verifier can correct the name after an approval that timed out
+    (SAP created the partner, the app never heard): matching on the name alone
+    then dropped the reserved code and reserved a new one.
+    """
+    if existing.get("card_type") != family.card_type:
+        return False
+    if (existing.get("card_name") or "").strip().upper() == registration.card_name.strip().upper():
+        return True
+    if not (registration.gstin or registration.pan):
+        return False
+    matches = sap.partners_with_tax_ids(family.card_type, gstin=registration.gstin, pan=registration.pan)
+    return any(match.get("card_code") == existing.get("card_code") for match in matches)
 
 
 def _sap_file_name(registration, attachment) -> str:
@@ -483,7 +495,7 @@ def approve(family, pk, company, user, manager: dict, bank_codes: list, confirm_
 
             if registration.card_code:
                 existing = sap.business_partner(registration.card_code)
-                if existing is not None and _is_ours(existing, registration, family):
+                if existing is not None and _is_ours(existing, registration, family, sap):
                     _mark_created(
                         registration, user, registration.card_code, registration.sap_attachment_entry, [], adopted=True
                     )
