@@ -15,7 +15,7 @@ from company.permissions import HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .services import ProductionExecutionService, ProductionMovementService
-from .services import filling_cost
+from .services import filling_cost, filling_cost_board
 from .models import (
     ProductionLine, ProductionRun, MachineBreakdown, WasteLog, BreakdownCategory,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
@@ -2755,6 +2755,33 @@ class FillingCostSheetDetailAPI(APIView):
                             status=status.HTTP_404_NOT_FOUND)
         sheet.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class FillingCostBoardAPI(APIView):
+    """``GET ?month=YYYY-MM[&day=YYYY-MM-DD]`` — Beverages' filling cost board.
+
+    The month's saved sheets day by day, and ``day`` (yesterday unless given)
+    in full. See ``services.filling_cost_board``.
+    """
+
+    def get_permissions(self):
+        return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                CanViewFillingCost()]
+
+    def get(self, request):
+        day = filling_cost_board.yesterday()
+        if request.GET.get('day'):
+            day = parse_date(request.GET['day'])
+            if day is None:
+                return Response({'detail': 'day must be a date (YYYY-MM-DD).'},
+                                status=status.HTTP_400_BAD_REQUEST)
+        month = day
+        if request.GET.get('month'):
+            month = parse_date(f"{request.GET['month']}-01")
+            if month is None:
+                return Response({'detail': 'month must be YYYY-MM.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+        return Response(filling_cost_board.board(request.company.company, month, day))
 
 
 class FillingCostDefaultsAPI(APIView):

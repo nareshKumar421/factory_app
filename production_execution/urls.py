@@ -74,7 +74,7 @@ from .views import (
     LineSkuConfigAutoFillAPI,
     # Filling Cost Sheet
     FillingCostSheetListCreateAPI, FillingCostSheetDetailAPI,
-    FillingCostDefaultsAPI,
+    FillingCostDefaultsAPI, FillingCostBoardAPI,
     # Cost Master
 )
 from .views_settings import ProductionSettingsAPI
@@ -323,6 +323,7 @@ urlpatterns = [
     path('filling-costs/', FillingCostSheetListCreateAPI.as_view(), name='pe-filling-cost-list-create'),
     path('filling-costs/<int:sheet_id>/', FillingCostSheetDetailAPI.as_view(), name='pe-filling-cost-detail'),
     path('filling-costs/defaults/', FillingCostDefaultsAPI.as_view(), name='pe-filling-cost-defaults'),
+    path('filling-costs/board/', FillingCostBoardAPI.as_view(), name='pe-filling-cost-board'),
 
     # ------------------------------------------------------------------
     # Production settings — the RM / PM / FG warehouses

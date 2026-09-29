@@ -151,6 +151,8 @@ class Production:
     wastage: Decimal = ZERO            # rupees
     wastage_logs: int = 0
     scrap_kg: Decimal = ZERO
+    #: (product, bottles a case) -> cases: what the shift filled, SKU by SKU.
+    skus: Dict[tuple, Decimal] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
     @property
@@ -248,6 +250,8 @@ def production(company, day, shift='', line=None, now=None):
         cases = part.total * part.fraction
         result.cases += cases
         result.run_count += 1
+        sku = ((run.product or run.line.name).strip(), run.pieces_per_case)
+        result.skus[sku] = result.skus.get(sku, ZERO) + cases
         if run.pieces_per_case:
             bottles = cases * run.pieces_per_case
             result.bottles += bottles
