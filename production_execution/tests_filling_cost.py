@@ -284,3 +284,338 @@ class FillingCostSheetTests(APITestCase):
                          status.HTTP_403_FORBIDDEN)
         self.assertEqual(self._post().status_code, status.HTTP_403_FORBIDDEN)
         self.assertFalse(FillingCostSheet.objects.exists())
+
+
+
+
+class FillingCostDefaultsTests(APITestCase):
+    """A new sheet opens worked out from the shift's runs and the Cost Master.
+
+    The fixture is the factory's own night-shift sheet for the 28th: 500 ML at
+    24 a box, 5,655 boxes, Fixed Manpower 46,154 and so on down to the total.
+    """
+
+    RATES = [
+        ('Fixed Manpower', 'PER_MONTH', '1200000'),
+        ('Maintenance', 'PER_MONTH', '250000'),
+        ('Batch Coding', 'PER_BOTTLE', '0.03'),
+        ('Lubrication', 'PER_LITRE', '0.0133'),
+        ('Lab', 'PER_MONTH', '5000'),
+        ('Miscellaneous', 'PER_MONTH', '10000'),
+        ('Scrap Recovering', 'PER_KG', '7.5'),
+    ]
+    DAY = '2026-09-28'
+
+    def setUp(self):
+        from datetime import date
+        from unittest import mock
+
+        from cost_master.codes import FILLING_COST_TYPES
+        from cost_master.models import CostRate, CostType
+
+        self.company = Company.objects.create(
+            name='Jivo Beverages', code='JIVO_BEVERAGES')
+        self.role = UserRole.objects.create(name='Accounts')
+        self.line = ProductionLine.objects.create(company=self.company, name='Sidel')
+        # Put in place by cost_master migrations 0004/0005; made here as well
+        # because the test settings build the schema without migrations.
+        self.types = {}
+        for head, basis, rate in self.RATES:
+            code, name, _, _ = FILLING_COST_TYPES[head]
+            self.types[head], _ = CostType.objects.get_or_create(
+                code=code, defaults={'name': name, 'default_basis': basis,
+                                     'is_credit': head == 'Scrap Recovering'})
+            CostRate.objects.create(
+                cost_type=self.types[head], scope='COMPANY', company=self.company,
+                basis=basis, rate=Decimal(rate), effective_from=date(2026, 9, 1))
+
+        # Electricity++ for the day, as its allocation would report it.
+        patcher = mock.patch(
+            'production_execution.services.filling_cost._electricity',
+            return_value=(Decimal('32787'), {'Production Floor Beverage': Decimal('32787')}))
+        self.electricity = patcher.start()
+        self.addCleanup(patcher.stop)
+        # No night readings unless a test reads the meter twice.
+        rounds = mock.patch(
+            'production_execution.services.filling_cost._meter_rounds', return_value={})
+        self.rounds = rounds.start()
+        self.addCleanup(rounds.stop)
+
+        self.user = FillingCostSheetTests._user(
+            self, 'entry@bev.test', 'E001', ['can_view_filling_cost'])
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        self.url = reverse('pe-filling-cost-defaults')
+
+    # -- fixtures ---------------------------------------------------------------
+
+    def _at(self, day, clock):
+        from datetime import datetime
+
+        from django.utils import timezone
+
+        return timezone.make_aware(datetime.fromisoformat(f"{day}T{clock}"))
+
+    def _run(self, number, segments, *, status_='IN_PROGRESS', total='0', line=None,
+             run_date=None, pieces=24, litres='0.5'):
+        """``segments``: (start, end, cases) with start/end as 'YYYY-MM-DD HH:MM'."""
+        from datetime import date
+
+        from .models import ProductionRun, ProductionSegment
+
+        run = ProductionRun.objects.create(
+            company=self.company, line=line or self.line, run_number=number,
+            date=run_date or date.fromisoformat(self.DAY), status=status_,
+            total_production=Decimal(total), pieces_per_case=pieces,
+            litres_per_piece=Decimal(litres) if litres else None,
+            product='JIVO WATER 500 ML')
+        for start, end, cases in segments:
+            ProductionSegment.objects.create(
+                production_run=run,
+                start_time=self._at(*start.split()), end_time=self._at(*end.split()),
+                produced_cases=Decimal(cases), is_active=False)
+        return run
+
+    def _waste(self, run, qty, uom='KG', price='10', code='PF-500'):
+        from .models import ProductionMaterialUsage, WasteLog
+
+        ProductionMaterialUsage.objects.get_or_create(
+            production_run=run, material_code=code,
+            defaults={'material_name': 'PREFORM 500 ML',
+                      'unit_price': Decimal(price) if price else None})
+        WasteLog.objects.create(
+            production_run=run, company=self.company, material_code=code,
+            material_name='PREFORM 500 ML', wastage_qty=Decimal(qty), uom=uom)
+
+    def _night_of_the_28th(self):
+        run = self._run(1, [('2026-09-28 20:00', '2026-09-29 06:00', '5655')])
+        self._waste(run, '412.1')        # 412.1 kg at ₹10 = ₹4,121
+        return run
+
+    def _open(self, shift='', **params):
+        response = self.client.get(self.url, {'date': self.DAY, 'shift': shift, **params})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        return response.data
+
+    def _amounts(self, data):
+        return {e['head']: e['amount'] for e in data['entries']}
+
+    # -- the manual sheet -------------------------------------------------------
+
+    def test_the_night_shift_opens_as_the_factory_writes_it(self):
+        self._night_of_the_28th()
+        data = self._open('NIGHT')
+
+        self.assertEqual(data['produced_cases'], '5655.00')
+        self.assertEqual(data['bottles'], '135720')          # 5,655 x 24
+        self.assertEqual(data['litres'], '67860')            # x 0.5 L
+        self.assertEqual(self._amounts(data), {
+            'Electricity': '32787.00',
+            'Fixed Manpower': '46153.85',   # 12,00,000 / 26; only night ran
+            'Maintenance': '9615.38',
+            'Batch Coding': '4071.60',      # 1,35,720 bottles x 0.03
+            'Lubrication': '902.54',        # 67,860 L x 0.0133 (0.2 / 15)
+            'Lab': '192.31',
+            'Miscellaneous': '384.62',
+            'Scrap Recovering': '-3090.75',  # a credit: 412.1 kg x 7.5
+            'Wastage': '4121.00',
+        })
+        self.assertEqual(data['warnings'], [])
+
+    def test_each_figure_says_where_it_came_from(self):
+        self._night_of_the_28th()
+        explain = {e['head']: e['explain'] for e in self._open('NIGHT')['entries']}
+        self.assertEqual(explain['Fixed Manpower'], '₹12,00,000 a month ÷ 26 days')
+        self.assertEqual(explain['Batch Coding'], '1,35,720 bottles × ₹0.03')
+        self.assertIn('32,787', explain['Electricity'])
+        self.assertIn('412.100 kg', explain['Scrap Recovering'])
+
+    def test_the_day_shift_of_a_night_only_day_takes_nothing(self):
+        self._night_of_the_28th()
+        data = self._open('DAY')
+        amounts = self._amounts(data)
+        self.assertEqual(data['produced_cases'], '0.00')
+        self.assertEqual(amounts['Fixed Manpower'], '0.00')
+        self.assertEqual(amounts['Electricity'], '0.00')
+
+    # -- two shifts -------------------------------------------------------------
+
+    def test_two_shifts_share_the_day(self):
+        self._night_of_the_28th()                                   # 10 h, 5,655
+        self._run(2, [('2026-09-28 07:00', '2026-09-28 19:00', '3000')])  # 12 h
+
+        night, day = self._amounts(self._open('NIGHT')), self._amounts(self._open('DAY'))
+        # The monthly heads by running hours: 10 of 22, and 12 of 22.
+        self.assertEqual(night['Fixed Manpower'], '20979.02')
+        self.assertEqual(day['Fixed Manpower'], '25174.83')
+        # Electricity by cases: 5,655 and 3,000 of 8,655.
+        self.assertEqual(night['Electricity'], '21422.36')
+        self.assertEqual(day['Electricity'], '11364.64')
+        whole = self._amounts(self._open(''))
+        self.assertEqual(whole['Fixed Manpower'], '46153.85')
+        self.assertEqual(whole['Electricity'], '32787.00')
+
+    def test_a_meter_read_by_day_and_by_night_splits_by_its_readings(self):
+        self._night_of_the_28th()
+        self._run(2, [('2026-09-28 07:00', '2026-09-28 19:00', '3000')])
+        self.rounds.return_value = {
+            'Production Floor Beverage': {'DAY': Decimal('3000'), 'NIGHT': Decimal('1000')}}
+
+        night = {e['head']: e for e in self._open('NIGHT')['entries']}['Electricity']
+        self.assertEqual(night['amount'], '8196.75')             # a quarter of 32,787
+        self.assertIn('1 meter by their night readings', night['explain'])
+        day = {e['head']: e for e in self._open('DAY')['entries']}['Electricity']
+        self.assertEqual(day['amount'], '24590.25')
+
+    def test_a_run_across_shifts_is_split_by_its_segments(self):
+        # 600 logged by day and 200 by night; 1,000 entered at completion.
+        self._run(3, [('2026-09-28 15:00', '2026-09-28 19:00', '600'),
+                      ('2026-09-28 19:00', '2026-09-28 21:00', '200')],
+                  status_='COMPLETED', total='1000')
+        self.assertEqual(self._open('DAY')['produced_cases'], '750.00')
+        self.assertEqual(self._open('NIGHT')['produced_cases'], '250.00')
+        self.assertEqual(self._open('')['produced_cases'], '1000.00')
+
+    def test_a_night_runs_past_midnight_on_its_own_date(self):
+        # Segment starts 01:00 on the 29th: still the night of the 28th.
+        self._run(4, [('2026-09-29 01:00', '2026-09-29 05:00', '900')])
+        self.assertEqual(self._open('NIGHT')['produced_cases'], '900.00')
+
+    def test_a_line_takes_only_its_runs_and_its_part_of_the_day(self):
+        other = ProductionLine.objects.create(company=self.company, name='Krones')
+        self._night_of_the_28th()                                   # Sidel, 10 h
+        self._run(5, [('2026-09-28 20:00', '2026-09-29 06:00', '2000')], line=other)
+
+        data = self._open('NIGHT', line_id=self.line.id)
+        self.assertEqual(data['produced_cases'], '5655.00')
+        amounts = self._amounts(data)
+        self.assertEqual(amounts['Fixed Manpower'], '23076.92')     # half the hours
+        self.assertEqual(amounts['Batch Coding'], '4071.60')        # its own bottles
+
+    def test_drafts_and_other_days_are_left_out(self):
+        self._night_of_the_28th()
+        self._run(6, [], status_='DRAFT', total='0')
+        self._run(7, [('2026-09-27 20:00', '2026-09-28 06:00', '4000')])
+        self.assertEqual(self._open('NIGHT')['produced_cases'], '5655.00')
+
+    # -- what cannot be worked out ------------------------------------------------
+
+    def test_a_run_without_bottles_per_case_is_named(self):
+        self._run(8, [('2026-09-28 20:00', '2026-09-29 06:00', '100')], pieces=None)
+        data = self._open('NIGHT')
+        self.assertEqual(self._amounts(data)['Batch Coding'], '0.00')
+        self.assertIn('No bottles per case on run #8', data['warnings'][0])
+
+    def test_waste_without_a_price_is_named_not_guessed(self):
+        run = self._run(9, [('2026-09-28 20:00', '2026-09-29 06:00', '100')])
+        self._waste(run, '5', price=None)
+        data = self._open('NIGHT')
+        self.assertEqual(self._amounts(data)['Wastage'], '0.00')
+        self.assertTrue(any('No SAP price for PREFORM 500 ML' in w for w in data['warnings']))
+
+    def test_no_scrap_rate_leaves_scrap_to_be_typed(self):
+        from cost_master.models import CostRate
+
+        CostRate.objects.filter(cost_type=self.types['Scrap Recovering']).update(rate=0)
+        self._night_of_the_28th()
+        data = self._open('NIGHT')
+        self.assertNotIn('Scrap Recovering', self._amounts(data))
+        self.assertTrue(any('Scrap Recovering: no rate' in w for w in data['warnings']))
+
+    def test_no_meter_readings_leaves_electricity_to_be_typed(self):
+        self.electricity.return_value = (Decimal('0'), {})
+        data = self._open('NIGHT')
+        self.assertNotIn('Electricity', self._amounts(data))
+
+    def test_fixed_manpower_takes_over_an_old_salary_row(self):
+        heads = {e['head']: e for e in self._open('NIGHT')['entries']}
+        self.assertEqual(heads['Fixed Manpower']['aliases'], ['Salary'])
+
+    # -- the request --------------------------------------------------------------
+
+    def test_a_date_is_required_and_a_shift_must_be_one(self):
+        self.assertEqual(self.client.get(self.url).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.client.get(self.url, {'date': self.DAY, 'shift': 'EVENING'})
+                         .status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_another_companys_line_is_refused(self):
+        oil = Company.objects.create(name='Jivo Oil', code='JIVO_OIL')
+        line = ProductionLine.objects.create(company=oil, name='Oil Line')
+        response = self.client.get(self.url, {'date': self.DAY, 'line_id': line.id})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_only_beverages_gets_defaults(self):
+        oil = Company.objects.create(name='Jivo Oil', code='JIVO_OIL')
+        user = FillingCostSheetTests._user(
+            self, 'entry@oil.test', 'E005', ['can_view_filling_cost'], company=oil)
+        self.client.force_authenticate(user)
+        self.client.credentials(HTTP_COMPANY_CODE=oil.code)
+        self.assertEqual(self.client.get(self.url, {'date': self.DAY}).status_code,
+                         status.HTTP_403_FORBIDDEN)
+
+
+class FillingCostShiftSheetTests(FillingCostSheetTests):
+    """A day can hold a sheet per shift, and one for the whole day besides."""
+
+    def test_a_day_holds_a_sheet_per_shift(self):
+        for shift in ('DAY', 'NIGHT', ''):
+            response = self.client.post(self.list_url, {
+                'date': '2026-09-28', 'shift': shift, 'cases': '5655',
+                'entries': entries_payload()}, format='json')
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        response = self.client.post(self.list_url, {
+            'date': '2026-09-28', 'shift': 'NIGHT', 'cases': '1',
+            'entries': entries_payload()}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Night', response.data['detail'])
+
+        listed = self.client.get(self.list_url, {'date': '2026-09-28', 'shift': 'NIGHT'}).data
+        self.assertEqual([s['shift'] for s in listed], ['NIGHT'])
+
+    def test_saving_without_the_shift_keeps_it(self):
+        sheet = self.client.post(self.list_url, {
+            'date': '2026-09-28', 'shift': 'NIGHT', 'cases': '5655',
+            'entries': entries_payload()}, format='json').data
+        self.client.patch(self._detail_url(sheet['id']), {'cases': '6000'}, format='json')
+        self.assertEqual(FillingCostSheet.objects.get(pk=sheet['id']).shift, 'NIGHT')
+
+
+class BeverageFillingCostMigrationTests(APITestCase):
+    """cost_master 0004 puts the sheet's types and Beverages' rates in place."""
+
+    def _run(self):
+        from importlib import import_module
+
+        from django.apps import apps
+
+        import_module('cost_master.migrations.0004_beverage_filling_cost_types') \
+            .add_beverage_filling_costs(apps, None)
+
+    def test_the_hand_entered_salary_is_renamed_not_duplicated(self):
+        from datetime import date
+
+        from cost_master.models import CostRate, CostType
+
+        company = Company.objects.create(name='Jivo Beverages', code='JIVO_BEVERAGES')
+        hand = CostType.objects.create(code='1', name='beverage salary',
+                                       default_basis='PER_MONTH')
+        CostRate.objects.create(cost_type=hand, scope='FACTORY', basis='PER_MONTH',
+                                rate=Decimal('1200000'), effective_from=date(2026, 9, 29))
+        self._run()
+        self._run()  # and again, as a re-run would
+
+        hand.refresh_from_db()
+        self.assertEqual(hand.code, 'beverage-salary')
+        self.assertEqual(hand.name, 'Beverage — Fixed Manpower')
+        self.assertFalse(CostType.objects.filter(code='1').exists())
+        self.assertEqual(hand.rates.count(), 2)  # the hand-entered one, kept, and Beverages'
+        rates = {r.cost_type.code: r.rate for r in CostRate.objects.filter(
+            scope='COMPANY', company=company)}
+        self.assertEqual(rates, {
+            'beverage-salary': Decimal('1200000'),
+            'beverage-maintenance': Decimal('250000'),
+            'beverage-batch-coding': Decimal('0.03'),
+            'beverage-lubrication': Decimal('0.0133'),
+            'beverage-lab': Decimal('5000'),
+            'beverage-miscellaneous': Decimal('10000'),
+        })

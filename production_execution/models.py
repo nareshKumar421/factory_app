@@ -1313,8 +1313,19 @@ def filling_cost_per_case(amount, cases):
     )
 
 
+class FillingCostShift(models.TextChoices):
+    """The factory's two twelve-hour shifts (as ``labour_count.LabourShift``).
+
+    A night shift belongs to the date it starts on: Night on the 28th runs
+    from 19:00 on the 28th to 07:00 on the 29th. Blank on a sheet = the whole
+    day, both shifts.
+    """
+    DAY = 'DAY', 'Day (07:00-19:00)'
+    NIGHT = 'NIGHT', 'Night (19:00-07:00)'
+
+
 class FillingCostSheet(models.Model):
-    """One day of filling cost, entered by hand from the factory's own sheet.
+    """One day (or one shift of it) of filling cost, as the factory's sheet has it.
 
     Nothing on it is derived. Each head's amount for the day is typed in, and
     the per-case column is that amount over ``cases`` — the "Per N Cases" the
@@ -1334,6 +1345,10 @@ class FillingCostSheet(models.Model):
         help_text="Blank = the filling floor as a whole; set = that line only."
     )
     date = models.DateField(help_text="The day the sheet covers.")
+    shift = models.CharField(
+        max_length=10, choices=FillingCostShift.choices, blank=True, default='',
+        help_text="Blank = the whole day; set = that shift only."
+    )
     cases = models.DecimalField(
         max_digits=15, decimal_places=2,
         help_text="Cases the day's cost is spread over — the sheet's "
@@ -1353,28 +1368,29 @@ class FillingCostSheet(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['-date', 'line']
+        ordering = ['-date', 'line', 'shift']
         verbose_name = 'Filling Cost Sheet'
         verbose_name_plural = 'Filling Cost Sheets'
         constraints = [
-            # One sheet per day per scope. A NULL line never collides in a
-            # unique index, so the floor-wide sheet needs a constraint of its
-            # own rather than riding along on the per-line one.
+            # One sheet per day and shift per scope. A NULL line never
+            # collides in a unique index, so the floor-wide sheet needs a
+            # constraint of its own rather than riding along on the per-line one.
             models.UniqueConstraint(
-                fields=['company', 'date'],
+                fields=['company', 'date', 'shift'],
                 condition=models.Q(line__isnull=True),
-                name='uniq_filling_cost_sheet_per_day',
+                name='uniq_filling_cost_sheet_per_shift',
             ),
             models.UniqueConstraint(
-                fields=['company', 'line', 'date'],
+                fields=['company', 'line', 'date', 'shift'],
                 condition=models.Q(line__isnull=False),
-                name='uniq_filling_cost_sheet_per_line_day',
+                name='uniq_filling_cost_sheet_per_line_shift',
             ),
         ]
 
     def __str__(self):
         scope = self.line.name if self.line_id else 'All lines'
-        return f"Filling cost {self.date:%d %b %Y} — {scope}"
+        shift = f", {self.get_shift_display()}" if self.shift else ''
+        return f"Filling cost {self.date:%d %b %Y}{shift} — {scope}"
 
     @property
     def total_amount(self):

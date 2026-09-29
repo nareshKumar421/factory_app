@@ -15,12 +15,13 @@ from company.permissions import HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .services import ProductionExecutionService, ProductionMovementService
+from .services import filling_cost
 from .models import (
     ProductionLine, ProductionRun, MachineBreakdown, WasteLog, BreakdownCategory,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, InProcessQCCheck, FinalQCCheck,
-    FillingCostSheet, FillingCostSheetEntry,
+    FillingCostSheet, FillingCostSheetEntry, FillingCostShift,
 )
 from .serializers import (
     # Master Data
@@ -2585,9 +2586,11 @@ def _resolve_filling_cost_line(company, line_id):
     return line, None
 
 
-def _filling_cost_day(day):
-    """'26 September 2026' — how a sheet is named in a refusal."""
-    return f"{day.day} {day:%B %Y}"
+def _filling_cost_day(day, shift=''):
+    """'26 September 2026' (or '26 September 2026, Night (19:00-07:00)') —
+    how a sheet is named in a refusal."""
+    label = f"{day.day} {day:%B %Y}"
+    return f"{label}, {FillingCostShift(shift).label}" if shift else label
 
 
 def _replace_filling_cost_entries(sheet, entries):
@@ -2635,6 +2638,13 @@ class FillingCostSheetListCreateAPI(APIView):
                                 status=status.HTTP_400_BAD_REQUEST)
             qs = qs.filter(date=parsed)
 
+        if 'shift' in request.GET:
+            shift = request.GET['shift']
+            if shift and shift not in FillingCostShift.values:
+                return Response({'detail': 'shift must be DAY, NIGHT or blank.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            qs = qs.filter(shift=shift)
+
         # A sheet a day adds up, so the page asks for the newest few it needs
         # rather than every day ever entered.
         limit = request.GET.get('limit')
@@ -2664,6 +2674,7 @@ class FillingCostSheetListCreateAPI(APIView):
                     company=company,
                     line=line,
                     date=data['date'],
+                    shift=data.get('shift', ''),
                     cases=data['cases'],
                     notes=data.get('notes', ''),
                     created_by=request.user,
@@ -2674,7 +2685,7 @@ class FillingCostSheetListCreateAPI(APIView):
             # One sheet per day per scope — edit the one that is there.
             return Response(
                 {'detail': f"A filling cost sheet already exists for "
-                           f"{_filling_cost_day(data['date'])}."},
+                           f"{_filling_cost_day(data['date'], data.get('shift', ''))}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(FillingCostSheetSerializer(sheet).data,
@@ -2718,7 +2729,7 @@ class FillingCostSheetDetailAPI(APIView):
             if error:
                 return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
             sheet.line = line
-        for field in ('date', 'cases', 'notes'):
+        for field in ('date', 'shift', 'cases', 'notes'):
             if field in data:
                 setattr(sheet, field, data[field])
         sheet.updated_by = request.user
@@ -2731,7 +2742,7 @@ class FillingCostSheetDetailAPI(APIView):
         except IntegrityError:
             return Response(
                 {'detail': f"A filling cost sheet already exists for "
-                           f"{_filling_cost_day(sheet.date)}."},
+                           f"{_filling_cost_day(sheet.date, sheet.shift)}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         sheet = self._get_sheet(request, sheet_id)
@@ -2744,3 +2755,32 @@ class FillingCostSheetDetailAPI(APIView):
                             status=status.HTTP_404_NOT_FOUND)
         sheet.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class FillingCostDefaultsAPI(APIView):
+    """``GET ?date=YYYY-MM-DD[&line_id=N|none][&shift=DAY|NIGHT]`` — what a new
+    sheet opens with. See ``services.filling_cost``."""
+
+    def get_permissions(self):
+        return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                CanViewFillingCost()]
+
+    def get(self, request):
+        day = parse_date(request.GET.get('date') or '')
+        if day is None:
+            return Response({'detail': 'date must be a date (YYYY-MM-DD).'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        company = request.company.company
+        line_id = request.GET.get('line_id') or 'none'
+        if line_id != 'none' and not line_id.isdigit():
+            return Response({'detail': 'line_id must be a number or "none".'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        line, error = _resolve_filling_cost_line(
+            company, None if line_id == 'none' else int(line_id))
+        if error:
+            return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+        shift = request.GET.get('shift') or ''
+        if shift and shift not in FillingCostShift.values:
+            return Response({'detail': 'shift must be DAY or NIGHT.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response(filling_cost.defaults(company, day, shift, line))

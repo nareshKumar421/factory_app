@@ -68,3 +68,27 @@ PRODUCTION_BASIS_TO_CENTRAL = {
     'PER_MONTH': 'PER_MONTH',
 }
 CENTRAL_BASIS_TO_PRODUCTION = {v: k for k, v in PRODUCTION_BASIS_TO_CENTRAL.items()}
+
+# Beverages' filling cost sheet: the heads a new day's sheet takes from the
+# Cost Master, and the working days a monthly figure is spread over. Resolved
+# by production_execution's FillingCostDefaultsAPI; rates are entered at the
+# Beverages company scope.
+#
+# head -> (code, name, default_basis, description). How each basis becomes
+# the sheet's amount is production_execution.services.filling_cost's business.
+FILLING_COST_WORKING_DAYS = 26
+FILLING_COST_TYPES = {
+    'Fixed Manpower': ('beverage-salary', 'Beverage — Fixed Manpower', 'PER_MONTH',
+                       "Beverages' monthly salaries."),
+    'Maintenance': ('beverage-maintenance', 'Beverage — Maintenance', 'PER_MONTH', ''),
+    'Batch Coding': ('beverage-batch-coding', 'Beverage — Batch Coding', 'PER_BOTTLE', ''),
+    'Lubrication': ('beverage-lubrication', 'Beverage — Lubrication', 'PER_LITRE',
+                    'Rs. 0.2 per 15 litres.'),
+    'Lab': ('beverage-lab', 'Beverage — Lab', 'PER_MONTH', ''),
+    'Miscellaneous': ('beverage-miscellaneous', 'Beverage — Miscellaneous', 'PER_MONTH', ''),
+    # A credit: waste sold as scrap comes off the sheet's total.
+    'Scrap Recovering': ('beverage-scrap-recovery', 'Beverage — Scrap Recovery', 'PER_KG',
+                         'Credit: rupees per kg of logged waste sold as scrap.'),
+}
+# Older sheets name a head differently; a new day renames the carried-over row.
+FILLING_COST_HEAD_ALIASES = {'Fixed Manpower': ('Salary',)}

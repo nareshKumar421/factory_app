@@ -16,7 +16,7 @@ from .models import (
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, ProductionRunCostLine, InProcessQCCheck, FinalQCCheck,
-    FillingCostSheet, FillingCostSheetEntry,
+    FillingCostSheet, FillingCostSheetEntry, FillingCostShift,
 )
 from .services.production_service import bom_request_required, start_checks_are_optional
 
@@ -1364,7 +1364,7 @@ class FillingCostSheetSerializer(serializers.ModelSerializer):
     class Meta:
         model = FillingCostSheet
         fields = [
-            'id', 'line', 'line_name', 'date', 'cases', 'notes',
+            'id', 'line', 'line_name', 'date', 'shift', 'cases', 'notes',
             'entries', 'total_amount', 'total_per_case',
             'created_by_name', 'updated_by_name', 'created_at', 'updated_at',
         ]
@@ -1395,6 +1395,9 @@ class FillingCostSheetWriteSerializer(serializers.Serializer):
     """
     line_id = serializers.IntegerField(required=False, allow_null=True)
     date = serializers.DateField()
+    # Blank = the whole day.
+    shift = serializers.ChoiceField(
+        choices=FillingCostShift.choices, required=False, allow_blank=True, default='')
     cases = serializers.DecimalField(
         max_digits=15, decimal_places=2, min_value=Decimal('0.01'),
         help_text="The sheet's 'Per N Cases' divisor.")
@@ -1420,6 +1423,9 @@ class FillingCostSheetUpdateSerializer(FillingCostSheetWriteSerializer):
     outright — which is what the page does on each save, so a row deleted on
     screen is a row gone from the sheet."""
     date = serializers.DateField(required=False)
+    # No default here: a save that does not mention the shift keeps it.
+    shift = serializers.ChoiceField(
+        choices=FillingCostShift.choices, required=False, allow_blank=True)
     cases = serializers.DecimalField(
         max_digits=15, decimal_places=2, min_value=Decimal('0.01'), required=False)
     entries = FillingCostEntryWriteSerializer(many=True, required=False)
