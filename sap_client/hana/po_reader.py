@@ -6,7 +6,7 @@ from hdbcli import dbapi
 
 from .connection import HanaConnection
 from ..dtos import PODTO, POAdditionalExpenseDTO, POItemDTO
-from ..exceptions import SAPConnectionError, SAPDataError
+from ..exceptions import SAPConnectionError, SAPDataError, SAPUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -91,9 +91,14 @@ class HanaPOReader:
                 (int(row[0]), int(row[1])): float(row[2] or 0)
                 for row in cursor.fetchall()
             }
-        except dbapi.Error as e:
+        except dbapi.ProgrammingError as e:
             logger.error("SAP HANA open-qty lookup failed for %s: %s", doc_entries, e)
             raise SAPDataError(f"Could not read open PO quantities from SAP: {e}")
+        except dbapi.Error as e:
+            # Not the query: HANA refused or dropped the connection. That is SAP
+            # being down, which a caller may wait out, not bad data it must stop on.
+            logger.error("SAP HANA unreachable reading open PO quantities: %s", e)
+            raise SAPUnavailable(f"Could not reach SAP HANA to read open PO quantities: {e}")
         finally:
             if cursor:
                 try:

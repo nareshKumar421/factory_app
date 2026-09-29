@@ -2418,7 +2418,7 @@ class GRPOService:
         except GRPOPosting.DoesNotExist:
             raise ValueError(f"GRPO posting {grpo_posting_id} not found")
 
-        if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED):
+        if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED, GRPOStatus.QUEUED):
             raise ValueError(
                 f"Only draft or failed GRPOs can be posted. "
                 f"This posting is '{draft.status}'."
@@ -2479,6 +2479,110 @@ class GRPOService:
                 att.file.delete(save=False)
         draft.delete()
         return posting
+
+    # -- the SAP posting queue (sap_postings; see grpo/sap_posting.py) ---------
+
+    def draft_po_receipts(self, draft: GRPOPosting) -> List[POReceipt]:
+        """The PO receipts a saved GRPO posts, as its payload names them."""
+        ids = (draft.request_payload or {}).get("po_receipt_ids") or list(
+            draft.po_receipts.values_list("id", flat=True)
+        )
+        return list(POReceipt.objects.filter(id__in=ids).order_by("id"))
+
+    def find_app_posted_grpo(self, draft: GRPOPosting) -> Optional[Dict[str, Any]]:
+        """The GRPO this app already posted for the draft's truck and POs, if SAP has it.
+
+        Asked before every queued try. A post that timed out may have committed in
+        SAP anyway, and a second GRPO against the same PO lines is a real
+        over-receipt. The app stamps every GRPO it posts with its gate entry
+        ("... | Gate Entry: GE-2026-0542 | ..."), and the lines name the POs:
+        the same vendor, that stamp and exactly these POs is this truck's GRPO.
+
+        Raises ``SAPUnavailable`` when HANA cannot be asked: not knowing whether
+        it is there must never be read as "it is not".
+        """
+        from hdbcli import dbapi
+
+        from sap_client.exceptions import SAPUnavailable
+
+        receipts = self.draft_po_receipts(draft)
+        po_entries = {int(pr.sap_doc_entry) for pr in receipts if pr.sap_doc_entry}
+        if not receipts or not po_entries:
+            return None
+        entry_no = draft.vehicle_entry.entry_no
+        linked = set(
+            GRPOPosting.objects.filter(sap_doc_entry__isnull=False)
+            .exclude(id=draft.id)
+            .values_list("sap_doc_entry", flat=True)
+        )
+        connection = HanaConnection(CompanyContext(self.company_code).hana)
+        conn = cursor = None
+        try:
+            conn = connection.connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                    SELECT h."DocEntry", h."DocNum", h."DocTotal", l."BaseEntry"
+                    FROM "{connection.schema}"."OPDN" h
+                    JOIN "{connection.schema}"."PDN1" l ON l."DocEntry" = h."DocEntry"
+                    WHERE h."CANCELED" = 'N' AND h."CardCode" = ? AND l."BaseType" = 22
+                      AND (h."Comments" LIKE ? OR h."Comments" LIKE ?)
+                """,
+                [
+                    receipts[0].supplier_code,
+                    f"%Gate Entry: {entry_no} |%",
+                    f"%Gate Entry: {entry_no}",
+                ],
+            )
+            docs: Dict[int, Dict[str, Any]] = {}
+            for doc_entry, doc_num, total, base_entry in cursor.fetchall():
+                doc = docs.setdefault(
+                    int(doc_entry),
+                    {"doc_entry": int(doc_entry), "doc_num": int(doc_num),
+                     "doc_total": Decimal(str(total or 0)), "po_entries": set()},
+                )
+                doc["po_entries"].add(int(base_entry))
+        except dbapi.Error as exc:
+            raise SAPUnavailable(
+                f"Could not reach SAP HANA to check whether this GRPO is already posted: {exc}"
+            ) from exc
+        finally:
+            for handle in (cursor, conn):
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
+        matches = [
+            doc for doc in docs.values()
+            if doc["po_entries"] == po_entries and doc["doc_entry"] not in linked
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def adopt_app_posted_grpo(draft: GRPOPosting, found: Dict[str, Any], user) -> GRPOPosting:
+        """Record the GRPO SAP already holds as this draft's post, and post nothing."""
+        draft.status = GRPOStatus.POSTED
+        draft.sap_doc_entry = found["doc_entry"]
+        draft.sap_doc_num = found["doc_num"]
+        draft.sap_doc_total = found["doc_total"]
+        draft.posted_at = timezone.now()
+        draft.posted_by = draft.posted_by or user
+        draft.error_message = (
+            f"Found already posted in SAP as GRPO {found['doc_num']} when it was sent "
+            f"again, so it was recorded rather than posted twice."
+        )
+        draft.save()
+        return draft
+
+    @staticmethod
+    def mark_grpo_waiting_for_sap(draft_id: int, message: str) -> None:
+        """The saved GRPO waits for SAP. An update, not a save: waiting is not a failure,
+        and a save would tell the GRPO group it failed."""
+        GRPOPosting.objects.filter(
+            id=draft_id,
+            status__in=[GRPOStatus.DRAFT, GRPOStatus.FAILED, GRPOStatus.QUEUED],
+        ).update(status=GRPOStatus.QUEUED, error_message=message[:5000])
 
     def get_pending_service_grpo_entries(
         self,

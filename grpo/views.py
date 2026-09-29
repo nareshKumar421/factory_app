@@ -11,6 +11,8 @@ from company.permissions import HasCompanyContext
 from quality_control.models import RawMaterialInspection
 from quality_control.serializers import RawMaterialInspectionSerializer
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from sap_postings import services as sap_postings
+from sap_postings.models import SapPostingOutcome
 
 from .notifications import notify_material_grpo_failed, notify_service_grpo_failed
 from .pagination import (
@@ -20,6 +22,7 @@ from .pagination import (
     paginate_queryset,
     build_page,
 )
+from . import sap_posting as grpo_sap_posting
 from .services import GRPOService, ServiceGRPOAlreadyInSAP
 from .serializers import (
     GRPOPreviewSerializer,
@@ -702,7 +705,7 @@ class PostSavedGRPOAPI(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED):
+        if draft.status not in (GRPOStatus.DRAFT, GRPOStatus.FAILED, GRPOStatus.QUEUED):
             return Response(
                 {"detail": f"Only draft or failed GRPOs can be posted. "
                            f"This posting is '{draft.status}'."},
@@ -716,6 +719,7 @@ class PostSavedGRPOAPI(APIView):
 
         service = GRPOService(company_code=request.company.company.code)
         vehicle_entry_id = draft.vehicle_entry_id
+        receipts = service.draft_po_receipts(draft)
 
         def notify(error_message):
             notify_material_grpo_failed(
@@ -725,47 +729,54 @@ class PostSavedGRPOAPI(APIView):
                 vehicle_entry_id=vehicle_entry_id,
             )
 
+        # Through the SAP posting queue: logged, and if SAP does not answer the
+        # GRPO waits and the worker posts it once SAP is back.
         try:
-            posting = service.post_saved_grpo(
-                grpo_posting_id=posting_id, user=request.user
+            sap_posting_row, outcome = sap_postings.post_now(
+                kind=grpo_sap_posting.KIND,
+                company=request.company.company,
+                source_id=draft.id,
+                title=grpo_sap_posting.title_for(draft, [pr.po_number for pr in receipts]),
+                link=grpo_sap_posting.draft_link(draft),
+                user=request.user,
             )
-        except ValueError as e:
-            # Draft may already be marked FAILED by the service (e.g. SAP rejected
-            # a value surfaced as ValueError); surface the message to the operator.
-            notify(str(e))
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except SAPValidationError as e:
-            notify(str(e))
-            return Response(
-                {"detail": f"SAP validation error: {str(e)}"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        except SAPConnectionError:
-            notify("SAP system unavailable")
-            return Response(
-                {"detail": "SAP system is currently unavailable. Please try again later."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE
-            )
-        except SAPDataError as e:
-            notify(str(e))
-            return Response(
-                {"detail": f"SAP error: {str(e)}"},
-                status=status.HTTP_502_BAD_GATEWAY
-            )
-        except Exception as e:
-            logger.exception("Unexpected error posting saved GRPO")
-            # post_saved_grpo only marks FAILED for known errors; guard the rest
-            # so the draft still survives an unexpected failure.
-            GRPOPosting.objects.filter(id=posting_id).update(
-                status=GRPOStatus.FAILED,
-                error_message=f"Unexpected error: {e}",
-            )
-            notify(str(e))
-            return Response(
-                {"detail": "Unexpected error while posting GRPO."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        except sap_postings.PostingInProgress as e:
+            return Response({"detail": str(e)}, status=status.HTTP_409_CONFLICT)
 
+        if outcome.kind == SapPostingOutcome.WAITING:
+            # Not a failure, so nobody is told it failed: it posts by itself.
+            message = (
+                "Saved. SAP is not answering, so this GRPO is waiting and will post "
+                "by itself once SAP is back."
+            )
+            return Response(
+                {
+                    "success": True,
+                    "queued": True,
+                    "code": "SAP_QUEUED",
+                    "grpo_posting_id": draft.id,
+                    "sap_posting_id": sap_posting_row.pk,
+                    "message": message,
+                    "detail": message,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+        if outcome.kind == SapPostingOutcome.REJECTED:
+            error = outcome.context.get("error")
+            notify(outcome.message)
+            if isinstance(error, SAPDataError):
+                return Response(
+                    {"detail": f"SAP error: {outcome.message}"},
+                    status=status.HTTP_502_BAD_GATEWAY
+                )
+            if isinstance(error, SAPValidationError):
+                return Response(
+                    {"detail": f"SAP validation error: {outcome.message}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            return Response({"detail": outcome.message}, status=status.HTTP_400_BAD_REQUEST)
+
+        posting = outcome.context["posting"]
         response_data = {
             "success": True,
             "grpo_posting_id": posting.id,

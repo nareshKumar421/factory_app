@@ -13,6 +13,9 @@ class GRPOStatus(models.TextChoices):
     POSTED = "POSTED", "Posted to SAP"
     FAILED = "FAILED", "Failed"
     PARTIALLY_POSTED = "PARTIALLY_POSTED", "Partially Posted"
+    # A saved GRPO whose post found SAP not answering: nothing is wrong with it,
+    # and the SAP posting queue (sap_postings) sends it once SAP is back.
+    QUEUED = "QUEUED", "Waiting for SAP"
 
 
 class SAPAttachmentStatus(models.TextChoices):

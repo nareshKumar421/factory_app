@@ -38,11 +38,13 @@ logger = logging.getLogger(__name__)
 #: kind -> handler class. A handler is imported only when its kind is sent.
 HANDLERS = {
     "goods_return.receive": "goods_return.sap_posting.ReceiveHandler",
+    "grpo.material": "grpo.sap_posting.MaterialGRPOHandler",
 }
 
 #: kind -> what a person calls that kind of posting, for the log's filter.
 KIND_LABELS = {
     "goods_return.receive": "Goods return (A/R Return)",
+    "grpo.material": "Material GRPO",
 }
 
 
@@ -69,6 +71,9 @@ class Outcome:
     detail: dict = field(default_factory=dict)
     #: For whoever made this try just now (a view's response); never stored.
     context: dict = field(default_factory=dict)
+    #: Where the record now lives, when posting moved it (a GRPO draft becomes
+    #: a new posted row); replaces the posting's link.
+    link: str = ""
 
     @classmethod
     def posted(cls, message="", **kw):
@@ -225,6 +230,8 @@ def _finish(posting, log, outcome):
         log.detail = outcome.detail or {}
         log.save(update_fields=["finished_at", "outcome", "message", "detail"])
 
+        if outcome.link:
+            posting.link = outcome.link[:255]
         if outcome.kind == SapPostingOutcome.POSTED:
             posting.status = SapPostingStatus.POSTED
             posting.posted_at = now
@@ -241,7 +248,8 @@ def _finish(posting, log, outcome):
             posting.next_attempt_at = None
         posting.save(
             update_fields=[
-                "status", "posted_at", "result", "last_error", "next_attempt_at", "updated_at",
+                "status", "posted_at", "result", "last_error", "next_attempt_at", "link",
+                "updated_at",
             ]
         )
 

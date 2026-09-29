@@ -100,6 +100,12 @@ class GRPOWriter:
                 logger.error("SAP authentication/authorization error")
                 raise SAPUnavailable("SAP authentication failed")
 
+            # 502/503/504 come from the Service Layer's own load balancer when no
+            # worker behind it would take the request: nothing was processed.
+            if response.status_code in (502, 503, 504):
+                logger.error("SAP Service Layer gateway error %s creating GRPO", response.status_code)
+                raise SAPUnavailable(f"SAP Service Layer not available (HTTP {response.status_code})")
+
             # Other errors
             error_msg = self._extract_error_message(response)
             logger.error(f"SAP error creating GRPO: {error_msg}")
