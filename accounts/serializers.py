@@ -99,7 +99,24 @@ class MeSerializer(serializers.ModelSerializer):
         - group permissions
         """
         return sorted(list(obj.get_all_permissions()))
-    
+
+
+class UpdateMeSerializer(serializers.ModelSerializer):
+    """What a user may change about themselves: their name, and nothing else.
+
+    Email is the login, and the employee code, flags and companies are an
+    administrator's to set, so any of those in the payload is ignored.
+    """
+
+    class Meta:
+        model = User
+        fields = ["full_name"]
+
+    def validate_full_name(self, value):
+        # Collapse the runs of spaces a typed name picks up; blank and
+        # whitespace-only names are already refused by the field itself.
+        return " ".join(value.split())
+
 
 
 class DepartmentSerializer(serializers.ModelSerializer):

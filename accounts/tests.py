@@ -113,3 +113,89 @@ class OptionalEmployeeCodeTests(TestCase):
         )
         self.assertIsNone(root.employee_code)
         self.assertTrue(root.is_superuser)
+
+
+class EditOwnNameTests(TestCase):
+    """PATCH /me/ lets a user fix their own name, and touches nothing else."""
+
+    ME_URL = "/api/v1/accounts/me/"
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            email="asha@example.com",
+            password="x",
+            full_name="Imported Person",
+            employee_code="EN-1",
+        )
+        self.client.force_authenticate(self.user)
+
+    def test_user_can_change_their_name(self):
+        response = self.client.patch(self.ME_URL, {"full_name": "Asha Kaur"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.full_name, "Asha Kaur")
+
+    def test_response_is_the_whole_me_payload(self):
+        response = self.client.patch(self.ME_URL, {"full_name": "Asha Kaur"}, format="json")
+
+        self.assertEqual(response.data["full_name"], "Asha Kaur")
+        self.assertEqual(response.data["email"], "asha@example.com")
+        self.assertIn("companies", response.data)
+        self.assertIn("permissions", response.data)
+
+    def test_stray_spaces_are_tidied(self):
+        self.client.patch(self.ME_URL, {"full_name": "  Asha    Kaur "}, format="json")
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.full_name, "Asha Kaur")
+
+    def test_blank_name_is_refused(self):
+        for blank in ("", "   "):
+            with self.subTest(blank=blank):
+                response = self.client.patch(self.ME_URL, {"full_name": blank}, format="json")
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("full_name", response.data)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.full_name, "Imported Person")
+
+    def test_missing_name_is_refused(self):
+        response = self.client.patch(self.ME_URL, {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("full_name", response.data)
+
+    def test_overlong_name_is_refused(self):
+        response = self.client.patch(self.ME_URL, {"full_name": "A" * 151}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_nothing_but_the_name_can_change(self):
+        response = self.client.patch(
+            self.ME_URL,
+            {
+                "full_name": "Asha Kaur",
+                "email": "boss@example.com",
+                "employee_code": "EN-999",
+                "is_staff": True,
+                "is_superuser": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.full_name, "Asha Kaur")
+        self.assertEqual(self.user.email, "asha@example.com")
+        self.assertEqual(self.user.employee_code, "EN-1")
+        self.assertFalse(self.user.is_staff)
+        self.assertFalse(self.user.is_superuser)
+
+    def test_signed_out_request_is_refused(self):
+        response = APIClient().patch(self.ME_URL, {"full_name": "Anyone"}, format="json")
+
+        self.assertEqual(response.status_code, 401)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.full_name, "Imported Person")

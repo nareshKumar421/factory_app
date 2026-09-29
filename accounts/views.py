@@ -7,7 +7,13 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .serializers import ChangePasswordSerializer, LoginSerializer, MeSerializer, UserSerializer
+from .serializers import (
+    ChangePasswordSerializer,
+    LoginSerializer,
+    MeSerializer,
+    UpdateMeSerializer,
+    UserSerializer,
+)
 
 from .models import Department, User
 from .serializers import DepartmentSerializer
@@ -47,6 +53,13 @@ class MeView(APIView):
     def get(self, request):
         serializer = MeSerializer(request.user)
         return Response(serializer.data)
+
+    def patch(self, request):
+        serializer = UpdateMeSerializer(request.user, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        # The whole /me payload, so the app can drop it straight into its store.
+        return Response(MeSerializer(request.user).data)
 
 
 class CustomTokenRefreshView(TokenRefreshView):
