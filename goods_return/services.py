@@ -66,15 +66,20 @@ class NothingPostedError(ValueError):
     SAP refusing, which is a 503 and not the operator's to fix.
     """
 
-    def __init__(self, message, *, refused=(), unreachable=False):
+    def __init__(self, message, *, refused=(), unreachable=False, log=()):
         super().__init__(message)
         self.refused = list(refused)
         self.unreachable = unreachable
+        #: Per note: what was sent and what SAP answered (see ``posting_log``).
+        self.log = list(log)
 
 
 RECEIVABLE_STATUSES = (
     GoodsReturnStatus.ARRIVED,
     GoodsReturnStatus.PARTIALLY_POSTED,
+    # Received, with the A/R Returns waiting for SAP to answer: the worker's retry
+    # and a person's "post now" are both a receive.
+    GoodsReturnStatus.SAP_QUEUED,
 )
 
 
@@ -595,36 +600,9 @@ class GoodsReturnService:
             .filter(pk=pk, is_active=True)
             .first()
         )
-        if gr is None:
-            raise ValueError("Goods return not found.")
-        if gr.company_id not in allowed_company_ids:
-            raise PermissionDenied("This record belongs to a company you cannot access.")
-        if gr.status not in RECEIVABLE_STATUSES:
-            raise ValueError("Only a gated-in (arrived) return can be received.")
-        if gr.requires_approval and gr.approval_status != GoodsReturnApprovalStatus.APPROVED:
-            if gr.approval_status == GoodsReturnApprovalStatus.REJECTED:
-                raise ValueError("This return's approval was rejected; it cannot be received.")
-            raise ValueError("This return is awaiting admin approval before it can be received.")
-
-        lines = gr.active_lines
-        if not lines:
-            raise ValueError("This return has no items to receive.")
-
-        warehouse_code = (warehouse_code or "").strip()
-        if not warehouse_code:
-            raise ValueError("Select the goods-return warehouse.")
-        # A retry keeps the warehouse the first run used: the stock already in SAP
-        # went there, and one return split across two warehouses would leave nobody
-        # able to say where the goods are.
-        if gr.sap_return_warehouse and gr.sap_return_warehouse != warehouse_code:
-            raise ValueError(
-                f"This return has already posted into {gr.sap_return_warehouse}, so "
-                f"the invoices still to post must go into the same warehouse."
-            )
-
-        # Validated before SAP is touched at all, so a grouping mistake costs a
-        # round-trip rather than a half-posted return nobody can withdraw.
-        self._resolve_grouping(gr, grouping)
+        lines, warehouse_code = self._check_receivable(
+            gr, warehouse_code, allowed_company_ids, grouping
+        )
 
         posted, failures = self._post_sap_returns(gr, lines, warehouse_code, user, grouping)
         if not posted:
@@ -636,6 +614,7 @@ class GoodsReturnService:
                 self._posting_failure_message(failures),
                 refused=gr.refused_refs,
                 unreachable=bool(failures) and gr.sap_unreachable,
+                log=gr.posting_log,
             )
 
         gr.sap_return_warehouse = warehouse_code
@@ -661,6 +640,74 @@ class GoodsReturnService:
         # while the documents SAP accepted stay recorded.
         gr.posting_failures = failures
         return gr
+
+    def assert_receivable(self, pk, warehouse_code, allowed_company_ids, grouping=None):
+        """Everything ``receive`` refuses before SAP is asked, without asking it.
+
+        Run first, so a return that is not ready to receive -- no warehouse
+        chosen, approval pending -- is a plain 400 and not a posting in the SAP
+        log that SAP never saw.
+        """
+        gr = (
+            GoodsReturn.objects.select_related("company")
+            .prefetch_related("invoice_refs", "lines")
+            .filter(pk=pk, is_active=True)
+            .first()
+        )
+        self._check_receivable(gr, warehouse_code, allowed_company_ids, grouping)
+        return gr
+
+    def _check_receivable(self, gr, warehouse_code, allowed_company_ids, grouping):
+        """Returns ``(lines, warehouse_code)`` or raises; shared by the two above."""
+        if gr is None:
+            raise ValueError("Goods return not found.")
+        if gr.company_id not in allowed_company_ids:
+            raise PermissionDenied("This record belongs to a company you cannot access.")
+        if gr.status not in RECEIVABLE_STATUSES:
+            raise ValueError("Only a gated-in (arrived) return can be received.")
+        if gr.requires_approval and gr.approval_status != GoodsReturnApprovalStatus.APPROVED:
+            if gr.approval_status == GoodsReturnApprovalStatus.REJECTED:
+                raise ValueError("This return's approval was rejected; it cannot be received.")
+            raise ValueError("This return is awaiting admin approval before it can be received.")
+
+        lines = gr.active_lines
+        if not lines:
+            raise ValueError("This return has no items to receive.")
+
+        warehouse_code = (warehouse_code or "").strip()
+        if not warehouse_code:
+            raise ValueError("Select the goods-return warehouse.")
+        # A retry keeps the warehouse the first run used: the stock already in SAP
+        # went there (or is queued to), and one return split across two warehouses
+        # would leave nobody able to say where the goods are.
+        if gr.sap_return_warehouse and gr.sap_return_warehouse != warehouse_code:
+            raise ValueError(
+                f"This return has already posted into {gr.sap_return_warehouse}, so "
+                f"the invoices still to post must go into the same warehouse."
+            )
+
+        # Validated before SAP is touched at all, so a grouping mistake costs a
+        # round-trip rather than a half-posted return nobody can withdraw.
+        self._resolve_grouping(gr, grouping)
+        return lines, warehouse_code
+
+    @staticmethod
+    def mark_waiting_for_sap(pk, user, warehouse_code) -> None:
+        """The goods are in; their A/R Returns wait for SAP to answer.
+
+        Only from ARRIVED: a half-posted return is already PARTIALLY_POSTED, which
+        says the same thing about the bills still owing. The warehouse is fixed
+        now, so the retry cannot send the stock anywhere else.
+        """
+        now = timezone.now()
+        GoodsReturn.objects.filter(pk=pk, status=GoodsReturnStatus.ARRIVED).update(
+            status=GoodsReturnStatus.SAP_QUEUED,
+            sap_return_warehouse=warehouse_code,
+            received_by=user,
+            received_at=now,
+            updated_by=user,
+            updated_at=now,
+        )
 
     @staticmethod
     def _posting_failure_message(failures) -> str:
@@ -965,8 +1012,17 @@ class GoodsReturnService:
         gr.refused_refs = []
         # Stays True only while every failure is SAP not answering.
         gr.sap_unreachable = True
+        # Per note, for the SAP posting log: what was sent and what came back.
+        gr.posting_log = []
         for refs, payload in prepared:
             label = ", ".join(guards._invoice_label(ref) for ref in refs)
+            entry = {
+                "invoices": label,
+                "reference": payload.get("NumAtCard", ""),
+                "card_code": payload.get("CardCode", ""),
+                "payload": payload,
+            }
+            gr.posting_log.append(entry)
             # Asked before every post, not only after a crash: the reference is
             # unique to (return, note), so a document already carrying it *is*
             # this one, and a second copy of a return nobody can cancel is the one
@@ -982,6 +1038,7 @@ class GoodsReturnService:
                     payload["NumAtCard"],
                 )
                 result = {"DocEntry": existing["doc_entry"], "DocNum": existing["doc_num"]}
+                entry["outcome"] = "already in SAP"
             else:
                 try:
                     result = writer.create(payload)
@@ -993,6 +1050,8 @@ class GoodsReturnService:
                         exc,
                     )
                     failures.append((label, self._posting_error_text(exc)))
+                    entry["outcome"] = "failed"
+                    entry["error"] = str(exc)
                     if not isinstance(exc, SAPConnectionError):
                         gr.sap_unreachable = False
                     # Every bill on the refused note is still owing a document, so
@@ -1002,6 +1061,9 @@ class GoodsReturnService:
                         gr.refused_refs.append((ref.pk, str(exc)))
                     continue
 
+            entry.setdefault("outcome", "posted")
+            entry["doc_entry"] = result.get("DocEntry")
+            entry["doc_num"] = str(result.get("DocNum") or "")
             self._record_posted(gr, refs, result, warehouse_code, user)
             posted.extend(refs or [None])
 
@@ -1328,6 +1390,7 @@ class GoodsReturnService:
             raise ValueError("This return does not require approval.")
         if gr.status in (
             GoodsReturnStatus.RECEIVED,
+            GoodsReturnStatus.SAP_QUEUED,
             GoodsReturnStatus.PARTIALLY_POSTED,
             GoodsReturnStatus.POSTED,
             GoodsReturnStatus.CANCELLED,
@@ -1365,6 +1428,7 @@ class GoodsReturnService:
         if gr.status in (
             GoodsReturnStatus.ARRIVED,
             GoodsReturnStatus.RECEIVED,
+            GoodsReturnStatus.SAP_QUEUED,
             GoodsReturnStatus.PARTIALLY_POSTED,
             GoodsReturnStatus.POSTED,
         ):

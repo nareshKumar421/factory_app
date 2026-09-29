@@ -24,9 +24,15 @@ seconds, every active superuser is told -- every manager here is one -- along
 with the ``SAP_HEALTH_ALERT_GROUP``, which is for anyone else who should hear;
 and all of them again when it is back.
 
-Probes are driven by :func:`snapshot`, which the health endpoint calls: every
-open FactoryFlow tab polls it, so while anyone is using the app SAP is asked
-about every ``PROBE_INTERVAL`` seconds, by one worker at a time.
+Probes are driven by :func:`snapshot`: the health endpoint calls it for every
+open FactoryFlow tab, and the SAP posting worker calls it on every pass, so SAP
+is asked about every ``PROBE_INTERVAL`` seconds whether or not anyone is looking.
+
+**Only the worker alerts** (``alert=True``). Every web process records what it
+finds, but if each could alert, an outage would be told once per process that
+noticed it -- which is what happens the moment the shared cache is missing or
+down. A web probe that sees SAP come back leaves the "it's back" owed, for the
+worker's next probe to send.
 """
 
 import logging
@@ -54,7 +60,7 @@ UNKNOWN = "unknown"
 PROBE_INTERVAL = 30
 #: While down, calls fail fast for this long after the last probe.
 RETRY_AFTER = 30
-#: Down this long, and the superusers and the alert group hear about it.
+#: Down this long, and the worker tells the superusers and the alert group.
 ALERT_AFTER = 300
 #: (connect, read) for the Service Layer probe; HANA's in milliseconds.
 SL_PROBE_TIMEOUT = (3, 5)
@@ -136,7 +142,7 @@ def guard_service_layer():
         raise SAPUnavailable(refusal(SERVICE_LAYER, state))
 
 
-def record_success(component, state=None, *, probed=False):
+def record_success(component, state=None, *, probed=False, alert=False):
     """SAP answered. Returns the state now stored.
 
     A real call that finds it already up writes nothing, so the hot path is one
@@ -149,9 +155,11 @@ def record_success(component, state=None, *, probed=False):
     status = state.get("status")
     if status == UP and not probed:
         return state
-    # They were told it went down, so they are owed "it's back". Only a probe
-    # sends that: a real call may be inside a transaction that rolls back, and
-    # should not wait on a push either. A real call just leaves it owed.
+    # They were told it went down, so they are owed "it's back". Only the
+    # worker's probe sends that: a real call may be inside a transaction that
+    # rolls back and should not wait on a push, and a web probe is one of
+    # several processes. Anything else just leaves it owed.
+    sends = probed and alert
     owed = (status == DOWN and state.get("alerted")) or state.get("recovery_pending")
     down_since = state.get("since") if status == DOWN else state.get("down_since")
     new = {
@@ -160,21 +168,25 @@ def record_success(component, state=None, *, probed=False):
         "checked_at": now,
         "error": "",
         "alerted": False,
-        "recovery_pending": bool(owed and not probed),
-        "down_since": down_since if owed and not probed else None,
+        "recovery_pending": bool(owed and not sends),
+        "down_since": down_since if owed and not sends else None,
     }
     _write(component, new)
     if status == DOWN:
         logger.warning(
             "SAP %s answering again (down since %s)", LABELS[component], _clock(down_since)
         )
-    if owed and probed:
+    if owed and sends:
         _alert(component, recovered=True, state={"since": down_since})
     return new
 
 
-def record_failure(component, error):
-    """A probe got no answer. Returns the state now stored."""
+def record_failure(component, error, *, alert=False):
+    """A probe got no answer. Returns the state now stored.
+
+    ``alert``: this is the worker's probe, which tells people once SAP has
+    been down for ``ALERT_AFTER``. Any other probe only records it.
+    """
     state = _read(component) or {}
     now = time.time()
     was_down = state.get("status") == DOWN
@@ -187,7 +199,7 @@ def record_failure(component, error):
     }
     if not was_down:
         logger.error("SAP %s stopped answering: %s", LABELS[component], error)
-    if not new["alerted"] and now - new["since"] >= ALERT_AFTER:
+    if alert and not new["alerted"] and now - new["since"] >= ALERT_AFTER:
         _alert(component, recovered=False, state=new)
         new["alerted"] = True
     _write(component, new)
@@ -241,7 +253,7 @@ def _describe(exc) -> str:
     return str(exc) or type(exc).__name__
 
 
-def probe():
+def probe(*, alert=False):
     """Ask both components now, side by side, and record the answers."""
     with ThreadPoolExecutor(max_workers=len(COMPONENTS)) as pool:
         pending = {c: pool.submit(_PROBES[c]) for c in COMPONENTS}
@@ -252,13 +264,13 @@ def probe():
             try:
                 future.result()
             except Exception as exc:  # noqa: BLE001 -- any failure is the answer
-                states[component] = record_failure(component, _describe(exc))
+                states[component] = record_failure(component, _describe(exc), alert=alert)
             else:
-                states[component] = record_success(component, probed=True)
+                states[component] = record_success(component, probed=True, alert=alert)
     return _render(states)
 
 
-def snapshot(*, refresh=True):
+def snapshot(*, refresh=True, alert=False):
     """The API's answer. Asks SAP first if the stored one is stale.
 
     One worker probes at a time; the rest answer with what is stored rather
@@ -270,7 +282,7 @@ def snapshot(*, refresh=True):
     )
     if refresh and stale and _take_probe_lock():
         try:
-            return probe()
+            return probe(alert=alert)
         finally:
             _release_probe_lock()
     return _render(states)

@@ -677,22 +677,99 @@ class ReceiveEndpointWhenSAPIsDownTests(PostingTestCase):
                 HTTP_COMPANY_CODE="OIL",
             )
 
-    def test_unreachable_sap_is_a_503_and_the_invoice_keeps_the_error(self):
+    def test_unreachable_sap_confirms_the_receipt_and_queues_the_return(self):
         from sap_client.exceptions import SAPUnavailable
+        from sap_postings.models import SapPosting, SapPostingStatus
 
         response = self.post(
             UnreachableWriter(SAPUnavailable("SAP Service Layer connection timeout"))
         )
 
-        self.assertEqual(response.status_code, 503, response.content)
-        self.assertEqual(response.json()["code"], "SAP_UNAVAILABLE")
-        ref = self.gr.invoice_refs.get()
-        self.assertIn("connection timeout", ref.sap_post_error)
+        self.assertEqual(response.status_code, 202, response.content)
+        body = response.json()
+        self.assertEqual(body["code"], "SAP_QUEUED")
+        self.assertEqual(body["status"], GoodsReturnStatus.SAP_QUEUED)
         self.gr.refresh_from_db()
-        self.assertEqual(self.gr.status, GoodsReturnStatus.ARRIVED)
+        self.assertEqual(self.gr.status, GoodsReturnStatus.SAP_QUEUED)
+        self.assertEqual(self.gr.sap_return_warehouse, WAREHOUSE)
+        self.assertIsNotNone(self.gr.received_at)
+        self.assertIn("connection timeout", self.gr.invoice_refs.get().sap_post_error)
+
+        posting = SapPosting.objects.get(pk=body["sap_posting_id"])
+        self.assertEqual(posting.status, SapPostingStatus.QUEUED)
+        self.assertEqual(posting.params["warehouse_code"], WAREHOUSE)
+        self.assertEqual(posting.link, f"/returns/customer/{self.gr.pk}")
+        documents = posting.attempt_log.get().detail["documents"]
+        self.assertEqual(documents[0]["outcome"], "failed")
+        self.assertIn("INV 1500", documents[0]["reference"])
+
+    def test_the_worker_posts_it_once_sap_is_back_and_tells_the_clerk(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from sap_client.exceptions import SAPUnavailable
+        from sap_postings import services as sap_postings
+        from sap_postings.models import SapPosting, SapPostingStatus
+
+        self.post(UnreachableWriter(SAPUnavailable("SAP Service Layer connection timeout")))
+        posting = SapPosting.objects.get()
+        SapPosting.objects.filter(pk=posting.pk).update(
+            next_attempt_at=timezone.now() - timedelta(seconds=1)
+        )
+
+        with mock.patch("sap_client.client.SAPClient", return_value=self.client_stub), \
+             mock.patch("sap_client.context.CompanyContext", return_value=object()), \
+             mock.patch(
+                 "sap_client.service_layer.returns_writer.ReturnsWriter",
+                 return_value=FakeWriter(start=9700),
+             ), \
+             mock.patch("sap_client.health.failing_fast", return_value=False), \
+             mock.patch(
+                 "notifications.services.NotificationService.send_notification_to_user"
+             ) as notify:
+            self.assertEqual(sap_postings.run_due(), 1)
+
+        posting.refresh_from_db()
+        self.assertEqual(posting.status, SapPostingStatus.POSTED)
+        self.assertEqual(posting.result, {"doc_nums": ["169701"]})
+        self.gr.refresh_from_db()
+        self.assertEqual(self.gr.status, GoodsReturnStatus.POSTED)
+        self.assertEqual(self.gr.invoice_refs.get().sap_post_error, "")
+        self.assertEqual(notify.call_args.kwargs["user"], self.user)
+        self.assertIn(self.gr.entry_no, notify.call_args.kwargs["title"])
 
     def test_a_refusal_is_still_a_400_and_is_kept_too(self):
+        from sap_postings.models import SapPosting, SapPostingStatus
+
         response = self.post(FakeWriter(refuse=["1500"]))
 
         self.assertEqual(response.status_code, 400, response.content)
         self.assertIn("-5002 refused", self.gr.invoice_refs.get().sap_post_error)
+        self.assertEqual(SapPosting.objects.get().status, SapPostingStatus.REJECTED)
+        self.gr.refresh_from_db()
+        self.assertEqual(self.gr.status, GoodsReturnStatus.ARRIVED)
+
+    def test_a_return_that_is_not_ready_is_refused_before_any_posting(self):
+        from sap_postings.models import SapPosting
+
+        with mock.patch("sap_client.service_layer.returns_writer.ReturnsWriter") as writer:
+            response = self.api.post(
+                f"/api/v1/goods-return/{self.gr.id}/receive/",
+                {"warehouse_code": ""},
+                format="json",
+                HTTP_COMPANY_CODE="OIL",
+            )
+        self.assertEqual(response.status_code, 400)
+        writer.assert_not_called()
+        self.assertFalse(SapPosting.objects.exists())
+
+    def test_posting_straight_through_is_logged_as_posted(self):
+        from sap_postings.models import SapPosting, SapPostingStatus
+
+        response = self.post(FakeWriter(start=9800))
+
+        self.assertEqual(response.status_code, 200, response.content)
+        posting = SapPosting.objects.get()
+        self.assertEqual(posting.status, SapPostingStatus.POSTED)
+        self.assertEqual(posting.attempt_log.get().detail["documents"][0]["outcome"], "posted")

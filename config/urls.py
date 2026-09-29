@@ -46,6 +46,8 @@ urlpatterns = [
     path("api/v1/sap-identity/", include("sap_client.urls_identity")),
     # Whether SAP is answering, for the app-wide "SAP is down" banner.
     path("api/v1/sap-health/", include("sap_client.urls_health")),
+    # The SAP posting log: what was posted, what waits for SAP, what SAP refused.
+    path("api/v1/sap-postings/", include("sap_postings.urls")),
     # Master-data pickers (items, codes, accounts, partners…) ported from SAP
     # Portal's /api/sap/lookup/*; shared by several modules' forms.
     path("api/v1/sap-lookups/", include("sap_client.urls_lookups")),

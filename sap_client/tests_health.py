@@ -55,9 +55,10 @@ class HealthStateTests(SimpleTestCase):
         alert.start()
         self.addCleanup(alert.stop)
 
-    def probe(self, sl=_fine, hana=_fine):
+    def probe(self, sl=_fine, hana=_fine, *, alert=True):
+        """The worker's probe unless ``alert=False`` (a web process's)."""
         with mock.patch.dict(health._PROBES, {health.SERVICE_LAYER: sl, health.HANA: hana}):
-            return health.probe()
+            return health.probe(alert=alert)
 
     # -- probing ---------------------------------------------------------
 
@@ -150,6 +151,34 @@ class HealthStateTests(SimpleTestCase):
         self.now += 60
         self.probe(sl=_hung)
         self.assertEqual(self.alerts, [("service_layer", False)])
+
+    def test_a_web_process_never_alerts_however_long_it_is_down(self):
+        # Several web processes each notice an outage; told once per process,
+        # everyone would hear it several times over.
+        self.probe(sl=_hung, alert=False)
+        self.now += health.ALERT_AFTER + 1
+        self.probe(sl=_hung, alert=False)
+        self.assertEqual(self.alerts, [])
+        # ...and the worker's next probe is the one that tells them.
+        self.probe(sl=_hung)
+        self.assertEqual(self.alerts, [("service_layer", False)])
+
+    def test_a_web_process_seeing_it_back_leaves_the_news_to_the_worker(self):
+        self.probe(sl=_hung)
+        self.now += health.ALERT_AFTER + 1
+        self.probe(sl=_hung)
+        self.probe(alert=False)  # a browser's poll finds it back first
+        self.assertEqual(self.alerts, [("service_layer", False)])
+        self.assertEqual(health.current(health.SERVICE_LAYER)["status"], "up")
+        self.probe()
+        self.assertEqual(self.alerts, [("service_layer", False), ("service_layer", True)])
+
+    def test_the_endpoints_snapshot_does_not_alert(self):
+        self.probe(sl=_hung)
+        self.now += health.ALERT_AFTER + 1
+        with mock.patch.dict(health._PROBES, {health.SERVICE_LAYER: _hung, health.HANA: _fine}):
+            health.snapshot()
+        self.assertEqual(self.alerts, [])
 
     def test_a_blip_under_five_minutes_tells_nobody(self):
         self.probe(sl=_hung)

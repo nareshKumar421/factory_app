@@ -1,0 +1,29 @@
+# /etc/systemd/system/factory-sap-postings.service on the 117 box.
+#
+# The SAP posting worker (manage.py run_sap_postings), next to gunicorn.service
+# and with the same environment. It exits when a deploy moves `current`, and
+# Restart=always brings it back on the new release.
+#
+#   sudo cp sap_postings/deploy/factory-sap-postings.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now factory-sap-postings
+#   journalctl -u factory-sap-postings -f
+[Unit]
+Description=factory_app SAP posting worker
+After=network.target gunicorn.service
+
+[Service]
+User=superadmin
+Group=www-data
+WorkingDirectory=/home/superadmin/django_projects/factory_app/current
+Environment="DJANGO_SETTINGS_MODULE=config.settings"
+Environment="PYTHONPATH=/home/superadmin/django_projects/factory_app/current"
+Environment="LD_LIBRARY_PATH=/usr/sap/hdbclient"
+Environment="ODBCINI=/etc/odbc.ini"
+Environment="ODBCSYSINI=/etc"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/superadmin/django_projects/factory_app/current/.venv/bin/python manage.py run_sap_postings --exit-when-moved /home/superadmin/django_projects/factory_app/current
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

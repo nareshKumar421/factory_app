@@ -41,6 +41,11 @@ class GoodsReturnStatus(models.TextChoices):
     # Only invoice-basis returns post today, and calling the others "Posted to
     # SAP" claimed a document that does not exist.
     RECEIVED = "RECEIVED", "Received (not in SAP)"
+    # The goods are in, and the A/R Returns are waiting for SAP to answer: SAP
+    # was down when the receipt was confirmed, and the posting queue sends them
+    # once it is back (sap_postings). Not RECEIVED, which means no SAP document
+    # is ever coming.
+    SAP_QUEUED = "SAP_QUEUED", "Received (waiting for SAP)"
     # A return booked against several invoices posts one SAP document per invoice,
     # and SAP can accept some and refuse others. The accepted ones stand -- a
     # posted return cannot be withdrawn -- so the return sits here until the

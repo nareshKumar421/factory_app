@@ -12,9 +12,10 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from control_boards.permissions import CanReadBoard
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
-from sap_client.drf import SAP_UNAVAILABLE
+from sap_postings import services as sap_postings
+from sap_postings.models import SapPostingOutcome
 
-from . import analytics, services
+from . import analytics, sap_posting, services
 from .permissions import (
     CanApproveGoodsReturn,
     CanCreateGoodsReturn,
@@ -40,7 +41,7 @@ from .serializers import (
     InvoiceRefAddSerializer,
     ReturnWarehouseSerializer,
 )
-from .services import GoodsReturnService, NothingPostedError
+from .services import GoodsReturnService
 
 logger = logging.getLogger(__name__)
 
@@ -345,41 +346,67 @@ class GoodsReturnReceiveAPI(APIView):
         serializer = GoodsReturnReceiveSerializer(data=request.data)
         if not serializer.is_valid():
             return _validation_error(serializer)
+        warehouse = (serializer.validated_data.get("warehouse_code") or "").strip()
+        grouping = serializer.validated_data.get("groups")
+        service = _service(request)
+        allowed = _allowed_ids(request)
+        # Refused here, before the posting exists: a return that is not ready to
+        # receive is a 400, not an entry in the SAP log that SAP never saw.
         try:
-            gr = _service(request).receive(
-                pk,
-                request.user,
-                serializer.validated_data.get("warehouse_code"),
-                _allowed_ids(request),
-                grouping=serializer.validated_data.get("groups"),
-            )
-        except NothingPostedError as exc:
-            # The receive rolled back, so write back what SAP said about each bill
-            # now: otherwise the return shows no trace of having been tried.
-            GoodsReturnService.record_posting_errors(exc.refused, request.user)
-            if exc.unreachable:
-                return Response(
-                    {"detail": str(exc), "code": SAP_UNAVAILABLE},
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
-            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            gr = service.assert_receivable(pk, warehouse, allowed, grouping)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        failures = getattr(gr, "posting_failures", None)
+        try:
+            posting, outcome = sap_postings.post_now(
+                kind=sap_posting.KIND,
+                company=gr.company,
+                source_id=gr.pk,
+                title=sap_posting.title_for(gr),
+                link=sap_posting.link_for(gr),
+                params={"warehouse_code": warehouse, "grouping": grouping},
+                user=request.user,
+            )
+        except sap_postings.PostingInProgress as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        gr = service._get_scoped(pk, allowed)
+        failures = outcome.context.get("failures") or []
+        if outcome.kind == SapPostingOutcome.POSTED:
+            return _detail(gr)
+
+        data = GoodsReturnDetailSerializer(gr).data
+        data["sap_posting_id"] = posting.pk
+        if outcome.kind == SapPostingOutcome.WAITING:
+            # SAP did not answer. The receipt stands; the A/R Returns wait in the
+            # SAP posting queue, which sends them once SAP is back.
+            if failures:
+                data["detail"] = (
+                    f"{len(failures)} of this return's invoices could not reach SAP — "
+                    f"{GoodsReturnService._posting_failure_message(failures)}. The rest "
+                    f"posted; these will post automatically once SAP answers."
+                )
+            else:
+                data["detail"] = (
+                    "Receipt confirmed. SAP is not answering, so the A/R Return is "
+                    "waiting and will post automatically once SAP is back — you will "
+                    "get a notification."
+                )
+            data["code"] = "SAP_QUEUED"
+            return Response(data, status=status.HTTP_202_ACCEPTED)
+
         if failures:
             # SAP took some of the return's invoices and refused others. Reported
             # as an error, because invoices are still owed a document -- but with
             # the record as it now stands, since the accepted documents cannot be
             # withdrawn and are not rolled back.
-            data = GoodsReturnDetailSerializer(gr).data
             data["detail"] = (
                 f"{len(failures)} of this return's invoices were refused by SAP — "
                 f"{GoodsReturnService._posting_failure_message(failures)}. The rest "
                 f"posted; receive again to retry the refused ones."
             )
             return Response(data, status=status.HTTP_207_MULTI_STATUS)
-        return _detail(gr)
+        return Response({"detail": outcome.message}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class GoodsReturnPrintAPI(APIView):

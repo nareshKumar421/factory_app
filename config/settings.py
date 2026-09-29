@@ -195,6 +195,9 @@ INSTALLED_APPS = [
     'artwork.apps.ArtworkConfig',
     'etp.apps.EtpConfig',
     'sap_reports',
+    # Every SAP posting and every attempt at it; SAP being down makes a posting
+    # wait for the worker (manage.py run_sap_postings) rather than fail.
+    'sap_postings',
     # One number, looked up in every company's SAP and in this app's own
     # records at once. Stores nothing; owns only its permission.
     'universal_search.apps.UniversalSearchConfig',

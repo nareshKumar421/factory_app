@@ -72,6 +72,7 @@ EXCLUDED_STATUSES = (GoodsReturnStatus.CANCELLED,)
 ARRIVED_STATUSES = (
     GoodsReturnStatus.ARRIVED,
     GoodsReturnStatus.RECEIVED,
+    GoodsReturnStatus.SAP_QUEUED,
     GoodsReturnStatus.PARTIALLY_POSTED,
     GoodsReturnStatus.POSTED,
 )
