@@ -12,6 +12,9 @@ simply never configuring somebody.
 ``can_manage_sap_reports``, see everything: they run the catalogue and the
 assignment page, and scoping them would deadlock the first deploy -- nobody
 could assign the reports they cannot see.
+
+``can_sync_sap_reports`` does **not** exempt anyone. Refreshing the catalogue
+from SAP is a chore, not a reason to see reports nobody assigned.
 """
 
 

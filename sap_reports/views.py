@@ -4,8 +4,9 @@ sap_reports/views.py
 API for the SAP Reports module.
 
 Every endpoint requires JWT authentication, a ``Company-Code`` header, and the
-``can_view_sap_reports`` permission; the catalogue-management endpoints require
-``can_manage_sap_reports`` on top. Reports are always scoped to the company in
+``can_view_sap_reports`` permission. Syncing from SAP needs
+``can_sync_sap_reports`` (or manage) on top, and the other catalogue-management
+endpoints need ``can_manage_sap_reports``. Reports are always scoped to the company in
 the header -- a saved query lives in one company database and means nothing
 outside it.
 """
@@ -26,7 +27,7 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidatio
 from .exceptions import SapReportError, SapReportParameterError, SapReportSqlError
 from .exports import csv_response, xlsx_response
 from .models import SapReport, SapReportAccess, SapReportParameter, SapReportRun
-from .permissions import CanManageSapReports, CanViewSapReports
+from .permissions import CanManageSapReports, CanSyncSapReports, CanViewSapReports
 from .serializers import (
     CategorySerializer,
     ExportReportSerializer,
@@ -79,6 +80,9 @@ class SapReportBaseAPI(APIView):
 
     def can_manage(self) -> bool:
         return self.request.user.has_perm("sap_reports.can_manage_sap_reports")
+
+    def can_sync(self) -> bool:
+        return CanSyncSapReports().has_permission(self.request, self)
 
     def handle_exception(self, exc):
         """
@@ -142,6 +146,7 @@ class SapReportListAPI(SapReportBaseAPI):
                     "total": reports.count(),
                     "categories": categories,
                     "can_manage": self.can_manage(),
+                    "can_sync": self.can_sync(),
                     # True when the per-user assignment rule applies to this
                     # user, so the frontend can say "nothing assigned to you
                     # yet" instead of "no reports exist".
@@ -373,7 +378,7 @@ class SapReportCategoriesAPI(SapReportBaseAPI):
         IsAuthenticated,
         HasCompanyContext,
         CanViewSapReports,
-        CanManageSapReports,
+        CanSyncSapReports,
     ]
 
     def get(self, request):
@@ -401,13 +406,16 @@ class SyncSapReportsAPI(SapReportBaseAPI):
     machinery categories are skipped). New queries appear, edited SQL is
     refreshed, and a query deleted in SAP is flagged. Friendly names,
     descriptions and corrected parameter labels are never overwritten.
+
+    Needs sync, not manage: a syncer stays scoped to their assigned reports,
+    and new reports reach them only once an admin assigns them.
     """
 
     permission_classes = [
         IsAuthenticated,
         HasCompanyContext,
         CanViewSapReports,
-        CanManageSapReports,
+        CanSyncSapReports,
     ]
 
     def post(self, request):

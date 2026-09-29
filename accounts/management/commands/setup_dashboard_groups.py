@@ -356,6 +356,12 @@ ACTION_GROUPS: dict[str, list[str]] = {
         "sap_reports.can_view_sap_reports",
         "sap_reports.can_manage_sap_reports",
     ],
+    # Just the "Sync from SAP" button. Unlike Admin, the member still sees only
+    # the reports assigned to them.
+    "SAP Reports Sync": [
+        "sap_reports.can_view_sap_reports",
+        "sap_reports.can_sync_sap_reports",
+    ],
 }
 
 

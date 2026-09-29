@@ -143,6 +143,9 @@ class SapReport(models.Model):
         permissions = [
             ("can_view_sap_reports", "Can view and run SAP reports"),
             ("can_manage_sap_reports", "Can sync SAP reports and edit their setup"),
+            # Refreshing the catalogue on its own, for someone who should keep
+            # seeing only their assigned reports -- manage would exempt them.
+            ("can_sync_sap_reports", "Can sync SAP reports from SAP"),
         ]
         verbose_name = "SAP report"
         verbose_name_plural = "SAP reports"

@@ -1033,6 +1033,7 @@ class TestSapReportsAccess(SapReportsAPITestCase):
         self.assertEqual(response.data["data"][0]["slug"], "stock-transfer-report")
         self.assertEqual(response.data["meta"]["categories"], ["Factory"])
         self.assertFalse(response.data["meta"]["can_manage"])
+        self.assertFalse(response.data["meta"]["can_sync"])
 
 
 class TestSapReportsCatalogueAPI(SapReportsAPITestCase):
@@ -1354,6 +1355,25 @@ class TestSyncAPI(SapReportsAPITestCase):
             status.HTTP_403_FORBIDDEN,
         )
 
+    def test_the_sync_right_alone_is_enough_to_sync(self):
+        self.grant("can_sync_sap_reports")
+
+        response = self.client.post(self.URL, {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.service_class.return_value.sync.assert_called_once_with(
+            category_name=None, dry_run=False
+        )
+
+    def test_the_sync_right_still_needs_the_view_right(self):
+        self.user.user_permissions.clear()
+        self.grant("can_sync_sap_reports")
+
+        self.assertEqual(
+            self.client.post(self.URL, {}, format="json").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
     def test_a_manager_syncs_every_report_category_by_default(self):
         self.grant("can_manage_sap_reports")
 
@@ -1447,6 +1467,11 @@ class TestCategoriesAPI(SapReportsAPITestCase):
     def test_a_viewer_cannot_list_sap_categories(self):
         self.assertEqual(self.client.get(self.URL).status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_a_syncer_sees_what_could_be_synced(self):
+        self.grant("can_sync_sap_reports")
+
+        self.assertEqual(self.client.get(self.URL).status_code, status.HTTP_200_OK)
+
     def test_a_manager_sees_what_could_be_synced(self):
         self.grant("can_manage_sap_reports")
 
@@ -1508,6 +1533,39 @@ class TestPerUserReportScoping(SapReportsAPITestCase):
 
         self.assertEqual(len(response.data["data"]), 1)
         self.assertFalse(response.data["meta"]["restricted"])
+
+    def test_the_sync_right_does_not_lift_scoping(self):
+        """Being allowed to press "Sync from SAP" must not show every report."""
+        self.access.is_active = False
+        self.access.save()
+        self.grant("can_sync_sap_reports")
+
+        response = self.client.get(f"{self.LIST_URL}?include_hidden=true")
+
+        self.assertEqual(response.data["data"], [])
+        self.assertTrue(response.data["meta"]["restricted"])
+        self.assertTrue(response.data["meta"]["can_sync"])
+        self.assertFalse(response.data["meta"]["can_manage"])
+        self.assertEqual(
+            self.client.get(self.DETAIL_URL).status_code, status.HTTP_404_NOT_FOUND
+        )
+
+    def test_the_sync_right_grants_none_of_the_manage_rights(self):
+        self.grant("can_sync_sap_reports")
+
+        self.assertEqual(
+            self.client.get(f"{self.DETAIL_URL}sql/").status_code, status.HTTP_403_FORBIDDEN
+        )
+        self.assertEqual(
+            self.client.patch(self.DETAIL_URL, {"display_name": "x"}, format="json").status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(
+            self.client.get("/api/v1/sap-reports/runs/").status_code, status.HTTP_403_FORBIDDEN
+        )
+        self.assertEqual(
+            self.client.get("/api/v1/sap-reports/access/").status_code, status.HTTP_403_FORBIDDEN
+        )
 
     def test_a_superuser_is_exempt_from_scoping(self):
         self.access.delete()
