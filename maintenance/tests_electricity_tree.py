@@ -43,6 +43,7 @@ from maintenance.tests_meter_scope import client_for, make_user
 from production_execution.models import ProductionLine, ProductionRun, ProductionSegment
 
 METERS_URL = "/api/v1/maintenance/electricity-tree-meters/"
+OLD_READINGS_URL = "/api/v1/maintenance/daily-electricity-readings/"
 SETUPS_URL = "/api/v1/maintenance/electricity-meter-setups/"
 READINGS_URL = "/api/v1/maintenance/electricity-tree-readings/"
 SHEET_URL = "/api/v1/maintenance/electricity-day-sheet/"
@@ -57,10 +58,10 @@ def day(n: int) -> date:
     return D1 + timedelta(days=n - 1)
 
 
-def reading(meter_id, on, opening, closing, *, mf=1, rate=9, reset=False, rid=None):
+def reading(meter_id, on, opening, closing, *, mf=1, rate=9, reset=False, rid=None, shift="DAY"):
     opening, closing, mf = Decimal(str(opening)), Decimal(str(closing)), Decimal(str(mf))
     return Reading(
-        meter_id, on, opening, closing, (closing - opening) * mf, Decimal(str(rate)), mf, reset, rid
+        meter_id, on, opening, closing, (closing - opening) * mf, Decimal(str(rate)), mf, reset, rid, shift
     )
 
 
@@ -190,6 +191,82 @@ class EngineTreeTests(SimpleTestCase):
         ]
         result = self.allocate(readings, day(1), day(2))
         self.assertNotIn(IssueKind.BREAK, [i.kind for i in result.issues])
+
+    def first_floor(self, readings, date_from, date_to):
+        result = self.allocate(readings, date_from, date_to)
+        return result, {node.day: node for node in result.nodes if node.meter_id == self.FIRST}
+
+    def test_a_day_is_its_day_round_and_its_night_round_together(self):
+        result, first = self.first_floor(
+            [
+                reading(self.FIRST, day(1), 0, 100),
+                reading(self.FIRST, day(1), 100, 160, shift="NIGHT"),
+                reading(self.FIRST, day(2), 160, 260),
+            ],
+            day(1),
+            day(2),
+        )
+        self.assertEqual(first[day(1)].measured, Decimal("160"))
+        self.assertEqual(first[day(2)].measured, Decimal("100"))
+        self.assertEqual([i.kind for i in result.issues if i.kind in (IssueKind.BREAK, IssueKind.SPREAD)], [])
+
+    def test_the_night_is_chained_after_its_day_whatever_order_they_come_in(self):
+        _, first = self.first_floor(
+            [
+                reading(self.FIRST, day(1), 100, 160, shift="NIGHT"),
+                reading(self.FIRST, day(1), 0, 100),
+            ],
+            day(1),
+            day(1),
+        )
+        self.assertEqual(first[day(1)].measured, Decimal("160"))
+
+    def test_an_unread_night_goes_with_the_next_day_and_skips_no_day(self):
+        result, first = self.first_floor(
+            [reading(self.FIRST, day(1), 0, 100), reading(self.FIRST, day(2), 100, 250)],
+            day(1),
+            day(2),
+        )
+        self.assertEqual(first[day(2)].measured, Decimal("150"))
+        self.assertEqual(first[day(2)].spread_over, 1)
+        self.assertNotIn(IssueKind.SPREAD, [i.kind for i in result.issues])
+
+    def test_a_night_that_does_not_open_on_its_days_closing_is_a_break(self):
+        result, first = self.first_floor(
+            [reading(self.FIRST, day(1), 0, 100), reading(self.FIRST, day(1), 120, 160, shift="NIGHT")],
+            day(1),
+            day(1),
+        )
+        breaks = [i for i in result.issues if i.kind == IssueKind.BREAK]
+        self.assertEqual([(b.units, b.detail["previous_shift"]) for b in breaks], [(Decimal("20"), "DAY")])
+        self.assertEqual(first[day(1)].measured, Decimal("140"))
+
+    def test_skipped_days_are_spread_and_the_night_stays_on_its_own_day(self):
+        result, first = self.first_floor(
+            [
+                reading(self.FIRST, day(1), 0, 100, shift="NIGHT"),
+                reading(self.FIRST, day(3), 100, 300, rid=7),
+                reading(self.FIRST, day(3), 300, 340, shift="NIGHT"),
+            ],
+            day(2),
+            day(3),
+        )
+        self.assertEqual(first[day(2)].measured, Decimal("100"))
+        self.assertEqual(first[day(3)].measured, Decimal("140"))
+        spread = [i for i in result.issues if i.kind == IssueKind.SPREAD]
+        self.assertEqual([(i.units, i.detail["days"]) for i in spread], [(Decimal("200"), 2)])
+
+    def test_a_day_read_at_two_rates_is_costed_at_each(self):
+        result, first = self.first_floor(
+            [
+                reading(self.FIRST, day(1), 0, 100, rate=8),
+                reading(self.FIRST, day(1), 100, 200, rate=10, shift="NIGHT"),
+            ],
+            day(1),
+            day(1),
+        )
+        self.assertEqual(first[day(1)].cost, Decimal("1800"))
+        self.assertEqual(result.party_totals()[OIL]["cost"], Decimal("1800"))
 
     def test_a_day_nobody_entered_is_one_note_not_a_flood(self):
         result = self.allocate(self.full_day(), day(1), day(2))
@@ -849,6 +926,214 @@ class DaySheetTests(TreeFixture):
         )
         self.assertEqual(response.status_code, 403)
         self.assertFalse(DailyElectricityReading.objects.filter(date=day(2)).exists())
+
+
+class ShiftTests(TreeFixture):
+    """A meter is read by day, then by night. The night opens on the day's
+    closing and the next day on the night's — or on the day's, when the night
+    was not read."""
+
+    def night(self, meter, on, closing, **extra):
+        payload = {"meter": meter.id, "date": str(on), "shift": "NIGHT", "closing_reading": str(closing)}
+        payload.update(extra)
+        return self.client.post(READINGS_URL, payload, format="json")
+
+    def get(self, meter, on, shift="DAY"):
+        return DailyElectricityReading.objects.get(meter=meter, date=on, shift=shift)
+
+    def sheet(self, on, shift=None):
+        params = {"date": str(on)}
+        if shift:
+            params["shift"] = shift
+        response = self.client.get(SHEET_URL, params)
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def save_sheet(self, on, shift, closings):
+        return self.client.post(
+            SHEET_URL,
+            {
+                "date": str(on),
+                "shift": shift,
+                "entries": [{"meter": meter.id, "closing_reading": str(value)} for meter, value in closings],
+            },
+            format="json",
+        )
+
+    def test_the_night_opens_on_the_days_closing(self):
+        self.read(self.first, day(1), 0, 100)
+        response = self.night(self.first, day(1), 160)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["shift"], "NIGHT")
+        self.assertEqual(Decimal(response.data["opening_reading"]), Decimal("100"))
+        self.assertEqual(Decimal(response.data["units_consumed"]), Decimal("60"))
+
+    def test_the_next_day_opens_on_the_nights_closing(self):
+        self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        response = self.client.post(
+            READINGS_URL, {"meter": self.first.id, "date": str(day(2)), "closing_reading": "200"}, format="json"
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["shift"], "DAY")
+        self.assertEqual(Decimal(response.data["opening_reading"]), Decimal("160"))
+
+    def test_an_unread_night_leaves_the_next_day_on_the_days_closing(self):
+        self.read(self.first, day(1), 0, 100)
+        response = self.client.post(
+            READINGS_URL, {"meter": self.first.id, "date": str(day(2)), "closing_reading": "200"}, format="json"
+        )
+        self.assertEqual(Decimal(response.data["opening_reading"]), Decimal("100"))
+
+    def test_a_night_opening_off_the_days_closing_is_refused(self):
+        self.read(self.first, day(1), 0, 100)
+        response = self.night(self.first, day(1), 160, opening_reading="120")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("100.00 on 01 Sep 2026", str(response.data["opening_reading"]))
+
+    def test_the_next_day_is_held_to_the_nights_closing(self):
+        self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        response = self.read(self.first, day(2), 100, 200)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("160.00 on 01 Sep 2026 (night)", str(response.data["opening_reading"]))
+
+    def test_a_night_filled_in_later_takes_its_units_out_of_the_next_day(self):
+        self.read(self.first, day(1), 0, 100)
+        self.read(self.first, day(2), 100, 250)
+        self.assertEqual(self.night(self.first, day(1), 160).status_code, 201)
+        second = self.get(self.first, day(2))
+        self.assertEqual((second.opening_reading, second.units_consumed), (Decimal("160"), Decimal("90")))
+
+    def test_correcting_the_day_moves_the_nights_opening(self):
+        first_day = self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        response = self.client.patch(
+            f"{READINGS_URL}{first_day.data['id']}/", {"closing_reading": "110"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        night = self.get(self.first, day(1), "NIGHT")
+        self.assertEqual((night.opening_reading, night.units_consumed), (Decimal("110"), Decimal("50")))
+
+    def test_the_day_cannot_overtake_its_night(self):
+        first_day = self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        response = self.client.patch(
+            f"{READINGS_URL}{first_day.data['id']}/", {"closing_reading": "170"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("(night)", str(response.data))
+
+    def test_deleting_a_night_hands_its_units_to_the_next_day(self):
+        self.read(self.first, day(1), 0, 100)
+        night = self.night(self.first, day(1), 160)
+        self.read(self.first, day(2), 160, 250)
+        self.assertEqual(self.client.delete(f"{READINGS_URL}{night.data['id']}/").status_code, 204)
+        second = self.get(self.first, day(2))
+        self.assertEqual((second.opening_reading, second.units_consumed), (Decimal("100"), Decimal("150")))
+
+    def test_one_night_reading_a_day_and_it_stays_a_night_reading(self):
+        self.read(self.first, day(1), 0, 100)
+        night = self.night(self.first, day(1), 160)
+        self.assertEqual(self.night(self.first, day(1), 170).status_code, 400)
+        response = self.client.patch(f"{READINGS_URL}{night.data['id']}/", {"shift": "DAY"}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_the_readings_list_can_be_cut_to_one_round(self):
+        self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        rows = self.client.get(READINGS_URL, {"date": str(day(1))}).data
+        self.assertEqual([row["shift"] for row in rows], ["NIGHT", "DAY"])
+        nights = self.client.get(READINGS_URL, {"date": str(day(1)), "shift": "night"}).data
+        self.assertEqual([row["closing_reading"] for row in nights], ["160.00"])
+
+    def test_the_night_sheet_opens_on_the_days_closings(self):
+        self.read_day(day(1))
+        day_sheet = self.sheet(day(1))
+        self.assertEqual(day_sheet["shift"], "DAY")
+        self.assertEqual(day_sheet["read"], {"DAY": 4, "NIGHT": 0})
+        night_sheet = self.sheet(day(1), "NIGHT")
+        self.assertEqual(night_sheet["shift"], "NIGHT")
+        kwh = night_sheet["rows"][0]
+        self.assertIsNone(kwh["reading"])
+        self.assertEqual(kwh["previous"], {"date": day(1), "shift": "DAY", "closing_reading": "1000.00"})
+
+    def test_saving_the_night_sheet_chains_the_next_morning_onto_it(self):
+        self.read_day(day(1))
+        response = self.save_sheet(day(1), "NIGHT", [(self.kwh, 1500), (self.first, 700)])
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual((response.data["created"], response.data["updated"]), (2, 0))
+        self.assertEqual(response.data["sheet"]["shift"], "NIGHT")
+        self.assertEqual(response.data["sheet"]["read"], {"DAY": 4, "NIGHT": 2})
+        self.assertEqual(self.get(self.kwh, day(1), "NIGHT").units_consumed, Decimal("500"))
+        # The day readings are untouched.
+        self.assertEqual(self.get(self.kwh, day(1)).closing_reading, Decimal("1000"))
+
+        rows = {row["name"]: row for row in self.sheet(day(2))["rows"]}
+        self.assertEqual(rows["KWH"]["previous"]["closing_reading"], "1500.00")
+        self.assertEqual(rows["KWH"]["previous"]["shift"], "NIGHT")
+        # The ground floor was not read that night, so it opens on its day's closing.
+        self.assertEqual(rows["Ground Floor"]["previous"]["shift"], "DAY")
+        # And the day sheet of the first shows the night's opening coming next.
+        first = {row["name"]: row for row in self.sheet(day(1))["rows"]}["KWH"]
+        self.assertEqual(first["next"]["shift"], "NIGHT")
+
+    def test_correcting_the_night_sheet_leaves_the_day_alone(self):
+        self.read_day(day(1))
+        self.save_sheet(day(1), "NIGHT", [(self.kwh, 1500)])
+        response = self.save_sheet(day(1), "NIGHT", [(self.kwh, 1600)])
+        self.assertEqual((response.data["created"], response.data["updated"]), (0, 1))
+        self.assertEqual(self.get(self.kwh, day(1), "NIGHT").units_consumed, Decimal("600"))
+        self.assertEqual(self.get(self.kwh, day(1)).units_consumed, Decimal("1000"))
+
+    def test_a_shift_the_sheet_does_not_know_is_refused(self):
+        self.assertEqual(self.client.get(SHEET_URL, {"date": str(D1), "shift": "EVENING"}).status_code, 400)
+        response = self.save_sheet(D1, "EVENING", [(self.kwh, 10)])
+        self.assertEqual(response.status_code, 400)
+
+    def test_the_split_counts_the_day_and_the_night(self):
+        self.read_day(day(1))
+        self.save_sheet(day(1), "NIGHT", [(self.kwh, 1600), (self.ground, 600), (self.lab, 60), (self.first, 900)])
+        data = self.client.get(SPLIT_URL, {"date_from": str(day(1)), "date_to": str(day(1))}).data
+        self.assertEqual(data["totals"]["supply_units"], "1600.00")
+        parties = {row["party"]: row["units"] for row in data["totals"]["by_party"]}
+        # Ground's rest 540 + half the lab 30; first floor 900 + half the lab 30.
+        self.assertEqual(parties, {OIL: "930.00", BEV: "570.00", UNASSIGNED: "100.00"})
+        self.assertNotIn("SPREAD", [issue["kind"] for issue in data["issues"]])
+
+    def test_a_break_between_the_day_and_the_night_says_so(self):
+        self.read(self.first, day(1), 0, 100)
+        DailyElectricityReading.objects.create(
+            meter=self.first, date=day(1), shift="NIGHT", opening_reading=Decimal("150"),
+            closing_reading=Decimal("200"), rate_per_unit=Decimal("9"),
+        )
+        data = self.client.get(SPLIT_URL, {"date_from": str(day(1)), "date_to": str(day(1))}).data
+        issue = next(i for i in data["issues"] if i["kind"] == "BREAK")
+        self.assertIn("between the day and night readings of 01 Sep", issue["message"])
+
+    def test_the_old_page_still_corrects_a_day_that_has_a_night(self):
+        day_reading = self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        response = self.client.patch(
+            f"{OLD_READINGS_URL}{day_reading.data['id']}/", {"remarks": "checked"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        # A second day reading is still refused there.
+        refused = self.client.post(
+            OLD_READINGS_URL,
+            {"meter": self.first.id, "date": str(day(1)), "opening_reading": "0", "closing_reading": "50"},
+            format="json",
+        )
+        self.assertEqual(refused.status_code, 400)
+
+    def test_the_old_page_carries_on_from_the_nights_closing(self):
+        self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        response = self.client.post(
+            OLD_READINGS_URL, {"meter": self.first.id, "date": str(day(2)), "closing_reading": "200"}, format="json"
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Decimal(response.data["opening_reading"]), Decimal("160"))
 
 
 class SplitReportTests(TreeFixture):

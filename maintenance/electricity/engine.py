@@ -163,6 +163,17 @@ class Reading:
     #: to follow on from the previous closing.
     meter_reset: bool = False
     id: Optional[int] = None
+    #: The day or the night round of ``date``; see :data:`SHIFT_ORDER`.
+    shift: str = "DAY"
+
+
+#: A meter is read by day and then by night; both belong to the reading's date.
+SHIFT_ORDER = {"DAY": 0, "NIGHT": 1}
+
+
+def chain_key(reading: Reading) -> Tuple[date, int]:
+    """Where a reading sits in its meter's chain."""
+    return reading.date, SHIFT_ORDER.get(reading.shift, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -172,13 +183,16 @@ class Reading:
 
 @dataclass(frozen=True)
 class DayUnits:
-    """One meter's units on one day, and the reading they came from."""
+    """One meter's units on one day, and the readings they came from."""
 
     units: Decimal
     rate: Decimal
+    #: The day's first reading — the one that covers any skipped days.
     reading: Reading
-    #: How many days the reading covers. 1 unless days were skipped.
+    #: How many days that reading covers. 1 unless days were skipped.
     spread_over: int = 1
+    #: Every reading with units on the day: the day and the night round.
+    readings: Tuple[Reading, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -283,6 +297,11 @@ def spread_readings(
     opening carries straight on from that reading's closing. Otherwise — the
     first reading of a meter, a reset, or a break — it covers its own day only,
     and a break is reported with the units that fell between the two readings.
+
+    A day read twice, by day and by night, has both rounds' units. The chain
+    runs through the shifts in order, but only whole days are ever skipped: a
+    day round that follows the previous day's (the night went unread) covers
+    its own day, and takes the night's units with it.
     """
     by_meter: Dict[int, List[Reading]] = defaultdict(list)
     for reading in readings:
@@ -291,14 +310,18 @@ def spread_readings(
     daily: Dict[int, Dict[date, DayUnits]] = defaultdict(dict)
     issues: List[Issue] = []
     for meter_id, rows in by_meter.items():
-        rows.sort(key=lambda row: row.date)
+        rows.sort(key=chain_key)
+        # day -> [(units, reading, days that reading covers)], in chain order.
+        parts: Dict[date, List[Tuple[Decimal, Reading, int]]] = defaultdict(list)
         previous: Optional[Reading] = None
         for reading in rows:
             covered = [reading.date]
             if previous is not None and not reading.meter_reset:
                 if reading.opening == previous.closing:
                     span = (reading.date - previous.date).days
-                    covered = [previous.date + timedelta(days=n) for n in range(1, span + 1)]
+                    covered = [
+                        previous.date + timedelta(days=n) for n in range(1, span + 1)
+                    ] or [reading.date]
                 else:
                     issues.append(
                         Issue(
@@ -309,6 +332,7 @@ def spread_readings(
                             * reading.multiplying_factor,
                             detail={
                                 "previous_date": previous.date,
+                                "previous_shift": previous.shift,
                                 "previous_closing": previous.closing,
                                 "opening": reading.opening,
                             },
@@ -316,8 +340,22 @@ def spread_readings(
                     )
             share = reading.units / len(covered)
             for day in covered:
-                daily[meter_id][day] = DayUnits(share, reading.rate, reading, len(covered))
+                parts[day].append((share, reading, len(covered)))
             previous = reading
+
+        for day, pieces in parts.items():
+            units = sum((piece[0] for piece in pieces), ZERO)
+            rates = {piece[1].rate for piece in pieces}
+            if len(rates) == 1:
+                rate = rates.pop()
+            elif units:
+                rate = sum((piece[0] * piece[1].rate for piece in pieces), ZERO) / units
+            else:
+                rate = pieces[-1][1].rate
+            _, first, spread_over = pieces[0]
+            daily[meter_id][day] = DayUnits(
+                units, rate, first, spread_over, tuple(piece[1] for piece in pieces)
+            )
     return daily, issues
 
 
@@ -414,14 +452,14 @@ class Allocator:
             if meter is None or meter.register_of is not None:
                 continue
             if day in per_day and meter_id not in setups:
-                reading = per_day[day].reading
-                if reading.date == day:
+                own = [reading for reading in per_day[day].readings if reading.date == day]
+                if own:
                     out.issues.append(
                         Issue(
                             IssueKind.READ_OUT_OF_SERVICE,
                             day,
                             meter_id,
-                            units=reading.units,
+                            units=sum((reading.units for reading in own), ZERO),
                         )
                     )
 

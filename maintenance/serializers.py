@@ -77,6 +77,7 @@ from .models import (
     MaterialIndentQuotationLine,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
+    ReadingShift,
     SafetyFine,
     SafetyFinePhoto,
     SafetyViolationType,
@@ -3472,8 +3473,11 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
         date = attrs.get("date") or (self.instance.date if self.instance else None)
 
         # Friendly duplicate check (UniqueConstraint would 500 otherwise).
+        # This page enters one reading a day, the day reading; Daily
+        # Electricity++ may add a night reading beside it, which is not a clash.
         if meter and date:
-            clash = DailyElectricityReading.objects.filter(meter=meter, date=date)
+            shift = self.instance.shift if self.instance else ReadingShift.DAY
+            clash = DailyElectricityReading.objects.filter(meter=meter, date=date, shift=shift)
             if self.instance:
                 clash = clash.exclude(pk=self.instance.pk)
             if clash.exists():
@@ -3488,7 +3492,7 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
         if opening is None and meter and date:
             previous = (
                 DailyElectricityReading.objects.filter(meter=meter, date__lt=date)
-                .order_by("-date")
+                .order_by("-date", "-shift")
                 .first()
             )
             if previous is None:

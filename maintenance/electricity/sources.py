@@ -180,6 +180,7 @@ def load(
             multiplying_factor=row.multiplying_factor,
             meter_reset=row.meter_reset,
             id=row.id,
+            shift=row.shift,
         )
         for row in DailyElectricityReading.objects.filter(
             is_active=True,
@@ -195,6 +196,7 @@ def load(
             "rate_per_unit",
             "multiplying_factor",
             "meter_reset",
+            "shift",
         )
     ]
 

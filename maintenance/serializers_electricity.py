@@ -15,6 +15,10 @@ Two rules shape the reading serializer here, and the split depends on both:
   moves the next reading's opening with it, filling in a skipped day takes that
   day out of the reading that had covered it, and deleting a reading hands its
   days to the next one. See :func:`relink_next`.
+
+The chain runs through the day's two rounds in order: the day reading, then the
+night reading, which opens on the day's closing. The next day's round opens on
+the night's closing — or on the day's, when the night was not read.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from decimal import Decimal
 from typing import Optional
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -38,6 +43,7 @@ from .models import (
     ElectricityConsumer,
     ElectricityMeter,
     ElectricityMeterSetup,
+    ReadingShift,
 )
 from .serializers import _meter_rate_per_unit as meter_rate_per_unit
 
@@ -351,18 +357,47 @@ class TreeMeterSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 
 
-def previous_reading(meter, day, *, exclude_pk=None) -> Optional[DailyElectricityReading]:
-    rows = DailyElectricityReading.objects.filter(meter=meter, date__lt=day, is_active=True)
-    if exclude_pk:
-        rows = rows.exclude(pk=exclude_pk)
-    return rows.order_by("-date").first()
+def earlier_than(day, shift=ReadingShift.DAY) -> Q:
+    """Readings before ``shift`` of ``day`` in the chain: a night follows its day."""
+    earlier = Q(date__lt=day)
+    if shift == ReadingShift.NIGHT:
+        earlier |= Q(date=day, shift=ReadingShift.DAY)
+    return earlier
 
 
-def next_reading(meter, day, *, exclude_pk=None) -> Optional[DailyElectricityReading]:
-    rows = DailyElectricityReading.objects.filter(meter=meter, date__gt=day, is_active=True)
+def later_than(day, shift=ReadingShift.DAY) -> Q:
+    """Readings after ``shift`` of ``day`` in the chain."""
+    later = Q(date__gt=day)
+    if shift == ReadingShift.DAY:
+        later |= Q(date=day, shift=ReadingShift.NIGHT)
+    return later
+
+
+def previous_reading(
+    meter, day, shift=ReadingShift.DAY, *, exclude_pk=None
+) -> Optional[DailyElectricityReading]:
+    rows = DailyElectricityReading.objects.filter(earlier_than(day, shift), meter=meter, is_active=True)
     if exclude_pk:
         rows = rows.exclude(pk=exclude_pk)
-    return rows.order_by("date").first()
+    # The shift values sort in the order the rounds are worked.
+    return rows.order_by("-date", "-shift").first()
+
+
+def next_reading(
+    meter, day, shift=ReadingShift.DAY, *, exclude_pk=None
+) -> Optional[DailyElectricityReading]:
+    rows = DailyElectricityReading.objects.filter(later_than(day, shift), meter=meter, is_active=True)
+    if exclude_pk:
+        rows = rows.exclude(pk=exclude_pk)
+    return rows.order_by("date", "shift").first()
+
+
+def reading_label(reading) -> str:
+    """"28 Sep 2026", or "28 Sep 2026 (night)" for the night round."""
+    label = f"{reading.date:%d %b %Y}"
+    if reading.shift == ReadingShift.NIGHT:
+        label += " (night)"
+    return label
 
 
 def relink_next(reading_next: Optional[DailyElectricityReading], was: Decimal, now: Decimal, user=None):
@@ -448,6 +483,7 @@ class TreeReadingSerializer(serializers.ModelSerializer):
             "consumer_codes",
             "attribution_display",
             "date",
+            "shift",
             "reading_time",
             "opening_reading",
             "closing_reading",
@@ -484,28 +520,35 @@ class TreeReadingSerializer(serializers.ModelSerializer):
         instance = self.instance
         meter = attrs.get("meter") or (instance.meter if instance else None)
         day = attrs.get("date") or (instance.date if instance else None)
+        shift = attrs.get("shift") or (instance.shift if instance else ReadingShift.DAY)
         if instance is not None and (
             ("meter" in attrs and attrs["meter"] != instance.meter)
             or ("date" in attrs and attrs["date"] != instance.date)
+            or ("shift" in attrs and attrs["shift"] != instance.shift)
         ):
             raise serializers.ValidationError(
                 {
                     "date": (
-                        "A reading cannot be moved to another meter or day. Delete it "
-                        "and enter it again where it belongs, so the days either side "
-                        "stay joined up."
+                        "A reading cannot be moved to another meter, day or shift. "
+                        "Delete it and enter it again where it belongs, so the "
+                        "readings either side stay joined up."
                     )
                 }
             )
         if meter is None or day is None:
             return attrs
 
-        clash = DailyElectricityReading.objects.filter(meter=meter, date=day)
+        clash = DailyElectricityReading.objects.filter(meter=meter, date=day, shift=shift)
         if instance:
             clash = clash.exclude(pk=instance.pk)
         if clash.exists():
             raise serializers.ValidationError(
-                {"date": "A reading for this meter and date already exists."}
+                {
+                    "date": (
+                        f"A {ReadingShift(shift).label.lower()} reading for this meter "
+                        "and date already exists."
+                    )
+                }
             )
 
         if instance is None:
@@ -514,8 +557,8 @@ class TreeReadingSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"date": refused})
 
         exclude = instance.pk if instance else None
-        previous = previous_reading(meter, day, exclude_pk=exclude)
-        following = next_reading(meter, day, exclude_pk=exclude)
+        previous = previous_reading(meter, day, shift, exclude_pk=exclude)
+        following = next_reading(meter, day, shift, exclude_pk=exclude)
         meter_reset = attrs.get("meter_reset", instance.meter_reset if instance else False)
 
         opening = attrs.get("opening_reading", instance.opening_reading if instance else None)
@@ -547,7 +590,7 @@ class TreeReadingSerializer(serializers.ModelSerializer):
                 {
                     "opening_reading": (
                         f"The opening must be the previous closing, "
-                        f"{previous.closing_reading} on {previous.date:%d %b %Y}. If the "
+                        f"{previous.closing_reading} on {reading_label(previous)}. If the "
                         "meter was replaced or its dial reset, tick 'Meter reset'. If "
                         "that closing is wrong, correct that reading instead."
                     )
@@ -574,7 +617,7 @@ class TreeReadingSerializer(serializers.ModelSerializer):
                 {
                     "closing_reading": (
                         f"This is above the next reading's closing, "
-                        f"{following.closing_reading} on {following.date:%d %b %Y}."
+                        f"{following.closing_reading} on {reading_label(following)}."
                     )
                 }
             )
@@ -594,7 +637,7 @@ class TreeReadingSerializer(serializers.ModelSerializer):
         reading = super().create(validated_data)
         # A reading filling in a skipped day: the next reading had covered this
         # day from the previous closing, and now carries on from this one.
-        following = next_reading(reading.meter, reading.date, exclude_pk=reading.pk)
+        following = next_reading(reading.meter, reading.date, reading.shift, exclude_pk=reading.pk)
         relink_next(
             following,
             reading.opening_reading,
@@ -606,7 +649,7 @@ class TreeReadingSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def update(self, instance, validated_data):
         was = instance.closing_reading
-        following = next_reading(instance.meter, instance.date, exclude_pk=instance.pk)
+        following = next_reading(instance.meter, instance.date, instance.shift, exclude_pk=instance.pk)
         reading = super().update(instance, validated_data)
         relink_next(following, was, reading.closing_reading, user=validated_data.get("updated_by"))
         return reading
@@ -630,6 +673,7 @@ class DaySheetEntrySerializer(serializers.Serializer):
 
 class DaySheetSaveSerializer(serializers.Serializer):
     date = serializers.DateField()
+    shift = serializers.ChoiceField(choices=ReadingShift.choices, default=ReadingShift.DAY)
     entries = DaySheetEntrySerializer(many=True)
 
     def validate_entries(self, entries):

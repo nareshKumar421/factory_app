@@ -392,7 +392,12 @@ def _issue_message(group: dict, snapshot, allocator, on: date) -> str:
         if group.get("_gap"):
             where = ""
             if group["count"] == 1 and group.get("_since"):
-                where = f" between {group['_since']:%d %b} and {group['days'][0]:%d %b}"
+                since, on = group["_since"], group["days"][0]
+                where = (
+                    f" between the day and night readings of {on:%d %b}"
+                    if since == on
+                    else f" between {since:%d %b} and {on:%d %b}"
+                )
             parts.append(f"{money(group['_gap'])} units fell{where} into no reading at all")
         if group.get("_overlap"):
             parts.append(f"{money(group['_overlap'])} units were counted twice")

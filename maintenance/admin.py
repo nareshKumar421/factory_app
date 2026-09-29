@@ -597,6 +597,7 @@ class ElectricityMeterAdmin(admin.ModelAdmin):
 class DailyElectricityReadingAdmin(admin.ModelAdmin):
     list_display = (
         "date",
+        "shift",
         "reading_time",
         "meter",
         "attributed_to",
@@ -607,7 +608,7 @@ class DailyElectricityReadingAdmin(admin.ModelAdmin):
         "rate_per_unit",
         "total_cost",
     )
-    list_filter = ("meter", "date", "companies", "consumers")
+    list_filter = ("meter", "date", "shift", "companies", "consumers")
     search_fields = ("meter__name", "remarks")
     raw_id_fields = ("meter",)
     filter_horizontal = ("companies", "consumers")

@@ -35,12 +35,14 @@ from production_execution.models import ProductionLine
 
 from . import meter_scope
 from .electricity import service
+from .electricity.engine import SHIFT_ORDER
 from .electricity.setup import delete_setup
 from .models import (
     DailyElectricityReading,
     ElectricityAllocationBasis,
     ElectricityMeter,
     ElectricityMeterSetup,
+    ReadingShift,
 )
 from .models_manager import UserElectricityMeter
 from .permissions import (
@@ -116,7 +118,7 @@ class ElectricityTreeMeterViewSet(ElectricityMeterPermissionMixin, viewsets.Mode
 
     def get_queryset(self):
         latest = DailyElectricityReading.objects.filter(meter=OuterRef("pk"), is_active=True).order_by(
-            "-date"
+            "-date", "-shift"
         )
         qs = ElectricityMeter.objects.select_related("register_of").prefetch_related(
             "companies", "consumers"
@@ -264,6 +266,9 @@ class ElectricityTreeReadingViewSet(DailyElectricityPermissionMixin, viewsets.Mo
         day = params.get("date")
         if day:
             qs = qs.filter(date=day)
+        shift = params.get("shift")
+        if shift:
+            qs = qs.filter(shift=shift.upper())
         date_from = params.get("date_from")
         if date_from:
             qs = qs.filter(date__gte=date_from)
@@ -282,7 +287,7 @@ class ElectricityTreeReadingViewSet(DailyElectricityPermissionMixin, viewsets.Mo
         company = params.get("company")
         if company:
             qs = qs.filter(_attributed_to(company)).distinct()
-        return qs.order_by("-date", "meter__name")
+        return qs.order_by("-date", "-shift", "meter__name")
 
     def perform_create(self, serializer):
         meter_scope.assert_can_record_for(self.request.user, [serializer.validated_data.get("meter")])
@@ -298,18 +303,29 @@ class ElectricityTreeReadingViewSet(DailyElectricityPermissionMixin, viewsets.Mo
         # The next reading took over from this one's closing. With this one
         # gone it takes over from where this one started, so the days this
         # reading covered pass to it instead of dropping out of the register.
-        following = next_reading(instance.meter, instance.date, exclude_pk=instance.pk)
+        following = next_reading(instance.meter, instance.date, instance.shift, exclude_pk=instance.pk)
         relink_next(following, instance.closing_reading, instance.opening_reading, user=self.request.user)
         instance.delete()
 
 
-class ElectricityDaySheetAPI(APIView):
-    """One day's readings for every meter, in tree order — read and saved together.
+def _shift_param(request) -> str:
+    raw = (request.query_params.get("shift") or ReadingShift.DAY).upper()
+    if raw not in ReadingShift.values:
+        raise ValidationError({"shift": "Use DAY or NIGHT."})
+    return raw
 
-    ``GET ?date=`` lists every meter in the tree that day with its previous
-    closing and the day's reading if there is one. ``POST`` saves a set of
-    closings in one go: all of them or none, so a half-saved round never leaves
-    the parents and their sub-meters out of step.
+
+class ElectricityDaySheetAPI(APIView):
+    """One round's readings for every meter, in tree order — read and saved together.
+
+    A day has two rounds, the day and the night (``?shift=DAY|NIGHT``, the day
+    when omitted). The night opens on the day's closing, and the next day opens
+    on the night's — or on the day's, when the night was not read.
+
+    ``GET ?date=&shift=`` lists every meter in the tree that day with its
+    previous closing and the round's reading if there is one. ``POST`` saves a
+    set of closings in one go: all of them or none, so a half-saved round never
+    leaves the parents and their sub-meters out of step.
     """
 
     def get_permissions(self):
@@ -319,28 +335,32 @@ class ElectricityDaySheetAPI(APIView):
 
     def get(self, request):
         day = _date_param(request, "date", timezone.localdate())
-        return Response(self._sheet(request.user, day))
+        return Response(self._sheet(request.user, day, _shift_param(request)))
 
-    def _sheet(self, user, day: date) -> dict:
+    def _sheet(self, user, day: date, shift: str) -> dict:
         tree = service.meter_tree(day)
         in_tree = [mid for mid, info in tree.items() if info["in_service"]]
         meters = {m.id: m for m in ElectricityMeter.objects.filter(pk__in=in_tree).prefetch_related("companies")}
-        todays = {
-            row.meter_id: row
-            for row in DailyElectricityReading.objects.filter(date=day, meter_id__in=in_tree, is_active=True)
-        }
+        here = (day, SHIFT_ORDER[shift])
+        todays = {}
+        read_by_shift = {value: 0 for value in ReadingShift.values}
         window = timedelta(days=62)
         before, after = {}, {}
         for row in DailyElectricityReading.objects.filter(
             meter_id__in=in_tree, date__gte=day - window, date__lte=day + window, is_active=True
-        ).order_by("date"):
-            if row.date < day:
+        ).order_by("date", "shift"):
+            at = (row.date, SHIFT_ORDER.get(row.shift, 0))
+            if at < here:
                 before[row.meter_id] = row
-            elif row.date > day and row.meter_id not in after:
-                after[row.meter_id] = row
+            elif at > here:
+                after.setdefault(row.meter_id, row)
+            else:
+                todays[row.meter_id] = row
+            if row.date == day:
+                read_by_shift[row.shift] = read_by_shift.get(row.shift, 0) + 1
         for meter_id in in_tree:
             if meter_id not in before and meter_id in meters:
-                found = previous_reading(meters[meter_id], day)
+                found = previous_reading(meters[meter_id], day, shift)
                 if found is not None:
                     before[meter_id] = found
 
@@ -368,7 +388,11 @@ class ElectricityDaySheetAPI(APIView):
                     "rate_per_unit": str(meter_rate_per_unit(meter, as_of=day)),
                     "keeps": meter_scope.manages(user, meter),
                     "split": service.describe_setup(setup_row)["summary"] if setup_row else None,
-                    "previous": {"date": prev.date, "closing_reading": str(prev.closing_reading)}
+                    "previous": {
+                        "date": prev.date,
+                        "shift": prev.shift,
+                        "closing_reading": str(prev.closing_reading),
+                    }
                     if prev
                     else None,
                     "reading": {
@@ -382,17 +406,28 @@ class ElectricityDaySheetAPI(APIView):
                     }
                     if reading
                     else None,
-                    "next": {"date": nxt.date, "opening_reading": str(nxt.opening_reading)}
+                    "next": {
+                        "date": nxt.date,
+                        "shift": nxt.shift,
+                        "opening_reading": str(nxt.opening_reading),
+                    }
                     if nxt
                     else None,
                 }
             )
-        return {"date": day, "rows": rows}
+        return {
+            "date": day,
+            "shift": shift,
+            # How many meters each round of the day has read, for the switch.
+            "read": read_by_shift,
+            "rows": rows,
+        }
 
     def post(self, request):
         payload = DaySheetSaveSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
         day = payload.validated_data["date"]
+        shift = payload.validated_data["shift"]
         entries = payload.validated_data["entries"]
         if not entries:
             raise ValidationError({"entries": "Nothing to save."})
@@ -400,7 +435,7 @@ class ElectricityDaySheetAPI(APIView):
         existing = {
             row.meter_id: row
             for row in DailyElectricityReading.objects.filter(
-                date=day, meter__in=[entry["meter"] for entry in entries]
+                date=day, shift=shift, meter__in=[entry["meter"] for entry in entries]
             )
         }
         creating = [entry for entry in entries if entry["meter"].pk not in existing]
@@ -418,6 +453,7 @@ class ElectricityDaySheetAPI(APIView):
             data = {
                 "meter": meter.pk,
                 "date": day,
+                "shift": shift,
                 "closing_reading": entry["closing_reading"],
                 "meter_reset": entry.get("meter_reset", False),
                 "remarks": entry.get("remarks", ""),
@@ -430,6 +466,7 @@ class ElectricityDaySheetAPI(APIView):
             if instance is not None:
                 data.pop("meter")
                 data.pop("date")
+                data.pop("shift")
             serializer = TreeReadingSerializer(
                 instance=instance,
                 data=data,
@@ -456,7 +493,7 @@ class ElectricityDaySheetAPI(APIView):
             {
                 "created": len(creating),
                 "updated": len(updating),
-                "sheet": self._sheet(request.user, day),
+                "sheet": self._sheet(request.user, day, shift),
             },
             status=status.HTTP_200_OK,
         )

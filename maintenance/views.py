@@ -5531,7 +5531,7 @@ class ElectricityMeterViewSet(ElectricityMeterPermissionMixin, viewsets.ModelVie
 
     def get_queryset(self):
         latest = DailyElectricityReading.objects.filter(meter=OuterRef("pk")).order_by(
-            "-date"
+            "-date", "-shift"
         )
         qs = ElectricityMeter.objects.prefetch_related("companies", "consumers").annotate(
             last_reading_date=Subquery(latest.values("date")[:1]),

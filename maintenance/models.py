@@ -2831,8 +2831,22 @@ class ElectricityMeterDriver(models.Model):
         return f"{source} × {self.weight}"
 
 
+class ReadingShift(models.TextChoices):
+    """Which round of the day a reading closes.
+
+    Daily Electricity++ reads each meter twice a day: the day round, then the
+    night round, which opens on the day's closing. The next day's round opens
+    on the night's closing, or on the day's when the night was not read. The
+    values sort in the order the rounds are worked, so ordering by ``shift``
+    orders a day's readings.
+    """
+
+    DAY = "DAY", "Day"
+    NIGHT = "NIGHT", "Night"
+
+
 class DailyElectricityReading(BaseModel):
-    """One reading per meter per day; units and cost are derived on save.
+    """One reading per meter per shift per day; units and cost are derived on save.
 
     ``units_consumed`` is the *billed* figure: the dial difference multiplied by
     the meter's grid multiplying factor. Both the factor and the rate are
@@ -2849,6 +2863,13 @@ class DailyElectricityReading(BaseModel):
     ``meter_reset`` is Daily Electricity++'s: there an opening must follow on
     from the previous closing, unless the dial was replaced or reset and the
     reading says so. The Daily Electricity page never sets it.
+
+    ``shift`` is Daily Electricity++'s too. That page reads a meter by day and
+    by night, and both readings belong to ``date``: the night of the 29th is
+    the 29th's, though its dial is read on the morning of the 30th. The Daily
+    Electricity page enters one reading a day, which is a day reading, and the
+    boards add a day's readings up, so a night reading counts in its day there
+    too.
     """
 
     meter = models.ForeignKey(
@@ -2857,6 +2878,12 @@ class DailyElectricityReading(BaseModel):
         related_name="daily_readings",
     )
     date = models.DateField()
+    shift = models.CharField(
+        max_length=5,
+        choices=ReadingShift.choices,
+        default=ReadingShift.DAY,
+        help_text="The day or night round. The night opens on the day's closing.",
+    )
     # When the dial was actually read, which is not when the row was typed:
     # the morning round is entered at the end of the shift, and a day's units
     # only mean something against the hour the meter was looked at. ``created_at``
@@ -2915,10 +2942,10 @@ class DailyElectricityReading(BaseModel):
     remarks = models.TextField(blank=True, default="")
 
     class Meta:
-        ordering = ["-date", "meter__name"]
+        ordering = ["-date", "-shift", "meter__name"]
         constraints = [
             models.UniqueConstraint(
-                fields=["meter", "date"], name="uniq_meter_reading_per_day"
+                fields=["meter", "date", "shift"], name="uniq_meter_reading_per_shift"
             ),
         ]
         verbose_name = "Daily Electricity Reading"
@@ -2955,7 +2982,8 @@ class DailyElectricityReading(BaseModel):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.meter.name} @ {self.date}: {self.units_consumed} units"
+        shift = " night" if self.shift == ReadingShift.NIGHT else ""
+        return f"{self.meter.name} @ {self.date}{shift}: {self.units_consumed} units"
 
 
 class DailyWastageLog(BaseModel):
