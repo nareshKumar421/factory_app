@@ -15,6 +15,10 @@ from gate_core.models import BaseModel
 
 class ARInvoiceStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
+    # Billed from a warehouse its raiser does not manage: held here, with nothing
+    # in SAP yet, until that warehouse's manager approves it (see
+    # ``ARInvoiceWarehouseApproval``). Then it goes to SAP like any other.
+    AWAITING_MANAGER = "AWAITING_MANAGER", "Awaiting warehouse manager"
     # SAP intercepted the post into an approval draft (ODRF + OWDD).
     PENDING_APPROVAL = "PENDING_APPROVAL", "Awaiting SAP approval"
     # The approver cleared it but the draft is not an OINV document yet.
@@ -111,6 +115,65 @@ class ARInvoicePosting(BaseModel):
         """
         lines = self.lines.all()
         return bool(lines) and all(line.base_entry is None for line in lines)
+
+
+class ARWarehouseApprovalStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    APPROVED = "APPROVED", "Approved"
+    REJECTED = "REJECTED", "Rejected"
+
+
+class ARInvoiceWarehouseApproval(BaseModel):
+    """One warehouse's say on a bill raised by someone who does not manage it.
+
+    SAP will not stop these: the app posts as the shared Service Layer user, and
+    every A/R approval template that user originates on is inactive, so a bill
+    sent to SAP is simply added. The check therefore happens here, before
+    anything is sent — anyone may bill from any warehouse, but a line from a
+    warehouse the raiser does not manage waits for that warehouse's manager.
+
+    One row per such warehouse, not one per bill, because a bill can span
+    several and each manager answers only for their own stock. The bill goes to
+    SAP when every row is approved; any one rejection rejects it. The decision
+    is taken on the existing Invoice Approval page, beside the OMS and SAP rows.
+    """
+
+    ar_invoice = models.ForeignKey(
+        ARInvoicePosting,
+        on_delete=models.CASCADE,
+        related_name="warehouse_approvals",
+    )
+    warehouse_code = models.CharField(max_length=20)
+    status = models.CharField(
+        max_length=10,
+        choices=ARWarehouseApprovalStatus.choices,
+        default=ARWarehouseApprovalStatus.PENDING,
+    )
+    decided_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ar_invoice_warehouse_decisions",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    # Why it was rejected; blank on an approval.
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "ar_invoice_warehouse_approval"
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ar_invoice", "warehouse_code"],
+                name="uniq_ar_invoice_warehouse_approval",
+            ),
+        ]
+        indexes = [models.Index(fields=["warehouse_code", "status"])]
+        default_permissions = ()
+
+    def __str__(self):
+        return f"AR invoice #{self.ar_invoice_id} {self.warehouse_code}: {self.status}"
 
 
 class ARInvoiceLine(models.Model):

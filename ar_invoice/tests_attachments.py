@@ -76,6 +76,13 @@ class ARInvoiceAttachmentTests(APITestCase):
                 codename__in=["view_ar_invoice_posting", "create_ar_invoice_posting"],
             )
         )
+        # Billing from their own warehouse, so the bill goes straight to SAP
+        # rather than waiting for a warehouse manager.
+        from warehouse.models_manager import UserWarehouse
+
+        UserWarehouse.objects.create(
+            user=cls.creator, company=cls.company, warehouse_code="GP-FG"
+        )
 
     def setUp(self):
         self.client = APIClient()

@@ -1,6 +1,11 @@
 from django.urls import path
 
 from .views import (
+    AppInvoiceAuditView,
+    AppInvoiceHistoryView,
+    AppInvoiceListView,
+    AppInvoicePendingCountView,
+    AppInvoiceStatusUpdateView,
     InvoiceApprovalAuditView,
     InvoiceApprovalHistoryView,
     InvoiceApprovalListView,
@@ -60,5 +65,32 @@ urlpatterns = [
         "oms-invoices/<int:pk>/audit/",
         OmsInvoiceAuditView.as_view(),
         name="oms-invoice-approval-audit",
+    ),
+    # Factory bills — raised in this app from a warehouse the raiser does not
+    # manage, held for that warehouse's manager (rows from ar_invoice)
+    path(
+        "app-invoices/",
+        AppInvoiceListView.as_view(),
+        name="app-invoice-approval-list",
+    ),
+    path(
+        "app-invoices/pending-count/",
+        AppInvoicePendingCountView.as_view(),
+        name="app-invoice-approval-pending-count",
+    ),
+    path(
+        "app-invoices/<int:pk>/status/",
+        AppInvoiceStatusUpdateView.as_view(),
+        name="app-invoice-approval-status",
+    ),
+    path(
+        "app-invoices/<int:pk>/history/",
+        AppInvoiceHistoryView.as_view(),
+        name="app-invoice-approval-history",
+    ),
+    path(
+        "app-invoices/<int:pk>/audit/",
+        AppInvoiceAuditView.as_view(),
+        name="app-invoice-approval-audit",
     ),
 ]

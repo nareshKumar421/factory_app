@@ -12,7 +12,9 @@ from .models import (
     ARInvoiceLine,
     ARInvoicePayment,
     ARInvoicePosting,
+    ARInvoiceWarehouseApproval,
     ARPaymentStatus,
+    ARWarehouseApprovalStatus,
 )
 
 
@@ -205,9 +207,39 @@ class ARInvoicePaymentWriteSerializer(serializers.Serializer):
         return attrs
 
 
+class ARInvoiceWarehouseApprovalSerializer(serializers.ModelSerializer):
+    """One warehouse's approval on a held bill, as the raiser's screens show it.
+
+    ``approvers`` names who can clear a still-pending one, so the counter knows
+    whom to call while the customer waits.
+    """
+
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    decided_by_name = serializers.SerializerMethodField()
+    approvers = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ARInvoiceWarehouseApproval
+        fields = [
+            "id", "warehouse_code", "status", "status_display",
+            "decided_by_name", "decided_at", "remarks", "approvers",
+        ]
+
+    def get_decided_by_name(self, obj):
+        return ARInvoicePostingSerializer._name(obj.decided_by)
+
+    def get_approvers(self, obj):
+        if obj.status != ARWarehouseApprovalStatus.PENDING:
+            return []
+        from .services import warehouse_approver_names
+
+        return warehouse_approver_names(obj.ar_invoice.company_id, obj.warehouse_code)
+
+
 class ARInvoicePostingSerializer(serializers.ModelSerializer):
     lines = ARInvoiceLineSerializer(many=True, read_only=True)
     attachments = ARInvoiceAttachmentSerializer(many=True, read_only=True)
+    warehouse_approvals = ARInvoiceWarehouseApprovalSerializer(many=True, read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     created_by_name = serializers.SerializerMethodField()
     posted_by_name = serializers.SerializerMethodField()
@@ -223,7 +255,7 @@ class ARInvoicePostingSerializer(serializers.ModelSerializer):
             "sap_draft_entry", "sap_approval_code", "approval_remarks",
             "sap_doc_entry", "sap_doc_num", "sap_doc_total",
             "posted_at", "created_at", "created_by_name", "posted_by_name",
-            "lines", "attachments", "payment",
+            "lines", "attachments", "payment", "warehouse_approvals",
         ]
 
     @staticmethod

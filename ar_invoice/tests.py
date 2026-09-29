@@ -153,6 +153,15 @@ class ARInvoiceEndpointTests(APITestCase):
                 codename="view_ar_invoice_posting",
             )
         )
+        # The creator runs the warehouses these tests bill from, so their bills
+        # go straight to SAP. A bill from a warehouse they do not manage waits
+        # for its manager — see tests_warehouse_approval.
+        from warehouse.models_manager import UserWarehouse
+
+        for code in ("GP-FG", "DL-J3"):
+            UserWarehouse.objects.create(
+                user=cls.creator, company=cls.company, warehouse_code=code
+            )
 
     def setUp(self):
         self.client = APIClient()

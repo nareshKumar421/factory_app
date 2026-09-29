@@ -1,4 +1,4 @@
-"""APIViews for the invoice-approval module (OMS + SAP sources).
+"""APIViews for the invoice-approval module (OMS, SAP and factory-app sources).
 
 Head-office billing raises A/R invoices two ways, and the approver page shows
 both: entries logged in the external OMS service (the default view — proxied via
@@ -8,6 +8,11 @@ HANA via :class:`sap_client.client.SAPClient`, decided through the Service Layer
 ``invoices/`` routes). On a successful decision on either source we also write a
 local :class:`InvoiceApprovalAudit` row so JI can see which employee acted —
 SAP and OMS themselves only ever see the shared service account.
+
+The third source is this app's own A/R Invoices screen: a bill raised there from
+a warehouse its raiser does not manage is held until that warehouse's manager
+decides it (``app-invoices/`` routes, rows from ``ar_invoice``). The page shows
+those beside whichever of the other two is selected, so no toggle hides them.
 
 ``ApprovalBaseView`` mirrors ``marketplace/views.py`` ``MpBaseView`` — per-method
 permissions and a centralized ``handle_exception`` that maps the SAP domain errors
@@ -27,6 +32,7 @@ from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidatio
 from sap_client.models import SapApproverIdentity
 from warehouse.services import warehouse_scope
 
+from . import app_bills
 from . import permissions as approval_perms
 from .models import InvoiceApprovalAudit
 from .oms import (
@@ -468,3 +474,153 @@ class OmsInvoiceAuditView(OmsApprovalBaseView):
             source=InvoiceApprovalAudit.SOURCE_OMS,
         )
         return Response(InvoiceApprovalAuditSerializer(rows, many=True).data)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Factory bills — A/R invoices raised in THIS app from a warehouse the raiser
+# does not manage, held here until that warehouse's manager decides them. Same
+# page, permissions and warehouse scoping as the two sources above; the rows
+# are ``ar_invoice.ARInvoiceWarehouseApproval`` and the id is that row's.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class AppApprovalBaseView(ApprovalBaseView):
+    """Adds the A/R service and ValueError → 400 to ApprovalBaseView."""
+
+    def handle_exception(self, exc):
+        if isinstance(exc, ValueError):
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return super().handle_exception(exc)
+
+    def ar_service(self):
+        from ar_invoice.services import ARInvoiceService
+
+        return ARInvoiceService(company_code=self.company.code)
+
+    def can_approve(self):
+        return approval_perms.CanApproveInvoice().has_permission(self.request, self)
+
+    def approval_or_404(self, pk):
+        """The row, scope-checked against its warehouse — or None."""
+        from ar_invoice.models import ARInvoiceWarehouseApproval
+
+        approval = (
+            ARInvoiceWarehouseApproval.objects.select_related(
+                "ar_invoice", "ar_invoice__created_by", "ar_invoice__posted_by",
+                "decided_by",
+            )
+            .filter(pk=pk, ar_invoice__company=self.company)
+            .first()
+        )
+        if approval is not None:
+            self.assert_manages([approval.warehouse_code])
+        return approval
+
+
+class AppInvoiceListView(AppApprovalBaseView):
+    """GET /api/v1/invoice-approvals/app-invoices/?whs=BH-PTD&status=PENDING."""
+
+    def get(self, request):
+        query = InvoiceListQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        warehouse = query.validated_data["whs"]
+        self.assert_manages([warehouse])
+        approvals = list(
+            self.ar_service().warehouse_approvals_for(
+                warehouse, query.validated_data.get("status")
+            )
+        )
+        stock_map = app_bills.build_stock_map(self.company.code, approvals)
+        can_approve = self.can_approve()
+        return Response(
+            [app_bills.serialize_row(a, stock_map, can_approve) for a in approvals]
+        )
+
+
+class AppInvoicePendingCountView(AppApprovalBaseView):
+    """GET /api/v1/invoice-approvals/app-invoices/pending-count/[?whs=BH-PTD]
+
+    ``by_warehouse`` covers every warehouse the caller may decide, not only
+    ``whs``: the badge and the page use it to point a manager at a bill waiting
+    in a warehouse they do not have selected. ``pending`` is for ``whs`` alone.
+    """
+
+    def get(self, request):
+        whs = (request.query_params.get("whs") or "").strip().upper()
+        if whs:
+            self.assert_manages([whs])
+        by_warehouse = self.ar_service().pending_warehouse_approval_counts(request.user)
+        pending = by_warehouse.get(whs, 0) if whs else 0
+        return Response({
+            "pending": pending,
+            "total": pending,
+            "all_warehouses": sum(by_warehouse.values()),
+            "by_warehouse": by_warehouse,
+        })
+
+
+class AppInvoiceStatusUpdateView(AppApprovalBaseView):
+    """PATCH /api/v1/invoice-approvals/app-invoices/<pk>/status/ — approve or reject.
+
+    ``pk`` is the warehouse-approval row. The last approval a bill needs creates
+    it in SAP straight away; the response says what became of it.
+    """
+
+    def patch(self, request, pk):
+        serializer = InvoiceStatusUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if self.approval_or_404(pk) is None:
+            return Response(
+                {"detail": "No such bill waiting for approval."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        approve = data["status"] == "APPROVED"
+        result = self.ar_service().decide_warehouse_approval(
+            pk, request.user, approve=approve, reason=data.get("rejection_reason", "")
+        )
+        posting = result["posting"]
+        if not approve:
+            message = "Bill rejected. It will not be created in SAP."
+        elif posting.sap_doc_num:
+            message = f"Approved. Created in SAP as bill {posting.sap_doc_num}."
+        elif posting.status == "AWAITING_MANAGER":
+            message = "Approved. The bill still waits on another warehouse's manager."
+        else:
+            message = "Approved."
+        body = {
+            "message": message,
+            "posting_id": posting.id,
+            "posting_status": posting.status,
+            "sap_doc_entry": posting.sap_doc_entry,
+            "sap_doc_num": posting.sap_doc_num,
+        }
+        if result["warning"]:
+            body["warning"] = result["warning"]
+        return Response(body)
+
+
+class AppInvoiceHistoryView(AppApprovalBaseView):
+    """GET /api/v1/invoice-approvals/app-invoices/<pk>/history/ — the bill's trail."""
+
+    def get(self, request, pk):
+        approval = self.approval_or_404(pk)
+        if approval is None:
+            return Response(
+                {"detail": "No such bill waiting for approval."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(app_bills.history(approval.ar_invoice))
+
+
+class AppInvoiceAuditView(AppApprovalBaseView):
+    """GET /api/v1/invoice-approvals/app-invoices/<pk>/audit/ — who decided it."""
+
+    def get(self, request, pk):
+        approval = self.approval_or_404(pk)
+        if approval is None:
+            return Response(
+                {"detail": "No such bill waiting for approval."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(app_bills.audit(approval))

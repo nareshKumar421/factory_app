@@ -1,13 +1,22 @@
 """Coordinates the A/R invoice lifecycle against SAP.
 
-Flow: pick a customer's open Sales Order lines → submit (local PENDING record)
-→ post to SAP (``Invoices``, lines copied by ``BaseType 17``). The Service
-Layer login is expected to be an originator on an active ObjType-13 approval
-template, so the post normally comes back as ``pending_approval`` with an ODRF
-draft; the record tracks the draft's approval request (the same requests the
+Flow: pick a customer's open Sales Order lines (or build free cash-sale lines)
+→ submit (local PENDING record) → post to SAP (``Invoices``, SO lines copied by
+``BaseType 17``).
+
+Anyone may bill from any warehouse, but a line from a warehouse the raiser does
+not manage holds the whole bill here first (AWAITING_MANAGER, one
+``ARInvoiceWarehouseApproval`` per such warehouse). Nothing reaches SAP until
+every one of those managers approves it on the Invoice Approval page. SAP
+cannot be relied on for this: the Service Layer login is an originator only on
+*inactive* ObjType-13 approval templates (all 18 of them, as of 2026-09-29), so
+SAP adds whatever it is sent, and the app's bills went straight in.
+
+Should SAP ever hold a post as an approval draft (``pending_approval``, an ODRF
+draft), the record tracks the draft's approval request (the same requests the
 warehouse Invoice Approval page decides) until it is approved and the draft is
-added as the real OINV invoice. When no template matches, SAP posts directly
-and the record jumps straight to POSTED.
+added as the real OINV invoice. When no template matches, as today, SAP posts
+directly and the record jumps straight to POSTED.
 
 A/R specifics vs the A/P twin (``ap_invoice.services``):
 
@@ -34,6 +43,7 @@ from company.models import Company
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 from sap_client.hana.batch_stock_reader import InsufficientBatchStock
+from warehouse.services import warehouse_scope
 
 from .models import (
     ARInvoiceAttachment,
@@ -41,7 +51,9 @@ from .models import (
     ARInvoicePayment,
     ARInvoicePosting,
     ARInvoiceStatus,
+    ARInvoiceWarehouseApproval,
     ARPaymentStatus,
+    ARWarehouseApprovalStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +62,7 @@ logger = logging.getLogger(__name__)
 # releases them; POSTED lines are closed by SAP itself (OpenQty drops).
 ACTIVE_STATUSES = (
     ARInvoiceStatus.PENDING,
+    ARInvoiceStatus.AWAITING_MANAGER,
     ARInvoiceStatus.PENDING_APPROVAL,
     ARInvoiceStatus.APPROVED,
     ARInvoiceStatus.FAILED,
@@ -81,6 +94,45 @@ COUNTER_SALE_BILTY = "NA"
 # Wide enough that a bill raised "the other day" is on the screen without anyone
 # touching a date — a narrow default reads as "SAP has no such invoice".
 CASH_SALE_DEFAULT_DAYS = 90
+
+# What a warehouse manager needs, beyond managing the warehouse, to decide a bill
+# held for them — the same permission the Invoice Approval page gates its
+# approve/reject buttons on.
+APPROVE_INVOICE_PERMISSION = ("invoice_approval", "approve_invoice")
+
+
+def warehouse_approver_names(company_id: int, warehouse_code: str) -> List[str]:
+    """Who can clear a bill held for ``warehouse_code``: its managers who may approve.
+
+    Superusers can too, but naming them would send the counter to whoever
+    administers the system instead of whoever runs the warehouse.
+    """
+    from django.contrib.auth import get_user_model
+    from django.db.models import Q
+
+    app_label, codename = APPROVE_INVOICE_PERMISSION
+    holds_permission = Q(
+        user_permissions__content_type__app_label=app_label,
+        user_permissions__codename=codename,
+    ) | Q(
+        groups__permissions__content_type__app_label=app_label,
+        groups__permissions__codename=codename,
+    )
+    users = (
+        get_user_model()
+        .objects.filter(
+            is_active=True,
+            is_superuser=False,
+            managed_warehouses__company_id=company_id,
+            managed_warehouses__warehouse_code__iexact=(warehouse_code or "").strip(),
+            managed_warehouses__is_active=True,
+        )
+        .filter(holds_permission)
+        .distinct()
+    )
+    return sorted(
+        (getattr(user, "full_name", "") or user.get_username()) for user in users
+    )
 
 
 class ARInvoiceService:
@@ -181,7 +233,10 @@ class ARInvoiceService:
                     original_filename=getattr(uploaded_file, "name", ""),
                     uploaded_by=user,
                 )
+            held = self._hold_for_warehouse_managers(posting, user)
 
+        if held:
+            return posting
         return self.post_to_sap(posting.id, user)
 
     def create_direct_invoice(
@@ -313,14 +368,24 @@ class ARInvoiceService:
                     original_filename=getattr(uploaded_file, "name", ""),
                     uploaded_by=user,
                 )
+            held = self._hold_for_warehouse_managers(posting, user)
 
+        if held:
+            return posting
         return self.post_to_sap(posting.id, user)
 
     def post_to_sap(self, posting_id: int, user) -> ARInvoicePosting:
         """Send a PENDING/FAILED record to SAP (retriable)."""
         posting = self.get_posting(posting_id)
+        if posting.status == ARInvoiceStatus.AWAITING_MANAGER:
+            waiting = ", ".join(self._waiting_warehouses(posting)) or "its warehouse"
+            raise ValueError(
+                f"This bill is waiting for the manager of {waiting} to approve it. "
+                "It goes to SAP as soon as they do."
+            )
         if posting.status not in (ARInvoiceStatus.PENDING, ARInvoiceStatus.FAILED):
             raise ValueError("Only pending or failed A/R invoices can be posted to SAP.")
+        self._assert_cleared(posting, user)
 
         attachment_records = posting.attachments.all().order_by("id")
         sap_client = self.sap()
@@ -481,14 +546,19 @@ class ARInvoiceService:
     def cancel(self, posting_id: int, user) -> ARInvoicePosting:
         """Abandon a record that never reached SAP, releasing its SO lines.
 
-        Only PENDING/FAILED can be cancelled — once SAP holds a draft
-        (PENDING_APPROVAL onwards) the document exists there and must be
-        rejected or handled in SAP instead.
+        Only PENDING/FAILED, or a bill still waiting on a warehouse manager, can
+        be cancelled — once SAP holds a draft (PENDING_APPROVAL onwards) the
+        document exists there and must be rejected or handled in SAP instead.
         """
         posting = self.get_posting(posting_id)
-        if posting.status not in (ARInvoiceStatus.PENDING, ARInvoiceStatus.FAILED):
+        if posting.status not in (
+            ARInvoiceStatus.PENDING,
+            ARInvoiceStatus.AWAITING_MANAGER,
+            ARInvoiceStatus.FAILED,
+        ):
             raise ValueError(
-                "Only a pending or failed A/R invoice can be cancelled "
+                "Only a pending or failed A/R invoice, or one still waiting for a "
+                "warehouse manager, can be cancelled "
                 f"(current status: {posting.get_status_display()})."
             )
         posting.status = ARInvoiceStatus.CANCELLED
@@ -507,6 +577,255 @@ class ARInvoiceService:
         )
 
     # ------------------------------------------------------------------
+    # Warehouse-manager approval
+    # ------------------------------------------------------------------
+
+    def unmanaged_warehouses(self, user, warehouse_codes) -> List[str]:
+        """The warehouses among ``warehouse_codes`` that ``user`` does not manage.
+
+        Upper-cased and sorted. Empty for a superuser, who is exempt from the
+        warehouse rules everywhere else too — and a user who manages nothing gets
+        every one of them back: they may still bill, it all just waits.
+        """
+        if warehouse_scope.is_unrestricted(user):
+            return []
+        managed = warehouse_scope.managed_warehouses(user, self.company_code)
+        wanted = {(code or "").strip().upper() for code in warehouse_codes}
+        wanted.discard("")
+        return sorted(code for code in wanted if code not in managed)
+
+    def _hold_for_warehouse_managers(self, posting: ARInvoicePosting, user) -> bool:
+        """Hold a new bill for the managers of the warehouses its raiser does not run.
+
+        True when it is held, and then nothing may be sent to SAP: one approval
+        row is opened per such warehouse and the bill waits as AWAITING_MANAGER.
+        Called inside the transaction that creates the bill, so a bill never
+        exists, even for a moment, as a PENDING record that could be posted.
+        """
+        unmanaged = self.unmanaged_warehouses(
+            user, [line.warehouse_code for line in posting.lines.all()]
+        )
+        if not unmanaged:
+            return False
+        ARInvoiceWarehouseApproval.objects.bulk_create(
+            ARInvoiceWarehouseApproval(
+                ar_invoice=posting,
+                warehouse_code=code,
+                created_by=user,
+                updated_by=user,
+            )
+            for code in unmanaged
+        )
+        posting.status = ARInvoiceStatus.AWAITING_MANAGER
+        posting.save(update_fields=["status", "updated_at"])
+        return True
+
+    @staticmethod
+    def _waiting_warehouses(posting: ARInvoicePosting) -> List[str]:
+        return list(
+            posting.warehouse_approvals.filter(
+                status=ARWarehouseApprovalStatus.PENDING
+            ).values_list("warehouse_code", flat=True)
+        )
+
+    def _assert_cleared(self, posting: ARInvoicePosting, user) -> None:
+        """Refuse to send a bill to SAP for a warehouse nobody has answered for.
+
+        Every warehouse on the bill must be one ``user`` manages, or one whose
+        manager has approved this bill. Checked on every post, not only when the
+        bill is created: a FAILED bill can be retried by someone other than the
+        person who raised it, and a bill raised before this rule existed carries
+        no approvals at all.
+        """
+        approved = set(
+            posting.warehouse_approvals.filter(
+                status=ARWarehouseApprovalStatus.APPROVED
+            ).values_list("warehouse_code", flat=True)
+        )
+        missing = [
+            code
+            for code in self.unmanaged_warehouses(
+                user, [line.warehouse_code for line in posting.lines.all()]
+            )
+            if code not in approved
+        ]
+        if missing:
+            raise ValueError(
+                f"You do not manage {', '.join(missing)}, and its manager has not "
+                "approved this bill, so it cannot be sent to SAP. Cancel it and "
+                "raise it again to send it for approval."
+            )
+
+    def decide_warehouse_approval(
+        self, approval_id: int, user, approve: bool, reason: str = ""
+    ) -> Dict[str, Any]:
+        """One warehouse manager's decision on a held bill.
+
+        A rejection rejects the bill. An approval that leaves no warehouse still
+        waiting releases it: it is posted to SAP there and then, as the person who
+        raised it, exactly as it would have been had they managed the warehouse.
+
+        Returns ``{"posting": ..., "warning": str | None}``. The warning is a post
+        that failed after the approval was recorded — the approval stands, the
+        bill is FAILED, and it is retried from the A/R Invoices page like any
+        other failed post.
+        """
+        if not approve and not (reason or "").strip():
+            raise ValueError("Say why the bill is rejected — its raiser reads this.")
+        name = (getattr(user, "full_name", "") or user.get_username() or "").strip()
+        with transaction.atomic():
+            approval = (
+                ARInvoiceWarehouseApproval.objects.select_for_update()
+                .filter(pk=approval_id, ar_invoice__company=self.company)
+                .first()
+            )
+            if approval is None:
+                raise ValueError(f"No bill is waiting on approval {approval_id}.")
+            posting = ARInvoicePosting.objects.select_for_update().get(
+                pk=approval.ar_invoice_id
+            )
+            warehouse_scope.assert_manages(
+                user,
+                self.company_code,
+                [approval.warehouse_code],
+                action="decide bills raised from this warehouse",
+            )
+            if (
+                posting.status != ARInvoiceStatus.AWAITING_MANAGER
+                or approval.status != ARWarehouseApprovalStatus.PENDING
+            ):
+                raise ValueError(
+                    "This bill is no longer waiting for approval "
+                    f"(it is {posting.get_status_display().lower()})."
+                )
+
+            approval.status = (
+                ARWarehouseApprovalStatus.APPROVED
+                if approve
+                else ARWarehouseApprovalStatus.REJECTED
+            )
+            approval.decided_by = user
+            approval.decided_at = timezone.now()
+            approval.remarks = "" if approve else (reason or "").strip()
+            approval.updated_by = user
+            approval.save(
+                update_fields=[
+                    "status", "decided_by", "decided_at", "remarks",
+                    "updated_by", "updated_at",
+                ]
+            )
+
+            if not approve:
+                posting.status = ARInvoiceStatus.REJECTED
+                posting.approval_remarks = (
+                    f"{approval.warehouse_code}: {approval.remarks} — {name}"
+                )
+                posting.updated_by = user
+                posting.save(
+                    update_fields=["status", "approval_remarks", "updated_by", "updated_at"]
+                )
+                return {"posting": posting, "warning": None}
+
+            if posting.warehouse_approvals.exclude(
+                status=ARWarehouseApprovalStatus.APPROVED
+            ).exists():
+                # Another warehouse on the same bill has still to answer.
+                return {"posting": posting, "warning": None}
+
+            posting.status = ARInvoiceStatus.PENDING
+            posting.updated_by = user
+            self._move_dispatch_to_release_day(posting)
+            posting.save(
+                update_fields=["status", "dispatch_date", "updated_by", "updated_at"]
+            )
+
+        # Outside the lock: SAP is slow, and a rolled-back transaction must never
+        # forget a document SAP has already added.
+        raiser = posting.created_by or user
+        try:
+            posting = self.post_to_sap(posting.id, raiser)
+        except (ValueError, SAPValidationError, SAPConnectionError, SAPDataError) as exc:
+            logger.warning(
+                "A/R invoice %s approved for %s but not posted: %s",
+                posting.id, approval.warehouse_code, exc,
+            )
+            posting.refresh_from_db()
+            return {
+                "posting": posting,
+                "warning": (
+                    f"Approved, but creating the bill in SAP failed: {exc} — "
+                    "retry it from the A/R Invoices page."
+                ),
+            }
+        return {"posting": posting, "warning": None}
+
+    @staticmethod
+    def _move_dispatch_to_release_day(posting: ARInvoicePosting) -> None:
+        """Keep a counter sale's dispatch date possible once it is released late.
+
+        The cash-sale form sends no invoice date, so SAP dates the bill the day
+        it is added — the day it is approved, for a held one — and SAP refuses a
+        dispatch date before the invoice's own (1300014). A counter sale cannot
+        have left before its bill existed, so a dispatch date the approval has
+        overtaken moves to the day the bill is actually raised.
+        """
+        today = timezone.localdate()
+        if (
+            posting.dispatch_date
+            and not posting.doc_date
+            and posting.dispatch_date < today
+        ):
+            posting.dispatch_date = today
+
+    def warehouse_approvals_for(self, warehouse_code: str, status: Optional[str] = None):
+        """The held bills one warehouse is asked about, as the approval page lists them.
+
+        PENDING means still actionable: the row is undecided AND the bill is
+        still held — a bill cancelled by its raiser, or rejected by another
+        warehouse on it, drops off the tab rather than lingering as undecidable.
+        """
+        rows = ARInvoiceWarehouseApproval.objects.filter(
+            ar_invoice__company=self.company,
+            warehouse_code=(warehouse_code or "").strip().upper(),
+        )
+        if status == ARWarehouseApprovalStatus.PENDING:
+            rows = rows.filter(
+                status=ARWarehouseApprovalStatus.PENDING,
+                ar_invoice__status=ARInvoiceStatus.AWAITING_MANAGER,
+            )
+        elif status:
+            rows = rows.filter(status=status)
+        return (
+            rows.select_related(
+                "ar_invoice", "ar_invoice__created_by", "decided_by"
+            )
+            .prefetch_related("ar_invoice__lines")
+            .order_by("-ar_invoice__created_at", "-id")
+        )
+
+    def pending_warehouse_approval_counts(self, user) -> Dict[str, int]:
+        """``{warehouse: bills waiting}`` over every warehouse ``user`` may decide.
+
+        Across all of them, not only the one the approval page has selected: a
+        manager of four warehouses must see that a counter bill is waiting at one
+        they are not currently looking at.
+        """
+        rows = ARInvoiceWarehouseApproval.objects.filter(
+            ar_invoice__company=self.company,
+            status=ARWarehouseApprovalStatus.PENDING,
+            ar_invoice__status=ARInvoiceStatus.AWAITING_MANAGER,
+        )
+        if not warehouse_scope.is_unrestricted(user):
+            managed = warehouse_scope.managed_warehouses(user, self.company_code)
+            if not managed:
+                return {}
+            rows = rows.filter(warehouse_code__in=managed)
+        counts: Dict[str, int] = {}
+        for code in rows.values_list("warehouse_code", flat=True):
+            counts[code] = counts.get(code, 0) + 1
+        return counts
+
+    # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
 
@@ -514,7 +833,9 @@ class ARInvoiceService:
         return (
             ARInvoicePosting.objects.filter(company=self.company)
             .select_related("company", "posted_by", "created_by")
-            .prefetch_related("lines", "attachments", "payments")
+            .prefetch_related(
+                "lines", "attachments", "payments", "warehouse_approvals__decided_by"
+            )
             .order_by("-created_at")
         )
 
