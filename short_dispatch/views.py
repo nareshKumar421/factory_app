@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 from company.permissions import HasCompanyContext
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
 
+from .models import ShortDispatchStatus
 from .permissions import CanCreateShortDispatch, CanViewShortDispatch
 from .serializers import (
     ShortDispatchCreateSerializer,
@@ -53,7 +54,8 @@ class ShortDispatchListCreateAPI(APIView):
         return Response(ShortDispatchListSerializer(entries, many=True).data)
 
     def post(self, request):
-        """The single form. A 201 means SAP already holds the Return Note."""
+        """The single form. A 201 means SAP already holds the Return Note; a 202,
+        that SAP was not answering and it is waiting to post."""
         serializer = ShortDispatchCreateSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(
@@ -64,9 +66,17 @@ class ShortDispatchListCreateAPI(APIView):
             entry = _service(request).create_and_post(serializer.validated_data, request.user)
         except ValueError as exc:
             return _bad_request(exc)
-        return Response(
-            ShortDispatchDetailSerializer(entry).data, status=status.HTTP_201_CREATED
-        )
+        data = ShortDispatchDetailSerializer(entry).data
+        if entry.status == ShortDispatchStatus.QUEUED:
+            # SAP did not answer: saved, and the posting queue sends it once SAP
+            # is back. Accepted, not created -- there is no Return Note yet.
+            data["code"] = "SAP_QUEUED"
+            data["detail"] = (
+                "Saved. SAP is not answering, so the return note is waiting and will "
+                "post by itself once SAP is back."
+            )
+            return Response(data, status=status.HTTP_202_ACCEPTED)
+        return Response(data, status=status.HTTP_201_CREATED)
 
 
 class ShortDispatchDetailAPI(APIView):

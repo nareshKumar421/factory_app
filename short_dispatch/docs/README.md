@@ -35,12 +35,21 @@ it is the same:
 2. Enter the short quantity and a reason per line, and confirm the warehouse (it
    is preselected to the floor most of the bill was picked from).
 3. Submit. `POST /api/v1/short-dispatch/` writes the record **and** posts the A/R
-   Return in one transaction.
+   Return, in one call.
 
-There is no draft stage. Either SAP takes the document and the entry exists, or
-SAP refuses it, the transaction rolls back, and the operator is told why with the
-form still in front of them — a half-saved short dispatch would be a record of a
-correction nobody made.
+There is no draft stage. Either SAP takes the document and the entry exists
+(`201`), or SAP refuses it, the entry is withdrawn, and the operator is told why
+with the form still in front of them (`400`) — a half-saved short dispatch would be
+a record of a correction nobody made.
+
+SAP *not answering* is neither. The entry is kept as **Waiting for SAP**
+(`status=QUEUED`, `202` with `code: SAP_QUEUED`), and the SAP posting queue
+(`sap_postings`, kind `short_dispatch.post`) posts it once SAP is back. Every try
+first asks SAP for a Return carrying the entry's reference (`NumAtCard =
+"<entry_no> INV <invoice>"`), so a timeout SAP committed anyway is recorded, not
+posted twice. A waiting entry counts against the bill's quantities. If SAP turns it
+down then, it becomes **Refused by SAP** (`REFUSED`), stops counting, and is keyed
+again. The posting log and Send now / Cancel are on Admin → SAP Postings.
 
 ## Endpoints
 

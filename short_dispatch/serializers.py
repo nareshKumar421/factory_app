@@ -37,6 +37,7 @@ class ShortDispatchListSerializer(serializers.ModelSerializer):
     )
     line_count = serializers.SerializerMethodField()
     total_short_quantity = serializers.SerializerMethodField()
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
         model = ShortDispatch
@@ -50,6 +51,9 @@ class ShortDispatchListSerializer(serializers.ModelSerializer):
             "customer_code",
             "customer_name",
             "warehouse_code",
+            "status",
+            "status_label",
+            "sap_error",
             "sap_return_doc_entry",
             "sap_return_doc_num",
             "posted_at",

@@ -31,9 +31,13 @@ quantity, the reason, the batch that was actually billed) is stored, alongside a
 per-line snapshot of item identity so a posted entry displays without a live SAP
 round-trip.
 
-A record only exists once SAP has taken the document: posting is part of the
-single form, and a refusal rolls the whole thing back rather than leaving a draft
-nobody will come back to (see ``services.ShortDispatchService.create_and_post``).
+A record exists once SAP has taken the document -- or while it waits for SAP to
+answer. Posting is part of the single form, and a refusal on the spot withdraws
+the entry rather than leaving a draft nobody will come back to. But SAP not
+answering is not a refusal: the entry is kept, "Waiting for SAP", and the SAP
+posting queue (sap_postings) posts it once SAP is back. Only a refusal that comes
+back later, from the worker, is kept as REFUSED, since nobody is at the form to
+be told (see ``services.ShortDispatchService.create_and_post``).
 """
 
 from django.conf import settings
@@ -52,6 +56,15 @@ class ShortDispatchReason(models.TextChoices):
     DAMAGED = "DAMAGED", "Damaged before loading"
     CUSTOMER_REFUSED = "CUSTOMER_REFUSED", "Pulled off at customer's request"
     OTHER = "OTHER", "Other"
+
+
+class ShortDispatchStatus(models.TextChoices):
+    POSTED = "POSTED", "Posted to SAP"
+    # Saved while SAP was not answering; the posting queue sends it once it is.
+    QUEUED = "QUEUED", "Waiting for SAP"
+    # SAP refused it when the worker sent it later. Not a return that happened:
+    # it counts for nothing against the invoice.
+    REFUSED = "REFUSED", "Refused by SAP"
 
 
 class ShortDispatch(BaseModel):
@@ -78,9 +91,18 @@ class ShortDispatch(BaseModel):
     # editable, because one bill can be picked across more than one floor.
     warehouse_code = models.CharField(max_length=50)
 
-    # The A/R Return SAP took. Never blank in practice -- a row is only committed
-    # once SAP has accepted the document -- but nullable so a future retry flow
-    # has somewhere to start from.
+    # Where the Return Note stands in SAP. Every entry before the posting queue
+    # was posted, hence the default.
+    status = models.CharField(
+        max_length=20,
+        choices=ShortDispatchStatus.choices,
+        default=ShortDispatchStatus.POSTED,
+        db_index=True,
+    )
+    # Why SAP did not take it yet (waiting) or at all (refused).
+    sap_error = models.TextField(blank=True)
+
+    # The A/R Return SAP took: blank while the entry waits for SAP.
     sap_return_doc_entry = models.IntegerField(null=True, blank=True)
     sap_return_doc_num = models.CharField(max_length=50, blank=True)
     posted_at = models.DateTimeField(null=True, blank=True)

@@ -39,12 +39,14 @@ logger = logging.getLogger(__name__)
 HANDLERS = {
     "goods_return.receive": "goods_return.sap_posting.ReceiveHandler",
     "grpo.material": "grpo.sap_posting.MaterialGRPOHandler",
+    "short_dispatch.post": "short_dispatch.sap_posting.ShortDispatchHandler",
 }
 
 #: kind -> what a person calls that kind of posting, for the log's filter.
 KIND_LABELS = {
     "goods_return.receive": "Goods return (A/R Return)",
     "grpo.material": "Material GRPO",
+    "short_dispatch.post": "Short dispatch (A/R Return)",
 }
 
 

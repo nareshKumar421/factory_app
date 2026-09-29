@@ -22,7 +22,9 @@ from rest_framework.exceptions import PermissionDenied
 
 from company.models import Company
 
-from .models import ShortDispatch, ShortDispatchItem
+from sap_client.exceptions import SAPConnectionError
+
+from .models import ShortDispatch, ShortDispatchItem, ShortDispatchStatus
 
 logger = logging.getLogger(__name__)
 
@@ -183,11 +185,13 @@ class ShortDispatchService:
                     "id": entry.id,
                     "entry_no": entry.entry_no,
                     "sap_return_doc_num": entry.sap_return_doc_num,
+                    "status": entry.status,
                     "created_at": entry.created_at,
                 }
+                # A refused one put nothing back, so it is not taken off below.
                 for entry in ShortDispatch.objects.filter(
                     is_active=True, company=company, sap_invoice_doc_entry=doc_entry
-                ).order_by("id")
+                ).exclude(status=ShortDispatchStatus.REFUSED).order_by("id")
             ],
         }
 
@@ -224,11 +228,15 @@ class ShortDispatchService:
     @staticmethod
     def _already_short(company: Company, doc_entry: int) -> dict:
         """``(line_num, item_code) -> quantity`` already returned for this bill."""
+        # A waiting entry counts -- it is going to post -- and a refused one does
+        # not, since nothing went back into the warehouse for it.
         rows = ShortDispatchItem.objects.filter(
             is_active=True,
             short_dispatch__is_active=True,
             short_dispatch__company=company,
             short_dispatch__sap_invoice_doc_entry=doc_entry,
+        ).exclude(
+            short_dispatch__status=ShortDispatchStatus.REFUSED,
         ).values_list("source_line_num", "item_code", "short_quantity")
         totals: dict = {}
         for line_num, item_code, quantity in rows:
@@ -250,7 +258,6 @@ class ShortDispatchService:
 
     # -- create + post ---------------------------------------------------------
 
-    @transaction.atomic
     def create_and_post(self, data, user) -> ShortDispatch:
         """The whole form, in one call: record the shortfall and post the Return.
 
@@ -258,13 +265,49 @@ class ShortDispatchService:
         sitting by the person who has just found the stock still standing there,
         and a half-saved one would be a record of a correction nobody made. So
         either SAP takes the document and the entry exists, or SAP refuses it, the
-        transaction rolls back, and the operator is told why with the form still in
+        entry is withdrawn, and the operator is told why with the form still in
         front of them.
 
-        SAP is called last, after every database write and every guard, because a
-        posted A/R Return cannot be withdrawn by this app (SAP restricts cancelling
-        one to a named list of users; a live ``Cancel`` came back ``-1116``).
-        Anything that can be refused is refused before then.
+        SAP not answering is neither. The entry is kept, "Waiting for SAP", and the
+        SAP posting queue posts it once SAP is back -- its reference is fixed by
+        then, so a retry finds a Return an earlier try did post. The posting runs
+        after the entry is committed, in the queue's own transaction, so the log of
+        it survives whatever happens here.
+        """
+        from sap_postings import services as sap_postings
+        from sap_postings.models import SapPostingOutcome
+
+        from . import sap_posting
+
+        entry = self.create_entry(data, user)
+        posting, outcome = sap_postings.post_now(
+            kind=sap_posting.KIND,
+            company=entry.company,
+            source_id=entry.pk,
+            title=sap_posting.title_for(entry),
+            link=sap_posting.link_for(entry),
+            user=user,
+        )
+        if outcome.kind == SapPostingOutcome.REJECTED:
+            # Refused while the operator is still at the form: withdrawn, as it
+            # always was, so they fix it and send it again. The log keeps why.
+            self.withdraw(entry)
+            sap_postings.cancel(
+                posting.pk, user,
+                "SAP refused it on the spot; the entry was withdrawn to be keyed again.",
+            )
+            raise ValueError(outcome.message)
+        entry.refresh_from_db()
+        return entry
+
+    @transaction.atomic
+    def create_entry(self, data, user) -> ShortDispatch:
+        """The entry and its lines, checked against the invoice, not yet posted.
+
+        Everything the form can be refused for is refused here, before SAP is
+        asked for anything: a posted A/R Return cannot be withdrawn by this app
+        (SAP restricts cancelling one to a named list of users; a live ``Cancel``
+        came back ``-1116``), so the post is the last step, and a separate one.
         """
         company = self._require_company()
 
@@ -292,13 +335,31 @@ class ShortDispatchService:
             customer_name=(bill.get("card_name") or "").strip(),
             warehouse_code=warehouse_code,
             remarks=(data.get("remarks") or "").strip(),
+            status=ShortDispatchStatus.QUEUED,
             created_by=user,
         )
         for line in lines:
             ShortDispatchItem.objects.create(short_dispatch=entry, created_by=user, **line)
-
-        self._post_return(entry, user)
         return entry
+
+    @staticmethod
+    def withdraw(entry: ShortDispatch) -> None:
+        """Take back an entry SAP refused while the operator was still at the form."""
+        with transaction.atomic():
+            ShortDispatchItem.objects.filter(short_dispatch=entry).delete()
+            ShortDispatch.objects.filter(pk=entry.pk).delete()
+
+    @staticmethod
+    def mark_waiting(entry_id: int, message: str) -> None:
+        ShortDispatch.objects.filter(pk=entry_id).exclude(
+            status=ShortDispatchStatus.POSTED
+        ).update(status=ShortDispatchStatus.QUEUED, sap_error=message[:5000])
+
+    @staticmethod
+    def mark_refused(entry_id: int, message: str) -> None:
+        ShortDispatch.objects.filter(pk=entry_id).exclude(
+            status=ShortDispatchStatus.POSTED
+        ).update(status=ShortDispatchStatus.REFUSED, sap_error=message[:5000])
 
     def _prepare_lines(self, company: Company, bill: dict, raw_lines) -> list[dict]:
         """The submitted lines, checked against the invoice they claim to be on.
@@ -458,6 +519,11 @@ class ShortDispatchService:
         else:
             try:
                 result = ReturnsWriter(CompanyContext(entry.company.code)).create(payload)
+            except SAPConnectionError:
+                # Not a refusal: the entry waits for SAP (see sap_posting). Its
+                # reference is fixed, so the next try finds a Return this one
+                # may have posted after all.
+                raise
             except Exception as exc:
                 logger.error(
                     "SAP A/R Return post failed for %s (invoice %s): %s",
@@ -465,12 +531,12 @@ class ShortDispatchService:
                     entry.sap_invoice_doc_num,
                     exc,
                 )
-                # Raised rather than recorded: nothing reached SAP, so the
-                # transaction rolls back and no half-made entry is left behind.
                 raise ValueError(f"SAP rejected the return note: {exc}")
 
         entry.sap_return_doc_entry = result.get("DocEntry")
         entry.sap_return_doc_num = str(result.get("DocNum") or "")
+        entry.status = ShortDispatchStatus.POSTED
+        entry.sap_error = ""
         entry.posted_at = timezone.now()
         entry.posted_by = user
         entry.updated_by = user
@@ -478,6 +544,8 @@ class ShortDispatchService:
             update_fields=[
                 "sap_return_doc_entry",
                 "sap_return_doc_num",
+                "status",
+                "sap_error",
                 "posted_at",
                 "posted_by",
                 "updated_by",
