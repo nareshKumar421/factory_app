@@ -331,7 +331,10 @@ PAGE_GROUPS: dict[str, list[str]] = {
     # /dashboards/dispatch-tracking
     "Dispatch Tracking": ["gate_core.can_view_dispatch_tracking"],
     # /dashboards/sap-reports — running published reports, not administering them.
-    "SAP Reports": ["sap_reports.can_view_sap_reports"],
+    # Sync is the one action here, by the user's choice (2026-09-29): it only
+    # refreshes the catalogue and still shows just the assigned reports. It is
+    # kept out of "All" (see NOT_IN_ALL).
+    "SAP Reports": ["sap_reports.can_view_sap_reports", "sap_reports.can_sync_sap_reports"],
     # /dashboards/dispatch-plans — a redirect onto the Dispatch module's plans
     # page, but it carries its own route guard, so it gets its own group.
     "Dispatch Plans": ["dispatch_plans.can_view_dispatch_plans"],
@@ -356,13 +359,10 @@ ACTION_GROUPS: dict[str, list[str]] = {
         "sap_reports.can_view_sap_reports",
         "sap_reports.can_manage_sap_reports",
     ],
-    # Just the "Sync from SAP" button. Unlike Admin, the member still sees only
-    # the reports assigned to them.
-    "SAP Reports Sync": [
-        "sap_reports.can_view_sap_reports",
-        "sap_reports.can_sync_sap_reports",
-    ],
 }
+
+# Action rights a page group carries that "All" -- every board, seen -- must not.
+NOT_IN_ALL = {"sap_reports.can_sync_sap_reports"}
 
 
 # --------------------------------------------------------------------------- #
@@ -442,7 +442,7 @@ def build_groups() -> dict[str, list[str]]:
     PAGE_GROUPS["Control Carousel"] = _carousel_rights()
     groups = {f"{PREFIX}{name}": list(codes) for name, codes in PAGE_GROUPS.items()}
     groups.update({f"{PREFIX}{name}": list(codes) for name, codes in ACTION_GROUPS.items()})
-    every_view = sorted({code for codes in PAGE_GROUPS.values() for code in codes})
+    every_view = sorted({code for codes in PAGE_GROUPS.values() for code in codes} - NOT_IN_ALL)
     groups[f"{PREFIX}All"] = every_view
 
     #: Every board READ right and nothing else -- the group this whole change
