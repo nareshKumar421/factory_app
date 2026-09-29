@@ -1,11 +1,12 @@
 """
 admin_board/views.py
 
-One endpoint for one screen.
+One endpoint for one screen, and one for the bills under its dispatch tile.
 
 ``GET /api/v1/dashboards/admin-board/board/``
+``GET /api/v1/dashboards/admin-board/dispatch-bills/?company=<code>``
 
-Read-only. Requires JWT authentication, a company context header, and any one
+The board is read-only. Requires JWT authentication, a company context header, and any one
 of the four rights the board's own reports are gated on.
 
 WHY THERE IS NO 500 HERE
@@ -29,16 +30,20 @@ sends an operator to the server room, the other to an administrator.
 
 import logging
 
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from company.models import UserCompany
 from company.permissions import HasCompanyContext
 
 from control_boards.permissions import CanReadBoard
 
 from .carousel import CanViewBoardCarousel
+from .constants import DISPATCH_COMPANIES
+from .dispatch_bills import company_bills
 from .permissions import CanViewAdminBoard
 from .services import AdminBoardService
 
@@ -97,3 +102,49 @@ class AdminBoardAPI(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         return Response(board, status=status.HTTP_200_OK)
+
+
+class AdminDispatchBillsAPI(APIView):
+    """The bills behind one company's row on the Total dispatch panel.
+
+    ``GET /api/v1/dashboards/admin-board/dispatch-bills/?company=JIVO_OIL``
+
+    Same window as the board — the calendar month to today — and the same
+    gate-out rows as the tile, one row per bill per truck.
+
+    NARROWER THAN THE BOARD, ON PURPOSE. Only the dispatch feed opens it: the
+    board's stock or expense rights do not, because those readers never see the
+    dispatch tile at all. The carousel right does not either — it is a key cut
+    for the board's one read, and a wall screen has no hand to click a row
+    with (see ``carousel.py``). And the company must be one the reader belongs
+    to, the same rule as the Logistics board's bill list: the tile's totals are
+    shown to the whole room, a customer-by-customer list is not.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanReadBoard("dispatch_plans", board="Admin Control"),
+    ]
+
+    def get(self, request):
+        code = (request.query_params.get("company") or "").strip().upper()
+        if code not in DISPATCH_COMPANIES:
+            return Response(
+                {"detail": f"`company` must be one of {', '.join(DISPATCH_COMPANIES)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        company_id = (
+            UserCompany.objects.filter(user=request.user, company__code=code, is_active=True)
+            .values_list("company_id", flat=True)
+            .first()
+        )
+        if company_id is None:
+            return Response(
+                {"detail": f"You are not a member of {code}, so its bills are not shown here."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        today = timezone.localdate()
+        return Response(company_bills(company_id, code, today.replace(day=1), today))

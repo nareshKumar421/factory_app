@@ -563,12 +563,9 @@ class AdminBoardService:
         wrongly strips 64 t of genuine Mart sales. Same shape as the item-code
         divergence between the two schemas.
         """
-        from dispatch_plans.dashboard_service import DispatchDashboardService
-        from gate_core.models.sales_dispatch import (
-            SalesDispatchGateOut,
-            SalesDispatchGateOutStatus,
-        )
         from django.db.models import Count, Sum
+
+        from .dispatch_bills import count_bills, dispatched_gate_outs
 
         company_ids: Dict[int, str] = {}
         for code in DISPATCH_COMPANIES:
@@ -584,41 +581,29 @@ class AdminBoardService:
         if not company_ids:
             raise ValueError("no dispatch company is configured")
 
-        rows = SalesDispatchGateOut.objects.filter(
-            company_id__in=list(company_ids),
-            gate_out_date__range=(self.month_first, self.today),
-            status=SalesDispatchGateOutStatus.DISPATCHED,
-        )
-        # The guard described above. Applied per company, so a code that is a
-        # group entity to one and a customer to the other is judged correctly.
-        for company_id, code in company_ids.items():
-            excluded = INTERCOMPANY_CARD_CODES.get(code, [])
-            if excluded:
-                rows = rows.exclude(company_id=company_id, customer_code__in=excluded)
+        # The guard described above is applied inside, per company, so a code
+        # that is a group entity to one and a customer to the other is judged
+        # correctly. Shared with the bill list the company rows open onto.
+        rows = dispatched_gate_outs(company_ids, self.month_first, self.today)
 
         companies = []
         for company_id, code in company_ids.items():
-            agg = rows.filter(company_id=company_id).aggregate(
-                weight=Sum("total_weight"),
-                trucks=Count("id"),
-                bills=Count("dispatch_plan_id", distinct=True),
-            )
+            company_rows = rows.filter(company_id=company_id)
+            agg = company_rows.aggregate(weight=Sum("total_weight"), trucks=Count("id"))
             companies.append(
                 {
                     "company_code": code,
                     "tons": round(_f(agg["weight"]) / 1000, 2),
                     "trucks": agg["trucks"] or 0,
-                    "bills": agg["bills"] or 0,
+                    "bills": count_bills(company_rows),
                 }
             )
 
-        total = rows.aggregate(
-            weight=Sum("total_weight"),
-            trucks=Count("id"),
-            # A truck carrying four invoices is four bills but one truck, so the
-            # bill count is distinct on the plan and never a sum of trucks.
-            bills=Count("dispatch_plan_id", distinct=True),
-        )
+        total = rows.aggregate(weight=Sum("total_weight"), trucks=Count("id"))
+        # A truck carrying four invoices is four bills but one truck. Counted
+        # from the invoices on the truck, not its plan link, which names only
+        # the first of them — see `dispatch_bills`.
+        total["bills"] = count_bills(rows)
         today_weight = rows.filter(gate_out_date=self.today).aggregate(
             weight=Sum("total_weight")
         )["weight"]
