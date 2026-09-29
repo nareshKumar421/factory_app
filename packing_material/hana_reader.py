@@ -678,6 +678,14 @@ HAVING ROUND(COALESCE(SUM(O."InQty"), 0), 3) > 0
         Rows with a zero balance are kept rather than filtered out. An item
         the plan needs and the stores hold none of is the most important row
         on this board, and it has to arrive as an explicit zero.
+
+        The benchmark comes back on the same row: ``OITW.MinStock``, the
+        figure the Stock Benchmark board reads, summed over the SAME stores
+        as the balance. Same stores because `Req` subtracts one from the
+        other -- a minimum set on the floor's own store would be a floor
+        target measured against stock that excludes the floor. On Oil it is
+        only set in BH-PM (202 of 881 packaging items, 29 September 2026),
+        and an unset minimum reads as 0, which SAP also means as "none".
         """
         if not warehouses:
             return []
@@ -686,7 +694,8 @@ HAVING ROUND(COALESCE(SUM(O."InQty"), 0), 3) > 0
         query = f"""
 SELECT
     W."ItemCode",
-    ROUND(COALESCE(SUM(W."OnHand"), 0), 3) AS "OnHand"
+    ROUND(COALESCE(SUM(W."OnHand"), 0), 3) AS "OnHand",
+    ROUND(COALESCE(SUM(W."MinStock"), 0), 3) AS "MinStock"
 FROM "{schema}"."OITW" W
 INNER JOIN "{schema}"."OITM" M
     ON M."ItemCode" = W."ItemCode"
@@ -695,7 +704,11 @@ WHERE M."ItmsGrpCod" = {PM_ITEM_GROUP}
 GROUP BY W."ItemCode"
 """
         return [
-            {"item_code": r[0] or "", "on_hand_qty": float(r[1] or 0)}
+            {
+                "item_code": r[0] or "",
+                "on_hand_qty": float(r[1] or 0),
+                "benchmark_qty": float(r[2] or 0),
+            }
             for r in self._execute(query, list(warehouses))
         ]
 

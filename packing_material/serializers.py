@@ -360,6 +360,13 @@ class RequirementRowSerializer(serializers.Serializer):
     open_po_qty = serializers.FloatField()
     req_after_po_qty = serializers.FloatField()
 
+    # The stock benchmark netted off as well: what the PM Requirement page
+    # shows as `Req`. Short when negative, and priced like the shortfall below.
+    benchmark_qty = serializers.FloatField()
+    req_after_benchmark_qty = serializers.FloatField()
+    short_after_benchmark_qty = serializers.FloatField()
+    short_after_benchmark_value = serializers.FloatField()
+
     # How the issue figure was made up: transferred up from the stores, or
     # made in-house straight onto the floor. Both count as plan fulfilled.
     issued_transfer_qty = serializers.FloatField()
@@ -408,10 +415,18 @@ class RequirementTotalsSerializer(serializers.Serializer):
     # never cancel a shortage on another.
     short_before_po_count = serializers.IntegerField()
     short_before_po_qty = serializers.FloatField()
+    short_before_po_value = serializers.FloatField()
     short_after_po_count = serializers.IntegerField()
     short_after_po_qty = serializers.FloatField()
     short_after_po_value = serializers.FloatField()
     covered_by_po_count = serializers.IntegerField()
+    benchmark_qty = serializers.FloatField()
+    benchmark_count = serializers.IntegerField()
+    short_after_benchmark_count = serializers.IntegerField()
+    short_after_benchmark_qty = serializers.FloatField()
+    short_after_benchmark_value = serializers.FloatField()
+    # Covered for the plan, short only of the benchmark.
+    benchmark_gap_count = serializers.IntegerField()
     po_due_after_plan_count = serializers.IntegerField()
     po_overdue_count = serializers.IntegerField()
     over_issued_count = serializers.IntegerField()

@@ -554,7 +554,20 @@ def build_requirement_rows(
         open_po_qty       what is already on order
         req_after_po_qty  req + open PO                (negative = still short)
 
-    Two more are derived from those and answer the buying question from the
+    And one more, which the PM Requirement page reads as ITS `Req`:
+
+        benchmark_qty            OITW.MinStock over the same stores as on hand
+        req_after_benchmark_qty  req - benchmark   (negative = short)
+
+    The plan is not the only claim on the stores. A buyer who orders exactly
+    what the rest of the plan needs ends the month with the stores empty, and
+    the Stock Benchmark board then reports every one of those items critical.
+    Netting the benchmark off says what has to be bought for the plan AND to
+    leave the stores at their minimum. It is a column of its own rather than
+    a change to `req_qty`, because the PO columns below and the Plant Control
+    board built on them still read `req_qty` as the plan alone.
+
+    Two more are derived from `req` and answer the buying question from the
     other end -- not "is there enough" but "was too much bought":
 
         to_buy_qty         what still has to be BOUGHT, stock counted
@@ -578,9 +591,7 @@ def build_requirement_rows(
         row["item_code"]: row for row in received if row.get("item_code")
     }
     on_hand_by_code = {
-        row["item_code"]: float(row.get("on_hand_qty", 0) or 0)
-        for row in on_hand
-        if row.get("item_code")
+        row["item_code"]: row for row in on_hand if row.get("item_code")
     }
     po_by_code = {row["item_code"]: row for row in open_po if row.get("item_code")}
 
@@ -594,8 +605,12 @@ def build_requirement_rows(
         movement = received_by_code.get(code, {})
         issued = float(movement.get("received_qty", 0) or 0)
         rest = planning - issued
-        held = on_hand_by_code.get(code, 0.0)
+        stock = on_hand_by_code.get(code, {})
+        held = float(stock.get("on_hand_qty", 0) or 0)
         req = held - rest
+        benchmark = float(stock.get("benchmark_qty", 0) or 0)
+        req_after_benchmark = req - benchmark
+        short_after_benchmark = max(0.0, -req_after_benchmark)
 
         po = po_by_code.get(code, {})
         open_po_qty = float(po.get("open_po_qty", 0) or 0)
@@ -637,6 +652,10 @@ def build_requirement_rows(
                 "rest_planning_qty": round(rest, 3),
                 "on_hand_qty": round(held, 3),
                 "req_qty": round(req, 3),
+                "benchmark_qty": round(benchmark, 3),
+                "req_after_benchmark_qty": round(req_after_benchmark, 3),
+                "short_after_benchmark_qty": round(short_after_benchmark, 3),
+                "short_after_benchmark_value": round(short_after_benchmark * unit_price, 2),
                 "open_po_qty": round(open_po_qty, 3),
                 "po_lines": int(po.get("po_lines", 0) or 0),
                 "po_earliest_due": earliest_due.isoformat() if earliest_due else None,
@@ -710,6 +729,9 @@ def requirement_totals(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     def total(key: str) -> float:
         return round(sum(float(row.get(key, 0) or 0) for row in rows), 3)
 
+    def total_money(key: str) -> float:
+        return round(sum(float(row.get(key, 0) or 0) for row in rows), 2)
+
     def value(key: str) -> float:
         """A column priced at the item master's last purchase price.
 
@@ -728,6 +750,9 @@ def requirement_totals(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
     short_before = [row for row in rows if row["req_qty"] < 0]
     short_after = [row for row in rows if row["req_after_po_qty"] < 0]
+    short_after_benchmark = [
+        row for row in rows if float(row.get("req_after_benchmark_qty", 0) or 0) < 0
+    ]
     over_purchased = [row for row in rows if row["over_purchased"]]
 
     return {
@@ -756,10 +781,27 @@ def requirement_totals(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         # still holes once what is already bought is taken into account.
         "short_before_po_count": len(short_before),
         "short_before_po_qty": round(sum(-row["req_qty"] for row in short_before), 3),
+        # `to_buy_qty` is exactly that shortfall as a magnitude -- zero on a
+        # covered row -- so pricing it prices the rows counted above.
+        "short_before_po_value": value("to_buy_qty"),
         "short_after_po_count": len(short_after),
         "short_after_po_qty": total("short_qty"),
         "short_after_po_value": round(sum(float(row["short_value"]) for row in rows), 2),
         "covered_by_po_count": sum(1 for row in rows if row["po_covers_shortage"]),
+        # The same question with the benchmark netted off, which is what the
+        # PM Requirement page leads on. `benchmark_gap_count` is the rows the
+        # plan is covered for but that would leave the stores under their
+        # minimum -- a restock rather than a threat to this month's production.
+        "benchmark_qty": total("benchmark_qty"),
+        "benchmark_count": sum(
+            1 for row in rows if float(row.get("benchmark_qty", 0) or 0) > 0
+        ),
+        "short_after_benchmark_count": len(short_after_benchmark),
+        "short_after_benchmark_qty": total("short_after_benchmark_qty"),
+        "short_after_benchmark_value": total_money("short_after_benchmark_value"),
+        "benchmark_gap_count": sum(
+            1 for row in short_after_benchmark if row["req_qty"] >= 0
+        ),
         # Short, an order exists, and the earliest of it lands after the plan
         # ends. Covered on paper, not covered in time.
         "po_due_after_plan_count": sum(

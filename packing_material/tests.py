@@ -1390,6 +1390,115 @@ class RequirementTotalsTests(SimpleTestCase):
         )
 
 
+class BenchmarkTests(SimpleTestCase):
+    """`Req` with the stock benchmark netted off, as the page now reads it.
+
+    The buyer's test with a minimum added: 1,000 needed against 800 in the
+    stores is 200 short for the plan, and with a benchmark of 300 the stores
+    also have to be left holding 300 -- so 500 to buy, not 200.
+    """
+
+    def rows(self, planning, on_hand, benchmark, issued=0.0, open_po=0.0, price=1.0):
+        return build_requirement_rows(
+            [{"item_code": "PM0000001", "planning_qty": planning, "sku_count": 1}],
+            (
+                [{"item_code": "PM0000001", "received_qty": issued, "transfer_qty": issued}]
+                if issued
+                else []
+            ),
+            [
+                {
+                    "item_code": "PM0000001",
+                    "on_hand_qty": on_hand,
+                    "benchmark_qty": benchmark,
+                }
+            ],
+            (
+                [{"item_code": "PM0000001", "open_po_qty": open_po, "po_lines": 1}]
+                if open_po
+                else []
+            ),
+            index_master([{"item_code": "PM0000001", "unit_price": price}]),
+            {},
+            {},
+            date(2026, 9, 30),
+            date(2026, 9, 9),
+        )
+
+    def test_the_benchmark_is_bought_on_top_of_the_plan(self):
+        row = self.rows(planning=1000, on_hand=800, benchmark=300, price=2.0)[0]
+        self.assertEqual(row["benchmark_qty"], 300.0)
+        self.assertEqual(row["req_qty"], -200.0)
+        self.assertEqual(row["req_after_benchmark_qty"], -500.0)
+        self.assertEqual(row["short_after_benchmark_qty"], 500.0)
+        self.assertEqual(row["short_after_benchmark_value"], 1000.0)
+
+    def test_a_row_the_plan_is_covered_for_can_still_be_under_its_benchmark(self):
+        """800 in the stores and 500 left to make leaves 300 against a 500 minimum."""
+        row = self.rows(planning=500, on_hand=800, benchmark=500)[0]
+        self.assertEqual(row["req_qty"], 300.0)
+        self.assertEqual(row["req_after_benchmark_qty"], -200.0)
+        totals = requirement_totals([row])
+        self.assertEqual(totals["short_before_po_count"], 0)
+        self.assertEqual(totals["short_after_benchmark_count"], 1)
+        self.assertEqual(totals["benchmark_gap_count"], 1)
+
+    def test_no_benchmark_leaves_req_as_the_plan_alone(self):
+        """MinStock 0 is SAP's "none set", and must not move the figure."""
+        row = self.rows(planning=1000, on_hand=800, benchmark=0)[0]
+        self.assertEqual(row["req_after_benchmark_qty"], row["req_qty"])
+
+    def test_a_stock_row_from_before_the_benchmark_reads_as_none(self):
+        """A reader that returns no benchmark at all is the same as a zero."""
+        rows = build_requirement_rows(
+            [{"item_code": "PM0000001", "planning_qty": 100.0, "sku_count": 1}],
+            [],
+            [{"item_code": "PM0000001", "on_hand_qty": 40.0}],
+            [],
+            index_master([]),
+            {},
+            {},
+            date(2026, 9, 30),
+            date(2026, 9, 9),
+        )
+        self.assertEqual(rows[0]["benchmark_qty"], 0.0)
+        self.assertEqual(rows[0]["req_after_benchmark_qty"], -60.0)
+
+    def test_the_po_columns_are_untouched_by_the_benchmark(self):
+        """The Plant Control board still reads these as the plan against orders."""
+        row = self.rows(planning=1000, on_hand=800, benchmark=300, open_po=400)[0]
+        self.assertEqual(row["req_after_po_qty"], 200.0)
+        self.assertEqual(row["short_qty"], 0.0)
+        self.assertEqual(row["to_buy_qty"], 200.0)
+        self.assertEqual(row["over_purchase_qty"], 200.0)
+        # And the benchmark figure does not net the order off.
+        self.assertEqual(row["req_after_benchmark_qty"], -500.0)
+
+    def test_totals_never_let_a_surplus_cancel_a_shortage(self):
+        short = self.rows(planning=1000, on_hand=800, benchmark=300, price=2.0)[0]
+        spare = {**self.rows(planning=0, on_hand=5000, benchmark=0)[0], "item_code": "PM2"}
+        totals = requirement_totals([short, spare])
+        self.assertEqual(totals["short_after_benchmark_count"], 1)
+        self.assertEqual(totals["short_after_benchmark_qty"], 500.0)
+        self.assertEqual(totals["short_after_benchmark_value"], 1000.0)
+        self.assertEqual(totals["benchmark_qty"], 300.0)
+        self.assertEqual(totals["benchmark_count"], 1)
+        # Short for the plan alone: 200 at Rs 2.
+        self.assertEqual(totals["short_before_po_value"], 400.0)
+        self.assertEqual(totals["benchmark_gap_count"], 0)
+
+    def test_every_serialized_field_is_on_the_row_and_the_totals(self):
+        """A serializer field the service forgot is a 500, not a blank column."""
+        from .serializers import RequirementRowSerializer, RequirementTotalsSerializer
+
+        row = self.rows(planning=1000, on_hand=800, benchmark=300)[0]
+        self.assertEqual(
+            RequirementRowSerializer(row).data["req_after_benchmark_qty"], -500.0
+        )
+        totals = RequirementTotalsSerializer(requirement_totals([row])).data
+        self.assertEqual(totals["short_after_benchmark_count"], 1)
+
+
 class UnplannedIssueTests(SimpleTestCase):
     def test_counts_what_the_plan_does_not_describe(self):
         report = unplanned_issue(
