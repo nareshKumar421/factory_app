@@ -743,8 +743,19 @@ class GoodsReturnService:
         would be silently dropped (its goods would never go back into SAP), and a
         bill named in two notes would return the same stock twice, which SAP will
         take and nobody can undo.
+
+        A bill nothing came back against owes no document at all: it was named on
+        the return, but no line was keyed against it. Named on a note anyway -- a
+        grouping queued while SAP was down, or a page that still lists it -- it
+        is dropped rather than refused, since it adds nothing to the note, and a
+        note left with no bills at all is dropped with it.
         """
-        owed = [ref for ref in gr.active_invoice_refs if not ref.is_posted]
+        returning = {line.invoice_ref_id for line in gr.active_lines if line.invoice_ref_id}
+        owed = [
+            ref
+            for ref in gr.active_invoice_refs
+            if not ref.is_posted and ref.id in returning
+        ]
         if grouping is None:
             return [[ref] for ref in owed]
 
@@ -761,6 +772,8 @@ class GoodsReturnService:
                 ref = by_id.get(ref_id)
                 if ref is None:
                     raise ValueError(f"Invoice {ref_id} is not on this return.")
+                if ref_id not in returning:
+                    continue
                 if ref.is_posted:
                     raise ValueError(
                         f"Invoice {ref.sap_invoice_doc_num or ref_id} is already in "
@@ -774,7 +787,8 @@ class GoodsReturnService:
                 seen.add(ref_id)
                 refs.append(ref)
             # In the order the bills were added, whatever order they were picked in.
-            resolved.append(sorted(refs, key=lambda ref: ref.id))
+            if refs:
+                resolved.append(sorted(refs, key=lambda ref: ref.id))
 
         missing = owed_ids - seen
         if missing:

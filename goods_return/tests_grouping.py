@@ -227,6 +227,63 @@ class ReturnNoteGroupingTests(PostingTestCase):
             self.receive_grouped(gr, [[ref.id for ref in refs], []])
         self.assertEqual(self.writer.posted, [])
 
+    # -- a bill nothing came back against ---------------------------------------
+
+    def with_an_empty_bill(self):
+        """Three bills with goods coming back, and one named but returning nothing."""
+        return self.build_return(
+            [
+                (5001, "1500", [("FG0000151", 10)]),
+                (5002, "1501", []),
+                (5003, "1502", [("FG0000032", 6)]),
+            ]
+        )
+
+    def test_a_bill_with_nothing_returned_need_not_be_on_a_note(self):
+        """Nothing came back against it, so it has no goods to post and owes no
+        document; leaving it off every note is not leaving goods behind."""
+        gr = self.with_an_empty_bill()
+        a, _empty, c = self.refs(gr)
+        gr = self.receive_grouped(gr, [[a.id], [c.id]])
+        self.assertEqual(len(self.writer.posted), 2)
+        self.assertEqual(gr.status, GoodsReturnStatus.POSTED)
+
+    def test_a_bill_with_nothing_returned_is_dropped_from_its_note(self):
+        """A grouping queued before the page stopped listing such bills still
+        names it; it adds nothing, so it is ignored rather than refused, and is
+        not stamped with a document it has no lines on."""
+        gr = self.with_an_empty_bill()
+        a, empty, c = self.refs(gr)
+        gr = self.receive_grouped(gr, [[a.id, empty.id], [c.id]])
+
+        self.assertEqual(len(self.writer.posted), 2)
+        self.assertEqual(self.writer.posted[0]["NumAtCard"], f"{gr.entry_no} INV 1500".upper())
+        empty.refresh_from_db()
+        self.assertIsNone(empty.sap_gr_doc_entry)
+
+    def test_a_note_of_only_empty_bills_posts_nothing_for_it(self):
+        """No document is raised for a note that returns nothing -- not even an
+        'empty note' refusal, since the operator put a real bill there."""
+        gr = self.with_an_empty_bill()
+        a, empty, c = self.refs(gr)
+        gr = self.receive_grouped(gr, [[a.id], [empty.id], [c.id]])
+        self.assertEqual(len(self.writer.posted), 2)
+        self.assertEqual(gr.status, GoodsReturnStatus.POSTED)
+
+    def test_an_empty_bill_of_another_customer_does_not_block_a_note(self):
+        """Its customer would refuse the combination, but it brings no goods to the
+        note, so there is nothing to refuse."""
+        gr = self.build_return(
+            [
+                (5001, "1500", [("FG0000151", 10)], "CUST001"),
+                (5002, "1501", [], "CUST002"),
+                (5003, "1502", [("FG0000032", 6)], "CUST001"),
+            ]
+        )
+        a, empty, c = self.refs(gr)
+        self.receive_grouped(gr, [[a.id, empty.id, c.id]])
+        self.assertEqual(len(self.writer.posted), 1)
+
     def test_the_grouping_is_checked_before_sap_is_touched(self):
         """A grouping mistake must not cost a half-posted, unwithdrawable return."""
         gr = self.three_bills()
