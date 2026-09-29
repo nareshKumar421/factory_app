@@ -3,6 +3,16 @@ from django.db import models
 
 from .access import PERMISSIONS
 from .models_licence import Licence, LicenceLine  # noqa: F401
+from .models_lot import (  # noqa: F401
+    ContractHistory,
+    LotChange,
+    LotFieldChange,
+    LotShortage,
+    OilLot,
+    StockDashboardRow,
+    TemporaryVendor,
+)
+from .models_tank import Tank, TankItem, TankLog  # noqa: F401
 
 
 class EximPermission(models.Model):

@@ -19,6 +19,10 @@ the deployment configured it. Nothing here writes, and nothing caches: a wall
 board showing a stale tank level is worse than one saying it could not read the
 farm.
 
+ONCE THE FARM HAS MOVED HERE the register is this project's own (``exim.Tank``,
+the Import / Export module's), and that is read instead - see ``_source``. The
+rows come out in the same shape, so everything below is the same either way.
+
 ⚠️ ``current_capacity`` IS THE STOCK, NOT A CAPACITY.
 The single worst trap in this table. ``tank_data`` carries ``tank_capacity``
 (what the vessel holds when full) and ``current_capacity`` (what is in it right
@@ -140,12 +144,58 @@ def _to_tons(value: Optional[Any]) -> float:
     return round(float(value) / LITRES_PER_TON, 2)
 
 
+#: Once the tank farm has moved into this project (``exim.Tank``, copied from
+#: EXIM by ``manage.py import_exim_tank_farm`` and kept here from then on) its
+#: register is read here and EXIM's frozen copy is not. ``EXIM_TANK_SOURCE``:
+#:   "auto"    (default) this project's tanks as soon as it holds any for
+#:             ``TANK_FARM_COMPANY``, else EXIM;
+#:   "exim"    EXIM's database only;
+#:   "factory" this project's tanks only.
+TANK_FARM_COMPANY = "JIVO_OIL"
+
+
+def _source() -> str:
+    source = getattr(settings, "EXIM_TANK_SOURCE", "auto")
+    if source != "auto":
+        return source
+    from exim.models import Tank
+
+    return "factory" if Tank.objects.filter(company__code=TANK_FARM_COMPANY).exists() else "exim"
+
+
+def _factory_rows() -> list:
+    """This project's tanks, in the shape ``TANK_SQL`` returns. Always litres."""
+    from exim.models import Tank
+
+    tanks = (
+        Tank.objects.filter(company__code=TANK_FARM_COMPANY, is_active=True)
+        .select_related("item")
+        .order_by("code")
+    )
+    return [
+        (
+            tank.code,
+            tank.kind,
+            tank.item.code if tank.item else None,
+            tank.item.name if tank.item else None,
+            (tank.item.category or None) if tank.item else None,
+            tank.capacity_l,
+            tank.level_l or 0,
+        )
+        for tank in tanks
+    ]
+
+
 def read_tanks() -> TankReading:
     """Every active vessel with its rated capacity and current level, in tonnes.
 
     Returns a reading whose ``reason`` is set on any unhappy path: the alias is
     not configured, or the server did not answer. Never raises.
     """
+    if _source() == "factory":
+        # Litres by construction, whatever EXIM_TANK_UNIT says about EXIM.
+        return _reading(_factory_rows(), lambda value: round(float(value or 0) / LITRES_PER_TON, 2))
+
     if not _configured():
         # The reason travels to a factory wall: it is printed in the Admin
         # board's action centre, and was on the oil tile. So it says what is
@@ -175,6 +225,10 @@ def read_tanks() -> TankReading:
         logger.warning("admin_board: EXIM tank read failed: %s", exc)
         return TankReading(reason="The tank farm register could not be read.")
 
+    return _reading(rows, _to_tons)
+
+
+def _reading(rows, to_tons) -> TankReading:
     tanks: List[Dict[str, Any]] = []
     by_type: Dict[str, Dict[str, float]] = {}
     capacity_total = 0.0
@@ -185,8 +239,8 @@ def read_tanks() -> TankReading:
     excluded_vessels = 0
 
     for code, vessel_type, item_code, item_name, category, capacity, stock in rows:
-        capacity_tons = _to_tons(capacity)
-        stock_tons = _to_tons(stock)
+        capacity_tons = to_tons(capacity)
+        stock_tons = to_tons(stock)
         kind = vessel_type or "TANK"
 
         if kind in HEADLINE_TYPES:
@@ -221,7 +275,7 @@ def read_tanks() -> TankReading:
         )
 
     if not tanks:
-        return TankReading(reason="The EXIM tank table holds no active vessels.")
+        return TankReading(reason="The tank farm register holds no active vessels.")
 
     return TankReading(
         tanks=sorted(tanks, key=lambda row: row["stock_tons"], reverse=True),

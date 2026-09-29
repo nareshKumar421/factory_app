@@ -50,3 +50,51 @@ class DjangoPermission(BasePermission):
 class CanViewCustomsRates(DjangoPermission):
     #: EXIM filed this one under its accounts app; the codename is unchanged.
     permission = "exim.view_exim_rates"
+
+
+# ---------------------------------------------------------------------------
+# The tank farm and oil lots. EXIM's codenames, unchanged: a lot is still
+# "stockstatus", a tank "tankdata", an oil "tankitem", a shortage "debitentry".
+# ---------------------------------------------------------------------------
+
+class Rights:
+    OIL_VIEW = "exim.view_tankitem"
+    OIL_ADD = "exim.add_tankitem"
+    OIL_CHANGE = "exim.change_tankitem"
+    OIL_DELETE = "exim.delete_tankitem"
+
+    TANK_VIEW = "exim.view_tankdata"
+    TANK_ADD = "exim.add_tankdata"
+    TANK_CHANGE = "exim.change_tankdata"
+    TANK_DELETE = "exim.delete_tankdata"
+    #: The weighted average cost of what is in the tanks.
+    TANK_AVERAGE = "exim.view_itemwise_average"
+    TANK_LOG_VIEW = "exim.view_tanklog"
+    #: Put a tank's opening stock on as a lot. EXIM filed it under accounts.
+    OPENING_STOCK = "exim.add_opening_rate"
+
+    LOT_VIEW = "exim.view_stockstatus"
+    LOT_ADD = "exim.add_stockstatus"
+    LOT_CHANGE = "exim.change_stockstatus"
+    LOT_DELETE = "exim.delete_stockstatus"
+    VEHICLE_REPORT = "exim.view_vehicle_report"
+    SHORTAGE_VIEW = "exim.view_debitentry"
+    #: The change log of every lot at once (a lot's own history needs LOT_VIEW).
+    CHANGE_LOG_VIEW = "exim.view_stockstatusupdatelog"
+    CONTRACT_HISTORY_VIEW = "exim.view_contractualhistory"
+    DASHBOARD_ORDER_CHANGE = "exim.change_dashboardorder"
+    #: A vendor that is not in SAP yet. EXIM's vendors were "party".
+    TEMP_VENDOR_ADD = "exim.add_party"
+    DIRECTOR_REPORT = "exim.view_director_report"
+
+
+def any_of(*rights):
+    """A permission class passing a user who holds at least one of ``rights``."""
+
+    class AnyOf(BasePermission):
+        def has_permission(self, request, view):
+            user = request.user
+            return bool(user and any(user.has_perm(right) for right in rights))
+
+    AnyOf.__name__ = "AnyOf(" + ", ".join(rights) + ")"
+    return AnyOf

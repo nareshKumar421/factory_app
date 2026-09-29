@@ -771,7 +771,7 @@ class EximTankReadingTests(SimpleTestCase):
 
     def _reading(self, rows, unit="LITRES"):
         with self.settings(
-            DATABASES={"default": {}, "exim": {}}, EXIM_TANK_UNIT=unit
+            DATABASES={"default": {}, "exim": {}}, EXIM_TANK_UNIT=unit, EXIM_TANK_SOURCE="exim"
         ):
             with mock.patch.object(exim_reader, "connections") as conns:
                 cursor = conns.__getitem__.return_value.cursor.return_value
@@ -833,7 +833,7 @@ class EximTankReadingTests(SimpleTestCase):
         are noise to them and actionable by none of them, so the sentence says
         what is wrong and the log carries what to set.
         """
-        with self.settings(DATABASES={"default": {}}):
+        with self.settings(DATABASES={"default": {}}, EXIM_TANK_SOURCE="exim"):
             with self.assertLogs("admin_board.exim_reader", level="WARNING") as logged:
                 reading = exim_reader.read_tanks()
 
@@ -852,7 +852,7 @@ class EximTankReadingTests(SimpleTestCase):
     def test_a_server_that_does_not_answer_is_reported_not_raised(self):
         from django.db import DatabaseError
 
-        with self.settings(DATABASES={"default": {}, "exim": {}}):
+        with self.settings(DATABASES={"default": {}, "exim": {}}, EXIM_TANK_SOURCE="exim"):
             with mock.patch.object(exim_reader, "connections") as conns:
                 conns.__getitem__.return_value.cursor.side_effect = DatabaseError(
                     "connection timed out"
