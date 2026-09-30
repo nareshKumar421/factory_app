@@ -12,7 +12,7 @@ That mixin allocates a code from the strict SECTION-DOCTYPE-CC-SS-GG-NN
 numbering scheme, but the codes on these sheets are typed in as printed
 (e.g. ``QA-TST-INH-14-02-10``, whose ``INH`` segment is outside that scheme).
 A plain unique-per-company field matches how the documents are actually
-labelled, and is consistent with ``TestingProcedure`` and ``RecordTemplate``.
+labelled.
 """
 
 from django.db import models
@@ -20,9 +20,12 @@ from django.db import models
 from company.models import Company
 from gate_core.models import BaseModel
 
-# Reused rather than redefined, so a PDF and a typed-up procedure are filed
-# under the very same two types.
-from .testing_procedure import ProcedureType
+
+class ProcedureType(models.TextChoices):
+    """The two families of testing procedure the QA team maintains."""
+
+    INHOUSE = "INHOUSE", "In-house Testing Procedure"
+    STANDARD = "STANDARD", "Standard Testing Procedure"
 
 
 class QCDocumentFile(BaseModel):

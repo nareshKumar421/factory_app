@@ -1,5 +1,5 @@
 """
-Management command to create Production Execution and Production QC groups.
+Management command to create Production Execution and QC groups.
 
 Usage:
     python manage.py setup_production_groups          # create/update all groups
@@ -173,7 +173,7 @@ PRODUCTION_GROUPS = {
 }
 
 # ---------------------------------------------------------------------------
-# Production QC groups
+# QC groups
 # ---------------------------------------------------------------------------
 QC_GROUPS = {
     "QC Store": [
@@ -194,10 +194,6 @@ QC_GROUPS = {
         "quality_control.change_rawmaterialinspection",
         "quality_control.can_submit_inspection",
         "quality_control.can_approve_as_chemist",
-        # Production QC
-        "quality_control.can_view_production_qc",
-        "quality_control.can_create_production_qc",
-        "quality_control.can_submit_production_qc",
     ],
     "QC Manager": [
         # Arrival slips – full
@@ -219,11 +215,6 @@ QC_GROUPS = {
         # Master data
         "quality_control.can_manage_material_types",
         "quality_control.can_manage_qc_parameters",
-        # Production QC
-        "quality_control.can_view_production_qc",
-        "quality_control.can_create_production_qc",
-        "quality_control.can_submit_production_qc",
-        "quality_control.can_approve_production_qc",
     ],
 }
 
@@ -247,7 +238,7 @@ ALL_GROUPS = {**PRODUCTION_GROUPS, **QC_GROUPS}
 
 
 class Command(BaseCommand):
-    help = "Create or update Production Execution and Production QC permission groups"
+    help = "Create or update Production Execution and QC permission groups"
 
     def add_arguments(self, parser):
         parser.add_argument(

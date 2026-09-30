@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.test import TestCase
-from django.utils import timezone
 from rest_framework.test import APIClient
 
 from company.models import Company, UserCompany, UserRole
@@ -324,23 +323,12 @@ class FGWarehouseTests(TestCase):
     """Finished goods go into the FG warehouse."""
 
     def setUp(self):
-        from quality_control.models.production_qc_session import (
-            ProductionQCSession,
-            ProductionQCSessionType,
-            ProductionQCWorkflowStatus,
-        )
         self.company = Company.objects.create(code='JIVO_OIL', name='Oil')
         line = ProductionLine.objects.create(company=self.company, name='Line-1')
         self.run = ProductionRun.objects.create(
             company=self.company, run_number=1, date=date(2026, 9, 18), line=line,
             product='FG0000372', item_code='FG0000372',
             total_production=Decimal('100'), status=RunStatus.COMPLETED,
-        )
-        ProductionQCSession.objects.create(
-            production_run=self.run, session_number=1, checked_at=timezone.now(),
-            session_type=ProductionQCSessionType.FINAL,
-            workflow_status=ProductionQCWorkflowStatus.APPROVED,
-            overall_result='PASS', is_active=True,
         )
         self.service = WarehouseService('JIVO_OIL')
 

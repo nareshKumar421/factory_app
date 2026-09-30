@@ -29,7 +29,7 @@ differences are handled by parameter sets, not by cloning the type.
 ### QCParameterSet
 A vendor-scoped set of parameters belonging to one material type. The set with a
 blank `vendor_code` is the **default**: it applies to every vendor without one of
-their own, and to production QC (which has no vendor). A vendor set is a full
+their own. A vendor set is a full
 standalone list, not a diff against the default.
 
 ### QCParameterMaster

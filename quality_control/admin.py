@@ -516,163 +516,6 @@ class InspectionParameterResultAdmin(admin.ModelAdmin):
         super().save_model(request, obj, form, change)
 
 
-# ==================== Online Quality Monitoring ====================
-from quality_control.models.online_monitoring import (  # noqa: E402
-    OnlineQualityRecord,
-    OnlineQualityReading,
-    OnlineQualityTorque,
-    OnlineQualitySpec,
-)
-
-
-class OnlineQualityTorqueInline(admin.TabularInline):
-    model = OnlineQualityTorque
-    extra = 0
-
-
-class OnlineQualityReadingInline(admin.TabularInline):
-    model = OnlineQualityReading
-    extra = 0
-    show_change_link = True
-
-
-@admin.register(OnlineQualityRecord)
-class OnlineQualityRecordAdmin(admin.ModelAdmin):
-    list_display = ("id", "date", "production_line", "sku", "shift", "batch_no", "status")
-    list_filter = ("status", "shift", "production_line")
-    search_fields = ("sku", "product_name", "batch_no")
-    date_hierarchy = "date"
-    inlines = [OnlineQualityReadingInline]
-
-
-@admin.register(OnlineQualityReading)
-class OnlineQualityReadingAdmin(admin.ModelAdmin):
-    list_display = ("id", "record", "reading_time", "filler_speed", "ph", "tds")
-    inlines = [OnlineQualityTorqueInline]
-
-
-@admin.register(OnlineQualitySpec)
-class OnlineQualitySpecAdmin(admin.ModelAdmin):
-    list_display = ("parameter_name", "parameter_key", "company", "specification_text",
-                    "min_value", "max_value", "unit", "validation_type", "is_active")
-    list_filter = ("validation_type", "company", "is_active")
-    search_fields = ("parameter_name", "parameter_key")
-
-
-# ==================== Testing Procedure (QC Documents) Admin ====================
-
-from .models import (  # noqa: E402
-    TestingProcedure,
-    TestingProcedureSection,
-    TestingProcedureLine,
-)
-
-
-class TestingProcedureSectionInline(admin.TabularInline):
-    model = TestingProcedureSection
-    extra = 0
-    fields = ("sequence", "section_number", "section_key", "title")
-    ordering = ("sequence",)
-    show_change_link = True
-
-
-class TestingProcedureLineInline(admin.TabularInline):
-    model = TestingProcedureLine
-    extra = 0
-    fields = ("sequence", "kind", "marker", "text", "interpretation")
-    ordering = ("sequence",)
-
-
-@admin.register(TestingProcedure)
-class TestingProcedureAdmin(admin.ModelAdmin):
-    list_display = (
-        "document_code", "title", "procedure_type", "revision_label",
-        "status", "company", "is_active",
-    )
-    list_filter = ("procedure_type", "status", "company", "is_active")
-    search_fields = ("document_code", "title")
-    inlines = [TestingProcedureSectionInline]
-    readonly_fields = ("created_at", "updated_at")
-
-
-@admin.register(TestingProcedureSection)
-class TestingProcedureSectionAdmin(admin.ModelAdmin):
-    list_display = ("procedure", "sequence", "section_number", "section_key", "title")
-    list_filter = ("section_key",)
-    search_fields = ("title", "procedure__document_code")
-    inlines = [TestingProcedureLineInline]
-
-
-# ==================== QC Record Forms (Documents) Admin ====================
-
-from .models import (  # noqa: E402
-    RecordTemplate,
-    RecordTemplateSection,
-    RecordTemplateParameter,
-    QCRecord,
-    RecordTimeSlot,
-    RecordValue,
-)
-
-
-class RecordTemplateSectionInline(admin.TabularInline):
-    model = RecordTemplateSection
-    extra = 0
-    fields = ("sequence", "title")
-    ordering = ("sequence",)
-    show_change_link = True
-
-
-class RecordTemplateParameterInline(admin.TabularInline):
-    """Add the rows of a printed form here -- no code change needed."""
-    model = RecordTemplateParameter
-    extra = 1
-    fields = (
-        "sequence", "sr_no", "name", "frequency", "specification",
-        "unit", "value_type", "min_value", "max_value",
-        "allowed_values", "conforming_values",
-    )
-    ordering = ("sequence",)
-
-
-@admin.register(RecordTemplate)
-class RecordTemplateAdmin(admin.ModelAdmin):
-    list_display = ("document_code", "title", "revision_label", "company", "is_active")
-    list_filter = ("company", "is_active")
-    search_fields = ("document_code", "title")
-    inlines = [RecordTemplateSectionInline]
-
-
-@admin.register(RecordTemplateSection)
-class RecordTemplateSectionAdmin(admin.ModelAdmin):
-    list_display = ("template", "sequence", "title")
-    search_fields = ("title", "template__document_code")
-    inlines = [RecordTemplateParameterInline]
-
-
-class RecordTimeSlotInline(admin.TabularInline):
-    model = RecordTimeSlot
-    extra = 0
-    fields = ("sequence", "slot_time")
-    ordering = ("sequence",)
-
-
-@admin.register(QCRecord)
-class QCRecordAdmin(admin.ModelAdmin):
-    list_display = ("template", "record_date", "shift", "status", "company", "is_active")
-    list_filter = ("status", "template", "company", "is_active")
-    date_hierarchy = "record_date"
-    inlines = [RecordTimeSlotInline]
-    readonly_fields = ("submitted_at", "approved_at", "created_at", "updated_at")
-
-
-@admin.register(RecordValue)
-class RecordValueAdmin(admin.ModelAdmin):
-    list_display = ("record", "time_slot", "parameter", "value")
-    list_filter = ("parameter__section__template",)
-    search_fields = ("value", "parameter__name")
-
-
 # ==================== QC PDF Document Library Admin ====================
 
 from .models import QCDocumentFile  # noqa: E402
@@ -715,3 +558,53 @@ class QCDocumentFileAuditLogAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+# ==================== Production QC Admin ====================
+
+from .models import (  # noqa: E402
+    ProductionParameter,
+    ProductionParameterType,
+    ProductionParameterTypeItem,
+    ProductionQCEntry,
+    ProductionQCResult,
+)
+
+
+class ProductionParameterInline(admin.TabularInline):
+    model = ProductionParameter
+    extra = 0
+    fields = ("sequence", "parameter_code", "parameter_name", "standard_value", "value_type",
+              "min_value", "max_value", "uom", "is_mandatory", "is_active")
+
+
+class ProductionParameterTypeItemInline(admin.TabularInline):
+    model = ProductionParameterTypeItem
+    extra = 0
+    fields = ("item_code", "item_name", "is_active")
+
+
+@admin.register(ProductionParameterType)
+class ProductionParameterTypeAdmin(admin.ModelAdmin):
+    list_display = ("code", "name", "company", "is_active")
+    list_filter = ("company", "is_active")
+    search_fields = ("code", "name")
+    inlines = [ProductionParameterInline, ProductionParameterTypeItemInline]
+
+
+class ProductionQCResultInline(admin.TabularInline):
+    model = ProductionQCResult
+    extra = 0
+    fields = ("sequence", "parameter_name", "standard_value", "result_value", "is_within_spec",
+              "remarks")
+    readonly_fields = ("sequence", "parameter_name", "standard_value")
+
+
+@admin.register(ProductionQCEntry)
+class ProductionQCEntryAdmin(admin.ModelAdmin):
+    list_display = ("id", "checked_at", "line", "product", "parameter_type", "status")
+    list_filter = ("status", "company", "line")
+    search_fields = ("product", "item_code")
+    date_hierarchy = "checked_at"
+    raw_id_fields = ("production_run",)
+    inlines = [ProductionQCResultInline]

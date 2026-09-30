@@ -8,14 +8,14 @@
 > `api_endpoints.md`, `permission.md`) are partially stale — trust this README and
 > the source when they disagree. Notable drift: report/lot numbers are **manually
 > entered**, not auto-generated; `QC_HOLD` is a real gate status; the module now
-> also covers **Production QC** and **QC print documents**.
+> also covers **QC print documents**.
 
 ---
 
 ## Overview — what it does & who uses it
 
-`quality_control` is the QA/lab side of the factory-operations platform. It has two
-largely independent halves plus shared master data:
+`quality_control` is the QA/lab side of the factory-operations platform. It has one
+main flow plus shared master data:
 
 1. **Arrival-slip / Raw-Material QC (LIVE, in daily use).** When a vehicle is
    received at the raw-material gate, a security guard fills a **Material Arrival
@@ -25,26 +25,28 @@ largely independent halves plus shared master data:
    (Accept / Reject / Hold) is the operational verdict that gates goods receipt
    (GRPO) and vendor returns.
 
-2. **Production QC (rolling out).** Per **ProductionRun**, QC records **In-Process**
-   and **Final (FG)** QC sessions against a product's parameter set, submits a
-   PASS/FAIL, and a QC approver approves/rejects. Production can *request* a Final
-   QC (creates a draft shell); QC owns parameter selection and the verdict.
-
-3. **Shared master data.** `MaterialType`, its `QCParameterMaster` rows, the
+2. **Shared master data.** `MaterialType`, its `QCParameterMaster` rows, the
    SAP-item→material-type mapping, and per-company `QCPrintDocument` IDs.
 
 Users (via Django auth groups, see [Permissions](#permissions--roles)):
 `qc_store` (guards / store), `qc_chemist` (lab technicians + chemist sign-off),
-`qc_manager` (QAM — holds every QC permission), plus a dedicated Production-QC group
-holding the line-clearance perms. The module is **deliberately gated** so shop-floor
-`production_execution` users (who hold `can_view_production_qc` for in-run checks) do
-**not** see the whole QC module.
+`qc_manager` (QAM — holds every QC permission), plus the "Production QC" group
+holding the line-clearance perms.
 
 **Line-clearance QA** permissions (`can_view_line_clearance_qc`,
-`can_approve_line_clearance_qc`) are *defined* on the `ProductionQCSession` model here,
-but the line-clearance **data and API live in `production_execution`** — QC only
-consumes/approves it. **Customer-Return QC** is a frontend-only prototype (browser
-`localStorage`); it has **no backend model in this app**.
+`can_approve_line_clearance_qc`) are *defined* on the `RawMaterialInspection` model
+here, but the line-clearance **data and API live in `production_execution`** — QC only
+consumes/approves it.
+
+**Removed 2026-09-29 (migration `0061`):** Production QC (in-process / final QC
+sessions per run, and the final-QC gate on FG receipts), Online Quality Monitoring,
+the fillable record sheets ("Documents") and the typed-up Testing Procedures. None
+was in use; they are to be rebuilt around what happens on the floor rather than
+around the paper reports. The line-clearance perms moved off `ProductionQCSession`
+onto `RawMaterialInspection` in that migration, keeping their codenames and grants.
+
+**Production QC, rebuilt (migrations `0063`, `0064`)** — see [Flow D](#flow-d--production-qc).
+Nothing of the removed version is reused: new tables, new permission codenames.
 
 ---
 
@@ -58,15 +60,13 @@ All models extend `gate_core.models.BaseModel` (adds `is_active`, `created_by`,
 | `MaterialType` | `models/material_type.py` | Company-scoped category defining a parameter set. `unique_together=(code, company)`. Custom perms `can_manage_material_types`, `can_manage_qc_parameters`. |
 | `MaterialTypeSAPItem` | `models/material_type_sap_item.py` | Maps a SAP `item_code` → a material type. **A SAP code may map to several material types**; `unique_together=(company, item_code, material_type)`. `item_code` force-uppercased on save. |
 | `QCParameterMaster` | `models/qc_parameter_master.py` | A test parameter for a material type. `standard_value` is **free text** (e.g. `"1.35±0.10"`, `"NLT 20"`, `"Blue"`). `min_value`/`max_value` exist but in practice are rarely filled. `parameter_type` ∈ NUMERIC/TEXT/BOOLEAN/RANGE. `is_mandatory`, `sequence`. `unique_together=(material_type, parameter_code)`. |
-| `QCPrintDocument` | `models/qc_print_document.py` | Per-company document ID printed on QC reports. `document_key=RAW_MATERIAL_INSPECTION`. `unique_together=(company, document_key)`. |
+| `QCPrintDocument` | `models/qc_print_document.py` | Master Data > Print Documents: the document number printed on each of QC's forms, per company — one row per arrival-slip report key, and one per production QC form (`document_key=PRODUCTION_QC_SHEET` + `production_parameter_type`; conditional unique constraints). `print-documents/options/` lists the forms a number can be set for. |
 | `MaterialArrivalSlip` | `models/material_arrival_slip.py` | `OneToOne` → `raw_material_gatein.POItemReceipt`. Status DRAFT/SUBMITTED/REJECTED. Methods `submit_to_qa`, `send_back_to_gate`, `reject_by_qa`. Perms `can_submit_arrival_slip`, `can_send_back_arrival_slip`. |
 | `ArrivalSlipAttachment` | `models/arrival_slip_attachment.py` | COA / COQ file. `unique_together=(arrival_slip, attachment_type)`. |
 | `RawMaterialInspection` | `models/raw_material_inspection.py` | `OneToOne` → arrival slip. The heart of RM QC (see below). |
 | `InspectionParameterResult` | `models/inspection_parameter_result.py` | One reading per parameter. `is_within_spec` auto-derived on `save()` (see spec evaluation). `unique_together=(inspection, parameter_master)`. |
 | `InspectionAttachment` | `models/inspection_attachment.py` | Lab files uploaded during inspection (`qc_attachments`). |
 | `InspectionManagerDecisionLog` | `models/raw_material_inspection.py` | Append-only audit row per QAM decision (kept even when a decision is overturned). |
-| `ProductionQCSession` | `models/production_qc_session.py` | Per `production_execution.ProductionRun`. `session_type` IN_PROCESS/FINAL, `session_number` auto-incremented per run, workflow DRAFT/SUBMITTED/APPROVED/REJECTED, `overall_result` PASS/FAIL. `unique_together=(production_run, session_number)`. Holds the production-QC + line-clearance perms. |
-| `ProductionQCResult` | `models/production_qc_result.py` | Per-parameter reading in a session; mirrors `InspectionParameterResult`. |
 
 ### `RawMaterialInspection` — the fields that matter
 
@@ -165,70 +165,34 @@ submitted to the chemist, send-back is refused ("use inspection rejection instea
 
 ### Flow D — Production QC
 
-1. **Session start.** `POST /production-qc/runs/<run_id>/sessions/` with a
-   `material_type_id`, `session_type`, `checked_at`. Parameter rows are populated
-   from the material type. Only **one FINAL** session per run.
-2. **Production requests Final QC** (optional): `POST
-   /production-qc/runs/<run_id>/request-final/` (needs
-   `can_edit_production_run`/`can_complete_production_run`, run must be COMPLETED).
-   Creates a **draft FINAL shell with `material_type=None`**; QC later picks the
-   parameter set via the create endpoint, which attaches to that shell.
-3. **Enter results** `POST /production-qc/sessions/<id>/results/` (DRAFT only).
-4. **Submit** `POST /production-qc/sessions/<id>/submit/` with PASS/FAIL. Requires a
-   material type + at least one result + all mandatory parameters filled. Locks the
-   session (DRAFT→SUBMITTED).
-5. **Approve / Reject** `.../approve/` or `.../reject/` (needs
-   `can_approve_production_qc`; only from SUBMITTED; approve requires PASS/FAIL).
+Checks QC makes on a line while a run is on it (`models/production_qc.py`,
+`services/production_qc.py`, `views_production_qc.py`, all under `production-qc/`).
 
-### Flow E — Record forms uploaded as Excel sheets (QC → Documents)
+**Masters** mirror the arrival-slip ones: a `ProductionParameterType` plays the part of
+a material type and carries its `ProductionParameter`s (spec as free text plus optional
+min/max, `value_type` NUMERIC/TEXT/BOOLEAN/RANGE, uom, mandatory, sequence). It is linked
+to FG products by SAP item code (`ProductionParameterTypeItem`, like
+`MaterialTypeSAPItem`). There are no vendor-specific sets: production has no vendor.
 
-QA's daily record forms (e.g. QA-FRM-14-01-05-02 *Oil Plant On Line Monitoring
-Record*) live as `RecordTemplate`s; a day's filled sheet is a `QCRecord`. A form is
-one of two kinds: **GRID** — laid out as sections/parameters in the format builder,
-values in `RecordValue` rows — or **SHEET** — uploaded as the Excel workbook QA
-already keeps and drawn exactly as the sheet looks. SHEET is described here.
+1. **Pick a running line** — `GET running-lines/`. A line is running while its
+   IN_PROGRESS run has an open segment, and for 24 h after its latest segment started
+   (a breakdown or the lunch stop closes the segment; QC still checks the line). Per
+   line, the run whose latest segment started most recently wins, so a stale run
+   nobody completed never shadows today's. Each line carries the types its product is
+   linked to.
+2. **Pick the type** — only the linked ones; a product with no link is offered every
+   type, and the one chosen is linked when the check is saved.
+3. **Fill and save** — `POST entries/` with one reading per parameter. Saving sends it
+   for approval (PENDING); there are no drafts. Every mandatory parameter needs a
+   value, and an out-of-spec reading needs an entry remark (as on the arrival slip).
+   Each `ProductionQCResult` snapshots the parameter's spec (`ParameterResultBase`),
+   so later edits to the master do not rewrite old checks. A BOOLEAN reading is
+   "Pass"/"Fail" and is its own verdict.
+4. **Approve** — a QC lead, one step: `approve/` or `send-back/` (remark required). A
+   sent-back entry is corrected with `PATCH entries/<id>/` and goes back to PENDING;
+   an approved one is final.
 
-1. **Upload.** `POST /record-templates/import-sheet/` (multipart `file`, optional
-   `sheet`; needs `can_approve_qc_records`). `services/record_sheet.py` reads the
-   print area (else the used range) into a **layout**: column widths / row heights
-   in px, every cell's text and style (fonts, borders, theme fills), merges, pictures
-   as data URLs, the print header/footer. Nothing is saved: the response carries the
-   layout, a **signed `layout_token`**, a first guess at the **cell fields**, and the
-   document code / revision / classification / title read off the footer and sheet.
-2. **Design.** The manager corrects which cells are filled in and how, sets the
-   document code and revision, and `POST /record-templates/` with `layout`,
-   `layout_token`, `cell_fields`. A layout is only accepted with the token issued for
-   it (a SHA-256 of the layout, signed, 24 h) — so a stored layout is always the
-   parser's own output. `cell_fields` are validated per cell (inside the range, not
-   inside a merge, known type, one REMARKS cell at most).
-3. **Fill.** `POST /qc-records/` opens the day's sheet as for any form;
-   `POST /qc-records/<id>/cells/` `{cells: {"D10": "0.12"}, remarks?}` saves only the
-   cells sent (blank clears one) into `QCRecord.cell_values`, under a row lock, so two
-   people filling different columns do not undo each other. TIME is normalised to
-   HH:MM and DATE to ISO; anything else invalid refuses the whole save.
-4. **Submit / approve / print** — the same endpoints and statuses as a GRID form.
-   The Q.A Chemist / Q.A.M signature cells show `submitted_by` / `approved_by`.
-
-**Cell field types:** value types `TEXT`, `NUMBER` (optional `min`/`max`), `TIME`,
-`DATE`, `CHOICE` (`options` offered, `ok` = the values that meet spec) are typed
-per record. Bound types `RECORD_DATE`, `SHIFT`, `REMARKS`, `SIGN_SUBMITTED`,
-`SIGN_APPROVED` are shown from the record and never stored as cells.
-`QCRecord.cell_checks` (serializer) judges NUMBER/CHOICE cells exactly like
-`RecordTemplateParameter.check_value`.
-
-**Detection heuristics** (only a starting point): empty boxed cells in columns that
-are otherwise blank are readings, while a column with text in >30% of its boxes (Sr
-No, Parameters, UOM) is a label column. A reading's type comes from its row — a UOM
-means NUMBER, "Absent" / "Present / Absent" means CHOICE, a spec like "6.5 - 8.5"
-sets limits — or, for a row with no label of its own (the row under a "Time"
-header), from the heading directly above. Loose labels `Date:`, `Shift:`,
-`Remarks:`, `…Chemist` / `Prepared by`, `Q.A.M` / `Approved by` bind the cell to their
-right (or below, at the right edge).
-
-**Lock:** once any record of the form has a value, its layout and cell fields
-cannot change (they would re-label readings); the header still can. A revised
-sheet is uploaded as a new form after retiring the old one (codes are unique among
-active forms).
+Lists: PENDING and SENT_BACK entries show whatever the date; a search spans all dates.
 
 ---
 
@@ -256,8 +220,6 @@ active forms).
   entry at `QC_PENDING`; any REJECTED (without all-terminal) → `QC_REJECTED`; any
   HOLD → `QC_HOLD`; all items ACCEPTED/REJECTED → `QC_COMPLETED`. `QC_COMPLETED`
   triggers a "gate can be completed" notification to `raw_material_gatein`.
-- **Production QC:** one FINAL per run; the `request-final` shell may only be filled
-  while it is DRAFT with `material_type=None`.
 
 ### Spec evaluation
 
@@ -267,7 +229,7 @@ and readings are typed into the text field. It parses tolerance (`235±5`, `+/-`
 (`58.6-61.7`), and pulls the first number out of labelled results (`"AVG-233"`→233).
 Structured `min_value`/`max_value` win when present. **Non-numeric / visual specs
 return `None`**, meaning "cannot auto-decide" — the inspector's manual pass/fail flag
-is left untouched. Used by both `InspectionParameterResult` and `ProductionQCResult`.
+is left untouched. Used by `InspectionParameterResult`.
 
 ---
 
@@ -279,7 +241,7 @@ is left untouched. Used by both `InspectionParameterResult` and `ProductionQCRes
 | Up/down | `gate_core` / `driver_management` (`VehicleEntry`, `GateEntryStatus`) | `services/rules.py` is the single writer of QC-phase gate statuses. |
 | Downstream | `gate_core` (`RejectedQCReturnEntry`/`Item`) | Rejected QC items are physically returned via a gate-out entry (`OneToOne` back to the inspection); it locks the QC decision. |
 | Downstream | `grpo` | A POSTED GRPO for the PO item locks the QC decision (`is_grpo_done`); QAM ACCEPTED notifies the `grpo` group with a preview link. |
-| Peer | `production_execution` (`ProductionRun`, line clearance) | Production QC sessions hang off runs; line-clearance perms live here but data lives there. |
+| Peer | `production_execution` (`ProductionRun`, line clearance) | Line-clearance QA: the perms live here, the data and API there. |
 | SAP (read-only) | `production_execution.services.sap_reader.ProductionOrderReader` | `SAPItemSearchAPI` searches the SAP **item master** to link SAP items to material types. On `SAPReadError` → **HTTP 503**. QC does **not** post anything to SAP. |
 | Cross-cutting | `notifications` (FCM) | `signals.py` sends push on slip submit/send-back and every inspection workflow transition (see below). |
 
@@ -355,11 +317,6 @@ they never break the QC action.
   outside spec, no remark. *Behaviour:* 400 `{"remarks": ["A remark is required …"]}`.
   A submit-only user can pass the remark inline on the submit call.
 
-- **Production Final QC requested twice.** *Trigger:* production requests FG QC when a
-  FINAL session already exists. *Behaviour:* the existing session is returned (or, if
-  it's a still-empty draft shell, QC's parameter selection attaches to it); a second
-  *filled* FINAL is refused ("A Final QC session already exists for this run").
-
 ---
 
 ## Failure modes / what can break
@@ -385,12 +342,9 @@ they never break the QC action.
 - **`min_value`/`max_value` are almost never populated**, so `is_within_spec` leans
   entirely on the free-text parser. Encouraging structured bounds would make
   pass/fail deterministic.
-- **Customer-Return QC has no backend here** — it is entirely browser `localStorage`
-  in the frontend and does not survive a device/browser change (see the frontend
-  doc). A server model + API is the obvious next step.
-- **Line-clearance perms defined on `ProductionQCSession`** but data lives in
-  `production_execution` — a slightly surprising split worth a code comment/onboarding
-  note (there is one in `module.config.tsx`).
+- **Line-clearance perms defined on `RawMaterialInspection`** but data lives in
+  `production_execution` — a slightly surprising split, kept so the codenames keep
+  their `quality_control` app label (commented on the model's `Meta`).
 - **`workflow_status=COMPLETED`** is legacy and unused by the current flow; consider
   removing to avoid confusion.
 - **`MaterialArrivalSlip.po_item_receipt` / `RawMaterialInspection.arrival_slip` are
@@ -416,16 +370,22 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
 | `can_reject_inspection` | Reject inspection |
 | `can_manage_material_types` | Material-type master + SAP search |
 | `can_manage_qc_parameters` | Parameter master + **print documents** |
-| `can_view/create/submit/approve_production_qc` | Production QC lifecycle |
 | `can_view/approve_line_clearance_qc` | Line-clearance QA (data in `production_execution`) |
+| `can_view_production_qc_entries` | See production QC checks |
+| `can_fill_production_qc_entries` | Make and correct checks (and so link a product to a type) |
+| `can_approve_production_qc_entries` | Approve / send back (the QC lead) |
+| `can_manage_production_qc_parameters` | Production parameter types, parameters, product links |
 
 **Auth groups** (migrations `0010`/`0012`, `0018`, `0025`):
 - `qc_store` — arrival-slip add/change/view/submit + `view_rawmaterialinspection`.
 - `qc_chemist` — view slips, inspection add/change/view/submit, `can_approve_as_chemist`.
 - `qc_manager` — **all** `quality_control` permissions (the QAM).
-- A dedicated Production-QC group carries the line-clearance perms; front-end nav is
-  gated on **line-clearance** perms (not `can_view_production_qc`) so shop-floor users
-  don't get the whole module. See the memory note *"Group perms vs frontend nav gating."*
+- The "Production QC" group carries the line-clearance perms; the front-end QC nav is
+  gated on them too, so that group sees the module. Migration `0064` also gives it
+  view + fill on production QC checks.
+- "Production QC Lead" (migration `0064`, empty until an administrator adds the leads)
+  — view + approve checks, and manage the production parameter types. `qc_manager`
+  gets all four production QC perms.
 
 ---
 
@@ -436,16 +396,15 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
   `qc_print_document.py`, `material_arrival_slip.py`, `arrival_slip_attachment.py`,
   `raw_material_inspection.py` (+ `InspectionManagerDecisionLog`),
   `inspection_parameter_result.py`, `inspection_attachment.py`,
-  `production_qc_session.py`, `production_qc_result.py`. (`models.py` is an empty stub.)
+  `qc_document_file.py` + `qc_document_file_audit.py` (QA Procedures PDF library),
+  `production_qc.py` (production parameter types, checks and their readings).
+  (`models.py` is an empty stub.)
 - `enums.py` — arrival-slip/inspection/decision/workflow/parameter enums.
 - `services/rules.py` — gate-status computation + QC-completed notification.
 - `services/spec_evaluation.py` — free-text spec → `is_within_spec`.
-- `services/record_sheet.py` — Excel form → layout, field detection, layout
-  signing, cell validation and spec checks (Flow E).
-- `models/qc_record.py`, `views_qc_record.py`, `serializers_qc_record.py` — the
-  Documents record forms, GRID and SHEET.
+- `services/production_qc.py` — running lines, saving / correcting / deciding a check.
+- `views_production_qc.py`, `serializers_production_qc.py` — the production QC API.
 - `views.py` — master data, arrival slips, inspections, approvals, status-based lists.
-- `views_production_qc.py` — production QC session lifecycle.
 - `serializers.py` — all read/write serializers (incl. `_safe_related` FK guard).
 - `permissions.py` — DRF permission classes.
 - `signals.py` — FCM notifications.

@@ -159,51 +159,40 @@ class CanManageInspection(BasePermission):
 
 # ==================== Production QC Permissions ====================
 
+PRODUCTION_QC_VIEW = "quality_control.can_view_production_qc_entries"
+PRODUCTION_QC_FILL = "quality_control.can_fill_production_qc_entries"
+PRODUCTION_QC_APPROVE = "quality_control.can_approve_production_qc_entries"
+PRODUCTION_QC_MANAGE = "quality_control.can_manage_production_qc_parameters"
+
+
+def _has_any(user, *perms):
+    return any(user.has_perm(p) for p in perms)
+
+
 class CanViewProductionQC(BasePermission):
-    """Permission to view production QC sessions."""
+    """See production QC entries. Whoever fills or approves them sees them too."""
 
     def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_view_production_qc")
+        return _has_any(request.user, PRODUCTION_QC_VIEW, PRODUCTION_QC_FILL, PRODUCTION_QC_APPROVE)
 
 
-class CanCreateProductionQC(BasePermission):
-    """Permission to create production QC sessions."""
-
+class CanFillProductionQC(BasePermission):
     def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_create_production_qc")
-
-
-class CanSubmitProductionQC(BasePermission):
-    """Permission to submit production QC for approval."""
-
-    def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_submit_production_qc")
+        return request.user.has_perm(PRODUCTION_QC_FILL)
 
 
 class CanApproveProductionQC(BasePermission):
-    """Permission to approve/reject production QC sessions."""
+    def has_permission(self, request, view):
+        return request.user.has_perm(PRODUCTION_QC_APPROVE)
+
+
+class CanReadOrManageProductionQCParameters(BasePermission):
+    """Read the parameter types to make a check; change them to manage the masters."""
 
     def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_approve_production_qc")
-
-
-# ==================== Online Quality Monitoring Permissions ====================
-
-class CanViewOnlineMonitoring(BasePermission):
-    def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_view_online_monitoring")
-
-
-class CanCreateOnlineMonitoring(BasePermission):
-    def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_create_online_monitoring")
-
-
-class CanSubmitOnlineMonitoring(BasePermission):
-    def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_submit_online_monitoring")
-
-
-class CanApproveOnlineMonitoring(BasePermission):
-    def has_permission(self, request, view):
-        return request.user.has_perm("quality_control.can_approve_online_monitoring")
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return _has_any(
+                request.user,
+                PRODUCTION_QC_VIEW, PRODUCTION_QC_FILL, PRODUCTION_QC_APPROVE, PRODUCTION_QC_MANAGE,
+            )
+        return request.user.has_perm(PRODUCTION_QC_MANAGE)

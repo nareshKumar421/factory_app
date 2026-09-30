@@ -81,9 +81,12 @@ App label: `quality_control`
 | 6 | `can_approve_as_chemist` | Can approve inspection as QA Chemist | `RawMaterialInspection` |
 | 7 | `can_approve_as_qam` | Can approve inspection as QA Manager | `RawMaterialInspection` |
 | 8 | `can_reject_inspection` | Can reject inspection | `RawMaterialInspection` |
-| 9 | `can_view_production_qc` | Can view production QC | `ProductionQCSession` |
-| 10 | `can_create_production_qc` | Can create production QC session | `ProductionQCSession` |
-| 11 | `can_submit_production_qc` | Can submit production QC session | `ProductionQCSession` |
+| 9 | `can_view_line_clearance_qc` | Can view line clearance QC | `RawMaterialInspection` |
+| 10 | `can_approve_line_clearance_qc` | Can approve line clearance QC | `RawMaterialInspection` |
+| 11 | `can_view_production_qc_entries` | Can view production QC entries | `ProductionQCEntry` |
+| 12 | `can_fill_production_qc_entries` | Can make and correct production QC entries | `ProductionQCEntry` |
+| 13 | `can_approve_production_qc_entries` | Can approve production QC entries | `ProductionQCEntry` |
+| 14 | `can_manage_production_qc_parameters` | Can manage production QC parameter types | `ProductionQCEntry` |
 
 **Django default permissions also used in views:**
 
@@ -202,7 +205,7 @@ Groups bundle permissions by **job role**. A user can belong to multiple groups.
 | `Shift Incharge` | Everything an Operator can do + complete runs, manpower, reports | Shift supervisors |
 | `Production Engineer` | Shift Incharge + manage machines, templates, approve waste (engineer) | Production engineers |
 | `Production HOD` | Full production access including line management and HOD waste approval | Head of production department |
-| `QA Officer` | View runs, line clearance QA approval, production QC | Quality assurance staff on the production floor |
+| `QA Officer` | View runs, line clearance QA approval | Quality assurance staff on the production floor |
 | `Store Incharge` | View runs, view material usage, view waste, approve waste (store) | Store/inventory personnel |
 | `Area Manager (AM)` | View runs, view waste, AM-level waste approval | Area/plant managers |
 
@@ -211,7 +214,7 @@ Groups bundle permissions by **job role**. A user can belong to multiple groups.
 | Group Name | Description | Who gets it |
 |------------|-------------|-------------|
 | `QC Store` | Create & submit arrival slips, view inspections | Store/security at receiving dock |
-| `QC Chemist` | Perform inspections, submit, chemist-level approval, production QC | Lab chemists |
+| `QC Chemist` | Perform inspections, submit, chemist-level approval | Lab chemists |
 | `QC Manager` | Full QC access — all permissions including QAM approval, master data | QA/QC department head |
 
 ### 3.3 Gate & Security Groups
@@ -293,9 +296,6 @@ Groups bundle permissions by **job role**. A user can belong to multiple groups.
 | `can_reject_inspection` | | | x |
 | `can_manage_material_types` | | | x |
 | `can_manage_qc_parameters` | | | x |
-| `can_view_production_qc` | | x | x |
-| `can_create_production_qc` | | x | x |
-| `can_submit_production_qc` | | x | x |
 
 ### 4.3 Gate & Security Permissions
 

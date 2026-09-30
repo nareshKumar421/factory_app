@@ -156,6 +156,11 @@ class RawMaterialInspection(BaseModel):
             ("can_approve_as_qam", "Can approve inspection as QA Manager"),
             ("can_reject_inspection", "Can reject inspection"),
             ("can_override_qc_vendor", "Can inspect against a vendor other than the PO's"),
+            # QC's sign-off on production line clearances. The clearances live
+            # in production_execution; these stay here so the codenames keep
+            # their quality_control app label.
+            ("can_view_line_clearance_qc", "Can view line clearance QC"),
+            ("can_approve_line_clearance_qc", "Can approve line clearance QC"),
         ]
 
     def __str__(self):

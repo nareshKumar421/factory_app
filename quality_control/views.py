@@ -101,7 +101,18 @@ def _material_type_queryset(company):
 
 
 def _qc_print_document_queryset(company):
-    return QCPrintDocument.objects.filter(company=company, is_active=True)
+    return QCPrintDocument.objects.filter(company=company, is_active=True).select_related(
+        "production_parameter_type"
+    )
+
+
+def _check_print_document_type(company, data):
+    """A production sheet's type must be one of this company's live types."""
+    parameter_type = data.get("production_parameter_type")
+    if parameter_type is not None and (
+        parameter_type.company_id != company.id or not parameter_type.is_active
+    ):
+        raise ValidationError({"production_parameter_type": ["Not a production QC form here."]})
 
 
 def _ensure_material_type_code_is_free(company, code, exclude_id=None, include_inactive=False):
@@ -414,11 +425,14 @@ class QCPrintDocumentListCreateAPI(APIView):
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
         company = request.company.company
+        _check_print_document_type(company, data)
         document_key = data.pop("document_key")
 
+        # One row per form: per key, or per production QC form.
         document = QCPrintDocument.objects.filter(
             company=company,
             document_key=document_key,
+            production_parameter_type=data.get("production_parameter_type"),
         ).first()
         response_status = status.HTTP_200_OK
 
@@ -440,6 +454,31 @@ class QCPrintDocumentListCreateAPI(APIView):
         return Response(QCPrintDocumentSerializer(document).data, status=response_status)
 
 
+class QCPrintDocumentOptionsAPI(APIView):
+    """The forms a document number can be set for: the fixed QC reports, and
+    each production QC form (parameter type) of the company."""
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
+
+    def get(self, request):
+        from .models import ProductionParameterType
+
+        Key = QCPrintDocument.DocumentKey
+        options = [
+            {"document_key": key.value, "production_parameter_type": None, "label": key.label}
+            for key in Key
+            if key != Key.PRODUCTION_QC_SHEET
+        ]
+        for parameter_type in ProductionParameterType.objects.filter(
+            company=request.company.company, is_active=True
+        ).order_by("name"):
+            options.append({
+                "document_key": Key.PRODUCTION_QC_SHEET.value,
+                "production_parameter_type": parameter_type.id,
+                "label": f"Production QC — {parameter_type.name}",
+            })
+        return Response(options)
+
+
 class QCPrintDocumentDetailAPI(APIView):
     """Get, update, or delete a QC print document ID."""
     permission_classes = [IsAuthenticated, HasCompanyContext, CanManageQCParameters]
@@ -459,17 +498,21 @@ class QCPrintDocumentDetailAPI(APIView):
         serializer = QCPrintDocumentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
+        _check_print_document_type(request.company.company, data)
 
         next_key = data.get("document_key", document.document_key)
         duplicate = QCPrintDocument.objects.filter(
             company=request.company.company,
             document_key=next_key,
-            is_active=True,
+            production_parameter_type=data.get("production_parameter_type"),
         ).exclude(id=document.id).first()
-        if duplicate:
+        if duplicate and duplicate.is_active:
             raise ValidationError({
                 "document_key": ["A print document already exists for this document type."]
             })
+        if duplicate:
+            # A removed row for the same form: this one takes its place.
+            duplicate.delete()
 
         for key, value in data.items():
             setattr(document, key, value)

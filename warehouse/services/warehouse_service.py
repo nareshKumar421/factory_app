@@ -1438,11 +1438,6 @@ class WarehouseService:
         Called automatically or manually by warehouse.
         """
         from production_execution.models import ProductionRun
-        from quality_control.models.production_qc_session import (
-            ProductionQCSession,
-            ProductionQCSessionType,
-            ProductionQCWorkflowStatus,
-        )
 
         run_id = data['production_run_id']
         try:
@@ -1452,18 +1447,6 @@ class WarehouseService:
 
         if run.status != 'COMPLETED':
             raise ValueError("Can only create FG receipt for completed runs.")
-
-        has_approved_final_qc = ProductionQCSession.objects.filter(
-            production_run=run,
-            session_type=ProductionQCSessionType.FINAL,
-            workflow_status=ProductionQCWorkflowStatus.APPROVED,
-            overall_result='PASS',
-            is_active=True,
-        ).exists()
-        if not has_approved_final_qc:
-            raise ValueError(
-                "Final QC must be approved with PASS before sending finished goods to warehouse."
-            )
 
         produced_qty = run.total_production
         rejected_qty = run.rejected_qty

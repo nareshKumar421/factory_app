@@ -116,15 +116,30 @@ class MaterialTypeSAPItemLinkSerializer(serializers.Serializer):
 # ==================== QC Print Document Serializers ====================
 
 class QCPrintDocumentSerializer(serializers.ModelSerializer):
-    document_key_label = serializers.CharField(source="get_document_key_display", read_only=True)
+    # The form's name: the key's, or "Production QC — <type>" for a production sheet.
+    document_key_label = serializers.CharField(source="label", read_only=True)
 
     class Meta:
         model = QCPrintDocument
         fields = [
-            "id", "document_key", "document_key_label", "document_id",
-            "notes", "is_active", "created_at", "updated_at"
+            "id", "document_key", "document_key_label", "production_parameter_type",
+            "document_id", "notes", "is_active", "created_at", "updated_at"
         ]
         read_only_fields = ["id", "document_key_label", "created_at", "updated_at"]
+        # Uniqueness is the model's two conditional constraints, checked in the
+        # view with a message a person can act on.
+        validators = []
+
+    def validate(self, attrs):
+        key = attrs.get("document_key")
+        parameter_type = attrs.get("production_parameter_type")
+        if key == QCPrintDocument.DocumentKey.PRODUCTION_QC_SHEET and parameter_type is None:
+            raise serializers.ValidationError(
+                {"production_parameter_type": ["Pick the production QC form."]}
+            )
+        if key != QCPrintDocument.DocumentKey.PRODUCTION_QC_SHEET:
+            attrs["production_parameter_type"] = None
+        return attrs
 
 
 # ==================== QC Parameter Set Serializers ====================
@@ -730,249 +745,3 @@ class ApprovalSerializer(serializers.Serializer):
 class ParameterResultBulkUpdateSerializer(serializers.Serializer):
     """For bulk updating parameter results"""
     results = InspectionParameterResultCreateSerializer(many=True)
-
-
-# ==================== Production QC Serializers ====================
-
-from quality_control.models.production_qc_session import (
-    ProductionQCSession,
-    ProductionQCSessionType,
-    ProductionQCWorkflowStatus,
-)
-from quality_control.models.production_qc_result import ProductionQCResult
-from production_execution.models import ProductionRun, RunStatus
-
-
-class ProductionQCResultSerializer(serializers.ModelSerializer):
-    """Read serializer for production QC parameter results.
-
-    Every parameter field is read from the row's own snapshot, not from the
-    master, so a session always reports the limits that applied when it ran.
-    """
-
-    class Meta:
-        model = ProductionQCResult
-        fields = [
-            "id", "parameter_master", "parameter_code", "parameter_name",
-            "standard_value", "parameter_type", "min_value", "max_value",
-            "uom", "is_mandatory", "result_value", "result_numeric",
-            "is_within_spec", "remarks"
-        ]
-        read_only_fields = [
-            "id", "parameter_code", "parameter_name", "standard_value",
-            "parameter_type", "min_value", "max_value", "uom", "is_mandatory"
-        ]
-
-
-class ProductionQCResultCreateSerializer(serializers.Serializer):
-    """For bulk creating/updating parameter results in a session."""
-    parameter_master_id = serializers.IntegerField()
-    result_value = serializers.CharField(max_length=200, required=False, allow_blank=True)
-    result_numeric = serializers.DecimalField(
-        max_digits=12, decimal_places=4, required=False, allow_null=True
-    )
-    is_within_spec = serializers.BooleanField(required=False, allow_null=True)
-    remarks = serializers.CharField(required=False, allow_blank=True)
-
-
-class ProductionQCSessionSerializer(serializers.ModelSerializer):
-    """Read serializer for production QC sessions."""
-    results = ProductionQCResultSerializer(many=True, read_only=True)
-    checked_by_name = serializers.CharField(
-        source="checked_by.full_name", read_only=True,
-        allow_null=True, default=None
-    )
-    submitted_by_name = serializers.CharField(
-        source="submitted_by.full_name", read_only=True,
-        allow_null=True, default=None
-    )
-    approved_by_name = serializers.CharField(
-        source="approved_by.full_name", read_only=True,
-        allow_null=True, default=None
-    )
-    rejected_by_name = serializers.CharField(
-        source="rejected_by.full_name", read_only=True,
-        allow_null=True, default=None
-    )
-    material_type_name = serializers.CharField(
-        source="material_type.name", read_only=True,
-        allow_null=True, default=None
-    )
-    material_type_code = serializers.CharField(
-        source="material_type.code", read_only=True,
-        allow_null=True, default=None
-    )
-    run_number = serializers.IntegerField(
-        source="production_run.run_number", read_only=True
-    )
-
-    class Meta:
-        model = ProductionQCSession
-        fields = [
-            "id", "production_run", "run_number",
-            "material_type", "material_type_name", "material_type_code",
-            "session_number", "session_type",
-            "checked_at", "checked_by", "checked_by_name",
-            "overall_result", "workflow_status",
-            "submitted_by", "submitted_by_name", "submitted_at",
-            "approved_by", "approved_by_name", "approved_at",
-            "approval_remarks",
-            "rejected_by", "rejected_by_name", "rejected_at",
-            "rejection_remarks",
-            "remarks", "results",
-            "created_at", "updated_at",
-        ]
-        read_only_fields = [
-            "id", "run_number", "material_type_name", "material_type_code",
-            "session_number", "overall_result", "workflow_status",
-            "checked_by", "checked_by_name",
-            "submitted_by", "submitted_by_name", "submitted_at",
-            "approved_by", "approved_by_name", "approved_at",
-            "approval_remarks",
-            "rejected_by", "rejected_by_name", "rejected_at",
-            "rejection_remarks",
-            "created_at", "updated_at",
-        ]
-
-
-class ProductionQCSessionListSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for list views."""
-    checked_by_name = serializers.CharField(
-        source="checked_by.full_name", read_only=True,
-        allow_null=True, default=None
-    )
-    material_type_name = serializers.CharField(
-        source="material_type.name", read_only=True,
-        allow_null=True, default=None
-    )
-    run_number = serializers.IntegerField(
-        source="production_run.run_number", read_only=True
-    )
-    run_date = serializers.DateField(
-        source="production_run.date", read_only=True
-    )
-    product = serializers.CharField(
-        source="production_run.product", read_only=True
-    )
-    line_name = serializers.CharField(
-        source="production_run.line.name", read_only=True
-    )
-    pass_count = serializers.SerializerMethodField()
-    fail_count = serializers.SerializerMethodField()
-    total_params = serializers.SerializerMethodField()
-
-    class Meta:
-        model = ProductionQCSession
-        fields = [
-            "id", "production_run", "run_number", "run_date", "product", "line_name",
-            "material_type", "material_type_name",
-            "session_number", "session_type",
-            "checked_at", "checked_by_name",
-            "overall_result", "workflow_status",
-            "pass_count", "fail_count", "total_params",
-            "created_at",
-        ]
-
-    def get_pass_count(self, obj):
-        return obj.results.filter(is_within_spec=True, is_active=True).count()
-
-    def get_fail_count(self, obj):
-        return obj.results.filter(is_within_spec=False, is_active=True).count()
-
-    def get_total_params(self, obj):
-        return obj.results.filter(is_active=True).count()
-
-
-class ProductionQCRunningRunSerializer(serializers.ModelSerializer):
-    """A currently-running production run a QC user can select to do QC on.
-
-    Carries enough to render a "pick a running line" list plus a QC-progress
-    hint (how many in-process rounds done, the latest round's state/result).
-    """
-    line_name = serializers.CharField(source="line.name", read_only=True)
-    live_status = serializers.SerializerMethodField()
-    inprocess_qc_count = serializers.SerializerMethodField()
-    latest_inprocess_status = serializers.SerializerMethodField()
-    latest_inprocess_result = serializers.SerializerMethodField()
-    has_pending_qc = serializers.SerializerMethodField()
-
-    class Meta:
-        model = ProductionRun
-        fields = [
-            "id", "run_number", "date", "line", "line_name",
-            "product", "item_code", "status", "live_status",
-            "inprocess_qc_count", "latest_inprocess_status",
-            "latest_inprocess_result", "has_pending_qc",
-        ]
-
-    def get_live_status(self, obj):
-        # Mirror ProductionRunListSerializer: is the line actually running?
-        if obj.status != RunStatus.IN_PROGRESS:
-            return obj.status
-        if obj.breakdowns.filter(is_active=True).exists():
-            return "BREAKDOWN"
-        if obj.segments.filter(is_active=True).exists():
-            return "RUNNING"
-        return "STOPPED"
-
-    def _inprocess_sessions(self, obj):
-        # qc_sessions is prefetched by the view; filter in memory.
-        return [
-            s for s in obj.qc_sessions.all()
-            if s.is_active and s.session_type == ProductionQCSessionType.IN_PROCESS
-        ]
-
-    def _latest(self, obj):
-        sessions = self._inprocess_sessions(obj)
-        return max(sessions, key=lambda s: s.session_number) if sessions else None
-
-    def get_inprocess_qc_count(self, obj):
-        return len(self._inprocess_sessions(obj))
-
-    def get_latest_inprocess_status(self, obj):
-        latest = self._latest(obj)
-        return latest.workflow_status if latest else None
-
-    def get_latest_inprocess_result(self, obj):
-        latest = self._latest(obj)
-        return (latest.overall_result or None) if latest else None
-
-    def get_has_pending_qc(self, obj):
-        return any(
-            s.workflow_status in (
-                ProductionQCWorkflowStatus.DRAFT,
-                ProductionQCWorkflowStatus.SUBMITTED,
-            )
-            for s in self._inprocess_sessions(obj)
-        )
-
-
-class ProductionQCSessionCreateSerializer(serializers.Serializer):
-    """For creating a new QC session."""
-    material_type_id = serializers.IntegerField()
-    session_type = serializers.ChoiceField(
-        choices=["IN_PROCESS", "FINAL"], default="IN_PROCESS"
-    )
-    checked_at = serializers.DateTimeField()
-    remarks = serializers.CharField(required=False, allow_blank=True, default="")
-
-
-class ProductionQCResultBulkUpdateSerializer(serializers.Serializer):
-    """For bulk updating parameter results in a session."""
-    results = ProductionQCResultCreateSerializer(many=True)
-
-
-class ProductionQCSubmitSerializer(serializers.Serializer):
-    """For submitting/finalizing a QC session with PASS/FAIL result."""
-    overall_result = serializers.ChoiceField(choices=["PASS", "FAIL"])
-
-
-class ProductionQCApprovalSerializer(serializers.Serializer):
-    """For approving a submitted production QC session."""
-    overall_result = serializers.ChoiceField(choices=["PASS", "FAIL"], required=False)
-    remarks = serializers.CharField(required=False, allow_blank=True, default="")
-
-
-class ProductionQCRejectSerializer(serializers.Serializer):
-    """For rejecting a submitted production QC session."""
-    remarks = serializers.CharField(required=False, allow_blank=True, default="")

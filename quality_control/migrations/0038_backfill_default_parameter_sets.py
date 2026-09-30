@@ -64,7 +64,13 @@ def create_default_sets(apps, schema_editor):
 
 def snapshot_result_definitions(apps, schema_editor):
     for model_name in ("InspectionParameterResult", "ProductionQCResult"):
-        model = apps.get_model("quality_control", model_name)
+        try:
+            model = apps.get_model("quality_control", model_name)
+        except LookupError:
+            # ProductionQCResult was removed in 0061. It still exists at this
+            # point of the chain; only a call with the current apps (the tests)
+            # lands here.
+            continue
         batch = []
         rows = model.objects.filter(
             parameter_code=""

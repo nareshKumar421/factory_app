@@ -10,6 +10,7 @@ from .views import (
     SAPItemSearchAPI,
     QCPrintDocumentListCreateAPI,
     QCPrintDocumentDetailAPI,
+    QCPrintDocumentOptionsAPI,
     # QC Parameter Set APIs
     QCParameterSetListCreateAPI,
     QCParameterSetDetailAPI,
@@ -46,54 +47,20 @@ from .views import (
     InspectionReturnToVendorAPI,
     InspectionDecisionChangedAPI,
 )
-from .views_online_monitoring import (
-    OnlineMonitoringLinesAPI,
-    OnlineMonitoringRunsAPI,
-    OnlineMonitoringListCreateAPI,
-    OnlineMonitoringDetailAPI,
-    OnlineMonitoringReadingAttachmentAPI,
-    OnlineMonitoringReadingAttachmentDetailAPI,
-    OnlineMonitoringReadingCreateAPI,
-    OnlineMonitoringReadingDetailAPI,
-    OnlineMonitoringSubmitAPI,
-    OnlineMonitoringApproveAPI,
-    OnlineMonitoringRejectAPI,
-    OnlineMonitoringReopenAPI,
-    OnlineMonitoringSpecListAPI,
-    OnlineMonitoringSpecDetailAPI,
-)
 from .views_production_qc import (
-    ProductionQCSessionListCreateAPI,
-    ProductionQCFinalRequestAPI,
-    ProductionQCSessionDetailAPI,
-    ProductionQCResultsAPI,
-    ProductionQCSubmitAPI,
-    ProductionQCPendingAPI,
-    ProductionQCRunningRunsAPI,
-    ProductionQCApproveAPI,
-    ProductionQCRejectAPI,
-    ProductionQCAllListAPI,
-    ProductionQCCountsAPI,
+    ProductionQCRunningLinesAPI,
+    ProductionQCEntryListCreateAPI,
+    ProductionQCEntryCountsAPI,
+    ProductionQCEntryDetailAPI,
+    ProductionQCEntryApproveAPI,
+    ProductionQCEntrySendBackAPI,
+    ProductionParameterTypeListCreateAPI,
+    ProductionParameterTypeDetailAPI,
+    ProductionParameterListCreateAPI,
+    ProductionParameterDetailAPI,
+    ProductionParameterTypeItemCreateAPI,
+    ProductionParameterTypeItemDetailAPI,
 )
-
-from .views_testing_procedure import (
-    TestingProcedureListCreateAPI,
-    TestingProcedureDetailAPI,
-    TestingProcedureCountsAPI,
-)
-
-from .views_qc_record import (
-    RecordTemplateListCreateAPI,
-    RecordTemplateDetailAPI,
-    QCRecordListCreateAPI,
-    QCRecordDetailAPI,
-    QCRecordValuesAPI,
-    QCRecordCellsAPI,
-    QCRecordSubmitAPI,
-    QCRecordApproveAPI,
-    RecordSheetImportAPI,
-)
-
 from .views_qc_document_file import (
     QCDocumentFileListCreateAPI,
     QCDocumentFileDetailAPI,
@@ -106,6 +73,32 @@ from .views_qc_document_file_audit import (
 )
 
 urlpatterns = [
+    # ==================== Production QC ====================
+    path("production-qc/running-lines/", ProductionQCRunningLinesAPI.as_view(),
+         name="production-qc-running-lines"),
+    path("production-qc/entries/", ProductionQCEntryListCreateAPI.as_view(),
+         name="production-qc-entries"),
+    path("production-qc/entries/counts/", ProductionQCEntryCountsAPI.as_view(),
+         name="production-qc-entry-counts"),
+    path("production-qc/entries/<int:entry_id>/", ProductionQCEntryDetailAPI.as_view(),
+         name="production-qc-entry-detail"),
+    path("production-qc/entries/<int:entry_id>/approve/", ProductionQCEntryApproveAPI.as_view(),
+         name="production-qc-entry-approve"),
+    path("production-qc/entries/<int:entry_id>/send-back/", ProductionQCEntrySendBackAPI.as_view(),
+         name="production-qc-entry-send-back"),
+    path("production-qc/parameter-types/", ProductionParameterTypeListCreateAPI.as_view(),
+         name="production-qc-parameter-types"),
+    path("production-qc/parameter-types/<int:type_id>/", ProductionParameterTypeDetailAPI.as_view(),
+         name="production-qc-parameter-type-detail"),
+    path("production-qc/parameter-types/<int:type_id>/parameters/",
+         ProductionParameterListCreateAPI.as_view(), name="production-qc-parameters"),
+    path("production-qc/parameters/<int:parameter_id>/", ProductionParameterDetailAPI.as_view(),
+         name="production-qc-parameter-detail"),
+    path("production-qc/parameter-types/<int:type_id>/items/",
+         ProductionParameterTypeItemCreateAPI.as_view(), name="production-qc-type-items"),
+    path("production-qc/items/<int:item_id>/", ProductionParameterTypeItemDetailAPI.as_view(),
+         name="production-qc-type-item-detail"),
+
     # ==================== QC PDF Document Library ====================
     path(
         "document-files/",
@@ -141,75 +134,16 @@ urlpatterns = [
         name="qc-document-file-download"
     ),
 
-    # ==================== QC Record Forms (Documents) APIs ====================
-    path(
-        "record-templates/",
-        RecordTemplateListCreateAPI.as_view(),
-        name="record-template-list-create"
-    ),
-    path(
-        "record-templates/import-sheet/",
-        RecordSheetImportAPI.as_view(),
-        name="record-template-import-sheet"
-    ),
-    path(
-        "record-templates/<int:template_id>/",
-        RecordTemplateDetailAPI.as_view(),
-        name="record-template-detail"
-    ),
-    path(
-        "qc-records/",
-        QCRecordListCreateAPI.as_view(),
-        name="qc-record-list-create"
-    ),
-    path(
-        "qc-records/<int:record_id>/",
-        QCRecordDetailAPI.as_view(),
-        name="qc-record-detail"
-    ),
-    path(
-        "qc-records/<int:record_id>/values/",
-        QCRecordValuesAPI.as_view(),
-        name="qc-record-values"
-    ),
-    path(
-        "qc-records/<int:record_id>/cells/",
-        QCRecordCellsAPI.as_view(),
-        name="qc-record-cells"
-    ),
-    path(
-        "qc-records/<int:record_id>/submit/",
-        QCRecordSubmitAPI.as_view(),
-        name="qc-record-submit"
-    ),
-    path(
-        "qc-records/<int:record_id>/approve/",
-        QCRecordApproveAPI.as_view(),
-        name="qc-record-approve"
-    ),
-
-    # ==================== Testing Procedure (Documents) APIs ====================
-    path(
-        "testing-procedures/",
-        TestingProcedureListCreateAPI.as_view(),
-        name="testing-procedure-list-create"
-    ),
-    path(
-        "testing-procedures/counts/",
-        TestingProcedureCountsAPI.as_view(),
-        name="testing-procedure-counts"
-    ),
-    path(
-        "testing-procedures/<int:procedure_id>/",
-        TestingProcedureDetailAPI.as_view(),
-        name="testing-procedure-detail"
-    ),
-
     # ==================== QC Print Document APIs ====================
     path(
         "print-documents/",
         QCPrintDocumentListCreateAPI.as_view(),
         name="qc-print-document-list-create"
+    ),
+    path(
+        "print-documents/options/",
+        QCPrintDocumentOptionsAPI.as_view(),
+        name="qc-print-document-options"
     ),
     path(
         "print-documents/<int:document_id>/",
@@ -415,93 +349,4 @@ urlpatterns = [
         InspectionRejectAPI.as_view(),
         name="inspection-reject"
     ),
-
-    # ==================== Production QC APIs ====================
-    path(
-        "production-qc/",
-        ProductionQCAllListAPI.as_view(),
-        name="production-qc-list"
-    ),
-    path(
-        "production-qc/counts/",
-        ProductionQCCountsAPI.as_view(),
-        name="production-qc-counts"
-    ),
-    path(
-        "production-qc/pending/",
-        ProductionQCPendingAPI.as_view(),
-        name="production-qc-pending"
-    ),
-    path(
-        "production-qc/running-runs/",
-        ProductionQCRunningRunsAPI.as_view(),
-        name="production-qc-running-runs"
-    ),
-    path(
-        "production-qc/runs/<int:run_id>/sessions/",
-        ProductionQCSessionListCreateAPI.as_view(),
-        name="production-qc-session-list-create"
-    ),
-    path(
-        "production-qc/runs/<int:run_id>/request-final/",
-        ProductionQCFinalRequestAPI.as_view(),
-        name="production-qc-final-request"
-    ),
-    path(
-        "production-qc/sessions/<int:session_id>/",
-        ProductionQCSessionDetailAPI.as_view(),
-        name="production-qc-session-detail"
-    ),
-    path(
-        "production-qc/sessions/<int:session_id>/results/",
-        ProductionQCResultsAPI.as_view(),
-        name="production-qc-results"
-    ),
-    path(
-        "production-qc/sessions/<int:session_id>/submit/",
-        ProductionQCSubmitAPI.as_view(),
-        name="production-qc-submit"
-    ),
-    path(
-        "production-qc/sessions/<int:session_id>/approve/",
-        ProductionQCApproveAPI.as_view(),
-        name="production-qc-approve"
-    ),
-    path(
-        "production-qc/sessions/<int:session_id>/reject/",
-        ProductionQCRejectAPI.as_view(),
-        name="production-qc-reject"
-    ),
-
-    # ==================== Online Quality Monitoring APIs ====================
-    path("online-monitoring/", OnlineMonitoringListCreateAPI.as_view(),
-         name="online-monitoring-list"),
-    path("online-monitoring/lines/", OnlineMonitoringLinesAPI.as_view(),
-         name="online-monitoring-lines"),
-    path("online-monitoring/runs/", OnlineMonitoringRunsAPI.as_view(),
-         name="online-monitoring-runs"),
-    path("online-monitoring/specs/", OnlineMonitoringSpecListAPI.as_view(),
-         name="online-monitoring-specs"),
-    path("online-monitoring/specs/<int:spec_id>/", OnlineMonitoringSpecDetailAPI.as_view(),
-         name="online-monitoring-spec-detail"),
-    path("online-monitoring/<int:record_id>/", OnlineMonitoringDetailAPI.as_view(),
-         name="online-monitoring-detail"),
-    path("online-monitoring/<int:record_id>/readings/", OnlineMonitoringReadingCreateAPI.as_view(),
-         name="online-monitoring-reading-create"),
-    path("online-monitoring/<int:record_id>/readings/<int:reading_id>/",
-         OnlineMonitoringReadingDetailAPI.as_view(), name="online-monitoring-reading-detail"),
-    path("online-monitoring/<int:record_id>/readings/<int:reading_id>/attachments/",
-         OnlineMonitoringReadingAttachmentAPI.as_view(),
-         name="online-monitoring-reading-attachments"),
-    path("online-monitoring/<int:record_id>/readings/<int:reading_id>/attachments/<int:attachment_id>/",
-         OnlineMonitoringReadingAttachmentDetailAPI.as_view(),
-         name="online-monitoring-reading-attachment-detail"),
-    path("online-monitoring/<int:record_id>/submit/", OnlineMonitoringSubmitAPI.as_view(),
-         name="online-monitoring-submit"),
-    path("online-monitoring/<int:record_id>/approve/", OnlineMonitoringApproveAPI.as_view(),
-         name="online-monitoring-approve"),
-    path("online-monitoring/<int:record_id>/reject/", OnlineMonitoringRejectAPI.as_view(),
-         name="online-monitoring-reject"),
-    path("online-monitoring/<int:record_id>/reopen/", OnlineMonitoringReopenAPI.as_view(),
-         name="online-monitoring-reopen"),
 ]

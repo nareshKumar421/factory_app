@@ -9,8 +9,7 @@ workflows plus a read-only analytics surface:
 1. **BOM Issue Requests** — production asks the warehouse store for the raw
    materials a run needs; the store reviews stock, approves/partially-approves,
    and posts a **Goods Issue** to SAP against the production order.
-2. **Finished-Goods (FG) Receipt** — after a run completes and passes Final QC,
-   the store receives the produced goods and posts a **Goods Receipt** to SAP.
+2. **Finished-Goods (FG) Receipt** — after a run completes, the store receives the produced goods and posts a **Goods Receipt** to SAP.
 3. **WMS read dashboards** (`/warehouse/wms/*`) — company-scoped, read-only SAP
    HANA queries powering stock, movement, transfer, batch-expiry, sales-backlog
    and billing screens.
@@ -32,7 +31,7 @@ workflows plus a read-only analytics surface:
 | Submit BOM request | **Production** (run screen) | A `PENDING` `BOMRequest` with one `BOMRequestLine` per material, scaled to the run's `required_qty`. |
 | Review / approve / reject | **Warehouse store** ("BOM & FG Store" group) | Line-level approved quantities, capped by live SAP stock. |
 | Issue materials to SAP | Warehouse store | SAP `InventoryGenExits` (Goods Issue) against the production order; `issued_qty` tracked per line. |
-| Create FG receipt | Production / warehouse | A `PENDING` `FinishedGoodsReceipt` for a **COMPLETED** run whose **Final QC** is approved/PASS. |
+| Create FG receipt | Production / warehouse | A `PENDING` `FinishedGoodsReceipt` for a **COMPLETED** run. No screen creates one any more (see Flow 2). |
 | Receive FG | Warehouse store | Receipt → `RECEIVED`. |
 | Post FG to SAP | Warehouse store | SAP `InventoryGenEntries` (Goods Receipt); receipt → `SAP_POSTED`. |
 | WMS dashboards | Anyone with `warehouse.can_view_bom_request` | Read-only stock/movement/billing analytics from SAP HANA. |
@@ -139,9 +138,10 @@ Defined in `warehouse/models.py`:
 
 1. **Create** (`create_fg_receipt`, `POST fg-receipts/create/`).
    - Run is `select_for_update`-locked; must be `COMPLETED`.
-   - **Gate:** requires an active `ProductionQCSession` of type `FINAL` with
-     `workflow_status = APPROVED` and `overall_result = PASS`, else 400
-     ("Final QC must be approved with PASS…").
+   - **No UI.** Until 2026-09-29 this was gated on an approved/PASS Final QC session
+     and started from the production Run Detail page. Production QC was removed
+     then (unused — no FG receipt since May 2026), and the Run Detail button with
+     it; the endpoint remains but nothing in the app calls it.
    - `produced_qty = run.total_production`, `good_qty = produced − rejected_qty`.
      Item/warehouse pulled from the SAP order header if not supplied.
    - **Idempotency:** if a locked/received receipt already exists → 400. Otherwise
@@ -176,7 +176,7 @@ per-feature permission). See the API surface below.
   `required_qty` **or** current on-hand (summed across warehouses with `OnHand>0`).
   Any violating line rejects the entire approve call.
 - **Issue never exceeds approval.** Per line, issue qty ≤ `approved_qty − issued_qty`.
-- **FG requires COMPLETED run + approved Final QC (PASS).** No receipt otherwise.
+- **FG requires a COMPLETED run.** No receipt otherwise.
 - **FG good qty is derived, not entered.** `good_qty = total_production − rejected_qty`.
 - **SAP derives item/warehouse from the order.** Both Goods Issue and Goods
   Receipt use `BaseType = 202` and send only quantities + base-line links; SAP
@@ -202,7 +202,6 @@ per-feature permission). See the API surface below.
 - **Production Execution.** `ProductionRun` is the anchor. This app writes back
   `warehouse_approval_status`, `required_qty`, `sap_receipt_doc_entry`,
   `sap_sync_status`. Mutations invalidate `['production-execution']` on the client.
-- **Quality Control.** `ProductionQCSession` (FINAL/APPROVED/PASS) gates FG receipt.
 - **Notifications.** `warehouse/notifications.py` + `signals.py` fire on
   `transaction.on_commit` to the `warehouse` group (BOM created, FG posted/failed)
   and to the requester (BOM reviewed).
@@ -252,9 +251,9 @@ Each: **trigger → current behaviour → operator-visible symptom → risk/gap.
    item code or warehouse"). → Operator sees the error; must fix the source order
    linkage. → Safe fail-fast.
 
-8. **Final QC not yet approved.** → FG create 400s. → "Final QC must be approved
-   with PASS…". → Correct gate; occasionally confusing when QC is approved but not
-   the *active* FINAL session.
+8. **Nobody can start an FG receipt.** → The Run Detail button went with Production
+   QC on 2026-09-29. → Intended: finished goods reach SAP through the production
+   movement flow; `POST fg-receipts/create/` is still there for when a flow needs it.
 
 9. **WMS dashboard with no warehouse filter on a large company.** → Stock overview
    pulls the **entire** `OITM×OITW` set into Python and paginates in memory; the
