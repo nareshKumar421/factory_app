@@ -33,6 +33,7 @@ from .serializers_transfer import (
     TransferRequestCreateSerializer,
     TransferRequestDetailSerializer,
     TransferRequestListSerializer,
+    TransferRequestUpdateSerializer,
     TransferSecondLegSerializer,
 )
 from .services.transfer_guards import TransferGuardError
@@ -117,6 +118,23 @@ class TransferRequestDetailView(_TransferView):
         def action():
             found = _service(request).get_request(request_id, link_bst=True)
             return Response(TransferRequestDetailSerializer(found).data)
+
+        return self.dispatch_action(action)
+
+    def patch(self, request, request_id: int):
+        """The requester changing items, quantities or remarks before a decision."""
+        if not CanCreateTransferRequest().has_permission(request, self):
+            return Response(
+                {"error": "You do not have permission to change a transfer request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = TransferRequestUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        def action():
+            updated = _service(request).update_request(request_id, serializer.validated_data)
+            return Response(TransferRequestDetailSerializer(updated).data)
 
         return self.dispatch_action(action)
 

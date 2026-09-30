@@ -237,9 +237,6 @@ class TransferRequestService:
             route=route,
         )
 
-        item_codes = [line.get('item_code') for line in raw_lines]
-        batch_flags = self.client.batch_managed_flags(item_codes)
-
         request = WarehouseTransferRequest.objects.create(
             company=self.company,
             entry_no=WarehouseTransferRequest.generate_entry_no(),
@@ -256,6 +253,19 @@ class TransferRequestService:
             requested_by=self.user,
         )
 
+        self._add_lines(request, raw_lines)
+        self._post_transfer_request(request)
+        logger.info(
+            "Transfer request %s raised (%s → %s, %s)",
+            request.entry_no, from_warehouse, to_warehouse, request.route_type,
+        )
+        return request
+
+    def _add_lines(self, request: WarehouseTransferRequest, raw_lines: list) -> None:
+        """Write the request's lines, numbered from zero as SAP numbers them."""
+        batch_flags = self.client.batch_managed_flags(
+            [line.get('item_code') for line in raw_lines]
+        )
         for index, line in enumerate(raw_lines):
             item_code = (line.get('item_code') or '').strip()
             quantity = Decimal(str(line.get('quantity') or 0))
@@ -280,12 +290,130 @@ class TransferRequestService:
                 is_batch_managed=bool(batch_flags.get(item_code)),
             )
 
-        self._post_transfer_request(request)
-        logger.info(
-            "Transfer request %s raised (%s → %s, %s)",
-            request.entry_no, from_warehouse, to_warehouse, request.route_type,
+    # ------------------------------------------------------------------
+    # 01b — edit, until it is decided
+    # ------------------------------------------------------------------
+
+    @transaction.atomic
+    def update_request(self, request_id: int, data: dict) -> WarehouseTransferRequest:
+        """Change a pending request's items, quantities or remarks.
+
+        Open to the person who raised it until the other side decides — after
+        that the quantities are the approver's to trim, and stock may already be
+        moving. The route stays as raised: it fixes who decides and which SAP
+        branch the request sits in, so a different route is a different request.
+
+        When the lines change, SAP's copy is replaced rather than patched: a new
+        transfer request carries the edited lines and the old one is closed.
+        Posting ties each transfer line to its request line by number
+        (`base_line`), and only a fresh request numbers its lines from zero the
+        way the app does. Remarks never reach SAP, so changing only those
+        leaves SAP alone.
+        """
+        request = self._locked(request_id)
+        if request.requested_by_id != getattr(self.user, 'pk', None):
+            raise PermissionDenied(
+                f"Only the person who raised {request.entry_no} can change it."
+            )
+        if request.status != TransferRequestStatus.PENDING:
+            raise TransferRequestError(
+                f"{request.entry_no} is already "
+                f"{request.get_status_display().lower()}, so it can no longer be changed."
+            )
+
+        if 'remarks' in data:
+            request.remarks = data['remarks']
+            request.save(update_fields=['remarks', 'updated_at'])
+
+        raw_lines = data.get('lines')
+        if raw_lines is not None:
+            if not raw_lines:
+                raise TransferRequestError("Add at least one item to the request.")
+            if self._lines_change_sap(request, raw_lines):
+                request.lines.all().delete()
+                self._add_lines(request, raw_lines)
+                self._replace_sap_request(request)
+        return self.get_request(request.pk)
+
+    @staticmethod
+    def _lines_change_sap(request: WarehouseTransferRequest, raw_lines: list) -> bool:
+        """Whether the edit alters anything SAP's request carries."""
+        current = [
+            (line.item_code, line.requested_qty, line.from_warehouse, line.to_warehouse)
+            for line in request.lines.all()
+        ]
+        edited = [
+            (
+                (line.get('item_code') or '').strip(),
+                Decimal(str(line.get('quantity') or 0)),
+                line.get('from_warehouse') or '',
+                line.get('to_warehouse') or '',
+            )
+            for line in raw_lines
+        ]
+        return edited != current
+
+    def _replace_sap_request(self, request: WarehouseTransferRequest) -> None:
+        """Raise SAP's request afresh from the edited lines, then close the old one.
+
+        In that order, so the stock is never left unreserved in between. If SAP
+        will not close the old one, the new one is closed instead and the edit
+        refused: rolled back, the app points at the old request again, and that
+        is the one still holding the stock.
+        """
+        superseded = (
+            request.sap_request_doc_entry if not request.sap_request_closed_at else None
         )
-        return request
+        superseded_num = request.sap_request_doc_num or superseded
+        self._post_transfer_request(request)
+        if request.sap_request_closed_at:
+            # The old one was already closed — by the stale sweep, or by hand
+            # in SAP — so the new request is the first to reserve anything.
+            request.sap_request_closed_at = None
+            request.save(update_fields=['sap_request_closed_at', 'updated_at'])
+
+        if superseded:
+            try:
+                self.client.close_transfer_request(superseded)
+            except (SAPConnectionError, SAPDataError, SAPValidationError) as exc:
+                # A timeout may have closed it anyway, and one closed by hand in
+                # SAP refuses a second close — neither should block the edit.
+                if self._still_open_in_sap(superseded):
+                    self._release_sap_request(request)
+                    raise TransferRequestError(
+                        f"SAP would not close request {superseded_num}, so the "
+                        f"change was not saved: {exc}"
+                    ) from exc
+
+        logger.info(
+            "Transfer request %s edited; SAP request %s replaced by %s",
+            request.entry_no, superseded_num or '—', request.sap_request_doc_num,
+        )
+
+    def _still_open_in_sap(self, doc_entry: int) -> bool:
+        """Whether SAP still holds a request open. Unknown counts as open."""
+        try:
+            summary = self.client.summarise_transfer_requests([doc_entry])
+        except (SAPConnectionError, SAPDataError):
+            return True
+        found = summary.get(doc_entry)
+        return bool(found and found['is_open'])
+
+    def _locked(self, request_id: int) -> WarehouseTransferRequest:
+        """The request, its row held until this transaction ends.
+
+        Editing and deciding both start from "is it still pending?", and an
+        edit racing a decision would otherwise see yes on both sides. Only the
+        request's own row is locked — not the company it joins to.
+        """
+        try:
+            return (
+                WarehouseTransferRequest.objects
+                .select_for_update(of=('self',))
+                .get(pk=request_id, company__code=self.company_code)
+            )
+        except WarehouseTransferRequest.DoesNotExist:
+            raise TransferRequestError(f"Transfer request {request_id} not found.")
 
     def _post_transfer_request(self, request: WarehouseTransferRequest) -> None:
         """Mirror the app request into SAP so the stock is reserved."""
@@ -330,7 +458,12 @@ class TransferRequestService:
         `data['lines']` is a list of `{"line_num": n, "approved_qty": q}`. Any
         line left out is approved at its requested quantity; a line approved at
         zero is rejected.
+
+        `data['updated_at']` is the request as the approver saw it. The
+        requester may edit a pending request, so a decision made on an older
+        copy is refused rather than applied, by line number, to other lines.
         """
+        self._locked(request_id)
         request = self.get_request(request_id)
         # The decision belongs to the destination: whoever runs the warehouse
         # the stock is coming into is the one who can say yes to it.
@@ -340,6 +473,12 @@ class TransferRequestService:
         if request.status != TransferRequestStatus.PENDING:
             raise TransferRequestError(
                 f"{request.entry_no} is already {request.get_status_display().lower()}."
+            )
+        seen = data.get('updated_at')
+        if seen and seen != request.updated_at:
+            raise TransferRequestError(
+                f"{request.entry_no} was changed after you opened it. Check its "
+                f"lines again, then approve."
             )
 
         decisions = {
@@ -391,6 +530,7 @@ class TransferRequestService:
     @transaction.atomic
     def reject(self, request_id: int, reason: str) -> WarehouseTransferRequest:
         """Receiving warehouse refuses the request; the reservation is released."""
+        self._locked(request_id)
         request = self.get_request(request_id)
         # Refusing is the same decision as approving, so it needs the same
         # standing — otherwise anyone could cancel another site's inbound stock.

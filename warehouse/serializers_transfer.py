@@ -150,6 +150,18 @@ class TransferRequestCreateSerializer(serializers.Serializer):
         return value
 
 
+class TransferRequestUpdateSerializer(serializers.Serializer):
+    """What the requester may change while the request waits for a decision.
+
+    Not the route: it decides who approves, so a new route is a new request.
+    Either field may be left out to keep what is there.
+    """
+    remarks = serializers.CharField(required=False, allow_blank=True)
+    lines = TransferRequestLineCreateSerializer(many=True, required=False)
+
+    validate_lines = TransferRequestCreateSerializer.validate_lines
+
+
 class TransferApprovalLineSerializer(serializers.Serializer):
     line_num = serializers.IntegerField(min_value=0)
     approved_qty = serializers.DecimalField(max_digits=15, decimal_places=3, min_value=0)
@@ -159,6 +171,9 @@ class TransferApproveSerializer(serializers.Serializer):
     """Lines left out are approved at the requested quantity."""
     lines = TransferApprovalLineSerializer(many=True, required=False)
     reason = serializers.CharField(required=False, allow_blank=True, default='')
+    # The request's `updated_at` as the approver saw it, so a decision on lines
+    # the requester has since edited is refused. Optional for older clients.
+    updated_at = serializers.DateTimeField(required=False)
 
 
 class TransferRejectSerializer(serializers.Serializer):
