@@ -2547,8 +2547,9 @@ class LineConfigPermissionTests(TestCase):
 class StartProductionGateTests(TestCase):
     """Beverages may start a run without the RM/PM request or line clearance.
 
-    Each check is opt-in there: once the request (or clearance) has been sent,
-    it gates the start as it does for every other company.
+    The request is opt-in there: once it has been sent, it gates the start as
+    it does for every other company. Elsewhere a clearance must be submitted
+    before the first start, but QA's decision on it never gates the start.
     """
 
     def _run_for(self, code):
@@ -2574,6 +2575,36 @@ class StartProductionGateTests(TestCase):
         with self.assertRaisesMessage(ValueError, 'line clearance'):
             service.start_production(run.id)
 
+    def test_a_draft_clearance_is_not_submitted(self):
+        run, service = self._run_for('JIVO_MART')
+        run.warehouse_approval_status = 'APPROVED'
+        run.save()
+        self._clearance(run, 'DRAFT')
+        with self.assertRaisesMessage(ValueError, 'submit the line clearance'):
+            service.start_production(run.id)
+
+    def test_any_decision_on_a_submitted_clearance_lets_the_line_start(self):
+        for number, decision in enumerate(
+                ('SUBMITTED', 'ON_HOLD', 'CLEARED', 'NOT_CLEARED'), start=1):
+            run, service = self._run_for(f'CO_{number}')
+            run.warehouse_approval_status = 'APPROVED'
+            run.save()
+            self._clearance(run, decision)
+            service.start_production(run.id)
+            run.refresh_from_db()
+            self.assertEqual(run.status, 'IN_PROGRESS', decision)
+
+    def test_a_clearance_reopened_mid_run_does_not_block_a_restart(self):
+        run, service = self._run_for('JIVO_MART')
+        run.warehouse_approval_status = 'APPROVED'
+        run.save()
+        clearance = self._clearance(run, 'NOT_CLEARED')
+        service.start_production(run.id)
+        service.stop_production(run.id, produced_cases=10)
+        clearance.status = 'DRAFT'
+        clearance.save()
+        service.start_production(run.id)
+
     def test_beverages_starts_with_neither_sent(self):
         run, service = self._run_for('JIVO_BEVERAGES')
         service.start_production(run.id)
@@ -2596,13 +2627,18 @@ class StartProductionGateTests(TestCase):
         run.save()
         service.start_production(run.id)
 
-    def test_beverages_sent_clearance_must_be_cleared(self):
-        run, service = self._run_for('JIVO_BEVERAGES')
-        clearance = self._clearance(run, 'SUBMITTED')
-        with self.assertRaisesMessage(ValueError, 'line clearance'):
-            service.start_production(run.id)
-        clearance.status = 'CLEARED'
+    def test_a_clearance_submits_without_an_attachment(self):
+        run, service = self._run_for('JIVO_MART')
+        clearance = self._clearance(run, 'DRAFT')
+        clearance.production_supervisor_sign = 'Supervisor'
         clearance.save()
+        service.submit_clearance(clearance.id)
+        clearance.refresh_from_db()
+        self.assertEqual(clearance.status, 'SUBMITTED')
+
+    def test_beverages_rejected_clearance_does_not_block(self):
+        run, service = self._run_for('JIVO_BEVERAGES')
+        self._clearance(run, 'NOT_CLEARED')
         service.start_production(run.id)
 
     def test_detail_tells_the_page_the_checks_are_optional(self):

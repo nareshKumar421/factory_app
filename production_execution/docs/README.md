@@ -132,8 +132,8 @@ its own line belongs to.
 1. `create_clearance()` inserts the 9 standard items (`status=DRAFT`).
 2. `update_clearance()` sets `all_checks_passed` + `production_supervisor_sign`
    (DRAFT only).
-3. `submit_clearance()` requires a supervisor name, bulk-sets every item to YES/NO
-   from the toggle, → `SUBMITTED`.
+3. `submit_clearance()` requires a supervisor name (attachments are optional),
+   bulk-sets every item to YES/NO from the toggle, → `SUBMITTED`.
 4. `approve_clearance()` (SUBMITTED only) → `CLEARED` (approved) or `NOT_CLEARED`.
    Permission `CanApproveLineClearanceQA` **also accepts** `quality_control.can_approve_line_clearance_qc`.
 
@@ -141,7 +141,10 @@ its own line belongs to.
 Hard gates, each raising `ValueError` → HTTP 400:
 - `warehouse_approval_status` must **not** be `NOT_REQUESTED`, `PENDING`, or `REJECTED`
   (i.e. must be `APPROVED`/`PARTIALLY_APPROVED`).
-- A `LineClearance` with `status=CLEARED` must exist for the run.
+- On the first start (run still `DRAFT`), a `LineClearance` for the run must have
+  been submitted (any status but `DRAFT`). QA's decision does not gate the start —
+  `CLEARED`, `NOT_CLEARED` or `ON_HOLD`, the line may start and the page shows it.
+  Beverages needs no clearance at all.
 - No active segment and no active breakdown may already exist.
 
 On success: create the first active `ProductionSegment`, flip `DRAFT`→`IN_PROGRESS`.
@@ -185,8 +188,8 @@ Final QC is requested (`quality_control`); on APPROVED + PASS the frontend creat
   creates on the same day can race on the `unique_together`.
 - **COMPLETED = locked:** `update_run`, material/runtime/manpower/breakdown edits all
   raise `ValueError` on a completed run.
-- **Start gates:** warehouse approval **and** a CLEARED line clearance are both
-  mandatory before a run can start (§4).
+- **Start gates:** warehouse approval **and** a submitted line clearance are both
+  mandatory before a run can start (§4); QA approval of the clearance is not.
 - **Material wastage** is always `opening + issued − closing` (recomputed on save).
 - **Resource cost** `total_cost` is computed in each model's `save()`; the run roll-up
   is recomputed after every resource mutation. `per_unit_cost = total_cost / total_production`
@@ -230,9 +233,9 @@ Each: **trigger → current behaviour → operator-visible symptom → risk/gap.
    via `POST warehouse/bom-requests/{id}/re-request/` (owned by warehouse), which
    raises a new `PENDING` follow-up for just the shortfall. A fully `REJECTED` request
    still blocks start until the follow-up is approved.
-4. **Line clearance rejected (`NOT_CLEARED`)** → `start_production` only accepts a
-   `CLEARED` clearance, so a rejected one never satisfies the gate → operator must create
-   a **new** clearance and get it approved; the old NOT_CLEARED record lingers.
+4. **Line clearance rejected (`NOT_CLEARED`)** → the line may still start; only a
+   submitted clearance is needed, whatever QA decided. The run page shows the rejection.
+   Reopening it (back to `DRAFT`) before the first start means it must be resubmitted.
 5. **Trying to complete with production still running / an open breakdown** →
    `complete_run` raises "Stop production first" / "Resolve it first" → Complete 400s →
    correct guard, but totals won't reflect the un-stopped segment until it's closed.

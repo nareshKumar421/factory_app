@@ -427,7 +427,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
         return list(obj.machines.values_list('id', flat=True))
 
     def get_start_checks_optional(self, obj):
-        """The RM/PM request and line clearance gate a start only once sent."""
+        """The RM/PM request gates a start only once sent; no clearance is needed."""
         return start_checks_are_optional(obj.company.code)
 
     def get_bom_request_required(self, obj):

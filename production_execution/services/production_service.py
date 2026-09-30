@@ -31,9 +31,9 @@ STANDARD_CLEARANCE_ITEMS = [
 ]
 
 #: Companies whose floor may start a run without sending the RM/PM request to
-#: warehouse or a line clearance to QA. Each check is still opt-in: once the
-#: request (or the clearance) has been sent, that check gates the start exactly
-#: as it does everywhere else — a rejected request or an uncleared line blocks.
+#: warehouse or a line clearance to QA. The request is still opt-in: once it has
+#: been sent, it gates the start exactly as it does everywhere else — a pending
+#: or rejected request blocks. A clearance never gates the start here.
 OPTIONAL_START_CHECK_COMPANY_CODES = frozenset({'JIVO_BEVERAGES'})
 
 
@@ -820,14 +820,15 @@ class ProductionExecutionService:
             if run.warehouse_approval_status == 'REJECTED':
                 raise ValueError("Cannot start production — BOM request was rejected by warehouse.")
 
-        # Line clearance gate — only allow start if QA has cleared. Where it is
-        # optional, it applies once a clearance has been sent to QA; a draft
-        # nobody submitted has not been sent.
-        clearances = run.line_clearances.all()
-        clearance_sent = clearances.exclude(status=ClearanceStatus.DRAFT).exists()
-        if not optional or clearance_sent:
-            if not clearances.filter(status=ClearanceStatus.CLEARED).exists():
-                raise ValueError("Cannot start production — line clearance has not been approved by QA.")
+        # Line clearance gate — the floor must submit a clearance before the
+        # first start; a draft nobody submitted does not count. QA's decision
+        # does not gate it: cleared, rejected or on hold, the line may start,
+        # and the page shows whichever it is. Only the first start is gated, so
+        # a rejected clearance reopened mid-run does not block a restart.
+        # Where the checks are optional, no clearance is needed at all.
+        if run.status == RunStatus.DRAFT and not optional:
+            if not run.line_clearances.exclude(status=ClearanceStatus.DRAFT).exists():
+                raise ValueError("Cannot start production — submit the line clearance first.")
 
         if run.segments.filter(is_active=True).exists():
             raise ValueError("Production is already running.")
@@ -1817,8 +1818,7 @@ class ProductionExecutionService:
         if not clearance.production_supervisor_sign:
             raise ValueError("Supervisor name is required before submitting.")
 
-        if not clearance.attachments.exists():
-            raise ValueError("At least one attachment of the cleared line is required before submitting.")
+        # Attachments are optional: the report is submitted with or without them.
 
         # Bulk-set all checklist items based on the single toggle
         result = ClearanceResult.YES if clearance.all_checks_passed else ClearanceResult.NO
