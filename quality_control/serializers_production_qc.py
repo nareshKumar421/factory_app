@@ -6,7 +6,6 @@ from .enums import ParameterType
 from .models import (
     ProductionParameter,
     ProductionParameterType,
-    ProductionParameterTypeItem,
     ProductionQCEntry,
     ProductionQCResult,
 )
@@ -21,15 +20,8 @@ def _user_name(user):
 # ==================== Masters ====================
 
 
-class ProductionParameterTypeItemSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ProductionParameterTypeItem
-        fields = ["id", "item_code", "item_name"]
-
-
 class ProductionParameterTypeSerializer(serializers.ModelSerializer):
     parameter_count = serializers.SerializerMethodField()
-    items = serializers.SerializerMethodField()
     # The form's number, kept in Master Data > Print Documents; read here so a
     # sheet prints it for whoever can see the type.
     print_document_id = serializers.SerializerMethodField()
@@ -38,7 +30,7 @@ class ProductionParameterTypeSerializer(serializers.ModelSerializer):
         model = ProductionParameterType
         fields = [
             "id", "code", "name", "description", "print_document_id", "revision", "revision_date",
-            "is_active", "parameter_count", "items", "created_at", "updated_at",
+            "is_active", "parameter_count", "created_at", "updated_at",
         ]
 
     def get_parameter_count(self, obj):
@@ -46,10 +38,6 @@ class ProductionParameterTypeSerializer(serializers.ModelSerializer):
         if annotated is not None:
             return annotated
         return obj.parameters.filter(is_active=True).count()
-
-    def get_items(self, obj):
-        items = [item for item in obj.items.all() if item.is_active]
-        return ProductionParameterTypeItemSerializer(items, many=True).data
 
     def get_print_document_id(self, obj):
         document = next((d for d in obj.print_documents.all() if d.is_active), None)
@@ -119,17 +107,6 @@ class ProductionParameterWriteSerializer(serializers.Serializer):
         return attrs
 
 
-class ProductionParameterTypeItemWriteSerializer(serializers.Serializer):
-    item_code = serializers.CharField(max_length=50)
-    item_name = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
-
-    def validate_item_code(self, value):
-        value = value.strip().upper()
-        if not value:
-            raise serializers.ValidationError("Enter an item code.")
-        return value
-
-
 # ==================== Running lines ====================
 
 
@@ -150,11 +127,6 @@ class RunningLineSerializer(serializers.Serializer):
     is_running_now = serializers.BooleanField()
     last_started_at = serializers.DateTimeField()
     stopped_at = serializers.DateTimeField(allow_null=True)
-    linked_parameter_types = serializers.SerializerMethodField()
-
-    def get_linked_parameter_types(self, obj):
-        linked = self.context.get("linked", {}).get(obj.item_code, [])
-        return _TypeRefSerializer(linked, many=True).data
 
 
 # ==================== Entries ====================

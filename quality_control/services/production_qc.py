@@ -12,7 +12,6 @@ from django.utils import timezone
 from ..enums import ParameterType
 from ..models import (
     ProductionParameterType,
-    ProductionParameterTypeItem,
     ProductionQCEntry,
     ProductionQCResult,
     ProductionQCStatus,
@@ -96,20 +95,6 @@ def running_lines(company, now=None):
     return sorted(lines.values(), key=lambda line: line.line_name.lower())
 
 
-def linked_types(company, item_code):
-    """The active parameter types a product is linked to."""
-    item_code = (item_code or "").strip().upper()
-    if not item_code:
-        return ProductionParameterType.objects.none()
-    return ProductionParameterType.objects.filter(
-        company=company,
-        is_active=True,
-        items__company=company,
-        items__item_code=item_code,
-        items__is_active=True,
-    ).distinct()
-
-
 def _parse_numeric(value):
     try:
         return Decimal(str(value).strip())
@@ -172,7 +157,8 @@ def _parameters_of(parameter_type):
 def create_entry(company, user, *, run_id, parameter_type_id, readings, remarks=""):
     """Save a new check on a running line and send it for approval.
 
-    A product not linked to any type yet gets linked to the one chosen here.
+    Any active type of the company can be checked on any line: types are not
+    tied to products.
     """
     line = next((l for l in running_lines(company) if l.run_id == run_id), None)
     if line is None:
@@ -184,13 +170,6 @@ def create_entry(company, user, *, run_id, parameter_type_id, readings, remarks=
     ).first()
     if parameter_type is None:
         raise ProductionQCError("Pick a parameter type.", "parameter_type_id")
-
-    linked = list(linked_types(company, line.item_code).values_list("pk", flat=True))
-    if linked and parameter_type.pk not in linked:
-        raise ProductionQCError(
-            "This product is linked to other parameter types; pick one of those.",
-            "parameter_type_id",
-        )
 
     parameters = _parameters_of(parameter_type)
     _check_readings(
@@ -218,18 +197,6 @@ def create_entry(company, user, *, run_id, parameter_type_id, readings, remarks=
         row.apply_parameter_snapshot(parameter)
         _apply_reading(row, parameter.value_type, readings.get(parameter.id, {}), user)
     _require_remark_if_out_of_spec(entry)
-
-    if not linked and line.item_code:
-        link, created = ProductionParameterTypeItem.objects.get_or_create(
-            company=company,
-            item_code=line.item_code,
-            parameter_type=parameter_type,
-            defaults={"item_name": line.product, "created_by": user, "updated_by": user},
-        )
-        if not created and not link.is_active:
-            link.is_active = True
-            link.updated_by = user
-            link.save(update_fields=["is_active", "updated_by", "updated_at"])
     return entry
 
 

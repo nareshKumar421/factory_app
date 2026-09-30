@@ -45,7 +45,7 @@ was in use; they are to be rebuilt around what happens on the floor rather than
 around the paper reports. The line-clearance perms moved off `ProductionQCSession`
 onto `RawMaterialInspection` in that migration, keeping their codenames and grants.
 
-**Production QC, rebuilt (migrations `0063`, `0064`)** — see [Flow D](#flow-d--production-qc).
+**Production QC, rebuilt (migrations `0063`, `0064`; types unlinked from products in `0069`)** — see [Flow D](#flow-d--production-qc).
 Nothing of the removed version is reused: new tables, new permission codenames.
 
 ---
@@ -170,18 +170,17 @@ Checks QC makes on a line while a run is on it (`models/production_qc.py`,
 
 **Masters** mirror the arrival-slip ones: a `ProductionParameterType` plays the part of
 a material type and carries its `ProductionParameter`s (spec as free text plus optional
-min/max, `value_type` NUMERIC/TEXT/BOOLEAN/RANGE, uom, mandatory, sequence). It is linked
-to FG products by SAP item code (`ProductionParameterTypeItem`, like
-`MaterialTypeSAPItem`). There are no vendor-specific sets: production has no vendor.
+min/max, `value_type` NUMERIC/TEXT/BOOLEAN/RANGE, uom, mandatory, sequence). Unlike a
+material type it is **not tied to products**: every active type of the company can be
+checked on any running line (the product-link table was dropped in `0069`). There are
+no vendor-specific sets: production has no vendor.
 
 1. **Pick a running line** — `GET running-lines/`. A line is running while its
    IN_PROGRESS run has an open segment, and for 24 h after its latest segment started
    (a breakdown or the lunch stop closes the segment; QC still checks the line). Per
    line, the run whose latest segment started most recently wins, so a stale run
-   nobody completed never shadows today's. Each line carries the types its product is
-   linked to.
-2. **Pick the type** — only the linked ones; a product with no link is offered every
-   type, and the one chosen is linked when the check is saved.
+   nobody completed never shadows today's.
+2. **Pick the type** — any active type of the company (`GET parameter-types/`).
 3. **Fill and save** — `POST entries/` with one reading per parameter. Saving sends it
    for approval (PENDING); there are no drafts. Every mandatory parameter needs a
    value, and an out-of-spec reading needs an entry remark (as on the arrival slip).
@@ -372,9 +371,9 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
 | `can_manage_qc_parameters` | Parameter master + **print documents** |
 | `can_view/approve_line_clearance_qc` | Line-clearance QA (data in `production_execution`) |
 | `can_view_production_qc_entries` | See production QC checks |
-| `can_fill_production_qc_entries` | Make and correct checks (and so link a product to a type) |
+| `can_fill_production_qc_entries` | Make and correct checks |
 | `can_approve_production_qc_entries` | Approve / send back (the QC lead) |
-| `can_manage_production_qc_parameters` | Production parameter types, parameters, product links |
+| `can_manage_production_qc_parameters` | Production parameter types and their parameters |
 
 **Auth groups** (migrations `0010`/`0012`, `0018`, `0025`):
 - `qc_store` — arrival-slip add/change/view/submit + `view_rawmaterialinspection`.

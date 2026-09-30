@@ -1,7 +1,6 @@
 # quality_control/views_production_qc.py
 """Production QC API: running lines, checks and their approval, and the masters."""
 
-from django.db import IntegrityError, transaction
 from datetime import date
 
 from django.db.models import Count, Min, Q
@@ -19,7 +18,6 @@ from .models import (
     QCPrintDocument,
     ProductionParameter,
     ProductionParameterType,
-    ProductionParameterTypeItem,
     ProductionQCEntry,
     ProductionQCStatus,
 )
@@ -31,8 +29,6 @@ from .permissions import (
 )
 from .serializers_production_qc import (
     ProductionParameterSerializer,
-    ProductionParameterTypeItemSerializer,
-    ProductionParameterTypeItemWriteSerializer,
     ProductionParameterTypeSerializer,
     ProductionParameterTypeWriteSerializer,
     ProductionParameterWriteSerializer,
@@ -79,7 +75,7 @@ def _types(company):
                 "parameters", filter=Q(parameters__is_active=True), distinct=True
             )
         )
-        .prefetch_related("items", "print_documents")
+        .prefetch_related("print_documents")
     )
 
 
@@ -132,28 +128,13 @@ def _set_form_number(parameter_type, number, user):
 
 
 class ProductionQCRunningLinesAPI(APIView):
-    """The lines a check can be made on, with the types their product is linked to."""
+    """The lines a check can be made on."""
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanFillProductionQC]
 
     def get(self, request):
-        company = request.company.company
-        lines = service.running_lines(company)
-        codes = {line.item_code for line in lines if line.item_code}
-        linked = {}
-        links = (
-            ProductionParameterTypeItem.objects.filter(
-                company=company,
-                item_code__in=codes,
-                is_active=True,
-                parameter_type__is_active=True,
-            )
-            .select_related("parameter_type")
-            .order_by("parameter_type__name")
-        )
-        for link in links:
-            linked.setdefault(link.item_code, []).append(link.parameter_type)
-        return Response(RunningLineSerializer(lines, many=True, context={"linked": linked}).data)
+        lines = service.running_lines(request.company.company)
+        return Response(RunningLineSerializer(lines, many=True).data)
 
 
 # ==================== Entries ====================
@@ -356,12 +337,7 @@ class ProductionParameterTypeListCreateAPI(APIView):
             qs = qs.filter(is_active=True)
         search = (request.query_params.get("search") or "").strip()
         if search:
-            qs = qs.filter(
-                Q(code__icontains=search)
-                | Q(name__icontains=search)
-                | Q(items__item_code__icontains=search, items__is_active=True)
-                | Q(items__item_name__icontains=search, items__is_active=True)
-            ).distinct()
+            qs = qs.filter(Q(code__icontains=search) | Q(name__icontains=search))
         return Response(ProductionParameterTypeSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -521,54 +497,3 @@ class ProductionParameterDetailAPI(APIView):
         parameter.save(update_fields=["is_active", "updated_by", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-
-class ProductionParameterTypeItemCreateAPI(APIView):
-    """Link a product to a type by hand (checks also link one on first use)."""
-
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanReadOrManageProductionQCParameters]
-
-    def post(self, request, type_id):
-        company = request.company.company
-        parameter_type = get_object_or_404(ProductionParameterType, company=company, pk=type_id)
-        serializer = ProductionParameterTypeItemWriteSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        try:
-            with transaction.atomic():
-                link, created = ProductionParameterTypeItem.objects.get_or_create(
-                    company=company,
-                    item_code=data["item_code"],
-                    parameter_type=parameter_type,
-                    defaults={
-                        "item_name": data.get("item_name", ""),
-                        "created_by": request.user,
-                        "updated_by": request.user,
-                    },
-                )
-        except IntegrityError:
-            link, created = ProductionParameterTypeItem.objects.get(
-                company=company, item_code=data["item_code"], parameter_type=parameter_type
-            ), False
-        if not created:
-            link.is_active = True
-            if data.get("item_name"):
-                link.item_name = data["item_name"]
-            link.updated_by = request.user
-            link.save()
-        return Response(
-            ProductionParameterTypeItemSerializer(link).data,
-            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
-        )
-
-
-class ProductionParameterTypeItemDetailAPI(APIView):
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanReadOrManageProductionQCParameters]
-
-    def delete(self, request, item_id):
-        link = get_object_or_404(
-            ProductionParameterTypeItem, company=request.company.company, is_active=True, pk=item_id
-        )
-        link.is_active = False
-        link.updated_by = request.user
-        link.save(update_fields=["is_active", "updated_by", "updated_at"])
-        return Response(status=status.HTTP_204_NO_CONTENT)

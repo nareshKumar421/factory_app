@@ -24,7 +24,6 @@ from quality_control.models import (
     QCPrintDocument,
     ProductionParameter,
     ProductionParameterType,
-    ProductionParameterTypeItem,
     ProductionQCEntry,
     ProductionQCStatus,
 )
@@ -156,19 +155,27 @@ class CreateEntryTests(ProductionQCBase):
         self.assertEqual(weight.parameter_type, "NUMERIC")
         self.assertTrue(weight.is_within_spec)
 
-    def test_an_unlinked_product_is_linked_to_the_type_chosen(self):
+    def test_any_type_can_be_checked_on_any_line(self):
+        # Types are not tied to products: a second type on the same product's
+        # line saves just as the first does.
         self._create()
-        self.assertTrue(
-            ProductionParameterTypeItem.objects.filter(
-                company=self.company, item_code="FG0000228", parameter_type=self.type
-            ).exists()
+        other = ProductionParameterType.objects.create(
+            company=self.company, code="BACKWASH", name="Backwashing"
         )
+        equipment = ProductionParameter.objects.create(
+            parameter_type=other, parameter_code="EQUIPMENT", parameter_name="Equipment",
+            standard_value="-", value_type="TEXT", sequence=1,
+        )
+        entry = service.create_entry(
+            self.company, self.user, run_id=self.run.id, parameter_type_id=other.id,
+            readings={equipment.id: {"result_value": "Micron filter"}},
+        )
+        self.assertEqual(entry.parameter_type, other)
+        self.assertEqual(entry.item_code, "FG0000228")
 
-    def test_a_linked_product_only_takes_its_own_types(self):
-        other = ProductionParameterType.objects.create(company=self.company, code="X", name="X")
-        ProductionParameterTypeItem.objects.create(
-            company=self.company, item_code="FG0000228", parameter_type=other
-        )
+    def test_an_inactive_type_cannot_be_checked(self):
+        self.type.is_active = False
+        self.type.save()
         with self.assertRaises(ProductionQCError) as caught:
             self._create()
         self.assertEqual(caught.exception.field, "parameter_type_id")
@@ -264,13 +271,15 @@ class ProductionQCAPITests(ProductionQCBase):
         payload.update(overrides)
         return payload
 
-    def test_running_lines_carry_the_products_linked_types(self):
-        ProductionParameterTypeItem.objects.create(
-            company=self.company, item_code="FG0000228", parameter_type=self.type
-        )
+    def test_neither_lines_nor_types_carry_products(self):
         resp = _client(self.company, FILL).get(reverse("production-qc-running-lines"))
         self.assertEqual(resp.status_code, 200, resp.data)
-        self.assertEqual(resp.data[0]["linked_parameter_types"][0]["code"], "PET_1L")
+        self.assertEqual(resp.data[0]["item_code"], "FG0000228")
+        self.assertNotIn("linked_parameter_types", resp.data[0])
+
+        resp = _client(self.company, MANAGE).get(reverse("production-qc-parameter-types"))
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertNotIn("items", resp.data[0])
 
     def test_a_filler_saves_and_cannot_approve(self):
         client = _client(self.company, VIEW, FILL)

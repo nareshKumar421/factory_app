@@ -4,9 +4,8 @@ Production QC: checks QC makes on a line while a run is on it.
 
 The masters mirror the arrival-slip ones. A :class:`ProductionParameterType`
 plays the part of a material type: it carries the list of parameters to check
-(:class:`ProductionParameter`, with the spec each must meet) and is linked to
-the FG products it applies to (:class:`ProductionParameterTypeItem`, keyed on
-the SAP item code, as material types are).
+(:class:`ProductionParameter`, with the spec each must meet). Types are not
+tied to products: any of a company's types can be checked on any line.
 
 A check is a :class:`ProductionQCEntry` against the run on the line at the
 time, holding one :class:`ProductionQCResult` per parameter of the chosen type.
@@ -25,7 +24,7 @@ from .parameter_result import ParameterResultBase
 
 
 class ProductionParameterType(BaseModel):
-    """A family of production checks, e.g. the parameters for 1 L PET oil.
+    """A family of production checks, e.g. the oil plant on-line monitoring.
 
     Each type is also a paper form QA keeps (e.g. the on-line monitoring
     record), so it carries that form's revision for the printed sheet. Its
@@ -48,37 +47,6 @@ class ProductionParameterType(BaseModel):
 
     def __str__(self):
         return f"{self.code} - {self.name}"
-
-
-class ProductionParameterTypeItem(BaseModel):
-    """Links an FG item code to a parameter type.
-
-    A product may be linked to several types; the type is chosen when the check
-    is made. A product with no link at all is offered every type, and the one
-    chosen is linked when the check is saved.
-    """
-
-    parameter_type = models.ForeignKey(
-        ProductionParameterType, on_delete=models.CASCADE, related_name="items"
-    )
-    company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name="production_parameter_type_items"
-    )
-    item_code = models.CharField(max_length=50)
-    item_name = models.CharField(max_length=200, blank=True)
-
-    class Meta:
-        unique_together = ("company", "item_code", "parameter_type")
-        ordering = ["item_code"]
-        indexes = [models.Index(fields=["company", "item_code"])]
-
-    def __str__(self):
-        return f"{self.item_code} -> {self.parameter_type.code}"
-
-    def save(self, *args, **kwargs):
-        self.item_code = (self.item_code or "").strip().upper()
-        self.item_name = (self.item_name or "").strip()
-        super().save(*args, **kwargs)
 
 
 class ProductionParameter(BaseModel):

@@ -19,7 +19,6 @@ from .qc_document_file_audit import (
 )
 from .production_qc import (
     ProductionParameterType,
-    ProductionParameterTypeItem,
     ProductionParameter,
     ProductionQCStatus,
     ProductionQCEntry,
