@@ -341,11 +341,38 @@ class StockAuditTests(APITestCase):
         return self.client.post(reverse(f'stock-audit-{name}', args=[audit.id]), data,
                                 format='json')
 
+    def _complete(self, audit):
+        """What an auditor does before Complete: 0 for everything not found."""
+        for line in audit.lines.filter(counted_qty__isnull=True):
+            self._count(audit, line.item_code, '0')
+        return self._step(audit, 'complete')
+
+    def test_every_item_is_counted_before_completing(self):
+        audit = self._audit()
+        self._count(audit, 'PM0000010', '30')
+        response = self._step(audit, 'complete')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('4 items are not counted yet', response.data['detail'])
+        self.assertIn('press 0', response.data['detail'])
+        # 0 for none found is a count.
+        for code in ('RM0000001', 'FG0000100', 'TL0000001', 'PM0000020'):
+            self._count(audit, code, '0')
+        self.assertEqual(self._complete(audit).data['status'], 'SUBMITTED')
+
+    def test_approving_and_rejecting_take_a_comment(self):
+        audit = self._audit()
+        self._complete(audit)
+        self._as(self._user('approver@jivo.test', 'P1', APPROVER))
+        self.assertEqual(self._step(audit, 'approve').status_code, status.HTTP_400_BAD_REQUEST)
+        response = self._step(audit, 'approve', comment='Rechecked racks A-C')
+        self.assertEqual((response.data['status'], response.data['approval_comment']),
+                         ('APPROVED', 'Rechecked racks A-C'))
+
     def test_a_completed_audit_waits_for_an_approver(self):
         audit = self._audit()
         self._as(self.auditor)
         self._count(audit, 'PM0000010', '30')
-        response = self._step(audit, 'complete')
+        response = self._complete(audit)
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.data['status'], 'SUBMITTED')
         # The auditor's part is done.
@@ -357,10 +384,10 @@ class StockAuditTests(APITestCase):
         audit = self._audit()
         self._as(self.auditor)
         self._count(audit, 'PM0000010', '30')
-        self._step(audit, 'complete')
+        self._complete(audit)
         self._as(self._user('approver@jivo.test', 'P1', APPROVER))
         self.assertEqual(self._count(audit, 'PM0000010', '2').data['counted_qty'], '32')
-        response = self._step(audit, 'approve')
+        response = self._step(audit, 'approve', comment='Checked')
         self.assertEqual((response.status_code, response.data['status']), (200, 'APPROVED'))
         self.assertEqual(self._count(audit, 'PM0000010', '1').status_code,
                          status.HTTP_400_BAD_REQUEST)
@@ -368,15 +395,15 @@ class StockAuditTests(APITestCase):
     def test_a_rejected_audit_goes_back_to_the_auditors_with_the_reason(self):
         audit = self._audit()
         self._as(self.auditor)
-        self._step(audit, 'complete')
+        self._complete(audit)
         self._as(self._user('approver@jivo.test', 'P1', APPROVER))
         self.assertEqual(self._step(audit, 'reject').status_code, status.HTTP_400_BAD_REQUEST)
-        response = self._step(audit, 'reject', reason='Count rack C again')
+        response = self._step(audit, 'reject', comment='Count rack C again')
         self.assertEqual(response.data['status'], 'OPEN')
         self.assertEqual(response.data['rejection_reason'], 'Count rack C again')
         self._as(self.auditor)
         self.assertEqual(self._count(audit, 'PM0000010', '5').status_code, status.HTTP_201_CREATED)
-        self.assertEqual(self._step(audit, 'complete').data['status'], 'SUBMITTED')
+        self.assertEqual(self._complete(audit).data['status'], 'SUBMITTED')
 
     def test_the_page_is_told_what_each_person_may_do(self):
         audit = self._audit()
@@ -385,7 +412,7 @@ class StockAuditTests(APITestCase):
         self.assertEqual(detail()['actions'], {
             'count': True, 'refresh': False, 'complete': True, 'approve': False,
             'post_to_sap': False, 'void_any': False})
-        self._step(audit, 'complete')
+        self._complete(audit)
         self.assertFalse(detail()['actions']['count'])
         self._as(self._user('approver@jivo.test', 'P1', APPROVER))
         self.assertTrue(detail()['actions']['count'])
@@ -393,10 +420,10 @@ class StockAuditTests(APITestCase):
 
     def test_a_warehouse_waiting_for_approval_cannot_be_audited_again_yet(self):
         audit = self._audit()
-        self._step(audit, 'complete')
+        self._complete(audit)
         self.assertEqual(self._start().status_code, status.HTTP_400_BAD_REQUEST)
         self._as(self._user('approver@jivo.test', 'P1', APPROVER))
-        self._step(audit, 'approve')
+        self._step(audit, 'approve', comment='Checked')
         self._as(self.manager)
         self.assertEqual(self._start().status_code, status.HTTP_201_CREATED)
 
@@ -533,17 +560,19 @@ class SapPostingTests(APITestCase):
         self._count(self.audit, 'PM0000010', '30')       # 2 short
         self._count(self.audit, 'FG0000100', '390')      # FG: shown, not posted
         self._count(self.audit, 'TL0000001', '3')        # matches
+        self._count(self.audit, 'PM0000020', '0')        # SAP says -12: 12 more
         self.client.post(reverse('stock-audit-complete', args=[self.audit.id]))
         self._as(self._user('approver@jivo.test', 'P1', APPROVER))
-        self.client.post(reverse('stock-audit-approve', args=[self.audit.id]))
+        self.client.post(reverse('stock-audit-approve', args=[self.audit.id]),
+                         {'comment': 'Checked'}, format='json')
         self._as(self._user('poster@jivo.test', 'S1', POSTER))
         self.url = reverse('stock-audit-sap-posting', args=[self.audit.id])
 
     def test_the_preview_is_the_rm_and_pm_differences(self):
         data = self.client.get(self.url).data
         self.assertEqual([(l['item_code'], l['difference']) for l in data['lines']],
-                         [('PM0000010', '-2'), ('RM0000001', '-100.5')])
-        rm = data['lines'][1]
+                         [('PM0000010', '-2'), ('PM0000020', '12'), ('RM0000001', '-100.5')])
+        rm = data['lines'][2]
         # The shortage off the oldest batch.
         self.assertEqual(rm['batches'], [{'batch': 'OLD', 'sap_qty': '1000', 'counted_qty': '899.5'}])
         self.assertEqual(data['blocked'], [])
@@ -556,9 +585,16 @@ class SapPostingTests(APITestCase):
         self.assertEqual(payload['BranchID'], 2)
         self.assertEqual([(l['ItemCode'], l['WarehouseCode'], l['CountedQuantity'])
                           for l in payload['InventoryPostingLines']],
-                         [('PM0000010', 'BH-PM', 30.0), ('RM0000001', 'BH-PM', 1400.0)])
-        self.assertEqual(payload['InventoryPostingLines'][1]['InventoryPostingBatchNumbers'],
-                         [{'BatchNumber': 'OLD', 'Quantity': 899.5, 'BaseLineNumber': 2}])
+                         [('PM0000010', 'BH-PM', 30.0), ('PM0000020', 'BH-PM', 0.0),
+                          ('RM0000001', 'BH-PM', 1400.0)])
+        self.assertEqual(payload['InventoryPostingLines'][2]['InventoryPostingBatchNumbers'],
+                         [{'BatchNumber': 'OLD', 'Quantity': 899.5, 'BaseLineNumber': 3}])
+        # ...and the audit keeps what was posted, to show.
+        posted = response.data['sap_posted_lines']
+        self.assertEqual([(l['item_code'], l['difference']) for l in posted],
+                         [('PM0000010', '-2'), ('PM0000020', '12'), ('RM0000001', '-100.5')])
+        self.assertEqual(posted[2]['batches'],
+                         [{'batch': 'OLD', 'sap_qty': '1000', 'counted_qty': '899.5'}])
         self.assertNotIn('InventoryPostingBatchNumbers', payload['InventoryPostingLines'][0])
 
     def test_it_is_never_posted_twice(self):

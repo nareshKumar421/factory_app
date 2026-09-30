@@ -85,6 +85,7 @@ def _audit_json(audit, request, with_summary=False):
         'completed_at': audit.completed_at,
         'approved_by': _person(audit.approved_by),
         'approved_at': audit.approved_at,
+        'approval_comment': audit.approval_comment,
         'rejected_by': _person(audit.rejected_by),
         'rejected_at': audit.rejected_at,
         'rejection_reason': audit.rejection_reason,
@@ -92,6 +93,10 @@ def _audit_json(audit, request, with_summary=False):
         'sap_doc_num': audit.sap_doc_num,
         'sap_posted_at': audit.sap_posted_at,
         'sap_posting_error': audit.sap_posting_error,
+        'sap_posted_by': _person(audit.sap_posted_by),
+        # What was sent: shown once posted, and after an attempt SAP refused
+        # or did not answer, so it can be checked against SAP.
+        'sap_posted_lines': audit.sap_posted_lines or [],
     }
     if with_summary:
         data['summary'] = services.summary(audit, with_sap=sees_sap(request.user))
@@ -387,14 +392,15 @@ class AuditApproveAPI(_AuditAction):
     permission = CanApproveStockAudit
 
     def act(self, request, audit):
-        services.approve(audit, request.user)
+        services.approve(audit, request.user, request.data.get('comment') or '')
 
 
 class AuditRejectAPI(_AuditAction):
     permission = CanApproveStockAudit
 
     def act(self, request, audit):
-        services.reject(audit, request.user, request.data.get('reason') or '')
+        services.reject(audit, request.user,
+                        request.data.get('comment') or request.data.get('reason') or '')
 
 
 class AuditPostToSapAPI(_AuditAction):

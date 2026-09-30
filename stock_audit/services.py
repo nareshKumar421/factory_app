@@ -167,8 +167,17 @@ def add_item(audit, item_code, as_approver=False) -> StockAuditLine:
 
 
 def complete(audit, user) -> StockAudit:
-    """The count is done: hand it to an approver."""
+    """The count is done: hand it to an approver.
+
+    Every item has to be counted first — one looked for and not found is
+    counted as 0 — so an approver never has to guess whether a blank line
+    means none or nobody looked.
+    """
     _require_open(audit)
+    uncounted = audit.lines.filter(counted_qty__isnull=True).count()
+    if uncounted:
+        raise AuditError(f"{uncounted} {'item is' if uncounted == 1 else 'items are'} not counted "
+                         f"yet. Count them, or press 0 for none found.")
     audit.status = AuditStatus.SUBMITTED
     audit.completed_by = user
     audit.completed_at = timezone.now()
@@ -176,13 +185,17 @@ def complete(audit, user) -> StockAudit:
     return audit
 
 
-def approve(audit, user) -> StockAudit:
+def approve(audit, user, comment) -> StockAudit:
     if audit.status != AuditStatus.SUBMITTED:
         raise AuditError('Only a completed audit can be approved.')
+    comment = (comment or '').strip()
+    if not comment:
+        raise AuditError('Add a comment to approve.')
     audit.status = AuditStatus.APPROVED
     audit.approved_by = user
     audit.approved_at = timezone.now()
-    audit.save(update_fields=['status', 'approved_by', 'approved_at'])
+    audit.approval_comment = comment[:300]
+    audit.save(update_fields=['status', 'approved_by', 'approved_at', 'approval_comment'])
     return audit
 
 
@@ -192,7 +205,7 @@ def reject(audit, user, reason) -> StockAudit:
         raise AuditError('Only a completed audit can be rejected.')
     reason = (reason or '').strip()
     if not reason:
-        raise AuditError('Say what needs to be counted again.')
+        raise AuditError('Add a comment to reject.')
     audit.status = AuditStatus.OPEN
     audit.rejected_by = user
     audit.rejected_at = timezone.now()
@@ -290,6 +303,22 @@ def _posting_payload(audit, preview, branch) -> dict:
     return payload
 
 
+def _plain(value):
+    return f"{value.normalize():f}"
+
+
+def _posted_lines(preview):
+    """The posting as the page shows it: each line, its change, and its batches."""
+    return [
+        {'item_code': l['item_code'], 'item_name': l['item_name'], 'uom': l['uom'],
+         'sap_qty': _plain(l['sap_qty']), 'counted_qty': _plain(l['counted_qty']),
+         'difference': _plain(l['counted_qty'] - l['sap_qty']),
+         'batches': [{'batch': b['batch'], 'sap_qty': _plain(b['sap_qty']),
+                      'counted_qty': _plain(b['counted_qty'])} for b in l['batches']]}
+        for l in preview['lines']
+    ]
+
+
 def post_to_sap(audit, user, confirm_unknown=False) -> StockAudit:
     """Post the approved audit's RM and PM differences to SAP, once.
 
@@ -321,6 +350,7 @@ def post_to_sap(audit, user, confirm_unknown=False) -> StockAudit:
     claimed = (StockAudit.objects.filter(pk=audit.pk, status=AuditStatus.APPROVED)
                .exclude(sap_posting__in=[SapPosting.POSTING, SapPosting.DONE])
                .update(sap_posting=SapPosting.POSTING, sap_posting_payload=payload,
+                       sap_posted_lines=_posted_lines(preview),
                        sap_posting_error='', sap_posted_by=user))
     if not claimed:
         raise AuditError('This audit is being posted to SAP right now.')

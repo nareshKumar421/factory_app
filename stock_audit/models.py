@@ -93,6 +93,7 @@ class StockAudit(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='stock_audits_approved')
     approved_at = models.DateTimeField(null=True, blank=True)
+    approval_comment = models.CharField(max_length=300, blank=True, default='')
     # The last rejection, kept on the reopened audit so the auditors see why.
     rejected_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
@@ -111,6 +112,8 @@ class StockAudit(models.Model):
     sap_doc_num = models.CharField(max_length=30, blank=True, default='')
     sap_posting_error = models.CharField(max_length=500, blank=True, default='')
     sap_posting_payload = models.JSONField(null=True, blank=True)
+    # What was sent, line by line and batch by batch, as the page shows it.
+    sap_posted_lines = models.JSONField(null=True, blank=True)
 
     class Meta:
         ordering = ['-started_at']
