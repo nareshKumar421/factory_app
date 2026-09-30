@@ -51,15 +51,44 @@ SCHEMA_CACHE_TTL_SECONDS = getattr(settings, "HANA_SCHEMA_CACHE_SECONDS", 6 * 60
 
 
 class HanaDispatchBillReader:
-    """Reads SAP B1 A/R invoices that act as dispatch bills."""
+    """Reads SAP B1 A/R invoices that act as dispatch bills.
 
-    def __init__(self, context):
+    When HANA cannot be reached, the bill list, a bill's lines and its picking
+    lines are answered from the app's copy of the last 30 days of bills
+    (``sap_mirror.bills``), each bill then carrying ``sap_copy_as_of``. A bill the
+    copy does not hold still fails as SAP being unavailable, never as "no such
+    bill". ``use_copy=False`` is for the job that takes the copy.
+    """
+
+    def __init__(self, context, *, use_copy: bool = True):
         self.connection = HanaConnection(context.hana)
         self._columns_cache: Dict[str, Dict[str, int | None]] = {}
+        company_code = getattr(context, "company_code", None)
+        self._copy_company = company_code if use_copy and isinstance(company_code, str) else None
+
+    def _from_copy(self, exc: Exception, serve):
+        """Answer a failed read from the bill copy, or re-raise ``exc``."""
+        from sap_mirror.services import hana_unreachable
+
+        if not self._copy_company or not hana_unreachable(exc):
+            raise exc
+        try:
+            from sap_mirror import bills as bill_copy
+
+            result = serve(bill_copy, self._copy_company)
+        except Exception:  # noqa: BLE001 -- a broken copy must not change what the caller sees
+            logger.exception("SAP bill copy could not answer for %s", self._copy_company)
+            raise exc
+        if result is None:
+            raise exc
+        return result
 
     def list_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
-        query, params = self._build_bills_query(filters)
-        rows = self._execute(query, params)
+        try:
+            query, params = self._build_bills_query(filters)
+            rows = self._execute(query, params)
+        except (SAPConnectionError, SAPDataError) as exc:
+            return self._from_copy(exc, lambda copy, code: copy.list_bills(code, filters))
         return [self._map_bill_row(row) for row in rows]
 
     def get_bill_by_number(self, invoice_number: str) -> Dict[str, Any] | None:
@@ -83,6 +112,31 @@ class HanaDispatchBillReader:
         )
 
     def list_bill_lines(self, doc_entry: int) -> List[Dict[str, Any]]:
+        try:
+            query = self._bill_lines_query('L."DocEntry" = ?', 'L."LineNum"')
+            rows = self._execute(query, [doc_entry])
+        except (SAPConnectionError, SAPDataError) as exc:
+            return self._from_copy(
+                exc, lambda copy, code: copy.list_bill_lines(code, int(doc_entry))
+            )
+        return [self._map_bill_line_row(row) for row in rows]
+
+    def list_bill_lines_for(self, doc_entries) -> Dict[int, List[Dict[str, Any]]]:
+        """``list_bill_lines`` for many bills in one round trip, keyed by DocEntry."""
+        entries = [int(entry) for entry in dict.fromkeys(doc_entries or [])]
+        if not entries:
+            return {}
+        placeholders = ", ".join("?" for _ in entries)
+        query = self._bill_lines_query(
+            f'L."DocEntry" IN ({placeholders})', 'L."DocEntry", L."LineNum"'
+        )
+        lines: Dict[int, List[Dict[str, Any]]] = {entry: [] for entry in entries}
+        for row in self._execute(query, entries):
+            # DocEntry is selected last, so the line mapping reads what it always has.
+            lines[int(row[18])].append(self._map_bill_line_row(row))
+        return lines
+
+    def _bill_lines_query(self, where: str, order_by: str) -> str:
         schema = self.connection.schema
         line_columns = self._table_columns("INV1")
         item_columns = self._table_columns("OITM")
@@ -133,15 +187,15 @@ class HanaDispatchBillReader:
                         THEN IFNULL(L."Quantity", 0) * {gross_weight_expr} / {pack_size_expr}
                     ELSE 0
                 END AS total_weight,
-                {sal_factor2_expr} AS sal_factor2
+                {sal_factor2_expr} AS sal_factor2,
+                L."DocEntry" AS doc_entry
             FROM "{schema}"."INV1" L
             LEFT JOIN "{schema}"."OITM" I
                 ON I."ItemCode" = L."ItemCode"
-            WHERE L."DocEntry" = ?
-            ORDER BY L."LineNum"
+            WHERE {where}
+            ORDER BY {order_by}
         """
-        rows = self._execute(query, [doc_entry])
-        return [self._map_bill_line_row(row) for row in rows]
+        return query
 
     def list_pickable_lines(self, doc_entries) -> List[Dict[str, Any]]:
         """Invoice lines for a set of invoices, as a picking sheet needs them.
@@ -161,7 +215,14 @@ class HanaDispatchBillReader:
         entries = [int(e) for e in doc_entries or []]
         if not entries:
             return []
+        try:
+            return self._list_pickable_lines(entries)
+        except (SAPConnectionError, SAPDataError) as exc:
+            return self._from_copy(
+                exc, lambda copy, code: copy.list_pickable_lines(code, entries)
+            )
 
+    def _list_pickable_lines(self, entries: List[int]) -> List[Dict[str, Any]]:
         schema = self.connection.schema
         item_columns = self._table_columns("OITM")
         line_columns = self._table_columns("INV1")
@@ -242,6 +303,44 @@ class HanaDispatchBillReader:
                 }
             )
         return out
+
+    def bill_versions(self, created_from) -> Dict[int, str]:
+        """``DocEntry -> "UpdateDate|UpdateTS"`` for every live bill created since.
+
+        What the bill copy compares to know which bills changed. ``UpdateTS`` is
+        guarded like every optional column: without it the version is the date
+        alone, and ``sap_mirror.bills`` re-reads that day's changes every time.
+        """
+        schema = self.connection.schema
+        header_columns = self._table_columns("OINV")
+        update_ts = 'H."UpdateTS"' if "UpdateTS" in header_columns else "NULL"
+        query = f"""
+            SELECT H."DocEntry", H."UpdateDate", {update_ts}
+            FROM "{schema}"."OINV" H
+            WHERE H."CANCELED" = 'N' AND H."CreateDate" >= ?
+        """
+        return {
+            int(row[0]): f"{self._format_date(row[1]) or ''}|{'' if row[2] is None else row[2]}"
+            for row in self._execute(query, [created_from])
+        }
+
+    def credited_doc_entries(self, created_from) -> Set[int]:
+        """Bills created since ``created_from`` that a live credit note is based on.
+
+        The same test as the list's ``exclude_credited``, for the whole window at once.
+        """
+        schema = self.connection.schema
+        query = f"""
+            SELECT DISTINCT CN."BaseEntry"
+            FROM "{schema}"."RIN1" CN
+            JOIN "{schema}"."ORIN" CH ON CH."DocEntry" = CN."DocEntry"
+            WHERE CN."BaseType" = 13
+              AND IFNULL(CH."CANCELED", 'N') = 'N'
+              AND CN."BaseEntry" IN (
+                  SELECT H."DocEntry" FROM "{schema}"."OINV" H WHERE H."CreateDate" >= ?
+              )
+        """
+        return {int(row[0]) for row in self._execute(query, [created_from]) if row[0] is not None}
 
     def list_stamped_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Invoices already carrying a dispatch stamp, with no app sheet involved.

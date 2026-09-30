@@ -17,21 +17,48 @@ class OitmItemService:
     FINISHED_GOODS_ITEM_GROUP_CODE = 102
 
     def __init__(self, company_code: str):
+        self.company_code = company_code
         self.client = SAPClient(company_code=company_code)
 
     def list_items(self, search: str = '', limit: int = 100) -> list[dict]:
+        """The picker's items, from SAP -- or, when HANA cannot be reached, from
+        the nightly copy (``sap_mirror``), each row then carrying the copy's
+        ``sap_copy_as_of`` so the page can say how old the list is."""
         try:
             limit = int(limit or 100)
         except (TypeError, ValueError):
             limit = 100
         limit = max(1, min(limit, 200))
 
-        schema = self.client.context.config['hana']['schema']
+        try:
+            return self._list_items_live(search, limit)
+        except OitmItemReadError as exc:
+            from sap_mirror import services as sap_mirror
+
+            if not sap_mirror.hana_unreachable(exc):
+                raise
+            copy = sap_mirror.copied_rows(
+                self.company_code, sap_mirror.FG_ITEMS, search=search, limit=limit
+            )
+            if copy is None:
+                raise
+            rows, as_of = copy
+            logger.warning(
+                'HANA unreachable; serving %s items for %s from the copy of %s',
+                len(rows), self.company_code, as_of,
+            )
+            return [{**row, 'sap_copy_as_of': as_of.isoformat()} for row in rows]
+
+    def list_all_for_copy(self) -> list[dict]:
+        """Every item the picker can offer, for the nightly copy."""
+        return self._list_items_live('', None)
+
+    def _finished_goods_where(self) -> str:
         # Restrict to real finished goods (FG*) only. FB* bundle/combo SKUs share
         # the same finished-goods item group, so the group filter alone lets them
         # into the picker where operators pick them by accident during box
         # generation — exclude them by code prefix.
-        where_clause = """
+        return """
             WHERE "InvntItem" = 'Y'
               AND "ItmsGrpCod" = {finished_goods_item_group_code}
               AND "ItemCode" LIKE 'FG%'
@@ -40,6 +67,10 @@ class OitmItemService:
         """.format(
             finished_goods_item_group_code=self.FINISHED_GOODS_ITEM_GROUP_CODE,
         )
+
+    def _list_items_live(self, search: str, limit: int | None) -> list[dict]:
+        schema = self.client.context.config['hana']['schema']
+        where_clause = self._finished_goods_where()
 
         if search:
             safe_search = search.replace("'", "''")
@@ -51,7 +82,7 @@ class OitmItemService:
             """
 
         sql = """
-            SELECT TOP {limit}
+            SELECT {top}
                 "ItemCode",
                 "ItemName",
                 "InvntryUom",
@@ -70,7 +101,7 @@ class OitmItemService:
             {where_clause}
             ORDER BY "ItemCode"
         """.format(
-            limit=limit,
+            top=f'TOP {int(limit)}' if limit else '',
             schema=schema,
             table_name=self.TABLE_NAME,
             where_clause=where_clause,
@@ -82,7 +113,7 @@ class OitmItemService:
             raise
         except Exception as exc:
             logger.error('Failed to fetch OITM item rows: %s', exc)
-            raise OitmItemReadError(str(exc))
+            raise OitmItemReadError(str(exc)) from exc
 
     def get_item(self, item_code: str) -> dict | None:
         """Look up one item by exact code, with its item group name (OITM ⋈ OITB).
@@ -246,17 +277,12 @@ class OitmItemService:
         connection = None
         cursor = None
         try:
-            conn = self.client.context.hana
-            from hdbcli import dbapi
-            from sap_client.hana.connection import HANA_TIMEOUTS
+            from sap_client.hana.connection import HanaConnection
 
-            connection = dbapi.connect(
-                address=conn['host'],
-                port=conn['port'],
-                user=conn['user'],
-                password=conn['password'],
-                **HANA_TIMEOUTS,
-            )
+            # Through HanaConnection for its fail-fast: while HANA is known to be
+            # down, a picker search goes to the copy at once, not after the
+            # connect timeout.
+            connection = HanaConnection(self.client.context.hana).connect()
             cursor = connection.cursor()
             if params is None:
                 cursor.execute(sql)
@@ -266,7 +292,7 @@ class OitmItemService:
             rows = cursor.fetchall()
             return [dict(zip(cols, row)) for row in rows]
         except Exception as exc:
-            raise OitmItemReadError(str(exc))
+            raise OitmItemReadError(str(exc)) from exc
         finally:
             if cursor is not None:
                 try:

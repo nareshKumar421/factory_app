@@ -1,0 +1,25 @@
+# /etc/systemd/system/factory-sap-copy.service on the 117 box.
+#
+# One run of manage.py sync_sap_copy, started by factory-sap-copy.timer. It runs
+# from `current`, so a deploy needs no step: the next run uses the new release.
+#
+#   sudo cp sap_mirror/deploy/factory-sap-copy.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now factory-sap-copy.timer
+#   journalctl -u factory-sap-copy
+[Unit]
+Description=factory_app SAP copies (one run)
+After=network.target
+
+[Service]
+Type=oneshot
+User=superadmin
+Group=www-data
+WorkingDirectory=/home/superadmin/django_projects/factory_app/current
+Environment="DJANGO_SETTINGS_MODULE=config.settings"
+Environment="PYTHONPATH=/home/superadmin/django_projects/factory_app/current"
+Environment="LD_LIBRARY_PATH=/usr/sap/hdbclient"
+Environment="ODBCINI=/etc/odbc.ini"
+Environment="ODBCSYSINI=/etc"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/superadmin/django_projects/factory_app/current/.venv/bin/python manage.py sync_sap_copy
+Nice=10

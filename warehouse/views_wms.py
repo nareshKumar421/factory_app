@@ -32,7 +32,12 @@ def _get_reader(request) -> WMSHanaReader:
 # ===========================================================================
 
 class WMSWarehouseListAPI(APIView):
-    """List of active warehouses for filter dropdowns."""
+    """List of active warehouses for filter dropdowns.
+
+    When HANA cannot be reached the list comes from the nightly copy
+    (``sap_mirror``), with ``sap_copy_as_of`` saying how old it is: a new pallet
+    still has to say which warehouse it is in.
+    """
     permission_classes = [IsAuthenticated, HasCompanyContext]
 
     def get(self, request):
@@ -41,6 +46,17 @@ class WMSWarehouseListAPI(APIView):
             data = reader.get_warehouses()
             return Response({"warehouses": data})
         except Exception as e:
+            from sap_mirror import services as sap_mirror
+
+            copy = (
+                sap_mirror.copied_rows(request.company.company.code, sap_mirror.WAREHOUSES)
+                if sap_mirror.hana_unreachable(e)
+                else None
+            )
+            if copy is not None:
+                rows, as_of = copy
+                logger.warning(f"HANA unreachable; warehouses served from the copy of {as_of}")
+                return Response({"warehouses": rows, "sap_copy_as_of": as_of.isoformat()})
             logger.error(f"WMS Warehouse List error: {e}")
             return Response(
                 {"error": str(e)},

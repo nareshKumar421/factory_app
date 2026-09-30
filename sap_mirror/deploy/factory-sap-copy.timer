@@ -1,0 +1,14 @@
+# /etc/systemd/system/factory-sap-copy.timer on the 117 box: sync_sap_copy every
+# 15 minutes. Nothing stays running between runs; each list decides whether it
+# is due (the master lists once a night).
+[Unit]
+Description=factory_app SAP copies, every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:0/15
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
