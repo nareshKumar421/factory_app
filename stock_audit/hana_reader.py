@@ -17,8 +17,9 @@ from sap_client.hana.connection import HanaConnection
 logger = logging.getLogger(__name__)
 
 _COLUMNS = '''
-    W."ItemCode", IFNULL(I."ItemName", ''), IFNULL(I."ItmsGrpCod", 0),
-    IFNULL(I."InvntryUom", ''), IFNULL(W."OnHand", 0)
+    I."ItemCode", IFNULL(I."ItemName", ''), IFNULL(I."ItmsGrpCod", 0),
+    IFNULL(I."InvntryUom", ''), IFNULL(W."OnHand", 0),
+    IFNULL(B."ItmsGrpNam", ''), IFNULL(I."ManBtchNum", 'N')
 '''
 
 
@@ -29,6 +30,8 @@ def _row(row) -> dict:
         'item_group': int(row[2] or 0),
         'uom': row[3] or '',
         'on_hand': Decimal(str(row[4] or 0)),
+        'item_group_name': (row[5] or '').strip(),
+        'is_batch': (row[6] or 'N') == 'Y',
     }
 
 
@@ -63,6 +66,7 @@ class StockAuditReader:
             SELECT {_COLUMNS}
             FROM "{{schema}}"."OITW" W
             JOIN "{{schema}}"."OITM" I ON I."ItemCode" = W."ItemCode"
+            LEFT JOIN "{{schema}}"."OITB" B ON B."ItmsGrpCod" = I."ItmsGrpCod"
             WHERE W."WhsCode" = ? AND I."InvntItem" = 'Y' AND IFNULL(W."OnHand", 0) <> 0
             ORDER BY W."ItemCode"
             ''',
@@ -74,11 +78,11 @@ class StockAuditReader:
         """One stock item, with the warehouse's on-hand (0 if it holds none)."""
         rows = self._query(
             f'''
-            SELECT I."ItemCode", IFNULL(I."ItemName", ''), IFNULL(I."ItmsGrpCod", 0),
-                   IFNULL(I."InvntryUom", ''), IFNULL(W."OnHand", 0)
+            SELECT {_COLUMNS}
             FROM "{{schema}}"."OITM" I
             LEFT JOIN "{{schema}}"."OITW" W
                    ON W."ItemCode" = I."ItemCode" AND W."WhsCode" = ?
+            LEFT JOIN "{{schema}}"."OITB" B ON B."ItmsGrpCod" = I."ItmsGrpCod"
             WHERE I."ItemCode" = ? AND I."InvntItem" = 'Y'
             ''',
             (warehouse_code, item_code),
@@ -90,11 +94,11 @@ class StockAuditReader:
         term = f"%{search.strip().upper()}%"
         rows = self._query(
             f'''
-            SELECT I."ItemCode", IFNULL(I."ItemName", ''), IFNULL(I."ItmsGrpCod", 0),
-                   IFNULL(I."InvntryUom", ''), IFNULL(W."OnHand", 0)
+            SELECT {_COLUMNS}
             FROM "{{schema}}"."OITM" I
             LEFT JOIN "{{schema}}"."OITW" W
                    ON W."ItemCode" = I."ItemCode" AND W."WhsCode" = ?
+            LEFT JOIN "{{schema}}"."OITB" B ON B."ItmsGrpCod" = I."ItmsGrpCod"
             WHERE I."InvntItem" = 'Y'
               AND (UPPER(I."ItemCode") LIKE ? OR UPPER(IFNULL(I."ItemName", '')) LIKE ?)
             ORDER BY I."ItemCode"
@@ -103,3 +107,28 @@ class StockAuditReader:
             (warehouse_code, term, term),
         )
         return [_row(r) for r in rows]
+
+    def batches(self, warehouse_code: str, item_code: str) -> List[dict]:
+        """The item's batches in the warehouse with stock, oldest first.
+
+        Oldest by the date the batch came in (OBTN.InDate), then by its SAP
+        entry, so a shortage is taken the way stock is used: first in, first out.
+        """
+        rows = self._query(
+            '''
+            SELECT N."DistNumber", Q."Quantity", N."InDate", N."AbsEntry"
+            FROM "{schema}"."OBTQ" Q
+            JOIN "{schema}"."OBTN" N ON N."AbsEntry" = Q."MdAbsEntry"
+            WHERE Q."ItemCode" = ? AND Q."WhsCode" = ? AND Q."Quantity" > 0
+            ORDER BY N."InDate", N."AbsEntry"
+            ''',
+            (item_code, warehouse_code),
+        )
+        return [{'batch': r[0], 'qty': Decimal(str(r[1] or 0))} for r in rows]
+
+    def warehouse_branch(self, warehouse_code: str) -> Optional[int]:
+        """OWHS.BPLid — the branch SAP posts the warehouse's documents under."""
+        rows = self._query(
+            'SELECT "BPLid" FROM "{schema}"."OWHS" WHERE "WhsCode" = ?', (warehouse_code,))
+        return int(rows[0][0]) if rows and rows[0][0] is not None else None
+

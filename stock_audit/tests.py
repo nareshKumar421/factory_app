@@ -26,13 +26,18 @@ from .models import StockAudit, StockAuditCount, StockAuditLine
 User = get_user_model()
 
 
-def sap_row(code, name, group, on_hand, uom='PCS'):
+GROUP_NAMES = {106: 'RAW MATERIAL', 105: 'PACKAGING MATERIAL', 102: 'FINISHED',
+               107: 'TRADING ITEMS', 115: 'SEMI FINISHED GOODS', 101: 'TOOLS'}
+
+
+def sap_row(code, name, group, on_hand, uom='PCS', batch=False):
     return {'item_code': code, 'item_name': name, 'item_group': group, 'uom': uom,
-            'on_hand': Decimal(on_hand)}
+            'on_hand': Decimal(on_hand), 'item_group_name': GROUP_NAMES.get(group, ''),
+            'is_batch': batch}
 
 
 WAREHOUSE = [
-    sap_row('RM0000001', 'CANOLA OIL', 106, '1500.5', 'KG'),
+    sap_row('RM0000001', 'CANOLA OIL', 106, '1500.5', 'KG', batch=True),
     sap_row('PM0000010', 'CAPS 28MM RED', 105, '32'),
     sap_row('FG0000100', 'JIVO CANOLA 1L', 102, '400', 'CASE'),
     sap_row('TL0000001', 'SPANNER', 101, '3'),
@@ -41,6 +46,8 @@ WAREHOUSE = [
 
 AUDITOR = ['can_view_stock_audit', 'can_count_stock_audit']
 MANAGER = AUDITOR + ['can_view_audit_sap_qty', 'can_manage_stock_audit']
+APPROVER = ['can_view_stock_audit', 'can_view_audit_sap_qty', 'can_approve_stock_audit']
+POSTER = ['can_view_stock_audit', 'can_post_stock_audit_to_sap']
 
 
 class StockAuditTests(APITestCase):
@@ -114,7 +121,7 @@ class StockAuditTests(APITestCase):
         self._audit()
         response = self._start()
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('already has an open audit', response.data['detail'])
+        self.assertIn('already has an audit in progress', response.data['detail'])
 
     def test_sap_down_starts_nothing(self):
         self.sap.return_value.warehouse_stock.side_effect = SAPConnectionError('SAP is down')
@@ -274,7 +281,9 @@ class StockAuditTests(APITestCase):
         self._count(audit, 'RM0000001', '1400')
         summary = self.client.get(reverse('stock-audit-detail', args=[audit.id])).data['summary']
         self.assertEqual(summary['total'], {'lines': 5, 'counted': 2, 'different': 1})
-        self.assertEqual(summary['by_category']['PM'], {'lines': 2, 'counted': 1, 'different': 0})
+        self.assertEqual(summary['by_group']['PACKAGING MATERIAL'],
+                         {'lines': 2, 'counted': 1, 'different': 0, 'category': 'PM'})
+        self.assertEqual(summary['by_group']['TOOLS']['lines'], 1)
 
     # -- items SAP did not list ----------------------------------------------------
 
@@ -326,14 +335,76 @@ class StockAuditTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('Counting has started', response.data['detail'])
 
-    def test_a_closed_audit_takes_no_counts(self):
+    # -- complete, approve, reject -------------------------------------------------
+
+    def _step(self, audit, name, **data):
+        return self.client.post(reverse(f'stock-audit-{name}', args=[audit.id]), data,
+                                format='json')
+
+    def test_a_completed_audit_waits_for_an_approver(self):
         audit = self._audit()
-        self.assertEqual(self.client.post(reverse('stock-audit-close', args=[audit.id]))
-                         .status_code, status.HTTP_200_OK)
+        self._as(self.auditor)
+        self._count(audit, 'PM0000010', '30')
+        response = self._step(audit, 'complete')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['status'], 'SUBMITTED')
+        # The auditor's part is done.
         self.assertEqual(self._count(audit, 'PM0000010', '1').status_code,
                          status.HTTP_400_BAD_REQUEST)
-        # ...and the warehouse can be audited again.
+        self.assertEqual(self._step(audit, 'approve').status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_an_approver_may_correct_the_count_before_approving(self):
+        audit = self._audit()
+        self._as(self.auditor)
+        self._count(audit, 'PM0000010', '30')
+        self._step(audit, 'complete')
+        self._as(self._user('approver@jivo.test', 'P1', APPROVER))
+        self.assertEqual(self._count(audit, 'PM0000010', '2').data['counted_qty'], '32')
+        response = self._step(audit, 'approve')
+        self.assertEqual((response.status_code, response.data['status']), (200, 'APPROVED'))
+        self.assertEqual(self._count(audit, 'PM0000010', '1').status_code,
+                         status.HTTP_400_BAD_REQUEST)
+
+    def test_a_rejected_audit_goes_back_to_the_auditors_with_the_reason(self):
+        audit = self._audit()
+        self._as(self.auditor)
+        self._step(audit, 'complete')
+        self._as(self._user('approver@jivo.test', 'P1', APPROVER))
+        self.assertEqual(self._step(audit, 'reject').status_code, status.HTTP_400_BAD_REQUEST)
+        response = self._step(audit, 'reject', reason='Count rack C again')
+        self.assertEqual(response.data['status'], 'OPEN')
+        self.assertEqual(response.data['rejection_reason'], 'Count rack C again')
+        self._as(self.auditor)
+        self.assertEqual(self._count(audit, 'PM0000010', '5').status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self._step(audit, 'complete').data['status'], 'SUBMITTED')
+
+    def test_the_page_is_told_what_each_person_may_do(self):
+        audit = self._audit()
+        detail = lambda: self.client.get(reverse('stock-audit-detail', args=[audit.id])).data
+        self._as(self.auditor)
+        self.assertEqual(detail()['actions'], {
+            'count': True, 'refresh': False, 'complete': True, 'approve': False,
+            'post_to_sap': False, 'void_any': False})
+        self._step(audit, 'complete')
+        self.assertFalse(detail()['actions']['count'])
+        self._as(self._user('approver@jivo.test', 'P1', APPROVER))
+        self.assertTrue(detail()['actions']['count'])
+        self.assertTrue(detail()['actions']['approve'])
+
+    def test_a_warehouse_waiting_for_approval_cannot_be_audited_again_yet(self):
+        audit = self._audit()
+        self._step(audit, 'complete')
+        self.assertEqual(self._start().status_code, status.HTTP_400_BAD_REQUEST)
+        self._as(self._user('approver@jivo.test', 'P1', APPROVER))
+        self._step(audit, 'approve')
+        self._as(self.manager)
         self.assertEqual(self._start().status_code, status.HTTP_201_CREATED)
+
+    def test_lines_filter_by_sap_item_group(self):
+        audit = self._audit()
+        data = self._lines(audit, group='PACKAGING MATERIAL')
+        self.assertEqual([r['item_code'] for r in data['results']], ['PM0000010', 'PM0000020'])
+        self.assertEqual(data['results'][0]['item_group_name'], 'PACKAGING MATERIAL')
 
     # -- the export ---------------------------------------------------------------
 
@@ -346,7 +417,7 @@ class StockAuditTests(APITestCase):
         audit = self._audit()
         self._count(audit, 'PM0000010', '30')
         rows = self._export(audit)
-        self.assertEqual(rows[0], ['Item code', 'Item name', 'Category', 'UoM', 'On hand (physical)',
+        self.assertEqual(rows[0], ['Item code', 'Item name', 'Item group', 'UoM', 'On hand (physical)',
                                    'SAP', 'Difference', 'Not in SAP copy'])
         caps = next(r for r in rows if r[0] == 'PM0000010')
         self.assertEqual(caps[4:7], ['30', '32', '-2'])
@@ -359,11 +430,12 @@ class StockAuditTests(APITestCase):
 
     # -- who ------------------------------------------------------------------------
 
-    def test_a_counter_cannot_start_refresh_or_close(self):
+    def test_a_counter_cannot_start_refresh_approve_or_post(self):
         audit = self._audit()
         self._as(self.auditor)
         self.assertEqual(self._start('BH-RM').status_code, status.HTTP_403_FORBIDDEN)
-        for name in ('stock-audit-refresh', 'stock-audit-close'):
+        for name in ('stock-audit-refresh', 'stock-audit-approve', 'stock-audit-reject',
+                     'stock-audit-sap-posting'):
             self.assertEqual(self.client.post(reverse(name, args=[audit.id])).status_code,
                              status.HTTP_403_FORBIDDEN)
 
@@ -383,6 +455,19 @@ class StockAuditTests(APITestCase):
 
 
 class StockAuditGroupsTests(APITestCase):
+    def test_the_approver_group_holds_its_rights(self):
+        from importlib import import_module
+
+        from django.apps import apps
+        from django.contrib.auth.models import Group
+
+        import_module('stock_audit.migrations.0004_backfill_groups_and_approver').forwards(apps, None)
+        rights = lambda name: set(Group.objects.get(name=name).permissions
+                                  .values_list('codename', flat=True))
+        self.assertEqual(rights('Stock Audit Approver'), set(APPROVER))
+        self.assertTrue({'can_approve_stock_audit', 'can_post_stock_audit_to_sap'}
+                        <= rights('Stock Audit Manager'))
+
     def test_the_groups_hold_their_rights(self):
         from importlib import import_module
 
@@ -394,3 +479,141 @@ class StockAuditGroupsTests(APITestCase):
                                   .values_list('codename', flat=True))
         self.assertEqual(rights('Stock Auditor'), set(AUDITOR))
         self.assertEqual(rights('Stock Audit Manager'), set(MANAGER))
+
+
+class BatchSpreadTests(APITestCase):
+    """A counted total put onto an item's batches: short from the oldest, excess on the newest."""
+
+    def spread(self, counted, *batches):
+        from .services import _spread_over_batches
+
+        rows = [{'batch': f'B{n}', 'qty': Decimal(q)} for n, q in enumerate(batches, start=1)]
+        return [(b, str(now), str(new)) for b, now, new in _spread_over_batches(Decimal(counted), rows)]
+
+    def test_a_shortage_comes_off_the_oldest_batch(self):
+        self.assertEqual(self.spread('90', '50', '50'), [('B1', '50', '40')])
+
+    def test_a_shortage_bigger_than_a_batch_spills_onto_the_next(self):
+        # 110 held, 30 counted: 80 short -- all 50 of B1, then 30 of B2.
+        self.assertEqual(self.spread('30', '50', '50', '10'),
+                         [('B1', '50', '0'), ('B2', '50', '20')])
+
+    def test_an_excess_goes_onto_the_newest_batch(self):
+        # 110 held, 130 counted: the 20 more goes on B3.
+        self.assertEqual(self.spread('130', '50', '50', '10'), [('B3', '10', '30')])
+
+    def test_nothing_changes_when_the_count_matches(self):
+        self.assertEqual(self.spread('100', '50', '50'), [])
+
+    def test_an_excess_with_no_batch_cannot_be_placed(self):
+        from .services import AuditError, _spread_over_batches
+
+        with self.assertRaises(AuditError):
+            _spread_over_batches(Decimal('5'), [])
+
+
+class SapPostingTests(APITestCase):
+    """An approved audit's RM and PM differences, posted to SAP once."""
+
+    # The audit fixtures, without inheriting (and so re-running) the audit tests.
+    _user, _as, _start, _audit, _line, _count = (
+        StockAuditTests._user, StockAuditTests._as, StockAuditTests._start,
+        StockAuditTests._audit, StockAuditTests._line, StockAuditTests._count)
+
+    def setUp(self):
+        StockAuditTests.setUp(self)
+        self.sap.return_value.batches.return_value = [
+            {'batch': 'OLD', 'qty': Decimal('1000')}, {'batch': 'NEW', 'qty': Decimal('500.5')}]
+        self.sap.return_value.warehouse_branch.return_value = 2
+        self.writer = mock.patch(
+            'sap_client.service_layer.inventory_posting_writer.InventoryPostingWriter').start()
+        self.writer.return_value.create.return_value = {'DocumentEntry': 77, 'DocumentNumber': 1234}
+        self.audit = self._audit()
+        self._count(self.audit, 'RM0000001', '1400')     # 100.5 short, batch item
+        self._count(self.audit, 'PM0000010', '30')       # 2 short
+        self._count(self.audit, 'FG0000100', '390')      # FG: shown, not posted
+        self._count(self.audit, 'TL0000001', '3')        # matches
+        self.client.post(reverse('stock-audit-complete', args=[self.audit.id]))
+        self._as(self._user('approver@jivo.test', 'P1', APPROVER))
+        self.client.post(reverse('stock-audit-approve', args=[self.audit.id]))
+        self._as(self._user('poster@jivo.test', 'S1', POSTER))
+        self.url = reverse('stock-audit-sap-posting', args=[self.audit.id])
+
+    def test_the_preview_is_the_rm_and_pm_differences(self):
+        data = self.client.get(self.url).data
+        self.assertEqual([(l['item_code'], l['difference']) for l in data['lines']],
+                         [('PM0000010', '-2'), ('RM0000001', '-100.5')])
+        rm = data['lines'][1]
+        # The shortage off the oldest batch.
+        self.assertEqual(rm['batches'], [{'batch': 'OLD', 'sap_qty': '1000', 'counted_qty': '899.5'}])
+        self.assertEqual(data['blocked'], [])
+
+    def test_posting_sends_one_inventory_posting_and_keeps_its_number(self):
+        response = self.client.post(self.url, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual((response.data['sap_posting'], response.data['sap_doc_num']), ('DONE', '1234'))
+        payload = self.writer.return_value.create.call_args[0][0]
+        self.assertEqual(payload['BranchID'], 2)
+        self.assertEqual([(l['ItemCode'], l['WarehouseCode'], l['CountedQuantity'])
+                          for l in payload['InventoryPostingLines']],
+                         [('PM0000010', 'BH-PM', 30.0), ('RM0000001', 'BH-PM', 1400.0)])
+        self.assertEqual(payload['InventoryPostingLines'][1]['InventoryPostingBatchNumbers'],
+                         [{'BatchNumber': 'OLD', 'Quantity': 899.5, 'BaseLineNumber': 2}])
+        self.assertNotIn('InventoryPostingBatchNumbers', payload['InventoryPostingLines'][0])
+
+    def test_it_is_never_posted_twice(self):
+        self.client.post(self.url, format='json')
+        response = self.client.post(self.url, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Already posted', response.data['detail'])
+        self.assertEqual(self.writer.return_value.create.call_count, 1)
+
+    def test_sap_refusing_it_can_be_tried_again(self):
+        from sap_client.exceptions import SAPValidationError
+
+        self.writer.return_value.create.side_effect = SAPValidationError('Period is locked')
+        response = self.client.post(self.url, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.audit.refresh_from_db()
+        self.assertEqual((self.audit.sap_posting, self.audit.sap_posting_error),
+                         ('FAILED', 'Period is locked'))
+        self.writer.return_value.create.side_effect = None
+        self.assertEqual(self.client.post(self.url, format='json').data['sap_posting'], 'DONE')
+
+    def test_no_answer_is_not_sent_again_until_sap_is_checked(self):
+        from sap_client.exceptions import SAPOutcomeUnknown
+
+        self.writer.return_value.create.side_effect = SAPOutcomeUnknown('timed out')
+        self.client.post(self.url, format='json')
+        self.audit.refresh_from_db()
+        self.assertEqual(self.audit.sap_posting, 'UNKNOWN')
+        self.writer.return_value.create.side_effect = None
+        response = self.client.post(self.url, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Check SAP', response.data['detail'])
+        self.assertEqual(self.client.post(self.url, {'confirm_unknown': True}, format='json')
+                         .data['sap_posting'], 'DONE')
+
+    def test_only_an_approved_audit_is_posted(self):
+        self._as(self.manager)
+        other = StockAudit.objects.create(company=self.company, warehouse_code='BH-RM',
+                                          snapshot_at=self.audit.snapshot_at)
+        self._as(self._user('poster2@jivo.test', 'S2', POSTER))
+        response = self.client.post(reverse('stock-audit-sap-posting', args=[other.id]),
+                                    format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.writer.return_value.create.assert_not_called()
+
+    def test_posting_needs_its_own_right(self):
+        self._as(self.manager)
+        self.assertEqual(self.client.post(self.url, format='json').status_code,
+                         status.HTTP_403_FORBIDDEN)
+
+    def test_a_batch_item_with_nothing_to_put_an_excess_on_blocks_the_posting(self):
+        self.sap.return_value.batches.return_value = []
+        data = self.client.get(self.url).data
+        self.assertEqual([b['item_code'] for b in data['blocked']], ['RM0000001'])
+        response = self.client.post(self.url, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.writer.return_value.create.assert_not_called()
+

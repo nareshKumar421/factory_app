@@ -19,9 +19,13 @@ from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from . import services
-from .models import AuditStatus, ItemCategory, StockAudit, StockAuditCount, StockAuditLine
+from .models import (
+    ACTIVE_STATUSES, AuditStatus, ItemCategory, SapPosting, StockAudit, StockAuditCount,
+    StockAuditLine,
+)
 from .permissions import (
-    MANAGE, CanCountStockAudit, CanManageStockAudit, CanViewStockAudit, has, sees_sap,
+    APPROVE, COUNT, MANAGE, POST_TO_SAP, CanApproveStockAudit, CanCountStockAudit,
+    CanManageStockAudit, CanPostStockAuditToSap, CanViewStockAudit, has, sees_sap,
 )
 
 PAGE_SIZE = 50
@@ -44,6 +48,27 @@ def _person(user):
     return (getattr(user, 'full_name', '') or getattr(user, 'email', '')) if user else ''
 
 
+def _as_approver(request, audit):
+    """Counting on an audit awaiting approval is an approver's correction."""
+    return audit.status == AuditStatus.SUBMITTED and has(request.user, APPROVE)
+
+
+def _actions(audit, user):
+    """What this user may do to the audit now, so the page shows only those buttons."""
+    status_ = audit.status
+    counts_exist = StockAuditCount.objects.filter(line__audit=audit).exists()
+    return {
+        'count': (status_ == AuditStatus.OPEN and has(user, COUNT, MANAGE, APPROVE))
+        or (status_ == AuditStatus.SUBMITTED and has(user, APPROVE)),
+        'refresh': status_ == AuditStatus.OPEN and not counts_exist and has(user, MANAGE),
+        'complete': status_ == AuditStatus.OPEN and has(user, COUNT, MANAGE),
+        'approve': status_ == AuditStatus.SUBMITTED and has(user, APPROVE),
+        'post_to_sap': (status_ == AuditStatus.APPROVED and audit.sap_posting != SapPosting.DONE
+                        and has(user, POST_TO_SAP)),
+        'void_any': has(user, MANAGE, APPROVE),
+    }
+
+
 def _audit_json(audit, request, with_summary=False):
     data = {
         'id': audit.id,
@@ -56,11 +81,21 @@ def _audit_json(audit, request, with_summary=False):
         'started_at': audit.started_at,
         'closed_by': _person(audit.closed_by),
         'closed_at': audit.closed_at,
+        'completed_by': _person(audit.completed_by),
+        'completed_at': audit.completed_at,
+        'approved_by': _person(audit.approved_by),
+        'approved_at': audit.approved_at,
+        'rejected_by': _person(audit.rejected_by),
+        'rejected_at': audit.rejected_at,
+        'rejection_reason': audit.rejection_reason,
+        'sap_posting': audit.sap_posting,
+        'sap_doc_num': audit.sap_doc_num,
+        'sap_posted_at': audit.sap_posted_at,
+        'sap_posting_error': audit.sap_posting_error,
     }
     if with_summary:
         data['summary'] = services.summary(audit, with_sap=sees_sap(request.user))
-        data['can_refresh'] = (audit.status == AuditStatus.OPEN and not
-                               StockAuditCount.objects.filter(line__audit=audit).exists())
+        data['actions'] = _actions(audit, request.user)
     return data
 
 
@@ -70,6 +105,8 @@ def _line_json(line, see_sap):
         'item_code': line.item_code,
         'item_name': line.item_name,
         'category': line.category,
+        'item_group_name': line.item_group_name or line.category,
+        'is_batch': line.is_batch,
         'uom': line.uom,
         'in_sap': line.in_sap,
         'counted_qty': _qty(line.counted_qty),
@@ -119,7 +156,7 @@ class WarehousesAPI(_Base):
         except (SAPConnectionError, SAPDataError) as e:
             return _sap_unavailable(e)
         open_audits = dict(StockAudit.objects.filter(
-            company=company, status=AuditStatus.OPEN).values_list('warehouse_code', 'id'))
+            company=company, status__in=ACTIVE_STATUSES).values_list('warehouse_code', 'id'))
         return Response([
             {'code': w.warehouse_code, 'name': w.warehouse_name,
              'open_audit_id': open_audits.get(w.warehouse_code)}
@@ -167,7 +204,7 @@ class AuditDetailAPI(_Base):
 
 
 class AuditLinesAPI(_Base):
-    """``?search=&category=RM|PM|FG|OTHER&state=uncounted|counted|different&page=``"""
+    """``?search=&group=<SAP item group>&category=RM|PM|FG|OTHER&state=uncounted|counted|different&page=``"""
 
     def get(self, request, audit_id):
         audit = _company_audit(request, audit_id)
@@ -181,6 +218,9 @@ class AuditLinesAPI(_Base):
         category = request.GET.get('category')
         if category in ItemCategory.values:
             lines = lines.filter(category=category)
+        group = (request.GET.get('group') or '').strip()
+        if group:
+            lines = lines.filter(Q(item_group_name=group) | Q(item_group_name='', category=group))
         state = request.GET.get('state')
         if state == 'uncounted':
             lines = lines.filter(counted_qty__isnull=True)
@@ -231,7 +271,8 @@ class LineCountsAPI(_Base):
         if not qty.is_finite() or abs(qty) >= Decimal('1e15'):
             return _refused('Enter the quantity found, in figures.')
         try:
-            services.add_count(line, qty, request.user, request.data.get('note') or '')
+            services.add_count(line, qty, request.user, request.data.get('note') or '',
+                               as_approver=_as_approver(request, line.audit))
         except services.AuditError as e:
             return _refused(e)
         line = StockAuditLine.objects.annotate(
@@ -248,7 +289,9 @@ class CountVoidAPI(_Base):
             StockAuditCount.objects.select_related('line__audit'),
             pk=count_id, line__audit_id=audit_id, line__audit__company=request.company.company)
         try:
-            services.void_count(count, request.user, may_void_others=has(request.user, MANAGE))
+            services.void_count(count, request.user,
+                                may_void_others=has(request.user, MANAGE, APPROVE),
+                                as_approver=_as_approver(request, count.line.audit))
         except services.AuditError as e:
             return _refused(e)
         line = StockAuditLine.objects.annotate(
@@ -285,7 +328,7 @@ class AuditItemsAPI(_Base):
         if not code:
             return _refused('Pick the item to add.')
         try:
-            line = services.add_item(audit, code)
+            line = services.add_item(audit, code, as_approver=_as_approver(request, audit))
         except services.AuditError as e:
             return _refused(e)
         except (SAPConnectionError, SAPDataError) as e:
@@ -309,17 +352,79 @@ class AuditRefreshAPI(_Base):
         return Response(_audit_json(audit, request, with_summary=True))
 
 
-class AuditCloseAPI(_Base):
+class _AuditAction(_Base):
+    """POST one step of the audit's workflow; answers with the audit as it now is."""
+    permission = CanViewStockAudit
+
     def get_permissions(self):
-        return [IsAuthenticated(), HasCompanyContext(), CanManageStockAudit()]
+        return [IsAuthenticated(), HasCompanyContext(), self.permission()]
+
+    def act(self, request, audit):
+        raise NotImplementedError
 
     def post(self, request, audit_id):
         audit = _company_audit(request, audit_id)
         try:
-            services.close(audit, request.user)
+            self.act(request, audit)
         except services.AuditError as e:
             return _refused(e)
+        except (SAPConnectionError, SAPDataError) as e:
+            return _sap_unavailable(e)
+        audit.refresh_from_db()
         return Response(_audit_json(audit, request, with_summary=True))
+
+
+class AuditCompleteAPI(_AuditAction):
+    permission = CanCountStockAudit
+
+    def act(self, request, audit):
+        if not has(request.user, COUNT, MANAGE):
+            raise services.AuditError('Only an auditor can complete the audit.')
+        services.complete(audit, request.user)
+
+
+class AuditApproveAPI(_AuditAction):
+    permission = CanApproveStockAudit
+
+    def act(self, request, audit):
+        services.approve(audit, request.user)
+
+
+class AuditRejectAPI(_AuditAction):
+    permission = CanApproveStockAudit
+
+    def act(self, request, audit):
+        services.reject(audit, request.user, request.data.get('reason') or '')
+
+
+class AuditPostToSapAPI(_AuditAction):
+    """GET: what the Inventory Posting would change. POST ``{confirm_unknown}``: post it."""
+    permission = CanPostStockAuditToSap
+
+    def get(self, request, audit_id):
+        audit = _company_audit(request, audit_id)
+        if audit.status != AuditStatus.APPROVED:
+            return _refused('Only an approved audit can be posted to SAP.')
+        try:
+            preview = services.posting_preview(audit)
+        except (SAPConnectionError, SAPDataError) as e:
+            return _sap_unavailable(e)
+
+        def line_json(line):
+            return {**{k: v for k, v in line.items() if k not in ('sap_qty', 'counted_qty', 'batches')},
+                    'sap_qty': _qty(line['sap_qty']), 'counted_qty': _qty(line['counted_qty']),
+                    'difference': _qty(line['counted_qty'] - line['sap_qty']),
+                    'batches': [{'batch': b['batch'], 'sap_qty': _qty(b['sap_qty']),
+                                 'counted_qty': _qty(b['counted_qty'])}
+                                for b in line.get('batches', [])]}
+        return Response({
+            'lines': [line_json(l) for l in preview['lines']],
+            'blocked': [{**line_json(l), 'reason': l['reason']} for l in preview['blocked']],
+        })
+
+    def act(self, request, audit):
+        services.post_to_sap(audit, request.user,
+                             confirm_unknown=bool(request.data.get('confirm_unknown')))
 
 
 class AuditExportAPI(_Base):
@@ -332,10 +437,10 @@ class AuditExportAPI(_Base):
         response['Content-Disposition'] = (
             f'attachment; filename="stock-audit-{audit.warehouse_code}-{audit.id}.csv"')
         writer = csv.writer(response)
-        head = ['Item code', 'Item name', 'Category', 'UoM', 'On hand (physical)']
+        head = ['Item code', 'Item name', 'Item group', 'UoM', 'On hand (physical)']
         writer.writerow(head + (['SAP', 'Difference'] if see_sap else []) + ['Not in SAP copy'])
         for line in audit.lines.all():
-            row = [line.item_code, line.item_name, line.category, line.uom,
+            row = [line.item_code, line.item_name, line.item_group_name or line.category, line.uom,
                    _qty(line.counted_qty) or '']
             if see_sap:
                 row += [_qty(line.sap_qty), _qty(line.difference) or '']
