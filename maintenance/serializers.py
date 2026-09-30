@@ -386,6 +386,21 @@ class AssetSerializer(CompanyScopedModelSerializer):
         return attrs
 
 
+def unique_spare_part_number(company, base):
+    """A part number built from ``base`` that no other spare in the company uses.
+
+    The store adds items by name alone, so the name stands in for the part
+    number; a clash gets a ``-2``, ``-3``... suffix inside the 100-char column.
+    """
+    base = (base.strip().upper() or "ITEM")[:100]
+    candidate, n = base, 1
+    while MaintenanceSpare.objects.filter(company=company, part_number__iexact=candidate).exists():
+        n += 1
+        suffix = f"-{n}"
+        candidate = f"{base[:100 - len(suffix)]}{suffix}"
+    return candidate
+
+
 class MaintenanceSpareSerializer(CompanyScopedModelSerializer):
     category_name = serializers.CharField(source="category.name", read_only=True)
     compatible_asset_codes = serializers.SerializerMethodField()
@@ -427,6 +442,13 @@ class MaintenanceSpareSerializer(CompanyScopedModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["created_by", "updated_by", "created_at", "updated_at"]
+        # The Store page adds an item by name, unit and place alone: a missing
+        # category falls back to "General" in the view, a missing part number to
+        # the name (see validate).
+        extra_kwargs = {
+            "category": {"required": False},
+            "part_number": {"required": False, "allow_blank": True},
+        }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -452,7 +474,17 @@ class MaintenanceSpareSerializer(CompanyScopedModelSerializer):
             raise serializers.ValidationError({"category": "Category must belong to current company."})
 
         part_number = attrs.get("part_number", getattr(self.instance, "part_number", "")).strip()
-        if part_number:
+        if not part_number and self.instance is None and company:
+            # Added by name alone, a second "Bearing" would just be a duplicate
+            # of the first; a distinct part number is what makes a variant.
+            name = attrs.get("name", "").strip()
+            if MaintenanceSpare.objects.filter(company=company, name__iexact=name).exists():
+                raise serializers.ValidationError({"name": "This item is already in the store."})
+            attrs["part_number"] = unique_spare_part_number(company, name)
+        elif not part_number and self.instance is not None:
+            # A blanked part number on edit keeps the old one.
+            attrs.pop("part_number", None)
+        elif part_number:
             qs = MaintenanceSpare.objects.filter(company=company, part_number__iexact=part_number)
             if self.instance:
                 qs = qs.exclude(pk=self.instance.pk)
@@ -1201,6 +1233,14 @@ class SpareMovementSerializer(CompanyScopedModelSerializer):
 class SpareRequestActionSerializer(serializers.Serializer):
     quantity = serializers.DecimalField(max_digits=14, decimal_places=3, min_value=Decimal("0.001"))
     remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class SpareGiveOutSerializer(serializers.Serializer):
+    """Store hands stock straight to a person — no work order behind it."""
+
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=3, min_value=Decimal("0.001"))
+    given_to = serializers.CharField(max_length=200)
+    remarks = serializers.CharField(required=False, allow_blank=True, default="")
 
 
 class SpareIssueSerializer(SpareRequestActionSerializer):

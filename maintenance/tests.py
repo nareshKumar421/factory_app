@@ -1900,7 +1900,10 @@ class MaintenanceAssetAPITests(APITestCase):
         self.assertEqual(adjust_up.status_code, status.HTTP_200_OK, adjust_up.data)
         spare.refresh_from_db()
         self.assertEqual(spare.current_stock, Decimal("8.000"))
-        movement = SpareMovement.objects.get(spare=spare, movement_type="ADJUSTMENT")
+        # (The opening 5 is an ADJUSTMENT too — "Opening stock" — so skip it.)
+        movement = SpareMovement.objects.exclude(remarks="Opening stock").get(
+            spare=spare, movement_type="ADJUSTMENT"
+        )
         self.assertEqual(movement.quantity, Decimal("3.000"))
 
         # A no-op adjustment and a negative target are rejected.
@@ -1931,7 +1934,9 @@ class MaintenanceAssetAPITests(APITestCase):
         spare.refresh_from_db()
         self.assertEqual(spare.current_stock, Decimal("6.000"))
         self.assertEqual(
-            SpareMovement.objects.filter(spare=spare, movement_type="ADJUSTMENT").count(),
+            SpareMovement.objects.filter(spare=spare, movement_type="ADJUSTMENT")
+            .exclude(remarks="Opening stock")
+            .count(),
             2,
         )
 
@@ -2744,8 +2749,9 @@ class MaterialIndentAPITests(APITestCase):
         self.assertEqual(receive.status_code, status.HTTP_200_OK, receive.data)
         self.assertEqual(receive.data["status"], "RECEIVED")
 
-        # Pen shortfall (40) is now a Store/Spares part with 40 in stock + a RECEIPT ledger row.
-        pen = MaintenanceSpare.objects.get(company=self.company, name__iexact="Pen")
+        # Pen shortfall (40) is now a Store/Spares part with 40 in stock + a RECEIPT ledger row;
+        # its specification ("Blue") is part of its name.
+        pen = MaintenanceSpare.objects.get(company=self.company, name__iexact="Pen (Blue)")
         self.assertEqual(pen.current_stock, Decimal("40.000"))
         self.assertTrue(
             SpareMovement.objects.filter(spare=pen, movement_type="RECEIPT", quantity=Decimal("40.000")).exists()
@@ -2922,6 +2928,170 @@ class MaterialIndentAPITests(APITestCase):
         response = self.client.post(
             f"/api/v1/maintenance/material-indents/{indent_id}/select-quotation/",
             {"quotation": quote["id"]}, format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ---- Store receipt ----
+
+    def _gated_in_indent(self, items_input):
+        response = self.client.post(
+            "/api/v1/maintenance/material-indents/",
+            {
+                "indent_date": timezone.localdate().isoformat(),
+                "purpose": "Road work",
+                "items_input": items_input,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        indent_id = self._submit(response.data)
+        for step in ("approve", "purchase", "gate-in"):
+            done = self.client.post(
+                f"/api/v1/maintenance/material-indents/{indent_id}/{step}/", {}, format="json"
+            )
+            self.assertEqual(done.status_code, status.HTTP_200_OK, (step, done.data))
+        return indent_id, response.data["items"]
+
+    def test_receive_keeps_each_specification_as_its_own_item(self):
+        indent_id, items = self._gated_in_indent([
+            {"particulars": "Zig zag tile", "specification": "Yellow 80mm", "quantity": "100", "unit": "NOS"},
+            {"particulars": "Zig zag tile", "specification": "Red 80mm", "quantity": "50", "unit": "NOS"},
+        ])
+        receive = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/receive/",
+            {"items": [{"id": items[0]["id"], "received_quantity": "90"},
+                       {"id": items[1]["id"], "received_quantity": "50"}]},
+            format="json",
+        )
+        self.assertEqual(receive.status_code, status.HTTP_200_OK, receive.data)
+
+        yellow = MaintenanceSpare.objects.get(company=self.company, name="Zig zag tile (Yellow 80mm)")
+        red = MaintenanceSpare.objects.get(company=self.company, name="Zig zag tile (Red 80mm)")
+        self.assertEqual(yellow.current_stock, Decimal("90.000"))
+        self.assertEqual(red.current_stock, Decimal("50.000"))
+        self.assertNotEqual(yellow.part_number, red.part_number)
+
+    def test_receive_fits_a_long_item_name_into_the_part_number(self):
+        long_name = "Polythene pipe for rain water harvesting system " * 4  # ~190 chars
+        indent_id, _ = self._gated_in_indent([
+            {"particulars": long_name.strip(), "specification": "315mm high density",
+             "quantity": "1650", "unit": "Rft"},
+        ])
+        receive = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/receive/", {}, format="json"
+        )
+        self.assertEqual(receive.status_code, status.HTTP_200_OK, receive.data)
+        pipe = MaintenanceSpare.objects.get(company=self.company)
+        self.assertLessEqual(len(pipe.part_number), 100)
+        self.assertEqual(pipe.current_stock, Decimal("1650.000"))
+
+    def test_receive_refuses_when_nothing_was_counted(self):
+        indent_id, items = self._gated_in_indent([
+            {"particulars": "Starter", "quantity": "1", "unit": "NOS"},
+        ])
+        receive = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/receive/",
+            {"items": [{"id": items[0]["id"], "received_quantity": "0"}]},
+            format="json",
+        )
+        self.assertEqual(receive.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            self.client.get(f"/api/v1/maintenance/material-indents/{indent_id}/").data["status"],
+            "GATE_IN",
+        )
+
+
+class StoreSpareAPITests(APITestCase):
+    """The Store page's own actions: add an item by name, give stock out."""
+
+    SPARES_URL = "/api/v1/maintenance/spares/"
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = get_user_model().objects.create_user(
+            email="store@example.com", password="x", full_name="Store User", employee_code="ST-1",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company, role=UserRole.objects.create(name="Store"),
+            is_default=True, is_active=True,
+        )
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="maintenance")
+        )
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+
+    def _add(self, **payload):
+        return self.client.post(self.SPARES_URL, payload, format="json")
+
+    def test_add_item_by_name_alone(self):
+        response = self._add(name="Tissue roll", uom="BOX", current_stock="5", storage_location="Rack A")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["category_name"], "General")
+        self.assertEqual(response.data["part_number"], "TISSUE ROLL")
+
+        # The opening stock is on the ledger, so the history adds up.
+        movement = SpareMovement.objects.get(spare_id=response.data["id"])
+        self.assertEqual(movement.movement_type, "ADJUSTMENT")
+        self.assertEqual(movement.quantity, Decimal("5.000"))
+        self.assertEqual(movement.remarks, "Opening stock")
+
+        # The same name again, with no part number to tell it apart, is a duplicate.
+        again = self._add(name="tissue roll", uom="BOX")
+        self.assertEqual(again.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("name", again.data)
+
+    def test_edit_without_a_part_number_keeps_the_old_one(self):
+        spare_id = self._add(name="Bearing 6205", uom="NOS").data["id"]
+        response = self.client.patch(
+            f"{self.SPARES_URL}{spare_id}/",
+            {"part_number": "", "storage_location": "Rack B"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["part_number"], "BEARING 6205")
+        self.assertEqual(response.data["storage_location"], "Rack B")
+
+    def test_give_out_takes_stock_and_notes_who_took_it(self):
+        spare_id = self._add(name="Bearing 6205", uom="NOS", current_stock="5").data["id"]
+        url = f"{self.SPARES_URL}{spare_id}/give-out/"
+
+        given = self.client.post(url, {"quantity": "2", "given_to": "Ramesh"}, format="json")
+        self.assertEqual(given.status_code, status.HTTP_200_OK, given.data)
+        self.assertEqual(Decimal(given.data["current_stock"]), Decimal("3"))
+        issue = SpareMovement.objects.get(spare_id=spare_id, movement_type="ISSUE")
+        self.assertEqual(issue.quantity, Decimal("2.000"))
+        self.assertEqual(issue.remarks, "Given to Ramesh")
+        self.assertIsNone(issue.work_order_id)
+
+        nobody = self.client.post(url, {"quantity": "1", "given_to": " "}, format="json")
+        self.assertEqual(nobody.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(MaintenanceSpare.objects.get(pk=spare_id).current_stock, Decimal("3.000"))
+
+    def test_give_out_can_take_stock_below_zero_until_the_counts_are_in(self):
+        spare_id = self._add(name="Bearing 6205", uom="NOS", current_stock="3").data["id"]
+        url = f"{self.SPARES_URL}{spare_id}/give-out/"
+
+        # The store's real stock is not entered yet, so the shelf count stops nothing.
+        given = self.client.post(url, {"quantity": "4", "given_to": "Ramesh"}, format="json")
+        self.assertEqual(given.status_code, status.HTTP_200_OK, given.data)
+        self.assertEqual(Decimal(given.data["current_stock"]), Decimal("-1"))
+
+        # Once it is, the one switch brings the check back.
+        with patch("maintenance.store_stock.ALLOW_NEGATIVE_STOCK", False):
+            refused = self.client.post(url, {"quantity": "1", "given_to": "Ramesh"}, format="json")
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(refused.data["quantity"], "Only -1 NOS in store.")
+
+    def test_give_out_needs_manage_permission(self):
+        spare_id = self._add(name="Bearing 6205", uom="NOS", current_stock="5").data["id"]
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="maintenance", codename="can_view_spare")
+        )
+        self.user = get_user_model().objects.get(pk=self.user.pk)  # drop the permission cache
+        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            f"{self.SPARES_URL}{spare_id}/give-out/", {"quantity": "1", "given_to": "Ramesh"}, format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 

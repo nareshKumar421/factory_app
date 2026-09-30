@@ -7,6 +7,9 @@ from django.db.models import F
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
 
+from maintenance.models import MaintenanceSpare
+from maintenance import store_stock
+
 from .constants import ReturnableLogAction, ReturnableStatus
 from .models import (
     ReturnableGatePass,
@@ -44,6 +47,9 @@ class ReturnableGatePassItemSerializer(CompanyScopedModelSerializer):
     pending_return_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
     is_fully_returned = serializers.BooleanField(read_only=True)
     condition_out_display = serializers.CharField(source="get_condition_out_display", read_only=True)
+    #: The Store / Spares item the line was picked from: its stock goes down at
+    #: gate out and back up when it returns.
+    spare_name = serializers.CharField(source="spare.name", read_only=True, default="")
 
     class Meta:
         model = ReturnableGatePassItem
@@ -58,6 +64,7 @@ class ReturnableGatePassItemSerializer(CompanyScopedModelSerializer):
             "serial_no",
             "make_model",
             "spare",
+            "spare_name",
             "asset",
             "uom",
             "quantity_out",
@@ -71,7 +78,9 @@ class ReturnableGatePassItemSerializer(CompanyScopedModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["quantity_returned", "gate_pass"]
+        # A store link is set only through the pass's own items_input, where
+        # it is checked against the store's stock.
+        read_only_fields = ["quantity_returned", "gate_pass", "spare"]
 
 
 class ReturnableGatePassItemInputSerializer(serializers.Serializer):
@@ -458,10 +467,13 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
         # before writing anything, so a bad line leaves the pass untouched.
         planned = []
         seen_ids = set()
+        store_wants = {}
         for index, payload in enumerate(items_input, start=1):
             item_id = payload.pop("id", None)
             payload["line_num"] = index
             item = existing.get(item_id) if item_id else None
+            if "spare" in payload:
+                payload["spare_id"] = self._store_item(company, index, payload, store_wants)
 
             if item is not None:
                 if payload["quantity_out"] < item.quantity_returned:
@@ -475,6 +487,19 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
                     )
                 seen_ids.add(item.id)
             planned.append((item, payload))
+
+        # Lines only change before gate out, so the shelf still holds everything
+        # a store line will take -- checked only once stock may not go below zero.
+        for spare, wanted in store_wants.values():
+            if store_stock.refuses(spare, wanted):
+                raise serializers.ValidationError(
+                    {
+                        "items_input": (
+                            f"Only {store_stock.qty_text(spare.current_stock)} {spare.uom} of "
+                            f"{spare.name} in store."
+                        )
+                    }
+                )
 
         # Removals come first. A dropped line must let go of its line_num before
         # a surviving line is renumbered into it.
@@ -514,6 +539,29 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             for field, field_value in payload.items():
                 setattr(item, field, field_value)
             item.save()
+
+    @staticmethod
+    def _store_item(company, index, payload, store_wants):
+        """Resolve a line's ``spare`` to this company's store item.
+
+        The line takes the item's unit, since its quantity comes off that
+        item's stock. Adds the quantity to ``store_wants`` so lines naming the
+        same item are checked against the shelf together.
+        """
+        spare_id = payload.pop("spare")
+        if not spare_id:
+            return None
+        spare = MaintenanceSpare.objects.filter(
+            company=company, pk=spare_id, is_active=True
+        ).first()
+        if spare is None:
+            raise serializers.ValidationError(
+                {"items_input": f"Line {index}: that item is not in this company's store."}
+            )
+        payload["uom"] = spare.uom
+        _, wanted = store_wants.get(spare.id, (spare, ZERO))
+        store_wants[spare.id] = (spare, wanted + payload["quantity_out"])
+        return spare.id
 
     @transaction.atomic
     def create(self, validated_data):

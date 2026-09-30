@@ -21,6 +21,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from company.models import Company, UserCompany, UserRole
+from maintenance.models import MaintenanceSpare, SpareCategory, SpareMovement
 
 from .constants import ReturnableStatus
 from .models import ReturnableGatePass, ReturnableGatePassItem, ReturnableGatePassSequence
@@ -1064,6 +1065,184 @@ class ReturnableGatePassFlowTests(APITestCase):
         # Same number string, different company, both valid.
         self.assertEqual(theirs.pass_no, mine.pass_no)
         self.assertNotEqual(theirs.company_id, mine.company_id)
+
+    # -- lines picked from Store / Spares ---------------------------------
+
+    def _store_item(self, name="Switch 6 amp", stock="5", company=None):
+        company = company or self.company
+        category, _ = SpareCategory.objects.get_or_create(company=company, name="General")
+        return MaintenanceSpare.objects.create(
+            company=company, category=category, name=name, part_number=name.upper(),
+            uom="NOS", current_stock=Decimal(stock),
+        )
+
+    def _store_pass(self, spare, quantity, returnable=False):
+        """A pass whose one line was picked from the store (sent in the wrong unit)."""
+        payload = self._payload() if returnable else self._non_returnable_payload()
+        payload["items_input"] = [
+            {"item_name": spare.name, "spare": spare.id, "quantity_out": quantity, "uom": "BOX"}
+        ]
+        return self.client.post(reverse("returnable-gatepass-list"), payload, format="json")
+
+    def _approved_store_pass(self, spare, quantity, returnable=False):
+        response = self._store_pass(spare, quantity, returnable=returnable)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        gate_pass = ReturnableGatePass.objects.get(pk=response.data["id"])
+        self._attach(gate_pass)
+        self.assertEqual(self._submit_and_approve(gate_pass).status_code, status.HTTP_200_OK)
+        return gate_pass
+
+    def test_store_line_takes_the_store_unit_and_is_not_held_to_the_shelf(self, _notify):
+        switch = self._store_item(stock="5")
+
+        # More than the shelf shows is fine until the store's stock is entered...
+        more = self._store_pass(switch, "6.000")
+        self.assertEqual(more.status_code, status.HTTP_201_CREATED, more.data)
+        # ...and refused again once the switch is turned off.
+        with patch("maintenance.store_stock.ALLOW_NEGATIVE_STOCK", False):
+            refused = self._store_pass(switch, "6.000")
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Only 5 NOS of Switch 6 amp in store.", str(refused.data))
+
+        response = self._store_pass(switch, "3.000")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        line = ReturnableGatePassItem.objects.get(gate_pass_id=response.data["id"])
+        self.assertEqual(line.spare_id, switch.id)
+        self.assertEqual(line.uom, "NOS")
+        # Saving the pass takes nothing: stock moves when it leaves the gate.
+        switch.refresh_from_db()
+        self.assertEqual(switch.current_stock, Decimal("5.000"))
+
+    def test_store_line_must_be_this_companys_item(self, _notify):
+        other = Company.objects.create(name="Other Co", code="OTHER")
+        theirs = self._store_item(company=other)
+        response = self._store_pass(theirs, "1.000")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_gate_out_takes_store_lines_off_the_shelf(self, _notify):
+        switch = self._store_item(stock="5")
+        gate_pass = self._approved_store_pass(switch, "3.000")
+
+        self.assertEqual(self._gate_out(gate_pass).status_code, status.HTTP_200_OK)
+        switch.refresh_from_db()
+        self.assertEqual(switch.current_stock, Decimal("2.000"))
+        movement = SpareMovement.objects.get(spare=switch)
+        self.assertEqual(movement.movement_type, "ISSUE")
+        self.assertEqual(movement.quantity, Decimal("3.000"))
+        self.assertEqual(movement.remarks, f"Gate pass {gate_pass.pass_no} (Suresh Patel)")
+
+    def test_gate_out_takes_the_store_below_zero_rather_than_stop_the_gate(self, _notify):
+        switch = self._store_item(stock="5")
+        first = self._approved_store_pass(switch, "3.000")
+        second = self._approved_store_pass(switch, "3.000")
+        self.assertEqual(self._gate_out(first).status_code, status.HTTP_200_OK)
+        self.assertEqual(self._gate_out(second).status_code, status.HTTP_200_OK)
+        switch.refresh_from_db()
+        self.assertEqual(switch.current_stock, Decimal("-1.000"))
+
+    def test_gate_out_is_refused_when_short_once_stock_may_not_go_below_zero(self, _notify):
+        switch = self._store_item(stock="5")
+        # Both passes were raised while 5 were on the shelf.
+        first = self._approved_store_pass(switch, "3.000")
+        second = self._approved_store_pass(switch, "3.000")
+        self.assertEqual(self._gate_out(first).status_code, status.HTTP_200_OK)
+
+        with patch("maintenance.store_stock.ALLOW_NEGATIVE_STOCK", False):
+            refused = self._gate_out(second)
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            refused.data["detail"],
+            "The store shows only 2 NOS of Switch 6 amp. Ask the store to count it again.",
+        )
+        second.refresh_from_db()
+        self.assertEqual(second.status, ReturnableStatus.PENDING_GATE_OUT)
+        switch.refresh_from_db()
+        self.assertEqual(switch.current_stock, Decimal("2.000"))
+        self.assertEqual(SpareMovement.objects.filter(spare=switch).count(), 1)
+
+    def test_a_returned_store_line_goes_back_on_the_shelf_unless_it_is_scrap(self, _notify):
+        tool = self._store_item(name="Welding machine set", stock="2")
+        gate_pass = self._approved_store_pass(tool, "2.000", returnable=True)
+        self._gate_out(gate_pass)
+        line = gate_pass.items.get()
+
+        back = self._record_return(
+            gate_pass,
+            {"lines": [{"pass_item": line.id, "quantity_returned": "1.000", "return_condition": "REPAIRED"}]},
+        )
+        self.assertEqual(back.status_code, status.HTTP_200_OK, back.data)
+        tool.refresh_from_db()
+        self.assertEqual(tool.current_stock, Decimal("1.000"))
+        returned = SpareMovement.objects.get(spare=tool, movement_type="RETURN")
+        self.assertEqual(returned.remarks, f"Back from gate pass {gate_pass.pass_no} (Repaired)")
+
+        scrap = self._record_return(
+            gate_pass,
+            {"lines": [{"pass_item": line.id, "quantity_returned": "1.000", "return_condition": "SCRAP"}]},
+        )
+        self.assertEqual(scrap.status_code, status.HTTP_200_OK, scrap.data)
+        tool.refresh_from_db()
+        self.assertEqual(tool.current_stock, Decimal("1.000"))
+
+    def test_cancelling_after_gate_out_puts_store_lines_back(self, _notify):
+        tool = self._store_item(name="Welding machine set", stock="2")
+        gate_pass = self._approved_store_pass(tool, "1.000", returnable=True)
+        self._gate_out(gate_pass)
+
+        response = self.client.post(
+            self._action_url(gate_pass, "cancel"), {"reason": "raised by mistake"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        tool.refresh_from_db()
+        self.assertEqual(tool.current_stock, Decimal("2.000"))
+        self.assertEqual(
+            SpareMovement.objects.get(spare=tool, movement_type="RETURN").remarks,
+            f"Gate pass {gate_pass.pass_no} cancelled",
+        )
+
+    def test_store_picker_lists_this_companys_items_whatever_their_stock(self, _notify):
+        self._store_item(name="Switch 6 amp", stock="5")
+        self._store_item(name="Switch 16 amp", stock="0")
+        self._store_item(name="Switch 32 amp", company=Company.objects.create(name="O", code="O"))
+        # The department clerk has the gate pass permissions only, none of the Store's.
+        response = self.client.get(reverse("returnable-store-items"), {"search": "switch"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual([row["name"] for row in response.data], ["Switch 16 amp", "Switch 6 amp"])
+        self.assertEqual(response.data[1]["current_stock"], "5.000")
+
+    def test_store_picker_adds_an_item_the_store_does_not_have(self, _notify):
+        url = reverse("returnable-store-items")
+        added = self.client.post(url, {"name": "MCB single pole", "uom": "nos"}, format="json")
+        self.assertEqual(added.status_code, status.HTTP_201_CREATED, added.data)
+        self.assertEqual(added.data["current_stock"], "0.000")
+        self.assertEqual(added.data["uom"], "NOS")
+        item = MaintenanceSpare.objects.get(pk=added.data["id"])
+        self.assertEqual(item.company, self.company)
+        self.assertEqual(item.category.name, "General")
+
+        # The same name again is the same item, not a second one.
+        again = self.client.post(url, {"name": "mcb single POLE"}, format="json")
+        self.assertEqual(again.status_code, status.HTTP_200_OK)
+        self.assertEqual(again.data["id"], item.id)
+
+        # A line on it takes the store below zero at gate out.
+        gate_pass = self._approved_store_pass(item, "2.000")
+        self.assertEqual(self._gate_out(gate_pass).status_code, status.HTTP_200_OK)
+        item.refresh_from_db()
+        self.assertEqual(item.current_stock, Decimal("-2.000"))
+
+    def test_a_line_cannot_be_edited_directly_once_approved(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+        line = gate_pass.items.first()
+        response = self.client.patch(
+            reverse("returnable-gatepass-item-detail", args=[line.pk]),
+            {"quantity_out": "9.000"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        line.refresh_from_db()
+        self.assertNotEqual(line.quantity_out, Decimal("9.000"))
 
 
 class ReturnableJobTests(APITestCase):

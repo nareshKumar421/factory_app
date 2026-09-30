@@ -29,6 +29,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
+from maintenance import store_stock
+from maintenance.models import MaintenanceSpare, SpareCategory
+from maintenance.serializers import unique_spare_part_number
 
 from . import notifications as notify
 from .constants import (
@@ -345,6 +348,7 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
     # -- stage 3: gate fills vehicle details and lets it out ---------------
 
     @action(detail=True, methods=["post"], url_path="gate-out")
+    @transaction.atomic
     def gate_out(self, request, pk=None):
         gate_pass = self.get_object()
         if gate_pass.status != ReturnableStatus.PENDING_GATE_OUT:
@@ -353,6 +357,23 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         serializer = GateOutInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         payload = serializer.validated_data
+
+        # Lines picked from Store / Spares leave the shelf as they leave the gate.
+        store_lines = [
+            (item.spare_id, item.quantity_out) for item in gate_pass.items.all() if item.spare_id
+        ]
+        if store_lines:
+            try:
+                store_stock.take_out(
+                    store_lines,
+                    user=request.user,
+                    remarks=f"Gate pass {gate_pass.pass_no} ({gate_pass.destination})",
+                )
+            except store_stock.NotEnoughInStore as short:
+                return self._reject(
+                    f"The store shows only {short.in_store} {short.spare.uom} of "
+                    f"{short.spare.name}. Ask the store to count it again."
+                )
 
         gate_pass.vehicle_id = payload.get("vehicle")
         gate_pass.driver_id = payload.get("driver")
@@ -498,6 +519,16 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
                 updated_by=request.user,
             )
             pass_item.recalculate_returned()
+            condition = line.get("return_condition") or ItemReturnCondition.OK
+            # A store line comes back onto the shelf -- unless it came back as
+            # scrap, which is not stock anyone can use.
+            if pass_item.spare_id and condition != ItemReturnCondition.SCRAP:
+                note = f"Back from gate pass {gate_pass.pass_no}"
+                if condition != ItemReturnCondition.OK:
+                    note = f"{note} ({ItemReturnCondition(condition).label})"
+                store_stock.put_back(
+                    pass_item.spare_id, line["quantity_returned"], user=request.user, remarks=note
+                )
 
         for photo in photos:
             ReturnableReturnEventAttachment.objects.create(
@@ -623,6 +654,7 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         return self._detail_response(gate_pass)
 
     @action(detail=True, methods=["post"])
+    @transaction.atomic
     def cancel(self, request, pk=None):
         gate_pass = self.get_object()
         if gate_pass.status not in CANCELLABLE_STATUSES:
@@ -635,6 +667,18 @@ class ReturnableGatePassViewSet(CompanyScopedViewSet):
         serializer = ReasonInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         reason = serializer.validated_data["reason"]
+
+        # Cancelling after gate out voids the pass (nothing has come back yet --
+        # that is short close), so what it took from the store is put back.
+        if gate_pass.gate_out_at:
+            for item in gate_pass.items.all():
+                if item.spare_id:
+                    store_stock.put_back(
+                        item.spare_id,
+                        item.quantity_out,
+                        user=request.user,
+                        remarks=f"Gate pass {gate_pass.pass_no} cancelled",
+                    )
 
         gate_pass.status = ReturnableStatus.CANCELLED
         gate_pass.cancel_reason = reason
@@ -706,6 +750,22 @@ class ReturnableGatePassItemViewSet(CompanyScopedViewSet):
         if self.action in ("create", "update", "partial_update", "destroy"):
             return base + [CanManageReturnable()]
         return base + [CanViewReturnableAtGate()]
+
+    def _refuse_unless_editable(self, item):
+        # Past approval the gate works off the pass as printed, and a store
+        # line's stock moves at gate out -- a line changed then would not match.
+        if item.gate_pass.status not in (ReturnableStatus.DRAFT, ReturnableStatus.PENDING_APPROVAL):
+            raise ValidationError(
+                {"status": "Only a draft, or a pass still waiting for approval, can be edited."}
+            )
+
+    def perform_update(self, serializer):
+        self._refuse_unless_editable(serializer.instance)
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self._refuse_unless_editable(instance)
+        instance.delete()
 
     def get_queryset(self):
         queryset = ReturnableGatePassItem.objects.filter(company=self.company())
@@ -935,6 +995,75 @@ class ReturnableSapItemSearchView(APIView):
                 for row in rows
             ]
         )
+
+
+class ReturnableStoreItemSearchView(APIView):
+    """Store / Spares items for the gate pass's "From store" picker.
+
+    Mounted here, like the SAP search, so a department clerk raising a pass
+    does not need the Store module's own permissions. Every item is offered
+    whatever its stock -- until the store's real stock is entered, a pass may
+    take it below zero -- and one the store does not have yet can be added
+    (POST), so its line still comes off the store at gate out.
+    """
+
+    LIMIT = 50
+
+    def get_permissions(self):
+        base = [IsAuthenticated(), HasCompanyContext()]
+        if self.request.method == "POST":
+            # Whoever may fill in a pass's lines: the department, or its approver.
+            return base + [CanEditReturnable()]
+        return base + [CanViewReturnableAtGate()]
+
+    @staticmethod
+    def _row(item):
+        return {
+            "id": item.id,
+            "name": item.name,
+            "uom": item.uom,
+            "current_stock": str(item.current_stock),
+            "storage_location": item.storage_location,
+        }
+
+    def get(self, request):
+        items = MaintenanceSpare.objects.filter(company=_company(request), is_active=True)
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            items = items.filter(
+                Q(name__icontains=search)
+                | Q(part_number__icontains=search)
+                | Q(storage_location__icontains=search)
+            )
+        return Response([self._row(item) for item in items.order_by("name")[: self.LIMIT]])
+
+    def post(self, request):
+        """Add an item to the store at 0, or hand back the one already named so."""
+        company = _company(request)
+        name = (request.data.get("name") or "").strip()[:200]
+        uom = (request.data.get("uom") or "").strip().upper()[:30] or "NOS"
+        if not name:
+            return Response({"name": "Write the item name."}, status=status.HTTP_400_BAD_REQUEST)
+        existing = MaintenanceSpare.objects.filter(
+            company=company, is_active=True, name__iexact=name
+        ).first()
+        if existing:
+            return Response(self._row(existing))
+        category, _ = SpareCategory.objects.get_or_create(
+            company=company,
+            name="General",
+            defaults={"created_by": request.user, "updated_by": request.user},
+        )
+        item = MaintenanceSpare.objects.create(
+            company=company,
+            category=category,
+            name=name,
+            part_number=unique_spare_part_number(company, name),
+            uom=uom,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        return Response(self._row(item), status=status.HTTP_201_CREATED)
 
 
 class ReturnableOptionsView(APIView):

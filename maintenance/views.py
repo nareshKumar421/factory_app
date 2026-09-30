@@ -21,7 +21,7 @@ from notifications.models import NotificationType
 from notifications.services import NotificationService
 from production_execution.models import Machine
 
-from . import meter_scope
+from . import meter_scope, store_stock
 from .constants import (
     AssetHierarchyLevel,
     AssetStatus,
@@ -193,6 +193,7 @@ from .serializers import (
     FireShiftReportPhotoSerializer,
     FireShiftReportSerializer,
     SpareCategorySerializer,
+    SpareGiveOutSerializer,
     SpareIssueSerializer,
     SpareMovementSerializer,
     SpareRequestActionSerializer,
@@ -220,6 +221,7 @@ from .serializers import (
     WorkPermitCompleteInputSerializer,
     WorkPermitSerializer,
     WorkPermitWorkerSerializer,
+    unique_spare_part_number,
 )
 
 User = get_user_model()
@@ -2889,11 +2891,38 @@ class MaintenanceSpareViewSet(CompanyScopedViewSet):
 
     def get_permissions(self):
         permissions = [IsAuthenticated(), HasCompanyContext()]
-        if self.action in ["create", "update", "partial_update", "destroy", "adjust_stock"]:
+        if self.action in ["create", "update", "partial_update", "destroy", "adjust_stock", "give_out"]:
             permissions.append(CanManageSpare())
         else:
             permissions.append(CanViewSpare())
         return permissions
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        company = self.company()
+        user = self.request.user
+        extra = {}
+        if not serializer.validated_data.get("category"):
+            extra["category"], _ = SpareCategory.objects.get_or_create(
+                company=company,
+                name="General",
+                defaults={"created_by": user, "updated_by": user},
+            )
+        spare = serializer.save(company=company, created_by=user, updated_by=user, **extra)
+        # Opening stock goes on the ledger too, so an item's history adds up
+        # to what is on the shelf from its first day.
+        if spare.current_stock > 0:
+            SpareMovement.objects.create(
+                company=company,
+                spare=spare,
+                movement_type=SpareMovementType.ADJUSTMENT,
+                quantity=spare.current_stock,
+                unit_cost=spare.unit_cost,
+                remarks="Opening stock",
+                performed_by=user,
+                created_by=user,
+                updated_by=user,
+            )
 
     def get_queryset(self):
         qs = (
@@ -2988,6 +3017,34 @@ class MaintenanceSpareViewSet(CompanyScopedViewSet):
             created_by=request.user,
             updated_by=request.user,
         )
+        return Response(self.get_serializer(spare).data, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="give-out")
+    def give_out(self, request, pk=None):
+        """Store hands stock to a person with no work order behind it (a lab
+        asking for tissue rolls, a fitter for a bearing) and notes who took it."""
+        payload = SpareGiveOutSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        spare = MaintenanceSpare.objects.filter(company=self.company(), pk=self.kwargs["pk"]).first()
+        if spare is None:
+            return Response({"detail": "Item not found."}, status=status.HTTP_404_NOT_FOUND)
+        remarks = f"Given to {payload.validated_data['given_to'].strip()}"
+        note = payload.validated_data["remarks"].strip()
+        if note:
+            remarks = f"{remarks}. {note}"
+        try:
+            store_stock.take_out(
+                [(spare.id, payload.validated_data["quantity"])],
+                user=request.user,
+                remarks=remarks,
+            )
+        except store_stock.NotEnoughInStore as short:
+            return Response(
+                {"quantity": f"Only {short.in_store} {spare.uom} in store."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        spare.refresh_from_db()
         return Response(self.get_serializer(spare).data, status=status.HTTP_200_OK)
 
 
@@ -3118,7 +3175,7 @@ class SpareRequestViewSet(CompanyScopedViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         spare = MaintenanceSpare.objects.select_for_update().get(pk=spare_request.spare_id)
-        if quantity > spare.current_stock:
+        if store_stock.refuses(spare, quantity):
             return Response(
                 {"detail": "Requested issue quantity is greater than available stock."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -4668,11 +4725,15 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
         payload = MaterialIndentReceiveSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
         overrides = {row["id"]: row["received_quantity"] for row in payload.validated_data.get("items", [])}
+        counts = [(item, overrides.get(item.id, item.shortfall_quantity)) for item in indent.items.all()]
+        if not any(qty and qty > 0 for _, qty in counts):
+            return Response(
+                {"detail": "Nothing was counted. Enter how many of each item came."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         with transaction.atomic():
-            for item in indent.items.all():
-                shortfall = item.shortfall_quantity
-                qty = overrides.get(item.id, shortfall)
+            for item, qty in counts:
                 if qty is None or qty <= 0:
                     continue
                 spare = self._match_or_create_spare(indent, item, request.user)
@@ -4713,11 +4774,20 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
 
     @staticmethod
     def _match_or_create_spare(indent, item, user):
-        """Find a Store/Spares part for the item (by part number/name) or create one."""
+        """Find a Store/Spares part for the item (by part number/name) or create one.
+
+        The specification is part of what the item is: the same interlock tile
+        in yellow and in red, or copper wire in black and in red, are separate
+        stock, so the name is "particulars (specification)".
+        """
         company = indent.company
-        name = item.particulars.strip()
+        particulars = item.particulars.strip()
+        specification = item.specification.strip()
+        label = f"{particulars} ({specification})" if specification else particulars
+        label = label or f"MI-{indent.indent_no}-{item.line_num}"
+        name = label[:200]
         spare = (
-            MaintenanceSpare.objects.filter(company=company, part_number__iexact=name).first()
+            MaintenanceSpare.objects.filter(company=company, part_number__iexact=label[:100]).first()
             or MaintenanceSpare.objects.filter(company=company, name__iexact=name).first()
         )
         if spare:
@@ -4728,15 +4798,11 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             name="Material Indent",
             defaults={"created_by": user, "updated_by": user},
         )
-        # part_number is unique per company; fall back to a namespaced value on clash.
-        part_number = name or f"MI-{indent.indent_no}-{item.line_num}"
-        if MaintenanceSpare.objects.filter(company=company, part_number=part_number).exists():
-            part_number = f"{part_number}-{indent.indent_no}-{item.line_num}"
         return MaintenanceSpare.objects.create(
             company=company,
             category=category,
-            name=name or part_number,
-            part_number=part_number,
+            name=name,
+            part_number=unique_spare_part_number(company, label),
             uom=item.unit or "NOS",
             current_stock=Decimal("0.000"),
             created_by=user,
