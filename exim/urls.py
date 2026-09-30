@@ -2,6 +2,7 @@
 
 from django.urls import path
 
+from .views_contract import ContractDetailAPI, ContractListAPI, ContractTermsAPI
 from .views_customs_rates import CustomsRatesAPI
 from .views_lot import (
     ContractHistoryAPI,
@@ -74,4 +75,7 @@ urlpatterns = [
     path("contract-history/", ContractHistoryAPI.as_view(), name="exim-contract-history"),
     path("vendors/", VendorListAPI.as_view(), name="exim-vendors"),
     path("director-inventory/", DirectorInventoryAPI.as_view(), name="exim-director-inventory"),
+    path("contracts/", ContractListAPI.as_view(), name="exim-contracts"),
+    path("contracts/<str:po_number>/", ContractDetailAPI.as_view(), name="exim-contract"),
+    path("contracts/<str:po_number>/terms/", ContractTermsAPI.as_view(), name="exim-contract-terms"),
 ]

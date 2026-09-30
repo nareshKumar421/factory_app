@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 
 from .access import PERMISSIONS
+from .models_contract import ContractTerms  # noqa: F401
 from .models_licence import Licence, LicenceLine  # noqa: F401
 from .models_lot import (  # noqa: F401
     ContractHistory,

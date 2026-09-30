@@ -87,6 +87,13 @@ class Rights:
     TEMP_VENDOR_ADD = "exim.add_party"
     DIRECTOR_REPORT = "exim.view_director_report"
 
+    #: Oil contracts: EXIM's domestic contract register ("domesticreports")
+    #: and its landed-cost sheet ("domesticcontractdetails"). Either opens the
+    #: contracts; the terms a contract's landed cost adds need the change right.
+    CONTRACT_VIEW = "exim.view_domesticreports"
+    LANDED_COST_VIEW = "exim.view_domesticcontractdetails"
+    CONTRACT_CHANGE = "exim.change_domesticreports"
+
 
 def any_of(*rights):
     """A permission class passing a user who holds at least one of ``rights``."""
