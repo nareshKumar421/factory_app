@@ -94,6 +94,16 @@ class Rights:
     LANDED_COST_VIEW = "exim.view_domesticcontractdetails"
     CONTRACT_CHANGE = "exim.change_domesticreports"
 
+    #: Oil prices: EXIM's daily commodity prices and its "Jivo rates".
+    PRICE_VIEW = "exim.view_dailyprice"
+    PRICE_GRAPH = "exim.view_daily_price_graph"
+    #: Read the price sheet as it stands; saving what it says needs PRICE_ADD.
+    PRICE_FETCH = "exim.fetch_daily_price"
+    PRICE_ADD = "exim.add_dailyprice"
+    RATE_VIEW = "exim.view_jivorates"
+    RATE_FETCH = "exim.fetch_jivo_rates"
+    RATE_ADD = "exim.add_jivorates"
+
 
 def any_of(*rights):
     """A permission class passing a user who holds at least one of ``rights``."""

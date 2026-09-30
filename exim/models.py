@@ -13,6 +13,7 @@ from .models_lot import (  # noqa: F401
     StockDashboardRow,
     TemporaryVendor,
 )
+from .models_price import CommodityPrice, PackRate  # noqa: F401
 from .models_tank import Tank, TankItem, TankLog  # noqa: F401
 
 
