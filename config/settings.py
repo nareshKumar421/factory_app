@@ -173,6 +173,8 @@ INSTALLED_APPS = [
     'barcode',
     'ai_assistant',
     'wms',
+    # A physical count of a SAP warehouse against SAP's figures (Warehouse Ops).
+    'stock_audit',
     'marketplace',
     'blowing',
     'attendance',

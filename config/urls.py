@@ -83,6 +83,7 @@ urlpatterns = [
     path("api/v1/tomorrow-run/", include("tomorrow_run.urls")),
     path("api/v1/warehouse/", include("warehouse.urls")),
     path("api/v1/wms/", include("wms.urls")),
+    path("api/v1/stock-audit/", include("stock_audit.urls")),
     path("api/v1/barcode/", include("barcode.urls")),
     path("api/v1/ai/", include("ai_assistant.urls")),
     path("api/v1/marketplace/", include("marketplace.urls")),
