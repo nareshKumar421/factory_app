@@ -87,6 +87,8 @@ class TransferRequestListCreateView(_TransferView):
             posting_status=request.query_params.get("posting_status"),
             from_warehouse=request.query_params.get("from_warehouse"),
             to_warehouse=request.query_params.get("to_warehouse"),
+            raised_by_side=request.query_params.get("raised_by_side"),
+            mine=request.query_params.get("mine") in ("1", "true"),
         )
         return Response(TransferRequestListSerializer(qs, many=True).data)
 

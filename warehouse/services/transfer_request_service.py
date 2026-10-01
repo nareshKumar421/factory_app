@@ -35,6 +35,7 @@ from sap_client.service_layer.stock_transfer_writer import (
 from ..models_transfer import (
     TransferLineStatus,
     TransferPostingStatus,
+    TransferRaisedBy,
     TransferRequestStatus,
     TransferRouteType,
     WarehouseTransferRequest,
@@ -122,8 +123,13 @@ class TransferRequestService:
         )
 
     def list_requests(self, *, status=None, posting_status=None,
-                      to_warehouse=None, from_warehouse=None):
+                      to_warehouse=None, from_warehouse=None,
+                      raised_by_side=None, mine=False):
         qs = self.base_queryset()
+        if raised_by_side:
+            qs = qs.filter(raised_by_side=raised_by_side)
+        if mine:
+            qs = qs.filter(requested_by=self.user)
         if status:
             qs = qs.filter(status=status)
         if posting_status:
@@ -215,16 +221,23 @@ class TransferRequestService:
         from_warehouse = (data.get('from_warehouse') or '').strip()
         to_warehouse = (data.get('to_warehouse') or '').strip()
         raw_lines = data.get('lines') or []
+        raised_by_side = data.get('raised_by_side') or TransferRaisedBy.SENDER
 
         if not raw_lines:
             raise TransferRequestError("Add at least one item to the request.")
 
-        # Only the warehouse's own manager may send its stock out. Checked
-        # before the route so the answer does not depend on whether the route
-        # happens to be a valid one.
-        warehouse_scope.assert_can_send_from(
-            self.user, self.company_code, [from_warehouse]
-        )
+        # The raiser must run the side they raise from: only a warehouse's own
+        # manager may offer its stock out, and only the receiving warehouse's
+        # manager may ask for stock to be sent in. Checked before the route so
+        # the answer does not depend on whether the route is a valid one.
+        if raised_by_side == TransferRaisedBy.RECEIVER:
+            warehouse_scope.assert_can_receive_into(
+                self.user, self.company_code, [to_warehouse]
+            )
+        else:
+            warehouse_scope.assert_can_send_from(
+                self.user, self.company_code, [from_warehouse]
+            )
 
         route = guards.resolve_route(
             from_warehouse=from_warehouse,
@@ -250,6 +263,7 @@ class TransferRequestService:
             to_branch_id=route.to_branch_id,
             intransit_warehouse=route.intransit_warehouse,
             remarks=data.get('remarks', ''),
+            raised_by_side=raised_by_side,
             requested_by=self.user,
         )
 
@@ -465,11 +479,7 @@ class TransferRequestService:
         """
         self._locked(request_id)
         request = self.get_request(request_id)
-        # The decision belongs to the destination: whoever runs the warehouse
-        # the stock is coming into is the one who can say yes to it.
-        warehouse_scope.assert_can_receive_into(
-            self.user, self.company_code, [request.to_warehouse]
-        )
+        self._assert_can_decide(request)
         if request.status != TransferRequestStatus.PENDING:
             raise TransferRequestError(
                 f"{request.entry_no} is already {request.get_status_display().lower()}."
@@ -533,10 +543,8 @@ class TransferRequestService:
         self._locked(request_id)
         request = self.get_request(request_id)
         # Refusing is the same decision as approving, so it needs the same
-        # standing — otherwise anyone could cancel another site's inbound stock.
-        warehouse_scope.assert_can_receive_into(
-            self.user, self.company_code, [request.to_warehouse]
-        )
+        # standing — otherwise anyone could cancel another site's stock move.
+        self._assert_can_decide(request)
         if request.status != TransferRequestStatus.PENDING:
             raise TransferRequestError(
                 f"{request.entry_no} is already {request.get_status_display().lower()}."
@@ -556,6 +564,22 @@ class TransferRequestService:
         self._release_sap_request(request)
         logger.info("Transfer request %s rejected: %s", request.entry_no, reason)
         return request
+
+    def _assert_can_decide(self, request: WarehouseTransferRequest) -> None:
+        """The side that did not raise the request is the side that decides.
+
+        Stock offered by the sender is accepted by whoever runs the warehouse it
+        is coming into. Stock asked for by the receiver is agreed to by whoever
+        runs the warehouse it leaves — they are the one handing it over.
+        """
+        if request.is_asked_for:
+            warehouse_scope.assert_can_send_from(
+                self.user, self.company_code, [request.from_warehouse]
+            )
+        else:
+            warehouse_scope.assert_can_receive_into(
+                self.user, self.company_code, [request.to_warehouse]
+            )
 
     def _release_sap_request(self, request: WarehouseTransferRequest) -> None:
         """Close the ITR so it stops reserving stock.

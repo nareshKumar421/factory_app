@@ -3,6 +3,7 @@
 from rest_framework import serializers
 
 from .models_transfer import (
+    TransferRaisedBy,
     WarehouseTransferRequest,
     WarehouseTransferRequestLine,
 )
@@ -45,6 +46,7 @@ def _person(user) -> str:
 
 class TransferRequestListSerializer(serializers.ModelSerializer):
     requested_by_name = serializers.SerializerMethodField()
+    deciding_warehouse = serializers.CharField(read_only=True)
     line_count = serializers.IntegerField(source='lines.count', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     posting_status_display = serializers.CharField(
@@ -58,6 +60,7 @@ class TransferRequestListSerializer(serializers.ModelSerializer):
         model = WarehouseTransferRequest
         fields = [
             'id', 'entry_no', 'from_warehouse', 'to_warehouse',
+            'raised_by_side', 'deciding_warehouse',
             'route_type', 'intransit_warehouse',
             'status', 'status_display',
             'posting_status', 'posting_status_display',
@@ -72,6 +75,7 @@ class TransferRequestListSerializer(serializers.ModelSerializer):
 class TransferRequestDetailSerializer(serializers.ModelSerializer):
     lines = TransferRequestLineSerializer(many=True, read_only=True)
     requested_by_name = serializers.SerializerMethodField()
+    deciding_warehouse = serializers.CharField(read_only=True)
     reviewed_by_name = serializers.SerializerMethodField()
     posted_by_name = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
@@ -99,6 +103,7 @@ class TransferRequestDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'entry_no', 'company',
             'from_warehouse', 'to_warehouse',
+            'raised_by_side', 'deciding_warehouse',
             'route_type', 'is_cross_branch', 'intransit_warehouse',
             'leg1_destination', 'awaits_second_leg',
             'from_branch_id', 'to_branch_id',
@@ -133,6 +138,10 @@ class TransferRequestCreateSerializer(serializers.Serializer):
     from_warehouse = serializers.CharField(max_length=20)
     to_warehouse = serializers.CharField(max_length=20)
     remarks = serializers.CharField(required=False, allow_blank=True, default='')
+    raised_by_side = serializers.ChoiceField(
+        choices=TransferRaisedBy.choices, required=False,
+        default=TransferRaisedBy.SENDER,
+    )
     lines = TransferRequestLineCreateSerializer(many=True)
 
     def validate_lines(self, value):

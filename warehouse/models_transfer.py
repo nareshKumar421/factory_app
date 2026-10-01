@@ -54,6 +54,20 @@ class TransferPostingStatus(models.TextChoices):
     FAILED = "FAILED", "Failed"
 
 
+class TransferRaisedBy(models.TextChoices):
+    """Which side of the move asked for it — and so which side decides.
+
+    A request is decided by the side that did NOT raise it. The sending
+    warehouse offering stock is accepted by the receiving one; the receiving
+    warehouse asking for stock is agreed to by the sending one, because the
+    manager who hands the stock over is the one who can say it is spare. The
+    production floor running BH-PC asking the oil store BH-LO for oil is the
+    second kind.
+    """
+    SENDER = "SENDER", "Sending warehouse (offered)"
+    RECEIVER = "RECEIVER", "Receiving warehouse (asked for)"
+
+
 class TransferLineStatus(models.TextChoices):
     PENDING = "PENDING", "Pending"
     APPROVED = "APPROVED", "Approved"
@@ -89,6 +103,12 @@ class WarehouseTransferRequest(models.Model):
     intransit_warehouse = models.CharField(
         max_length=20, blank=True, default='',
         help_text="Cross-branch only: the *-INT warehouse leg 1 ships into.",
+    )
+
+    raised_by_side = models.CharField(
+        max_length=10, choices=TransferRaisedBy.choices,
+        default=TransferRaisedBy.SENDER,
+        help_text="Which warehouse raised it. The other one approves or rejects.",
     )
 
     # --- approval (app-owned) ---------------------------------------------
@@ -209,6 +229,16 @@ class WarehouseTransferRequest(models.Model):
             self.is_cross_branch
             and self.posting_status == TransferPostingStatus.IN_TRANSIT
         )
+
+    @property
+    def is_asked_for(self) -> bool:
+        """Raised by the receiving warehouse — a request for stock."""
+        return self.raised_by_side == TransferRaisedBy.RECEIVER
+
+    @property
+    def deciding_warehouse(self) -> str:
+        """The warehouse whose manager approves or rejects: the one that did not ask."""
+        return self.from_warehouse if self.is_asked_for else self.to_warehouse
 
     @property
     def leg1_destination(self) -> str:
