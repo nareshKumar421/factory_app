@@ -374,6 +374,8 @@ def shape_line(line: dict, row: dict | None, lookups: dict) -> dict:
         "quantity": number(_pick(sources, ["Quantity"])),
         "uom": clean(_pick(sources, ["UoMCode", "MeasureUnit", "unitMsr"])),
         "unit_price": number(_pick(sources, ["UnitPrice", "Price"])),
+        # SAP Portal's item lines had a Disc % column (sap-approvals.html:864).
+        "discount_percent": number(_pick(sources, ["DiscountPercent", "DiscPrcnt"])),
         "line_total": number(_pick(sources, ["LineTotal"])),
         "tax_code": clean(_pick(sources, ["TaxCode", "VatGroup"])),
         "tax_percent": number(_pick(sources, ["TaxPercentagePerRow", "VatPrcnt"])),

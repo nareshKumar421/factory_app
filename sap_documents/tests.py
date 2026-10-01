@@ -704,7 +704,8 @@ class GroupCommandTests(TestCase):
 
 class LineFieldTests(SimpleTestCase):
     """What SAP Portal's approval lines showed beyond the document browser's:
-    whether a line is liable to withholding tax, and the bilty's date."""
+    whether a line is liable to withholding tax, the bilty's date, and the
+    line's discount."""
 
     def _line(self, line, row=None):
         from sap_documents.services import _empty_lookups, shape_line
@@ -720,3 +721,8 @@ class LineFieldTests(SimpleTestCase):
         self.assertEqual(self._line({"U_BiltyDate": "2026-09-14T00:00:00Z"})["bilty_date"], "2026-09-14")
         self.assertEqual(self._line({"U_Bilty_Date": "2026-09-15"})["bilty_date"], "2026-09-15")
         self.assertIsNone(self._line({})["bilty_date"])
+
+    def test_the_discount_reads_the_service_layer_and_hana_columns(self):
+        self.assertEqual(self._line({"DiscountPercent": 2.5})["discount_percent"], 2.5)
+        self.assertEqual(self._line({}, {"DiscPrcnt": "10.000000"})["discount_percent"], 10)
+        self.assertIsNone(self._line({})["discount_percent"])
