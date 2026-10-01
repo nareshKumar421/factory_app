@@ -108,6 +108,38 @@ class HanaStockDashboardReader:
             "critical_count": int(row[3] or 0),
         }
 
+    def get_grouped_as_of_stock_levels(
+        self,
+        filters: Dict[str, Any],
+        as_of_date,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> List[Dict]:
+        """Reconstructed rows summed across warehouses, one per item.
+
+        The as-of twin of `get_grouped_stock_levels`. Benchmarks are kept on one
+        store (BH-PM for Oil's packaging) while the stock sits in the others, so
+        judging each warehouse alone calls an item critical that the three
+        stores together hold plenty of. The live page sums them; this must too.
+        """
+        query, params = self._build_grouped_as_of_query(filters, as_of_date)
+        offset = (page - 1) * page_size
+        paginated_query = f"{query} LIMIT ? OFFSET ?"
+        rows = self._execute(paginated_query, params + [page_size, offset])
+        return [self._map_grouped_row(r) for r in rows]
+
+    def get_grouped_as_of_stock_stats(self, filters: Dict[str, Any], as_of_date) -> Dict:
+        """Stats for the reconstructed rows summed across warehouses."""
+        query, params = self._build_grouped_as_of_stats_query(filters, as_of_date)
+        rows = self._execute(query, params)
+        row = rows[0] if rows else (0, 0, 0, 0)
+        return {
+            "total_items": int(row[0] or 0),
+            "healthy_count": int(row[1] or 0),
+            "low_count": int(row[2] or 0),
+            "critical_count": int(row[3] or 0),
+        }
+
     def get_warehouse_occupancy(
         self,
         warehouse: Union[str, Sequence[str], None],
@@ -602,6 +634,11 @@ class HanaStockDashboardReader:
             clauses.append(f'w."WhsCode" IN ({placeholders})')
             params.extend(warehouse_list)
 
+        # Exact item, for the row-expand read. Not a request filter.
+        if filters.get("item_code"):
+            clauses.append('w."ItemCode" = ?')
+            params.append(filters["item_code"])
+
         item_group = (filters.get("item_group") or "").strip()
         if item_group:
             clauses.append('UPPER(IFNULL(grp."ItmsGrpNam", \'\')) = UPPER(?)')
@@ -865,6 +902,66 @@ class HanaStockDashboardReader:
                 {base_query}
             ) s
             {post_where}
+        """
+        return query, params
+
+    def _build_grouped_as_of_inner(self, filters: Dict[str, Any], as_of_date) -> Tuple[str, List]:
+        """Reconstructed warehouse rows summed per item, before status filters.
+
+        Same columns, in the same order, as `_build_grouped_query`'s inner
+        select, so `_map_grouped_row`, `_post_group_where_clause` and the grouped
+        sort map all apply unchanged.
+        """
+        base_query, params = self._build_as_of_base_query(filters, as_of_date)
+        query = f"""
+            SELECT
+                item_code,
+                item_name,
+                SUM(on_hand)   AS on_hand,
+                SUM(min_stock) AS min_stock,
+                uom,
+                COUNT(*)       AS warehouse_count,
+                SUM(CASE WHEN {self._AS_OF_STATUS_SQL["critical"]}
+                     THEN 1 ELSE 0 END) AS critical_wh,
+                SUM(CASE WHEN {self._AS_OF_STATUS_SQL["low"]}
+                     THEN 1 ELSE 0 END) AS low_wh,
+                MAX(last_consumption_date)       AS last_consumption_date,
+                MIN(days_since_last_consumption) AS days_since_last_consumption
+            FROM (
+                {base_query}
+            ) s
+            GROUP BY item_code, item_name, uom
+        """
+        return query, params
+
+    def _build_grouped_as_of_query(self, filters: Dict[str, Any], as_of_date) -> Tuple[str, List]:
+        inner, params = self._build_grouped_as_of_inner(filters, as_of_date)
+        query = f"""
+            SELECT * FROM (
+                {inner}
+            ) g
+            {self._post_group_where_clause(filters)}
+            {self._build_order_by(filters, grouped=True)}
+        """
+        return query, params
+
+    def _build_grouped_as_of_stats_query(
+        self, filters: Dict[str, Any], as_of_date
+    ) -> Tuple[str, List]:
+        inner, params = self._build_grouped_as_of_inner(filters, as_of_date)
+        query = f"""
+            SELECT
+                COUNT(*) AS total_items,
+                SUM(CASE WHEN {self._GROUPED_STATUS_SQL["healthy"]}
+                    THEN 1 ELSE 0 END) AS healthy_count,
+                SUM(CASE WHEN {self._GROUPED_STATUS_SQL["low"]}
+                    THEN 1 ELSE 0 END) AS low_count,
+                SUM(CASE WHEN {self._GROUPED_STATUS_SQL["critical"]}
+                    THEN 1 ELSE 0 END) AS critical_count
+            FROM (
+                {inner}
+            ) g
+            {self._post_group_where_clause(filters)}
         """
         return query, params
 

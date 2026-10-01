@@ -163,23 +163,41 @@ class StockDashboardService:
 
         This proof endpoint keeps benchmark and item master values current, while
         reconstructing on-hand and movement age from SAP OINM posting history.
+
+        Grouped across warehouses when 2+ are selected, exactly as
+        `get_stock_levels` is. Judged warehouse by warehouse, Oil's packaging
+        read 51 critical on 2026-09-30 against the live page's 9: SAP keeps the
+        benchmark on BH-PM only, and the stock sits in BH-PC and BH-BS.
         """
         page = int(filters.get("page", 1))
         page_size = int(filters.get("page_size", 50))
         as_of_date = filters["as_of_date"]
+        is_grouped = len(filters.get("warehouse", [])) >= 2
 
         warehouses = self.reader.get_warehouses()
-        filtered_stats = self.reader.get_as_of_stock_stats(filters, as_of_date)
+        if is_grouped:
+            filtered_stats = self.reader.get_grouped_as_of_stock_stats(filters, as_of_date)
+        else:
+            filtered_stats = self.reader.get_as_of_stock_stats(filters, as_of_date)
         filtered_total = filtered_stats["total_items"]
         total_pages = max(1, (filtered_total + page_size - 1) // page_size)
 
-        rows = self.reader.get_as_of_stock_levels(
-            filters,
-            as_of_date=as_of_date,
-            page=page,
-            page_size=page_size,
-        )
-        self._enrich_rows(rows)
+        if is_grouped:
+            rows = self.reader.get_grouped_as_of_stock_levels(
+                filters,
+                as_of_date=as_of_date,
+                page=page,
+                page_size=page_size,
+            )
+            self._enrich_grouped_rows(rows)
+        else:
+            rows = self.reader.get_as_of_stock_levels(
+                filters,
+                as_of_date=as_of_date,
+                page=page,
+                page_size=page_size,
+            )
+            self._enrich_rows(rows)
 
         return {
             "data": rows,
@@ -296,13 +314,18 @@ class StockDashboardService:
         Returns all filtered rows (capped at EXPORT_MAX_ROWS) for the Excel export.
 
         Mirrors the table endpoints: grouped rows when 2+ warehouses are selected,
-        SAP movement reconstruction when as_of_date is provided (never grouped,
-        matching the as-of endpoint).
+        SAP movement reconstruction when as_of_date is provided, the two together
+        when both are.
         """
         as_of_date = filters.get("as_of_date")
         is_grouped = len(filters.get("warehouse", [])) >= 2
 
-        if as_of_date:
+        if as_of_date and is_grouped:
+            rows = self.reader.get_grouped_as_of_stock_levels(
+                filters, as_of_date=as_of_date, page=1, page_size=EXPORT_MAX_ROWS
+            )
+            self._enrich_grouped_rows(rows)
+        elif as_of_date:
             rows = self.reader.get_as_of_stock_levels(
                 filters, as_of_date=as_of_date, page=1, page_size=EXPORT_MAX_ROWS
             )
@@ -315,9 +338,28 @@ class StockDashboardService:
             self._enrich_rows(rows)
         return rows
 
-    def get_item_detail(self, item_code: str, warehouses: List[str]) -> Dict:
-        """Returns per-warehouse breakdown for a single item (expand detail)."""
-        rows = self.reader.get_item_warehouses(item_code, warehouses)
+    def get_item_detail(
+        self, item_code: str, warehouses: List[str], as_of_date=None
+    ) -> Dict:
+        """Returns per-warehouse breakdown for a single item (expand detail).
+
+        With `as_of_date`, the warehouses are reconstructed to that date, so an
+        expanded row adds up to the as-of total above it rather than today's.
+        """
+        if as_of_date:
+            rows = self.reader.get_as_of_stock_levels(
+                {
+                    "item_code": item_code,
+                    "warehouse": warehouses,
+                    "sort_by": "warehouse",
+                    "sort_dir": "asc",
+                },
+                as_of_date=as_of_date,
+                page=1,
+                page_size=max(len(warehouses), 1),
+            )
+        else:
+            rows = self.reader.get_item_warehouses(item_code, warehouses)
         self._enrich_rows(rows)
         return {"data": rows}
 

@@ -198,9 +198,18 @@ class ItemDetailFilterSerializer(serializers.Serializer):
         required=True,
         help_text="Comma-separated warehouse codes",
     )
+    as_of_date = serializers.DateField(
+        required=False,
+        help_text="Optional: reconstruct each warehouse as of this date (YYYY-MM-DD).",
+    )
 
     def validate_warehouse(self, value):
         return [w.strip() for w in value.split(",") if w.strip()]
+
+    def validate_as_of_date(self, value):
+        if value > timezone.localdate():
+            raise serializers.ValidationError("as_of_date cannot be in the future.")
+        return value
 
 
 class ItemDetailResponseSerializer(serializers.Serializer):

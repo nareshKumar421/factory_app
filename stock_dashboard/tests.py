@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from .hana_reader import HanaStockDashboardReader
 from .serializers import (
+    ItemDetailFilterSerializer,
     StockDashboardAsOfFilterSerializer,
     StockDashboardExportFilterSerializer,
     StockDashboardFilterSerializer,
@@ -66,6 +67,25 @@ class StockDashboardFilterSerializerTests(SimpleTestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         self.assertNotIn("as_of_date", serializer.validated_data)
         self.assertEqual(serializer.validated_data["status"], ["low", "critical"])
+
+    def test_item_detail_filter_takes_an_optional_as_of_date(self):
+        historical = timezone.localdate() - timedelta(days=1)
+        dated = ItemDetailFilterSerializer(
+            data={"warehouse": "BH-PM,BH-PC", "as_of_date": historical.isoformat()}
+        )
+        undated = ItemDetailFilterSerializer(data={"warehouse": "BH-PM,BH-PC"})
+        future = ItemDetailFilterSerializer(
+            data={
+                "warehouse": "BH-PM",
+                "as_of_date": (timezone.localdate() + timedelta(days=1)).isoformat(),
+            }
+        )
+
+        self.assertTrue(dated.is_valid(), dated.errors)
+        self.assertEqual(dated.validated_data["as_of_date"], historical)
+        self.assertTrue(undated.is_valid(), undated.errors)
+        self.assertNotIn("as_of_date", undated.validated_data)
+        self.assertFalse(future.is_valid())
 
     def test_export_filter_rejects_future_as_of_date(self):
         future = timezone.localdate() + timedelta(days=1)
@@ -187,6 +207,49 @@ class HanaStockDashboardReaderQueryTests(SimpleTestCase):
         self.assertIn("on_hand < min_stock * 0.6", query)
         self.assertIn("NOT (days_since_last_consumption IS NULL", query)
         self.assertIn("FROM (", query)
+
+    def test_grouped_as_of_query_sums_reconstructed_warehouses_per_item(self):
+        as_of_date = date(2026, 9, 30)
+        query, params = self.reader._build_grouped_as_of_query(
+            {
+                "warehouse": ["BH-BS", "BH-PM", "BH-PC"],
+                "item_group": "PACKAGING MATERIAL",
+                "status": ["critical"],
+                "movement_status": ["recent"],
+            },
+            as_of_date,
+        )
+
+        self.assertIn('IFNULL(future_mov."FutureNetQty", 0)', query)
+        self.assertIn("SUM(on_hand)   AS on_hand", query)
+        self.assertIn("SUM(min_stock) AS min_stock", query)
+        self.assertIn("GROUP BY item_code, item_name, uom", query)
+        # Status is judged on the sums, after grouping.
+        self.assertIn(") g", query)
+        self.assertIn("min_stock > 0 AND on_hand < min_stock * 0.6", query)
+        self.assertEqual(params[:3], [as_of_date, as_of_date, as_of_date])
+        self.assertEqual(
+            params[3:], ["BH-BS", "BH-PM", "BH-PC", "PACKAGING MATERIAL"]
+        )
+
+    def test_grouped_as_of_stats_query_counts_grouped_rows(self):
+        query, _ = self.reader._build_grouped_as_of_stats_query(
+            {"warehouse": ["BH-PM", "BH-PC"]},
+            date(2026, 9, 30),
+        )
+
+        self.assertIn("COUNT(*) AS total_items", query)
+        self.assertIn("GROUP BY item_code, item_name, uom", query)
+        self.assertIn("AS critical_count", query)
+
+    def test_as_of_query_can_name_one_item_exactly(self):
+        query, params = self.reader._build_as_of_query(
+            {"item_code": "PM0000094", "warehouse": ["BH-PM", "BH-PC"]},
+            date(2026, 9, 30),
+        )
+
+        self.assertIn('w."ItemCode" = ?', query)
+        self.assertEqual(params[3:], ["BH-PM", "BH-PC", "PM0000094"])
 
     def test_grouped_stats_query_filters_by_item_group_name(self):
         query, params = self.reader._build_grouped_stats_query(
@@ -372,6 +435,88 @@ class StockDashboardServiceTests(SimpleTestCase):
         self.assertEqual(result["data"][0]["stock_status"], "low")
         self.assertEqual(result["data"][0]["movement_status"], "recent")
 
+    def test_as_of_stock_levels_group_multi_warehouse_like_the_live_view(self):
+        # The benchmark sits on BH-PM and the stock in BH-PC: judged alone,
+        # BH-PM is critical; summed, the item is healthy. 2026-09-30 regression.
+        as_of_date = date(2026, 9, 30)
+        reader = Mock()
+        reader.get_warehouses.return_value = ["BH-BS", "BH-PC", "BH-PM"]
+        reader.get_grouped_as_of_stock_stats.return_value = {
+            "total_items": 121,
+            "healthy_count": 105,
+            "low_count": 7,
+            "critical_count": 9,
+        }
+        reader.get_grouped_as_of_stock_levels.return_value = [
+            {
+                "item_code": "PM0000195",
+                "item_name": "PET BOTTLE 1 LTR 52 GMS GREEN",
+                "on_hand": 22544,
+                "min_stock": 8062,
+                "uom": "PCS",
+                "warehouse_count": 3,
+                "critical_warehouses": 1,
+                "low_warehouses": 0,
+                "days_since_last_consumption": 1,
+            }
+        ]
+        service = self.make_service(reader)
+        filters = {
+            "as_of_date": as_of_date,
+            "warehouse": ["BH-BS", "BH-PM", "BH-PC"],
+            "page": 1,
+            "page_size": 50,
+        }
+
+        result = service.get_as_of_stock_levels(filters)
+
+        reader.get_grouped_as_of_stock_stats.assert_called_once_with(filters, as_of_date)
+        reader.get_as_of_stock_stats.assert_not_called()
+        reader.get_as_of_stock_levels.assert_not_called()
+        self.assertEqual(result["meta"]["critical_stock_count"], 9)
+        self.assertEqual(result["meta"]["healthy_count"], 105)
+        row = result["data"][0]
+        self.assertEqual(row["stock_status"], "healthy")
+        self.assertEqual(row["warehouse"], "3 warehouses")
+        self.assertTrue(row["has_warning"])
+
+    def test_item_detail_reconstructs_each_warehouse_when_dated(self):
+        as_of_date = date(2026, 9, 30)
+        reader = Mock()
+        reader.get_as_of_stock_levels.return_value = [
+            {
+                "item_code": "PM0000094",
+                "item_name": "SHRINKS",
+                "warehouse": "BH-PC",
+                "on_hand": 15490,
+                "min_stock": 0,
+                "uom": "PCS",
+                "days_since_last_consumption": 2,
+            }
+        ]
+        service = self.make_service(reader)
+
+        result = service.get_item_detail(
+            "PM0000094", ["BH-PM", "BH-PC"], as_of_date=as_of_date
+        )
+
+        reader.get_item_warehouses.assert_not_called()
+        args, kwargs = reader.get_as_of_stock_levels.call_args
+        self.assertEqual(args[0]["item_code"], "PM0000094")
+        self.assertEqual(args[0]["warehouse"], ["BH-PM", "BH-PC"])
+        self.assertEqual(kwargs["as_of_date"], as_of_date)
+        self.assertEqual(result["data"][0]["on_hand"], 15490)
+
+    def test_item_detail_reads_today_without_a_date(self):
+        reader = Mock()
+        reader.get_item_warehouses.return_value = []
+        service = self.make_service(reader)
+
+        service.get_item_detail("PM0000094", ["BH-PM", "BH-PC"])
+
+        reader.get_item_warehouses.assert_called_once_with("PM0000094", ["BH-PM", "BH-PC"])
+        reader.get_as_of_stock_levels.assert_not_called()
+
     def test_item_without_benchmark_is_unset(self):
         service = self.make_service(Mock())
 
@@ -503,10 +648,26 @@ class StockDashboardServiceTests(SimpleTestCase):
         reader.get_as_of_stock_levels.return_value = []
         service = self.make_service(reader)
 
-        filters = {"warehouse": ["BH-PM", "GP-FG"], "as_of_date": as_of_date}
+        filters = {"warehouse": ["BH-PM"], "as_of_date": as_of_date}
         service.get_stock_levels_for_export(filters)
 
         reader.get_as_of_stock_levels.assert_called_once_with(
             filters, as_of_date=as_of_date, page=1, page_size=EXPORT_MAX_ROWS
         )
+        reader.get_grouped_stock_levels.assert_not_called()
+        reader.get_grouped_as_of_stock_levels.assert_not_called()
+
+    def test_export_groups_as_of_rows_for_multi_warehouse(self):
+        as_of_date = date(2026, 5, 1)
+        reader = Mock()
+        reader.get_grouped_as_of_stock_levels.return_value = []
+        service = self.make_service(reader)
+
+        filters = {"warehouse": ["BH-PM", "GP-FG"], "as_of_date": as_of_date}
+        service.get_stock_levels_for_export(filters)
+
+        reader.get_grouped_as_of_stock_levels.assert_called_once_with(
+            filters, as_of_date=as_of_date, page=1, page_size=EXPORT_MAX_ROWS
+        )
+        reader.get_as_of_stock_levels.assert_not_called()
         reader.get_grouped_stock_levels.assert_not_called()

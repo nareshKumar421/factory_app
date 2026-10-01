@@ -240,6 +240,9 @@ class StockItemDetailAPI(APIView):
     Per-warehouse breakdown for a single item (used by row expand).
 
     GET /api/v1/dashboards/stock/<item_code>/warehouses/?warehouse=WH-01,WH-02
+
+    Optional `as_of_date` reconstructs each warehouse to that date, matching an
+    as-of table row.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewStockDashboard]
@@ -253,10 +256,11 @@ class StockItemDetailAPI(APIView):
             )
 
         warehouses = filter_serializer.validated_data["warehouse"]
+        as_of_date = filter_serializer.validated_data.get("as_of_date")
         service = StockDashboardService(company_code=request.company.company.code)
 
         try:
-            result = service.get_item_detail(item_code, warehouses)
+            result = service.get_item_detail(item_code, warehouses, as_of_date=as_of_date)
         except SAPConnectionError:
             return Response(
                 {"detail": "SAP system is currently unavailable. Please try again later."},
