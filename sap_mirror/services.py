@@ -26,6 +26,7 @@ from hdbcli import dbapi
 from company.models import Company
 from sap_client.exceptions import SAPConnectionError
 
+from .codec import pack, unpack
 from .models import MirrorDataset, MirrorRow
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,13 @@ def _fetch_warehouses(company_code):
     return WMSHanaReader(company_code=company_code).get_warehouses()
 
 
+def _fetch_production_boms(company_code):
+    from production_execution.services.sap_reader import ProductionOrderReader
+
+    # use_copy=False: a HANA failure half-way fails this run, not the copy.
+    return ProductionOrderReader(company_code, use_copy=False).get_all_boms_for_copy()
+
+
 def _replace_list(fetch, key, search_text):
     """A refresh that swaps one company's copy of a small list for SAP's answer."""
 
@@ -69,7 +77,9 @@ def _replace_list(fetch, key, search_text):
             state.rows.all().delete()
             MirrorRow.objects.bulk_create(
                 [
-                    MirrorRow(dataset=state, key=code, search_text=search_text(row)[:400], data=row)
+                    MirrorRow(
+                        dataset=state, key=code, search_text=search_text(row)[:400], data=pack(row)
+                    )
                     for code, row in unique.items()
                 ]
             )
@@ -95,6 +105,7 @@ class Dataset:
 
 FG_ITEMS = "fg_items"
 WAREHOUSES = "warehouses"
+PRODUCTION_BOMS = "boms"
 BILLS = "bills"
 
 DATASETS = {
@@ -114,6 +125,19 @@ DATASETS = {
             fetch=lambda code: _fetch_warehouses(code),
             key=lambda row: row["code"],
             search_text=lambda row: f"{row['code']} {row['name']}".lower(),
+        ),
+    ),
+    # Starting a production run: the run-startable items (finished goods with a
+    # BOM), each with its BOM lines, pieces per case and litres per piece. The
+    # stock check is not copied -- it already steps aside when SAP is down.
+    PRODUCTION_BOMS: Dataset(
+        label="Production BOMs",
+        refresh=_replace_list(
+            fetch=lambda code: _fetch_production_boms(code),
+            key=lambda row: row["item"]["ItemCode"],
+            search_text=lambda row: (
+                f"{row['item']['ItemCode']} {row['item'].get('ItemName') or ''}".lower()
+            ),
         ),
     ),
     # Dispatch: the last 30 days of A/R bills. Booked the same day they load, so
@@ -235,4 +259,4 @@ def copied_rows(company_code, name, *, search="", limit=None):
         rows = rows.filter(search_text__contains=search)
     if limit:
         rows = rows[:limit]
-    return [row.data for row in rows], timezone.localtime(state.synced_at)
+    return [unpack(row.data) for row in rows], timezone.localtime(state.synced_at)

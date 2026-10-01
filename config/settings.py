@@ -201,7 +201,8 @@ INSTALLED_APPS = [
     # wait for the worker (manage.py run_sap_postings) rather than fail.
     'sap_postings',
     # Copies of the SAP reads the floor cannot work without (items, warehouses,
-    # the last 30 days of bills), served only while HANA does not answer;
+    # production BOMs, the last 30 days of bills), served only while HANA does
+    # not answer;
     # manage.py sync_sap_copy takes them.
     'sap_mirror',
     # One number, looked up in every company's SAP and in this app's own

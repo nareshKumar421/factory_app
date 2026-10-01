@@ -28,14 +28,43 @@ class SAPReadError(Exception):
 
 
 class ProductionOrderReader:
-    """Reads production orders from SAP HANA for a specific company."""
+    """Reads production orders from SAP HANA for a specific company.
 
-    def __init__(self, company_code: str):
+    When HANA cannot be reached, what starting a run needs -- the run-startable
+    item search, an item's BOM, its pieces per case and litres per piece -- is
+    answered from the nightly copy (``sap_mirror``, list ``boms``). Production
+    orders are not copied, so a run started from one still needs SAP.
+    ``use_copy=False`` is for the job that takes the copy.
+    """
+
+    def __init__(self, company_code: str, *, use_copy: bool = True):
         self.company_code = company_code
+        self.use_copy = use_copy
         try:
             self.client = SAPClient(company_code=company_code)
         except Exception as e:
             raise SAPReadError(f"Failed to initialize SAP client: {e}")
+
+    def _from_copy(self, exc, serve):
+        """Answer a failed read from the BOM copy, or re-raise ``exc``.
+
+        ``serve(items)`` gets the copy's rows -- one per run-startable item --
+        and returns the answer, or ``None`` when the copy cannot give one.
+        """
+        from sap_mirror import services as sap_mirror
+
+        if not self.use_copy or not sap_mirror.hana_unreachable(exc):
+            raise exc
+        try:
+            copy = sap_mirror.copied_rows(self.company_code, sap_mirror.PRODUCTION_BOMS)
+            result = None if copy is None else serve(copy[0])
+        except Exception:  # noqa: BLE001 -- a broken copy must not change what the caller sees
+            logger.exception("SAP BOM copy could not answer for %s", self.company_code)
+            raise exc
+        if result is None:
+            raise exc
+        logger.warning("HANA unreachable; %s answered from the copy of %s", self.company_code, copy[1])
+        return result
 
     def get_released_production_orders(self) -> list:
         """Get all released production orders with remaining qty > 0."""
@@ -248,7 +277,10 @@ class ProductionOrderReader:
             rows = self._execute(sql)
         except Exception as e:
             logger.error(f"Failed to fetch SalFactor2 for {len(codes)} items: {e}")
-            raise SAPReadError(f"Failed to fetch pieces-per-case: {e}")
+            return self._from_copy(
+                _caused_by(SAPReadError(f"Failed to fetch pieces-per-case: {e}"), e),
+                lambda items: _copied_map(items, codes, "pieces_per_case"),
+            )
         result = {}
         for row in rows:
             try:
@@ -288,7 +320,10 @@ class ProductionOrderReader:
             rows = self._execute(sql)
         except Exception as e:
             logger.error(f"Failed to fetch SalPackUn for {len(codes)} items: {e}")
-            raise SAPReadError(f"Failed to fetch litres-per-piece: {e}")
+            return self._from_copy(
+                _caused_by(SAPReadError(f"Failed to fetch litres-per-piece: {e}"), e),
+                lambda items: _copied_map(items, codes, "litres_per_piece"),
+            )
         result = {}
         for row in rows:
             try:
@@ -386,9 +421,44 @@ class ProductionOrderReader:
         material, nobody issues them, and carried into a run they become a
         warehouse request for something the store does not have and cannot get.
         """
-        schema = self.client.context.config['hana']['schema']
         safe_item = item_code.replace("'", "''")
-        sql = """
+        sql = self._bom_sql(f'T0."Code" = \'{safe_item}\'')
+        try:
+            return self._execute(sql)
+        except Exception as e:
+            logger.error(f"Failed to fetch BOM for item {item_code}: {e}")
+            return self._from_copy(
+                _caused_by(SAPReadError(f"Failed to fetch BOM for item {item_code}: {e}"), e),
+                lambda items: _copied_bom(items, item_code),
+            )
+
+    def get_all_boms_for_copy(self) -> list:
+        """Every run-startable item with its BOM, pieces per case and litres per
+        piece -- one row per item, as the nightly copy keeps it. Three round trips
+        for the whole company, not one per item."""
+        items = self.search_items(limit=None, produced_only=True)
+        codes = [item["ItemCode"] for item in items]
+        boms = {code: [] for code in codes}
+        if codes:
+            father = self._produced_items_sql()
+            for line in self._execute(self._bom_sql(f'T0."Code" IN ({father})', with_father=True)):
+                boms.setdefault(line.pop("Father"), []).append(line)
+        pieces = self.get_pieces_per_case_map(codes)
+        litres = self.get_litres_per_piece_map(codes)
+        return [
+            {
+                "item": item,
+                "bom": boms.get(item["ItemCode"], []),
+                "pieces_per_case": pieces.get(item["ItemCode"]),
+                "litres_per_piece": litres.get(item["ItemCode"]),
+            }
+            for item in items
+        ]
+
+    def _bom_sql(self, where: str, *, with_father: bool = False) -> str:
+        schema = self.client.context.config['hana']['schema']
+        father = ',\n                T0."Code"      AS "Father"' if with_father else ''
+        return """
             SELECT
                 T1."Code"      AS "ItemCode",
                 T1."ItemName"  AS "ItemName",
@@ -400,20 +470,15 @@ class ProductionOrderReader:
                 COALESCE(NULLIF(F."SalFactor2", 0), T0."Qauntity") AS "PiecesPerCase",
                 COALESCE(T1."Uom", I."InvntryUom") AS "UomCode",
                 T1."Warehouse" AS "Warehouse",
-                I."LastPurPrc" AS "UnitPrice"
+                I."LastPurPrc" AS "UnitPrice"{father}
             FROM "{schema}"."OITT" T0
             INNER JOIN "{schema}"."ITT1" T1 ON T0."Code" = T1."Father"
             LEFT JOIN "{schema}"."OITM" I ON T1."Code" = I."ItemCode"
             LEFT JOIN "{schema}"."OITM" F ON T0."Code" = F."ItemCode"
-            WHERE T0."Code" = '{item_code}'
+            WHERE {where}
               AND T1."Type" = {item_line}
-            ORDER BY T1."VisOrder" ASC
-        """.format(schema=schema, item_code=safe_item, item_line=BOM_LINE_TYPE_ITEM)
-        try:
-            return self._execute(sql)
-        except Exception as e:
-            logger.error(f"Failed to fetch BOM for item {item_code}: {e}")
-            raise SAPReadError(f"Failed to fetch BOM for item {item_code}: {e}")
+            ORDER BY T0."Code" ASC, T1."VisOrder" ASC
+        """.format(schema=schema, where=where, father=father, item_line=BOM_LINE_TYPE_ITEM)
 
     def get_bom_components_for_run(self, sap_doc_entry: int = None, item_code: str = None) -> list:
         """
@@ -458,12 +523,9 @@ class ProductionOrderReader:
                 f" OR LOWER(T0.\"ItemName\") LIKE LOWER('%{safe_search}%'))"
             )
         if produced_only:
-            where_clause += (
-                f' AND T0."ItemCode" IN (SELECT "Code" FROM "{schema}"."OITT")'
-                f" AND UPPER(IFNULL(G.\"ItmsGrpNam\", '')) = '{FINISHED_GOODS_ITEM_GROUP}'"
-            )
+            where_clause += f' AND T0."ItemCode" IN ({self._produced_items_sql()})'
         sql = """
-            SELECT TOP {limit}
+            SELECT {top}
                 T0."ItemCode",
                 T0."ItemName",
                 T0."InvntryUom" AS "UomCode"
@@ -471,25 +533,35 @@ class ProductionOrderReader:
             LEFT JOIN "{schema}"."OITB" G ON G."ItmsGrpCod" = T0."ItmsGrpCod"
             {where_clause}
             ORDER BY T0."ItemName" ASC
-        """.format(schema=schema, limit=limit, where_clause=where_clause)
+        """.format(
+            schema=schema, top=f'TOP {int(limit)}' if limit else '', where_clause=where_clause,
+        )
         try:
             return self._execute(sql)
         except Exception as e:
             logger.error(f"Failed to search SAP items: {e}")
-            raise SAPReadError(f"Failed to search items: {e}")
+            error = _caused_by(SAPReadError(f"Failed to search items: {e}"), e)
+            if not produced_only:
+                raise error  # only the run-startable items are copied
+            return self._from_copy(error, lambda items: _copied_search(items, search, limit))
+
+    def _produced_items_sql(self) -> str:
+        """The run-startable items: a production BOM, in the FINISHED item group."""
+        schema = self.client.context.config['hana']['schema']
+        return (
+            f'SELECT T9."ItemCode" FROM "{schema}"."OITM" T9'
+            f' LEFT JOIN "{schema}"."OITB" G9 ON G9."ItmsGrpCod" = T9."ItmsGrpCod"'
+            f' WHERE T9."ItemCode" IN (SELECT "Code" FROM "{schema}"."OITT")'
+            f" AND UPPER(IFNULL(G9.\"ItmsGrpNam\", '')) = '{FINISHED_GOODS_ITEM_GROUP}'"
+        )
 
     def _execute(self, sql: str) -> list:
         try:
-            conn = self.client.context.hana
-            from hdbcli import dbapi
-            from sap_client.hana.connection import HANA_TIMEOUTS
-            connection = dbapi.connect(
-                address=conn['host'],
-                port=conn['port'],
-                user=conn['user'],
-                password=conn['password'],
-                **HANA_TIMEOUTS,
-            )
+            from sap_client.hana.connection import HanaConnection
+
+            # Through HanaConnection for its fail-fast: while HANA is known to be
+            # down a read goes to the copy at once, not after the connect timeout.
+            connection = HanaConnection(self.client.context.hana).connect()
             cursor = connection.cursor()
             cursor.execute(sql)
             cols = [c[0] for c in cursor.description]
@@ -498,4 +570,39 @@ class ProductionOrderReader:
             connection.close()
             return [dict(zip(cols, row)) for row in rows]
         except Exception as e:
-            raise SAPReadError(str(e))
+            raise SAPReadError(str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# answering from the BOM copy (rows: {"item", "bom", "pieces_per_case", "litres_per_piece"})
+# ---------------------------------------------------------------------------
+
+def _caused_by(error, cause):
+    error.__cause__ = cause
+    return error
+
+
+def _copied_search(items, search, limit):
+    term = (search or "").strip().lower()
+    found = [
+        row["item"] for row in items
+        if not term
+        or term in row["item"]["ItemCode"].lower()
+        or term in (row["item"].get("ItemName") or "").lower()
+    ]
+    found.sort(key=lambda item: item.get("ItemName") or "")
+    return found[:limit] if limit else found
+
+
+def _copied_bom(items, item_code):
+    for row in items:
+        if row["item"]["ItemCode"] == item_code:
+            return row["bom"]
+    return None  # not a run-startable item the copy holds: say SAP is down
+
+
+def _copied_map(items, codes, field):
+    held = {row["item"]["ItemCode"]: row.get(field) for row in items}
+    if not any(code in held for code in codes):
+        return None
+    return {code: held[code] for code in codes if held.get(code)}

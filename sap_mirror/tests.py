@@ -74,10 +74,10 @@ class CopyTestCase(TestCase):
             patcher = patch(target, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
-        # The master lists only; the bill copy has its own tests (tests_bills).
+        # Items and warehouses only; the BOM and bill copies have their own tests.
         lists_only = patch.dict(
             services.DATASETS,
-            {name: spec for name, spec in services.DATASETS.items() if name != services.BILLS},
+            {name: services.DATASETS[name] for name in (services.FG_ITEMS, services.WAREHOUSES)},
             clear=True,
         )
         lists_only.start()
