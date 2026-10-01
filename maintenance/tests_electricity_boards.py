@@ -12,8 +12,10 @@ Beverages 380 (Ground Floor's own 360 and the other half), and the 100 KWH
 measured that no sub-meter did to nobody. At 9 a unit.
 
 Each board is asked for the same day and has to give exactly that: Admin
-Control the signed-in company's share, the expense wall the campus (KWH not
-added on top of its sub-meters), the matrix each company's column.
+Control the signed-in company's share, the expense wall the campus, the
+matrix each company's column. KWH, the main, is on no board: its 100 units
+nobody's meter saw are the supply's, not a meter anybody draws on, so the
+campus is the 900 its sub-meters carry.
 """
 from decimal import Decimal
 from types import SimpleNamespace
@@ -45,9 +47,26 @@ class ElectricityBoardsTests(TreeFixture):
         totals = service.party_totals(D1, D1)
         self.assertEqual(oil['units'], totals['company:JIVO_OIL']['units'])
 
-    def test_everybody_together_is_the_supply_each_unit_once(self):
+    def test_everybody_together_is_the_meters_each_unit_once_mains_left_out(self):
         everyone = boards.for_parties(boards.breakdown(D1, D1), None)
-        self.assertEqual(everyone['units'], Decimal('1000'))
+        self.assertEqual(everyone['units'], Decimal('900'))
+        self.assertNotIn('KWH', everyone['by_meter'])
+
+    def test_the_tree_is_reading_less_sub_meters_is_own(self):
+        rows = {r['name']: r for r in boards.meter_tree(D1, D1)}
+        self.assertNotIn('KWH', rows)                       # the main: on no board
+        ground = rows['Ground Floor']
+        self.assertEqual((ground['units'], ground['sub_metered_units'], ground['own_units']),
+                         ('400.00', '40.00', '360.00'))
+        # Under the main, so shown at the top; the Lab below it.
+        self.assertEqual((ground['depth'], rows['Lab']['depth']), (0, 1))
+        self.assertEqual(rows['Lab']['parent_id'], ground['id'])
+
+    def test_the_tree_shows_a_companys_part_of_each_meter(self):
+        rows = {r['name']: r for r in boards.meter_tree(D1, D1, 'JIVO_OIL')}
+        self.assertEqual((rows['Lab']['company_units'], rows['Lab']['company_share_pct']),
+                         ('20.00', '50.0'))
+        self.assertIsNone(rows['Ground Floor']['company_units'])   # Beverages' alone
 
     def test_a_meter_shared_says_what_share_it_is(self):
         result = boards.breakdown(D1, D1)
@@ -93,11 +112,12 @@ class ElectricityBoardsTests(TreeFixture):
                                  SimpleNamespace(electricity_only_company_meters=only_companies),
                                  focus=[D1])
 
-    def test_the_wall_is_the_campus_with_the_supply_meter_not_added_on_top(self):
+    def test_the_wall_is_the_meters_each_unit_once_and_no_main(self):
         per_date, meters, _ = self.wall(False)
-        # 1,000 metered, not 1,000 + 400 + 40 + 500 as the register sums it.
-        self.assertEqual(per_date[D1]['units'], Decimal('1000'))
-        self.assertEqual(sum(m['units'] for m in meters.values()), Decimal('1000'))
+        # 900, not 1,000 + 400 + 40 + 500 as the register sums it.
+        self.assertEqual(per_date[D1]['units'], Decimal('900'))
+        self.assertEqual(sum(m['units'] for m in meters.values()), Decimal('900'))
+        self.assertNotIn('KWH', meters)
 
     def test_the_wall_can_keep_to_its_companies(self):
         per_date, meters, _ = self.wall(True)
@@ -118,16 +138,17 @@ class ElectricityBoardsTests(TreeFixture):
         by_code = {c.code: per_company[c.id] for c in companies}
         self.assertEqual(by_code['JIVO_OIL']['cost'], self.money(520))
         self.assertEqual(by_code['JIVO_BEVERAGES']['cost'], self.money(380))
-        # What nobody was set to pay for is shared, not dropped.
-        self.assertEqual(shared['cost'], self.money(100))
-        self.assertEqual(allocated, self.money(1000))
+        # KWH's own 100 is the supply's, on no board.
+        self.assertEqual(shared['cost'], 0)
+        self.assertEqual(allocated, self.money(900))
         self.assertEqual(by_code['JIVO_OIL']['meters'], {'First Floor', 'Lab'})
 
     def test_the_matrix_reconciles_to_the_supply_meter(self):
         matrix, _, (_, _, incomer, allocated, _) = self.matrix()
         self.assertEqual(incomer['kwh']['units'], Decimal('1000'))
         check = matrix.reconcile_against_incomer(allocated, incomer)
-        self.assertEqual(check['drift_pct'], 0.0)
+        # The meters carry 900 of the 1,000 KWH brought in: 10% nobody metered.
+        self.assertEqual(check['drift_pct'], -10.0)
 
     def test_the_wall_and_the_matrix_agree(self):
         _, _, (_, _, _, allocated, _) = self.matrix()
@@ -145,7 +166,7 @@ class ElectricityBoardsTests(TreeFixture):
             rate_per_unit=Decimal('9'))
         result = boards.breakdown(D1, D1)
         # Counted in the campus (a supply of its own), charged to no company.
-        self.assertEqual(boards.for_parties(result, None)['units'], Decimal('1070'))
+        self.assertEqual(boards.for_parties(result, None)['units'], Decimal('970'))
         self.assertEqual(boards.company(result, 'JIVO_OIL')['units'], Decimal('520'))
         self.assertTrue(any('charged to no company yet: Canteen' in w
                             for w in boards.warnings(result)))
@@ -178,9 +199,11 @@ class ElectricityBoardAPITests(TreeFixture):
 
     def test_the_campus_board_is_the_supply_each_unit_once(self):
         data = self.board()
-        self.assertEqual(data['units'], '1000.00')
+        self.assertEqual(data['units'], '900.00')
         self.assertEqual(data['supply']['units'], '1000.00')
         self.assertTrue(all(m['share_pct'] is None for m in data['meters']))
+        self.assertEqual([r['name'] for r in data['tree']],
+                         ['First Floor', 'Ground Floor', 'Lab'])
 
     def test_the_board_needs_the_daily_electricity_right(self):
         from maintenance.tests_meter_scope import client_for, make_user

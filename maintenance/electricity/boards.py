@@ -45,17 +45,35 @@ def warnings(result, limit: Optional[int] = None):
     return messages[:limit] if limit else messages
 
 
+def main_meter_names():
+    """The supply meters (KWH, KVAH, ...): never on a board, never in a total.
+
+    A main measures the electricity coming in, which its sub-meters then
+    measure again in parts. What a main reads beyond its sub-meters is the
+    supply nobody's meter saw, owed by no company, so the boards leave the
+    mains out altogether and show the meters the factory actually draws on.
+    """
+    from maintenance.models import ElectricityMeter
+
+    return set(ElectricityMeter.objects.filter(is_main=True).values_list("name", flat=True))
+
+
 def parties_of(codes: Iterable[str]):
     return {company_party(code) for code in codes}
 
 
-def for_parties(result, parties) -> Dict:
+def for_parties(result, parties, mains=None) -> Dict:
     """The span's units and cost for ``parties``, in total, by day and by meter.
 
     ``parties`` is a set of party keys (``company:JIVO_OIL``…), or ``None`` for
     everybody — every company, every consumer and what nobody was set to pay
-    for — which is the whole metered supply, each unit once.
+    for. Main meters are left out (:func:`main_meter_names`), so the figure is
+    the meters the factory draws on, each unit once. Everything is added up
+    from the per-day, per-meter split, so the total, the days and the meters
+    always agree.
     """
+    mains = main_meter_names() if mains is None else mains
+
     def wanted(party):
         return parties is None or party in parties
 
@@ -64,26 +82,16 @@ def for_parties(result, parties) -> Dict:
     by_meter = defaultdict(_blank)
     by_day_meter = defaultdict(lambda: defaultdict(_blank))
 
-    for party, part in result["by_party"].items():
-        if wanted(party):
-            total["units"] += part["units"]
-            total["cost"] += part["cost"]
-    for day, parts in result["by_day"].items():
-        for party, part in parts.items():
-            if wanted(party):
-                by_day[day]["units"] += part["units"]
-                by_day[day]["cost"] += part["cost"]
-    for party, meters in result["by_meter"].items():
-        if wanted(party):
-            for name, part in meters.items():
-                by_meter[name]["units"] += part["units"]
-                by_meter[name]["cost"] += part["cost"]
     for day, parts in result["by_day_meter"].items():
         for party, meters in parts.items():
-            if wanted(party):
-                for name, part in meters.items():
-                    by_day_meter[day][name]["units"] += part["units"]
-                    by_day_meter[day][name]["cost"] += part["cost"]
+            if not wanted(party):
+                continue
+            for name, part in meters.items():
+                if name in mains:
+                    continue
+                for bucket in (total, by_day[day], by_meter[name], by_day_meter[day][name]):
+                    bucket["units"] += part["units"]
+                    bucket["cost"] += part["cost"]
 
     return {
         "units": total["units"],
@@ -94,9 +102,55 @@ def for_parties(result, parties) -> Dict:
     }
 
 
-def company(result, code: str) -> Dict:
+def company(result, code: str, mains=None) -> Dict:
     """One company's share of the span (see :func:`for_parties`)."""
-    return for_parties(result, {company_party(code)})
+    return for_parties(result, {company_party(code)}, mains)
+
+
+def meter_tree(date_from, date_to, code: str = "", mains=None):
+    """Each meter as reading − sub-meters = own, in tree order, mains left out.
+
+    The Electricity dashboard's sum, one row a meter: what the meter read, what
+    its sub-meters read of that, and the remainder, which is the meter's own
+    load. With ``code``, also the company's part of that own load. A meter
+    under a main is shown at the top, as the main is not shown at all; a
+    register that re-reads another meter (KVAH re-reading KWH) is left out too.
+    """
+    mains = main_meter_names() if mains is None else mains
+    report = service.report(date_from, date_to)
+    party = company_party(code) if code else None
+    hidden = {m["id"] for m in report["meters"]
+              if m["name"] in mains or m.get("register_of") or m.get("unplaced")}
+    by_id = {m["id"]: m for m in report["meters"]}
+    rows = []
+    for meter in report["meters"]:
+        if meter["id"] in hidden:
+            continue
+        # One level up for every hidden meter above it, anywhere up the chain;
+        # its parent on screen is the nearest one that is shown.
+        depth, parent = meter["depth"], None
+        above = meter.get("parent_id")
+        while above is not None:
+            if above in hidden:
+                depth -= 1
+            elif parent is None:
+                parent = above
+            above = by_id[above].get("parent_id")
+        share = next((s for s in meter.get("split", []) if s["party"] == party), None)
+        rows.append({
+            "id": meter["id"],
+            "name": meter["name"],
+            "depth": max(depth, 0),
+            "parent_id": parent,
+            "units": meter.get("units"),
+            "sub_metered_units": meter.get("sub_metered_units"),
+            "own_units": meter.get("own_units"),
+            "own_cost": meter.get("own_cost"),
+            "company_units": share["units"] if share else (None if party else meter.get("own_units")),
+            "company_cost": share["cost"] if share else (None if party else meter.get("own_cost")),
+            "company_share_pct": share["share_pct"] if share else None,
+        })
+    return rows
 
 
 def meter_share(result, party_units: Decimal, meter_name: str) -> Optional[Decimal]:

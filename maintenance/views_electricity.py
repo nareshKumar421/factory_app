@@ -588,6 +588,8 @@ class ElectricityBoardAPI(APIView):
             "meters": meters,
             "days": days,
             "supply": {"units": money(supply.get("units", 0)), "cost": money(supply.get("cost", 0))},
+            # Reading − sub-meters = own, meter by meter, mains left out.
+            "tree": boards.meter_tree(date_from, date_to, code),
             "warnings": boards.warnings(result),
         })
 

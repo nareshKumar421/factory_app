@@ -185,25 +185,26 @@ def electricity_by_company(companies, dates, settings_row):
         return {"cost": ZERO, "units": ZERO, "meters": set()}
 
     party_company = {company_party(c.code): c for c in companies}
+    mains = boards.main_meter_names()
     per_company = defaultdict(blank)
     shared = blank()
     allocated = ZERO
-    for day, parties in result["by_day"].items():
-        if day not in days:
-            continue
-        for party, part in parties.items():
-            company = party_company.get(party)
-            bucket = per_company[company.id] if company else shared
-            bucket["cost"] += part["cost"]
-            bucket["units"] += part["units"]
-            allocated += part["cost"]
     for day, parties in result["by_day_meter"].items():
         if day not in days:
             continue
         for party, meters in parties.items():
             company = party_company.get(party)
             bucket = per_company[company.id] if company else shared
-            bucket["meters"].update(name for name, part in meters.items() if part["units"])
+            for name, part in meters.items():
+                # The mains are the supply, not a meter anybody draws on: what
+                # one reads beyond its sub-meters is on no board.
+                if name in mains:
+                    continue
+                bucket["cost"] += part["cost"]
+                bucket["units"] += part["units"]
+                allocated += part["cost"]
+                if part["units"]:
+                    bucket["meters"].add(name)
 
     incomer = defaultdict(blank)
     for name, part in (result.get("supply_by_meter") or {}).items():
