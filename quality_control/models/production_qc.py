@@ -1,16 +1,20 @@
 # quality_control/models/production_qc.py
 """
-Production QC: checks QC makes on a line while a run is on it.
+QC Documents: the records QC maintains (on-line monitoring, water testing,
+net content, checklists...), each a paper form QA keeps.
 
-The masters mirror the arrival-slip ones. A :class:`ProductionParameterType`
-plays the part of a material type: it carries the list of parameters to check
-(:class:`ProductionParameter`, with the spec each must meet). Types are not
-tied to products: any of a company's types can be checked on any line.
+The models keep their first name, "production QC", from before the documents
+were cut loose from production; in the app the area is "Documents".
 
-A check is a :class:`ProductionQCEntry` against the run on the line at the
-time, holding one :class:`ProductionQCResult` per parameter of the chosen type.
-Saving it sends it for approval; a QC lead approves it or sends it back with a
-remark, and a sent-back entry is corrected and saved again.
+A :class:`ProductionParameterType` is a document type: one form, carrying the
+parameters it records (:class:`ProductionParameter`, with the spec each must
+meet). It is not tied to lines, runs or products — whatever the paper header
+asks for (product, line, batch...) is one of its parameters.
+
+An entry is a :class:`ProductionQCEntry`: one filled-in copy of the form at a
+time, holding one :class:`ProductionQCResult` per parameter. Saving it sends it
+for approval; a QC lead approves it or sends it back with a remark, and a
+sent-back entry is corrected and saved again.
 """
 
 from django.conf import settings
@@ -24,10 +28,10 @@ from .parameter_result import ParameterResultBase
 
 
 class ProductionParameterType(BaseModel):
-    """A family of production checks, e.g. the oil plant on-line monitoring.
+    """A QC document type, e.g. the oil plant on-line monitoring record.
 
-    Each type is also a paper form QA keeps (e.g. the on-line monitoring
-    record), so it carries that form's revision for the printed sheet. Its
+    Each is a paper form QA keeps, so it carries that form's revision for the
+    printed sheet. Its
     document number lives with every other form's, in Master Data > Print
     Documents (a QCPrintDocument for this type).
     """
@@ -86,26 +90,16 @@ class ProductionQCStatus(models.TextChoices):
 
 
 class ProductionQCEntry(BaseModel):
-    """One check made on a line, against the run that was on it."""
+    """One filled-in copy of a QC document: a reading for each of its parameters.
+
+    Not tied to production: a document is a record QC maintains, so whatever
+    the paper header asks for (product, line, batch...) is one of its
+    parameters.
+    """
 
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name="production_qc_entries"
     )
-    production_run = models.ForeignKey(
-        "production_execution.ProductionRun",
-        on_delete=models.PROTECT,
-        related_name="qc_entries",
-    )
-    # Snapshots of the run at the time of the check, so the list reads the same
-    # even if the run is edited later.
-    line = models.ForeignKey(
-        "production_execution.ProductionLine",
-        on_delete=models.PROTECT,
-        related_name="qc_entries",
-    )
-    item_code = models.CharField(max_length=100, blank=True)
-    product = models.CharField(max_length=200, blank=True)
-
     parameter_type = models.ForeignKey(
         ProductionParameterType, on_delete=models.PROTECT, related_name="entries"
     )
@@ -151,14 +145,14 @@ class ProductionQCEntry(BaseModel):
             models.Index(fields=["company", "checked_at"]),
         ]
         permissions = [
-            ("can_view_production_qc_entries", "Can view production QC entries"),
-            ("can_fill_production_qc_entries", "Can make and correct production QC entries"),
-            ("can_approve_production_qc_entries", "Can approve production QC entries"),
-            ("can_manage_production_qc_parameters", "Can manage production QC parameter types"),
+            ("can_view_production_qc_entries", "Can view QC document entries"),
+            ("can_fill_production_qc_entries", "Can fill and correct QC document entries"),
+            ("can_approve_production_qc_entries", "Can approve QC document entries"),
+            ("can_manage_production_qc_parameters", "Can manage QC document types"),
         ]
 
     def __str__(self):
-        return f"Production QC #{self.pk} - {self.line} - {self.parameter_type.code}"
+        return f"QC document #{self.pk} - {self.parameter_type.code}"
 
 
 class ProductionQCResult(ParameterResultBase):

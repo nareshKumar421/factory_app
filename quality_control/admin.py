@@ -595,9 +595,8 @@ class ProductionQCResultInline(admin.TabularInline):
 
 @admin.register(ProductionQCEntry)
 class ProductionQCEntryAdmin(admin.ModelAdmin):
-    list_display = ("id", "checked_at", "line", "product", "parameter_type", "status")
-    list_filter = ("status", "company", "line")
-    search_fields = ("product", "item_code")
+    list_display = ("id", "checked_at", "parameter_type", "company", "status")
+    list_filter = ("status", "company", "parameter_type")
+    search_fields = ("parameter_type__code", "parameter_type__name")
     date_hierarchy = "checked_at"
-    raw_id_fields = ("production_run",)
     inlines = [ProductionQCResultInline]

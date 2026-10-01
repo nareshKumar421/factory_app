@@ -1,9 +1,9 @@
 # quality_control/views_production_qc.py
-"""Production QC API: running lines, checks and their approval, and the masters."""
+"""QC Documents API (still under `production-qc/`): entries, their approval, and the document types."""
 
 from datetime import date
 
-from django.db.models import Count, Min, Q
+from django.db.models import Count, Exists, Min, OuterRef, Q
 from django.db.models.functions import TruncDate
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -19,6 +19,7 @@ from .models import (
     ProductionParameter,
     ProductionParameterType,
     ProductionQCEntry,
+    ProductionQCResult,
     ProductionQCStatus,
 )
 from .permissions import (
@@ -37,7 +38,6 @@ from .serializers_production_qc import (
     ProductionQCEntryDetailSerializer,
     ProductionQCEntryListSerializer,
     ProductionQCEntryUpdateSerializer,
-    RunningLineSerializer,
 )
 from .services import production_qc as service
 
@@ -83,7 +83,7 @@ def _entries(company):
     return (
         ProductionQCEntry.objects.filter(company=company, is_active=True)
         .select_related(
-            "line", "production_run", "parameter_type",
+            "parameter_type",
             "submitted_by", "approved_by", "sent_back_by",
         )
         .annotate(out_of_spec=Count("results", filter=Q(results__is_within_spec=False)))
@@ -124,19 +124,6 @@ def _set_form_number(parameter_type, number, user):
         )
 
 
-# ==================== Running lines ====================
-
-
-class ProductionQCRunningLinesAPI(APIView):
-    """The lines a check can be made on."""
-
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanFillProductionQC]
-
-    def get(self, request):
-        lines = service.running_lines(request.company.company)
-        return Response(RunningLineSerializer(lines, many=True).data)
-
-
 # ==================== Entries ====================
 
 
@@ -158,18 +145,22 @@ class ProductionQCEntryListCreateAPI(APIView):
         status_filter = (params.get("status") or "").strip().upper()
         if status_filter:
             qs = qs.filter(status=status_filter)
-        line_id = params.get("line_id")
-        if line_id:
-            qs = qs.filter(line_id=line_id)
+        parameter_type_id = params.get("parameter_type_id")
+        if parameter_type_id:
+            qs = qs.filter(parameter_type_id=parameter_type_id)
 
         search = (params.get("search") or "").strip()
         if search:
+            # A document's header (product, batch, line...) is among its
+            # readings, so a search looks there too.
             match = (
-                Q(product__icontains=search)
-                | Q(item_code__icontains=search)
-                | Q(line__name__icontains=search)
-                | Q(parameter_type__name__icontains=search)
+                Q(parameter_type__name__icontains=search)
                 | Q(parameter_type__code__icontains=search)
+                | Exists(
+                    ProductionQCResult.objects.filter(
+                        entry=OuterRef("pk"), result_value__icontains=search
+                    )
+                )
             )
             if search.isdigit():
                 match |= Q(pk=int(search))
@@ -205,7 +196,6 @@ class ProductionQCEntryListCreateAPI(APIView):
             entry = service.create_entry(
                 request.company.company,
                 request.user,
-                run_id=data["run_id"],
                 parameter_type_id=data["parameter_type_id"],
                 readings=serializer.readings(),
                 remarks=data.get("remarks", ""),

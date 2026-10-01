@@ -474,7 +474,7 @@ class QCPrintDocumentOptionsAPI(APIView):
             options.append({
                 "document_key": Key.PRODUCTION_QC_SHEET.value,
                 "production_parameter_type": parameter_type.id,
-                "label": f"Production QC — {parameter_type.name}",
+                "label": f"Document — {parameter_type.name}",
             })
         return Response(options)
 

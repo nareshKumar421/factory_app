@@ -107,29 +107,13 @@ class ProductionParameterWriteSerializer(serializers.Serializer):
         return attrs
 
 
-# ==================== Running lines ====================
+# ==================== Entries ====================
 
 
 class _TypeRefSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     code = serializers.CharField()
     name = serializers.CharField()
-
-
-class RunningLineSerializer(serializers.Serializer):
-    line_id = serializers.IntegerField()
-    line_name = serializers.CharField()
-    run_id = serializers.IntegerField()
-    run_number = serializers.IntegerField()
-    run_date = serializers.DateField()
-    item_code = serializers.CharField()
-    product = serializers.CharField()
-    is_running_now = serializers.BooleanField()
-    last_started_at = serializers.DateTimeField()
-    stopped_at = serializers.DateTimeField(allow_null=True)
-
-
-# ==================== Entries ====================
 
 
 class ProductionQCResultSerializer(serializers.ModelSerializer):
@@ -145,9 +129,6 @@ class ProductionQCResultSerializer(serializers.ModelSerializer):
 
 
 class ProductionQCEntryListSerializer(serializers.ModelSerializer):
-    line_name = serializers.CharField(source="line.name", read_only=True)
-    run_id = serializers.IntegerField(source="production_run_id", read_only=True)
-    run_number = serializers.IntegerField(source="production_run.run_number", read_only=True)
     parameter_type = _TypeRefSerializer(read_only=True)
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     out_of_spec_count = serializers.SerializerMethodField()
@@ -158,8 +139,7 @@ class ProductionQCEntryListSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductionQCEntry
         fields = [
-            "id", "line_id", "line_name", "run_id", "run_number", "item_code", "product",
-            "parameter_type", "checked_at", "status", "status_label", "out_of_spec_count",
+            "id", "parameter_type", "checked_at", "status", "status_label", "out_of_spec_count",
             "submitted_by_name", "submitted_at", "approved_by_name", "approved_at",
             "sent_back_by_name", "sent_back_at", "send_back_remarks",
         ]
@@ -214,7 +194,6 @@ class _ReadingsMixin(serializers.Serializer):
 
 
 class ProductionQCEntryCreateSerializer(_ReadingsMixin):
-    run_id = serializers.IntegerField()
     parameter_type_id = serializers.IntegerField()
 
 

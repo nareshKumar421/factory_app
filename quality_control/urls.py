@@ -48,7 +48,6 @@ from .views import (
     InspectionDecisionChangedAPI,
 )
 from .views_production_qc import (
-    ProductionQCRunningLinesAPI,
     ProductionQCEntryListCreateAPI,
     ProductionQCEntryCountsAPI,
     ProductionQCEntryDetailAPI,
@@ -71,9 +70,7 @@ from .views_qc_document_file_audit import (
 )
 
 urlpatterns = [
-    # ==================== Production QC ====================
-    path("production-qc/running-lines/", ProductionQCRunningLinesAPI.as_view(),
-         name="production-qc-running-lines"),
+    # ==================== QC Documents ("production QC" in code) ====================
     path("production-qc/entries/", ProductionQCEntryListCreateAPI.as_view(),
          name="production-qc-entries"),
     path("production-qc/entries/counts/", ProductionQCEntryCountsAPI.as_view(),

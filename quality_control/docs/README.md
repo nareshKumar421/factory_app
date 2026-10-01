@@ -45,7 +45,7 @@ was in use; they are to be rebuilt around what happens on the floor rather than
 around the paper reports. The line-clearance perms moved off `ProductionQCSession`
 onto `RawMaterialInspection` in that migration, keeping their codenames and grants.
 
-**Production QC, rebuilt (migrations `0063`, `0064`; types unlinked from products in `0069`)** — see [Flow D](#flow-d--production-qc).
+**Production QC, rebuilt (migrations `0063`, `0064`; types unlinked from products in `0069`), now "Documents" and cut loose from production (`0070`, `0071`)** — see [Flow D](#flow-d--qc-documents).
 Nothing of the removed version is reused: new tables, new permission codenames.
 
 ---
@@ -163,35 +163,43 @@ OneToOne** so a fresh inspection can be created later). Slip → DRAFT, entry �
 `ARRIVAL_SLIP_REJECTED`, guard notified. If the inspection has already been
 submitted to the chemist, send-back is refused ("use inspection rejection instead").
 
-### Flow D — Production QC
+### Flow D — QC Documents
 
-Checks QC makes on a line while a run is on it (`models/production_qc.py`,
+The records QC maintains — on-line monitoring, water and RO testing, net content,
+checklists, hold & release… — each a paper form QA keeps. In the app the area is
+**Documents**; the code keeps its first name, *production QC* (`models/production_qc.py`,
 `services/production_qc.py`, `views_production_qc.py`, all under `production-qc/`).
 
-**Masters** mirror the arrival-slip ones: a `ProductionParameterType` plays the part of
-a material type and carries its `ProductionParameter`s (spec as free text plus optional
-min/max, `value_type` NUMERIC/TEXT/BOOLEAN/RANGE, uom, mandatory, sequence). Unlike a
-material type it is **not tied to products**: every active type of the company can be
-checked on any running line (the product-link table was dropped in `0069`). There are
-no vendor-specific sets: production has no vendor.
+**Not tied to production** (since `0070`): an entry has no line, run or product.
+Whatever the paper header asks for (product, SKU, line, shift, batch…) is one of the
+document's parameters, and the entry search looks through the values entered.
 
-1. **Pick a running line** — `GET running-lines/`. A line is running while its
-   IN_PROGRESS run has an open segment, and for 24 h after its latest segment started
-   (a breakdown or the lunch stop closes the segment; QC still checks the line). Per
-   line, the run whose latest segment started most recently wins, so a stale run
-   nobody completed never shadows today's.
-2. **Pick the type** — any active type of the company (`GET parameter-types/`).
-3. **Fill and save** — `POST entries/` with one reading per parameter. Saving sends it
-   for approval (PENDING); there are no drafts. Every mandatory parameter needs a
-   value, and an out-of-spec reading needs an entry remark (as on the arrival slip).
-   Each `ProductionQCResult` snapshots the parameter's spec (`ParameterResultBase`),
-   so later edits to the master do not rewrite old checks. A BOOLEAN reading is
-   "Pass"/"Fail" and is its own verdict.
-4. **Approve** — a QC lead, one step: `approve/` or `send-back/` (remark required). A
+**Masters**: a `ProductionParameterType` is a *document type* — one form — carrying its
+`ProductionParameter`s (spec as free text plus optional min/max, `value_type`
+NUMERIC/TEXT/BOOLEAN/RANGE, uom, mandatory, sequence) and the form's revision; its
+number is its Print Documents row (`QCPrintDocument` PRODUCTION_QC_SHEET, one per type).
+Types are not tied to products (the link table was dropped in `0069`) and there are no
+vendor-specific sets.
+
+1. **Pick the document** — any active type of the company (`GET parameter-types/`).
+2. **Fill and save** — `POST entries/` with `parameter_type_id` and one reading per
+   parameter. Saving sends it for approval (PENDING); there are no drafts. Every
+   mandatory parameter needs a value, and an out-of-spec reading needs an entry remark
+   (as on the arrival slip). Each `ProductionQCResult` snapshots the parameter's spec
+   (`ParameterResultBase`), so later edits to the master do not rewrite old entries. A
+   BOOLEAN reading is "Pass"/"Fail" and is its own verdict.
+3. **Approve** — a QC lead, one step: `approve/` or `send-back/` (remark required). A
    sent-back entry is corrected with `PATCH entries/<id>/` and goes back to PENDING;
    an approved one is final.
 
-Lists: PENDING and SENT_BACK entries show whatever the date; a search spans all dates.
+A form checking several samples at once is filled once per sample (net content: one
+entry per bottle; blown bottle: one per mould), so the day's sheet shows them as
+columns, as the paper does.
+
+Lists: `?date=` gives one day, every status; otherwise PENDING and SENT_BACK entries show
+whatever the date and a search spans all dates. `?parameter_type_id=` narrows to one
+document; `?search=` matches the entry no., the document's code / name, and any value
+entered (an `Exists` subquery, so the out-of-spec count is not inflated).
 
 ---
 
@@ -379,12 +387,14 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
 - `qc_store` — arrival-slip add/change/view/submit + `view_rawmaterialinspection`.
 - `qc_chemist` — view slips, inspection add/change/view/submit, `can_approve_as_chemist`.
 - `qc_manager` — **all** `quality_control` permissions (the QAM).
-- The "Production QC" group carries the line-clearance perms; the front-end QC nav is
-  gated on them too, so that group sees the module. Migration `0064` also gives it
-  view + fill on production QC checks.
-- "Production QC Lead" (migration `0064`, empty until an administrator adds the leads)
-  — view + approve checks, and manage the production parameter types. `qc_manager`
-  gets all four production QC perms.
+- The "Production QC" group (the line QC staff, from before `0064`) carries the
+  line-clearance perms; the front-end QC nav is gated on them too, so that group sees
+  the module. Migration `0064` also gives it view + fill on document entries. It keeps
+  its name.
+- "QC Documents Lead" (made by `0064` as "Production QC Lead", renamed by `0071`) —
+  view + approve entries, and manage the document types. `qc_manager` gets all four
+  document perms. `0071` also rewrote the four permissions' stored names
+  ("Can view QC document entries"…); the codenames are unchanged.
 
 ---
 
@@ -396,13 +406,13 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
   `raw_material_inspection.py` (+ `InspectionManagerDecisionLog`),
   `inspection_parameter_result.py`, `inspection_attachment.py`,
   `qc_document_file.py` + `qc_document_file_audit.py` (QA Procedures PDF library),
-  `production_qc.py` (production parameter types, checks and their readings).
+  `production_qc.py` (QC document types, their entries and readings).
   (`models.py` is an empty stub.)
 - `enums.py` — arrival-slip/inspection/decision/workflow/parameter enums.
 - `services/rules.py` — gate-status computation + QC-completed notification.
 - `services/spec_evaluation.py` — free-text spec → `is_within_spec`.
-- `services/production_qc.py` — running lines, saving / correcting / deciding a check.
-- `views_production_qc.py`, `serializers_production_qc.py` — the production QC API.
+- `services/production_qc.py` — saving / correcting / deciding a document entry.
+- `views_production_qc.py`, `serializers_production_qc.py` — the QC Documents API.
 - `views.py` — master data, arrival slips, inspections, approvals, status-based lists.
 - `serializers.py` — all read/write serializers (incl. `_safe_related` FK guard).
 - `permissions.py` — DRF permission classes.

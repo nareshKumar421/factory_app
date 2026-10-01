@@ -1,12 +1,9 @@
 # quality_control/services/production_qc.py
-"""Production QC: which lines can be checked, and saving / deciding a check."""
+"""QC Documents: saving an entry of a document, and approving or sending it back."""
 
-from dataclasses import dataclass
-from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
-from django.db.models import Max, OuterRef, Subquery
 from django.utils import timezone
 
 from ..enums import ParameterType
@@ -17,15 +14,8 @@ from ..models import (
     ProductionQCStatus,
 )
 
-# A line counts as running while its run has an open segment, and for this long
-# after its latest segment started even if the line is stopped just now — a
-# breakdown or the lunch stop closes the segment, and QC still checks the line.
-# Older IN_PROGRESS runs are runs nobody completed, not lines that are running.
-RUNNING_WINDOW = timedelta(hours=24)
-
-
 class ProductionQCError(Exception):
-    """A check that cannot be saved or decided; the message is for the user."""
+    """An entry that cannot be saved or decided; the message is for the user."""
 
     def __init__(self, message, field=None):
         super().__init__(message)
@@ -33,66 +23,6 @@ class ProductionQCError(Exception):
 
     def as_response_data(self):
         return {self.field: [str(self)]} if self.field else {"detail": str(self)}
-
-
-@dataclass
-class RunningLine:
-    line_id: int
-    line_name: str
-    run_id: int
-    run_number: int
-    run_date: object
-    item_code: str
-    product: str
-    is_running_now: bool
-    last_started_at: object
-    stopped_at: object
-
-
-def running_lines(company, now=None):
-    """The lines a check can be made on, one run per line.
-
-    For each line, the IN_PROGRESS run whose latest segment started most
-    recently — so a stale run nobody completed never shadows today's run.
-    """
-    from production_execution.models import ProductionRun, ProductionSegment, RunStatus
-
-    now = now or timezone.now()
-    latest_segment = ProductionSegment.objects.filter(production_run=OuterRef("pk")).order_by(
-        "-start_time"
-    )
-    runs = (
-        ProductionRun.objects.filter(company=company, status=RunStatus.IN_PROGRESS)
-        .annotate(
-            last_started_at=Max("segments__start_time"),
-            last_segment_open=Subquery(latest_segment.values("is_active")[:1]),
-            last_segment_end=Subquery(latest_segment.values("end_time")[:1]),
-        )
-        .filter(last_started_at__isnull=False)
-        .select_related("line")
-        .order_by("line_id", "-last_started_at", "-id")
-    )
-
-    lines = {}
-    for run in runs:
-        if run.line_id in lines:
-            continue
-        open_now = bool(run.last_segment_open) and run.last_segment_end is None
-        if not open_now and run.last_started_at < now - RUNNING_WINDOW:
-            continue
-        lines[run.line_id] = RunningLine(
-            line_id=run.line_id,
-            line_name=run.line.name,
-            run_id=run.id,
-            run_number=run.run_number,
-            run_date=run.date,
-            item_code=(run.item_code or "").strip().upper(),
-            product=run.product,
-            is_running_now=open_now,
-            last_started_at=run.last_started_at,
-            stopped_at=None if open_now else run.last_segment_end,
-        )
-    return sorted(lines.values(), key=lambda line: line.line_name.lower())
 
 
 def _parse_numeric(value):
@@ -154,22 +84,16 @@ def _parameters_of(parameter_type):
 
 
 @transaction.atomic
-def create_entry(company, user, *, run_id, parameter_type_id, readings, remarks=""):
-    """Save a new check on a running line and send it for approval.
+def create_entry(company, user, *, parameter_type_id, readings, remarks=""):
+    """Save a new entry of one of the company's documents and send it for approval.
 
-    Any active type of the company can be checked on any line: types are not
-    tied to products.
+    A document is not tied to production: there is no line or run to pick.
     """
-    line = next((l for l in running_lines(company) if l.run_id == run_id), None)
-    if line is None:
-        raise ProductionQCError(
-            "That run is not on a running line any more. Pick the line again.", "run_id"
-        )
     parameter_type = ProductionParameterType.objects.filter(
         company=company, pk=parameter_type_id, is_active=True
     ).first()
     if parameter_type is None:
-        raise ProductionQCError("Pick a parameter type.", "parameter_type_id")
+        raise ProductionQCError("Pick a document.", "parameter_type_id")
 
     parameters = _parameters_of(parameter_type)
     _check_readings(
@@ -179,10 +103,6 @@ def create_entry(company, user, *, run_id, parameter_type_id, readings, remarks=
     now = timezone.now()
     entry = ProductionQCEntry.objects.create(
         company=company,
-        production_run_id=line.run_id,
-        line_id=line.line_id,
-        item_code=line.item_code,
-        product=line.product,
         parameter_type=parameter_type,
         checked_at=now,
         status=ProductionQCStatus.PENDING,
@@ -202,7 +122,7 @@ def create_entry(company, user, *, run_id, parameter_type_id, readings, remarks=
 
 @transaction.atomic
 def update_entry(entry, user, *, readings, remarks=""):
-    """Correct a check that is waiting for approval or was sent back, and send it again."""
+    """Correct an entry that is waiting for approval or was sent back, and send it again."""
     entry = ProductionQCEntry.objects.select_for_update().get(pk=entry.pk)
     if entry.status == ProductionQCStatus.APPROVED:
         raise ProductionQCError("An approved entry cannot be changed.")

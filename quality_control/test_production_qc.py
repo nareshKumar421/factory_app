@@ -1,7 +1,7 @@
-"""Production QC: running lines, saving a check, approving it, and the groups."""
+"""QC Documents ("production QC" in code): saving an entry, approving it, and the groups."""
 
 import importlib
-from datetime import date, timedelta
+from datetime import timedelta
 
 from django.apps import apps as global_apps
 from django.contrib.auth import get_user_model
@@ -14,12 +14,6 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from company.models import Company, UserCompany, UserRole
-from production_execution.models import (
-    ProductionLine,
-    ProductionRun,
-    ProductionSegment,
-    RunStatus,
-)
 from quality_control.models import (
     QCPrintDocument,
     ProductionParameter,
@@ -62,8 +56,6 @@ class ProductionQCBase(TestCase):
     def setUp(self):
         self.company = Company.objects.create(code="JIVO_OIL", name="Oil")
         self.user = _user(self.company, VIEW, FILL)
-        self.line = ProductionLine.objects.create(company=self.company, name="10 Head")
-        self.run = self._run(self.line, "FG0000228", "SO OLIVE OIL 1 LTR 16 PCS")
         self.type = ProductionParameterType.objects.create(
             company=self.company, code="PET_1L", name="PET 1 L"
         )
@@ -80,20 +72,6 @@ class ProductionQCBase(TestCase):
             standard_value="Legible", value_type="TEXT", sequence=3, is_mandatory=False,
         )
 
-    def _run(self, line, item_code, product, started=None, open_=True, run_date=None):
-        # Run numbers are unique per company and day.
-        run = ProductionRun.objects.create(
-            company=self.company, run_number=ProductionRun.objects.count() + 1,
-            date=run_date or date.today(),
-            line=line, product=product, item_code=item_code, status=RunStatus.IN_PROGRESS,
-        )
-        start = started or timezone.now() - timedelta(hours=1)
-        ProductionSegment.objects.create(
-            production_run=run, start_time=start, is_active=open_,
-            end_time=None if open_ else start + timedelta(minutes=30),
-        )
-        return run
-
     def _readings(self, weight="911", seal="Pass", note=""):
         return {
             self.weight.id: {"result_value": weight},
@@ -104,60 +82,22 @@ class ProductionQCBase(TestCase):
     def _create(self, user=None, **kwargs):
         kwargs.setdefault("readings", self._readings())
         return service.create_entry(
-            self.company, user or self.user, run_id=self.run.id,
-            parameter_type_id=self.type.id, **kwargs,
+            self.company, user or self.user, parameter_type_id=self.type.id, **kwargs
         )
-
-
-class RunningLinesTests(ProductionQCBase):
-    def test_a_line_with_an_open_segment_is_running(self):
-        [line] = service.running_lines(self.company)
-        self.assertEqual(line.run_id, self.run.id)
-        self.assertEqual(line.item_code, "FG0000228")
-        self.assertTrue(line.is_running_now)
-
-    def test_a_line_stopped_today_is_still_offered(self):
-        other = ProductionLine.objects.create(company=self.company, name="6 Head")
-        run = self._run(other, "FG0000043", "COLD PRESS 3 LTR", open_=False)
-        offered = {line.line_id: line for line in service.running_lines(self.company)}
-        self.assertIn(other.id, offered)
-        self.assertEqual(offered[other.id].run_id, run.id)
-        self.assertFalse(offered[other.id].is_running_now)
-        self.assertIsNotNone(offered[other.id].stopped_at)
-
-    def test_a_run_nobody_completed_is_not_a_running_line(self):
-        old = ProductionLine.objects.create(company=self.company, name="Manual")
-        self._run(old, "FG1", "Old", started=timezone.now() - timedelta(days=40), open_=False)
-        self.assertNotIn(old.id, [line.line_id for line in service.running_lines(self.company)])
-
-    def test_todays_run_wins_over_a_stale_run_left_open_on_the_same_line(self):
-        self._run(
-            self.line, "FG0000030", "Stale", started=timezone.now() - timedelta(days=70),
-            run_date=date.today() - timedelta(days=70),
-        )
-        [line] = service.running_lines(self.company)
-        self.assertEqual(line.run_id, self.run.id)
-
-    def test_a_completed_run_is_not_offered(self):
-        self.run.status = RunStatus.COMPLETED
-        self.run.save()
-        self.assertEqual(service.running_lines(self.company), [])
 
 
 class CreateEntryTests(ProductionQCBase):
     def test_saving_sends_it_for_approval_with_the_spec_snapshotted(self):
         entry = self._create()
         self.assertEqual(entry.status, ProductionQCStatus.PENDING)
-        self.assertEqual(entry.line, self.line)
-        self.assertEqual(entry.product, "SO OLIVE OIL 1 LTR 16 PCS")
+        self.assertEqual(entry.parameter_type, self.type)
         weight = entry.results.get(parameter_master=self.weight)
         self.assertEqual(weight.standard_value, "910±5")
         self.assertEqual(weight.parameter_type, "NUMERIC")
         self.assertTrue(weight.is_within_spec)
 
-    def test_any_type_can_be_checked_on_any_line(self):
-        # Types are not tied to products: a second type on the same product's
-        # line saves just as the first does.
+    def test_any_of_the_companys_documents_can_be_filled(self):
+        # A document is not tied to production: there is no line or run to pick.
         self._create()
         other = ProductionParameterType.objects.create(
             company=self.company, code="BACKWASH", name="Backwashing"
@@ -167,11 +107,10 @@ class CreateEntryTests(ProductionQCBase):
             standard_value="-", value_type="TEXT", sequence=1,
         )
         entry = service.create_entry(
-            self.company, self.user, run_id=self.run.id, parameter_type_id=other.id,
+            self.company, self.user, parameter_type_id=other.id,
             readings={equipment.id: {"result_value": "Micron filter"}},
         )
         self.assertEqual(entry.parameter_type, other)
-        self.assertEqual(entry.item_code, "FG0000228")
 
     def test_an_inactive_type_cannot_be_checked(self):
         self.type.is_active = False
@@ -199,18 +138,11 @@ class CreateEntryTests(ProductionQCBase):
         entry = self._create(readings=self._readings(seal="Fail"), remarks="Leak on head 2")
         self.assertFalse(entry.results.get(parameter_master=self.seal).is_within_spec)
 
-    def test_only_a_running_line_can_be_checked(self):
-        self.run.status = RunStatus.COMPLETED
-        self.run.save()
-        with self.assertRaises(ProductionQCError) as caught:
-            self._create()
-        self.assertEqual(caught.exception.field, "run_id")
-
     def test_a_type_without_parameters_cannot_be_used(self):
         empty = ProductionParameterType.objects.create(company=self.company, code="E", name="E")
         with self.assertRaises(ProductionQCError):
             service.create_entry(
-                self.company, self.user, run_id=self.run.id, parameter_type_id=empty.id,
+                self.company, self.user, parameter_type_id=empty.id,
                 readings={},
             )
 
@@ -261,7 +193,6 @@ class DecisionTests(ProductionQCBase):
 class ProductionQCAPITests(ProductionQCBase):
     def _payload(self, **overrides):
         payload = {
-            "run_id": self.run.id,
             "parameter_type_id": self.type.id,
             "remarks": "",
             "results": [
@@ -271,15 +202,26 @@ class ProductionQCAPITests(ProductionQCBase):
         payload.update(overrides)
         return payload
 
-    def test_neither_lines_nor_types_carry_products(self):
-        resp = _client(self.company, FILL).get(reverse("production-qc-running-lines"))
-        self.assertEqual(resp.status_code, 200, resp.data)
-        self.assertEqual(resp.data[0]["item_code"], "FG0000228")
-        self.assertNotIn("linked_parameter_types", resp.data[0])
+    def test_entries_and_types_carry_no_production(self):
+        client = _client(self.company, VIEW, FILL)
+        resp = client.post(reverse("production-qc-entries"), self._payload(), format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        for field in ("line_id", "line_name", "run_id", "run_number", "item_code", "product"):
+            self.assertNotIn(field, resp.data)
 
         resp = _client(self.company, MANAGE).get(reverse("production-qc-parameter-types"))
         self.assertEqual(resp.status_code, 200, resp.data)
         self.assertNotIn("items", resp.data[0])
+
+    def test_entries_are_filtered_by_document(self):
+        self._create()
+        other = ProductionParameterType.objects.create(
+            company=self.company, code="BACKWASH", name="Backwashing"
+        )
+        resp = _client(self.company, VIEW).get(
+            reverse("production-qc-entries"), {"parameter_type_id": other.id}
+        )
+        self.assertEqual(resp.data, [])
 
     def test_a_filler_saves_and_cannot_approve(self):
         client = _client(self.company, VIEW, FILL)
@@ -407,9 +349,19 @@ class ProductionQCDayTests(ProductionQCBase):
 
     def test_a_search_stays_on_the_day(self):
         resp = self.client_.get(
-            reverse("production-qc-entries"), {"date": self.today, "search": "OLIVE"}
+            reverse("production-qc-entries"), {"date": self.today, "search": "PET"}
         )
         self.assertEqual([row["id"] for row in resp.data], [self.today_entry.id])
+
+    def test_a_search_reads_the_entered_values(self):
+        # The paper header (product, batch...) is entered as readings.
+        tagged = self._create(readings=self._readings(note="Batch L2-0917"))
+        resp = self.client_.get(
+            reverse("production-qc-entries"), {"date": self.today, "search": "l2-09"}
+        )
+        self.assertEqual([row["id"] for row in resp.data], [tagged.id])
+        # One matching reading is one row, and its out-of-spec count is not inflated.
+        self.assertEqual(resp.data[0]["out_of_spec_count"], 0)
 
     def test_the_sheet_gets_the_readings(self):
         resp = self.client_.get(
@@ -457,7 +409,7 @@ class ProductionFormNumberTests(ProductionQCBase):
         labels = [option["label"] for option in resp.data]
         self.assertEqual(
             labels,
-            ["Arrival Slip Inspection Print", "Arrival Slip QC Parameters Print", "Production QC — PET 1 L"],
+            ["Arrival Slip Inspection Print", "Arrival Slip QC Parameters Print", "Document — PET 1 L"],
         )
         self.assertEqual(resp.data[2]["production_parameter_type"], self.type.id)
 
@@ -465,7 +417,7 @@ class ProductionFormNumberTests(ProductionQCBase):
         resp = self._set(document_key="PRODUCTION_QC_SHEET",
                          production_parameter_type=self.type.id, document_id="QA-FRM-14-01-05-02")
         self.assertEqual(resp.status_code, 201, resp.data)
-        self.assertEqual(resp.data["document_key_label"], "Production QC — PET 1 L")
+        self.assertEqual(resp.data["document_key_label"], "Document — PET 1 L")
 
         resp = _client(self.company, VIEW).get(
             reverse("production-qc-parameter-type-detail", args=[self.type.id])
@@ -481,7 +433,7 @@ class ProductionFormNumberTests(ProductionQCBase):
         listed = self.admin.get(reverse("qc-print-document-list-create")).data
         self.assertEqual(
             [(row["document_key_label"], row["document_id"]) for row in listed],
-            [("Production QC — PET 1 L", "QA-FRM-14-01-05-02")],
+            [("Document — PET 1 L", "QA-FRM-14-01-05-02")],
         )
 
         # Changed in Print Documents, the type reads the change.
@@ -567,4 +519,39 @@ class ProductionQCGroupsMigrationTests(TestCase):
         self.assertFalse(Group.objects.filter(name="Production QC Lead").exists())
         self.assertFalse(
             Group.objects.get(name="Production QC").permissions.filter(codename=FILL).exists()
+        )
+
+
+class DocumentsRenameMigrationTests(TestCase):
+    """0071: the lead's group and the permission labels say Documents now."""
+
+    class _Editor:
+        connection = connection
+
+    migration = importlib.import_module(
+        "quality_control.migrations.0071_rename_production_qc_to_documents"
+    )
+
+    def test_the_lead_group_is_renamed_and_keeps_its_members(self):
+        Group.objects.filter(name="QC Documents Lead").delete()
+        lead = Group.objects.create(name="Production QC Lead")
+        member = _user(Company.objects.create(code="JIVO_BEV", name="Bev"))
+        member.groups.add(lead)
+        line_qc, _ = Group.objects.get_or_create(name="Production QC")
+
+        self.migration.forwards(global_apps, self._Editor())
+        lead.refresh_from_db()
+        self.assertEqual(lead.name, "QC Documents Lead")
+        self.assertTrue(lead.user_set.filter(pk=member.pk).exists())
+        # The line QC staff's own group keeps its name.
+        self.assertTrue(Group.objects.filter(pk=line_qc.pk, name="Production QC").exists())
+        self.assertEqual(
+            Permission.objects.get(codename=VIEW).name, "Can view QC document entries"
+        )
+
+        self.migration.backwards(global_apps, self._Editor())
+        lead.refresh_from_db()
+        self.assertEqual(lead.name, "Production QC Lead")
+        self.assertEqual(
+            Permission.objects.get(codename=VIEW).name, "Can view production QC entries"
         )
