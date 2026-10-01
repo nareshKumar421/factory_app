@@ -3,7 +3,8 @@
 
 from datetime import date
 
-from django.db.models import Count, Exists, Min, OuterRef, Q
+from django.db import transaction
+from django.db.models import Count, Exists, Min, OuterRef, Prefetch, Q
 from django.db.models.functions import TruncDate
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -17,7 +18,9 @@ from company.permissions import HasCompanyContext
 from .models import (
     QCPrintDocument,
     ProductionParameter,
+    ProductionParameterDefaultValue,
     ProductionParameterType,
+    ProductionParameterTypeDefault,
     ProductionQCEntry,
     ProductionQCResult,
     ProductionQCStatus,
@@ -30,6 +33,8 @@ from .permissions import (
 )
 from .serializers_production_qc import (
     ProductionParameterSerializer,
+    ProductionParameterTypeDefaultSerializer,
+    ProductionParameterTypeDefaultWriteSerializer,
     ProductionParameterTypeSerializer,
     ProductionParameterTypeWriteSerializer,
     ProductionParameterWriteSerializer,
@@ -73,7 +78,10 @@ def _types(company):
         .annotate(
             active_parameter_count=Count(
                 "parameters", filter=Q(parameters__is_active=True), distinct=True
-            )
+            ),
+            active_default_count=Count(
+                "defaults", filter=Q(defaults__is_active=True), distinct=True
+            ),
         )
         .prefetch_related("print_documents")
     )
@@ -83,8 +91,15 @@ def _entries(company):
     return (
         ProductionQCEntry.objects.filter(company=company, is_active=True)
         .select_related(
-            "parameter_type",
+            "parameter_type", "submission",
             "submitted_by", "approved_by", "sent_back_by",
+        )
+        # The entries sent with each one, for its `submission_entry_ids`.
+        .prefetch_related(
+            Prefetch(
+                "submission__entries",
+                queryset=ProductionQCEntry.objects.only("id", "submission_id", "is_active"),
+            )
         )
         .annotate(out_of_spec=Count("results", filter=Q(results__is_within_spec=False)))
     )
@@ -156,6 +171,7 @@ class ProductionQCEntryListCreateAPI(APIView):
             match = (
                 Q(parameter_type__name__icontains=search)
                 | Q(parameter_type__code__icontains=search)
+                | Q(default_name__icontains=search)
                 | Exists(
                     ProductionQCResult.objects.filter(
                         entry=OuterRef("pk"), result_value__icontains=search
@@ -166,7 +182,11 @@ class ProductionQCEntryListCreateAPI(APIView):
                 match |= Q(pk=int(search))
             qs = qs.filter(match)
 
-        if day:
+        submission_id = params.get("submission_id")
+        if submission_id:
+            # The entries sent together — corrected together — whatever their date.
+            qs = qs.filter(submission_id=submission_id).order_by("id")
+        elif day:
             # One day's record, like the paper form: every status, that day only.
             qs = qs.filter(checked_at__date=day)
         elif not search and status_filter not in UNFINISHED:
@@ -193,16 +213,18 @@ class ProductionQCEntryListCreateAPI(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
-            entry = service.create_entry(
+            entries = service.create_entries(
                 request.company.company,
                 request.user,
                 parameter_type_id=data["parameter_type_id"],
-                readings=serializer.readings(),
+                default_id=data.get("default_id"),
+                samples=serializer.samples_readings(),
                 remarks=data.get("remarks", ""),
             )
         except service.ProductionQCError as exc:
             return _error(exc)
-        entry = _entries(request.company.company).get(pk=entry.pk)
+        # The first of them; its `submission_entry_ids` name the rest.
+        entry = _entries(request.company.company).get(pk=entries[0].pk)
         return Response(
             ProductionQCEntryDetailSerializer(entry).data, status=status.HTTP_201_CREATED
         )
@@ -279,10 +301,10 @@ class ProductionQCEntryDetailAPI(APIView):
         serializer = ProductionQCEntryUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            service.update_entry(
+            service.update_entries(
                 entry,
                 request.user,
-                readings=serializer.readings(),
+                readings_by_entry=serializer.readings_by_entry(entry),
                 remarks=serializer.validated_data.get("remarks", ""),
             )
         except service.ProductionQCError as exc:
@@ -487,3 +509,107 @@ class ProductionParameterDetailAPI(APIView):
         parameter.save(update_fields=["is_active", "updated_by", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+
+# ==================== Defaults ====================
+
+
+def _defaults(parameter_type):
+    return parameter_type.defaults.filter(is_active=True).prefetch_related("values")
+
+
+def _check_default(parameter_type, data, default=None):
+    """A 400 for a name the report already has or a parameter it does not; else None."""
+    taken = parameter_type.defaults.filter(is_active=True, name__iexact=data["name"])
+    if default is not None:
+        taken = taken.exclude(pk=default.pk)
+    if taken.exists():
+        return Response(
+            {"name": ["This report already has a default with this name."]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    own = set(parameter_type.parameters.filter(is_active=True).values_list("pk", flat=True))
+    if any(row["parameter_id"] not in own for row in data["values"]):
+        return Response(
+            {"values": ["A value was sent for a parameter not in this report."]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return None
+
+
+def _replace_values(default, rows):
+    default.values.all().delete()
+    ProductionParameterDefaultValue.objects.bulk_create([
+        ProductionParameterDefaultValue(default=default, **row) for row in rows
+    ])
+
+
+class ProductionParameterTypeDefaultListCreateAPI(APIView):
+    """A report's defaults — one per SKU, say: anyone who fills reads them; managers keep them."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanReadOrManageProductionQCParameters]
+
+    def get(self, request, type_id):
+        parameter_type = get_object_or_404(
+            ProductionParameterType, company=request.company.company, pk=type_id
+        )
+        return Response(ProductionParameterTypeDefaultSerializer(_defaults(parameter_type), many=True).data)
+
+    def post(self, request, type_id):
+        parameter_type = get_object_or_404(
+            ProductionParameterType, company=request.company.company, is_active=True, pk=type_id
+        )
+        serializer = ProductionParameterTypeDefaultWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        error = _check_default(parameter_type, data)
+        if error:
+            return error
+        with transaction.atomic():
+            default = ProductionParameterTypeDefault.objects.create(
+                parameter_type=parameter_type, name=data["name"],
+                created_by=request.user, updated_by=request.user,
+            )
+            _replace_values(default, data["values"])
+        default = _defaults(parameter_type).get(pk=default.pk)
+        return Response(
+            ProductionParameterTypeDefaultSerializer(default).data, status=status.HTTP_201_CREATED
+        )
+
+
+class ProductionParameterTypeDefaultDetailAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanReadOrManageProductionQCParameters]
+
+    def _get(self, request, default_id):
+        return get_object_or_404(
+            ProductionParameterTypeDefault.objects.select_related("parameter_type").prefetch_related("values"),
+            parameter_type__company=request.company.company,
+            is_active=True,
+            pk=default_id,
+        )
+
+    def get(self, request, default_id):
+        return Response(ProductionParameterTypeDefaultSerializer(self._get(request, default_id)).data)
+
+    def put(self, request, default_id):
+        """Replace the name and every value: the editor sends the whole default."""
+        default = self._get(request, default_id)
+        serializer = ProductionParameterTypeDefaultWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        error = _check_default(default.parameter_type, data, default)
+        if error:
+            return error
+        with transaction.atomic():
+            default.name = data["name"]
+            default.updated_by = request.user
+            default.save(update_fields=["name", "updated_by", "updated_at"])
+            _replace_values(default, data["values"])
+        return Response(ProductionParameterTypeDefaultSerializer(self._get(request, default_id)).data)
+
+    def delete(self, request, default_id):
+        # Soft: entries made with it keep its name and the standards they were judged on.
+        default = self._get(request, default_id)
+        default.is_active = False
+        default.updated_by = request.user
+        default.save(update_fields=["is_active", "updated_by", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)

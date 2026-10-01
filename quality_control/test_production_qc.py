@@ -17,9 +17,12 @@ from company.models import Company, UserCompany, UserRole
 from quality_control.models import (
     QCPrintDocument,
     ProductionParameter,
+    ProductionParameterDefaultValue,
     ProductionParameterType,
+    ProductionParameterTypeDefault,
     ProductionQCEntry,
     ProductionQCStatus,
+    ProductionQCSubmission,
 )
 from quality_control.services import production_qc as service
 from quality_control.services.production_qc import ProductionQCError
@@ -585,3 +588,253 @@ class QAReportsRenameMigrationTests(TestCase):
         self.assertEqual(
             Permission.objects.get(codename=APPROVE).name, "Can approve QC document entries"
         )
+
+
+class ReportDefaultsTests(ProductionQCBase):
+    """A report's named defaults: per-SKU standards, and values they pre-fill."""
+
+    def _default(self, name="1 L PET", **values):
+        default = ProductionParameterTypeDefault.objects.create(parameter_type=self.type, name=name)
+        for parameter, fields in values.items():
+            ProductionParameterDefaultValue.objects.create(
+                default=default, parameter=getattr(self, parameter), **fields
+            )
+        return default
+
+    def test_the_defaults_standard_is_the_one_the_entry_is_judged_on(self):
+        default = self._default(weight={"standard_value": "1000 ± 5"})
+        entry = self._create(readings=self._readings(weight="1002"), default_id=default.id)
+        weight = entry.results.get(parameter_master=self.weight)
+        self.assertEqual(weight.standard_value, "1000 ± 5")
+        self.assertTrue(weight.is_within_spec)
+        self.assertEqual(entry.default, default)
+        self.assertEqual(entry.default_name, "1 L PET")
+
+    def test_with_no_default_the_reports_own_standard_applies(self):
+        self._default(weight={"standard_value": "1000 ± 5"})
+        with self.assertRaises(ProductionQCError) as caught:
+            self._create(readings=self._readings(weight="1002"))
+        self.assertEqual(caught.exception.field, "remarks")  # 1002 is out of 910±5
+
+    def test_a_pre_fill_alone_leaves_the_spec_alone(self):
+        default = self._default(note={"value": "Legible, batch L2"})
+        entry = self._create(default_id=default.id)
+        self.assertEqual(entry.results.get(parameter_master=self.note).standard_value, "Legible")
+
+    def test_a_min_or_max_alone_replaces_the_spec(self):
+        default = self._default(weight={"max_value": "905"})
+        entry = self._create(readings=self._readings(weight="904"), default_id=default.id)
+        weight = entry.results.get(parameter_master=self.weight)
+        self.assertEqual(weight.standard_value, "-")
+        self.assertEqual(weight.max_value, 905)
+        self.assertTrue(weight.is_within_spec)
+
+    def test_a_default_of_another_report_or_a_removed_one_is_refused(self):
+        other = ProductionParameterType.objects.create(company=self.company, code="X", name="X")
+        foreign = ProductionParameterTypeDefault.objects.create(parameter_type=other, name="X 1")
+        removed = self._default(name="Old")
+        removed.is_active = False
+        removed.save()
+        for default in (foreign, removed):
+            with self.assertRaises(ProductionQCError) as caught:
+                self._create(default_id=default.id)
+            self.assertEqual(caught.exception.field, "default_id")
+
+    def test_a_filler_reads_defaults_and_a_manager_keeps_them(self):
+        url = reverse("production-qc-type-defaults", args=[self.type.id])
+        payload = {"name": "1 L PET", "values": [
+            {"parameter_id": self.weight.id, "standard_value": "1000 ± 5"},
+            {"parameter_id": self.note.id, "value": "L2"},
+            {"parameter_id": self.seal.id},  # sets nothing: dropped
+        ]}
+        filler = _client(self.company, FILL)
+        self.assertEqual(filler.post(url, payload, format="json").status_code, 403)
+
+        manager = _client(self.company, MANAGE)
+        resp = manager.post(url, payload, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(
+            {row["parameter_id"] for row in resp.data["values"]}, {self.weight.id, self.note.id}
+        )
+
+        resp = filler.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([d["name"] for d in resp.data], ["1 L PET"])
+        types = manager.get(reverse("production-qc-parameter-types")).data
+        self.assertEqual(types[0]["default_count"], 1)
+
+    def test_a_default_is_checked_replaced_and_removed(self):
+        manager = _client(self.company, MANAGE)
+        url = reverse("production-qc-type-defaults", args=[self.type.id])
+        created = manager.post(url, {"name": "1 L PET", "values": []}, format="json").data
+
+        resp = manager.post(url, {"name": "1 l pet"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("name", resp.data)
+
+        other = ProductionParameterType.objects.create(company=self.company, code="X", name="X")
+        stray = ProductionParameter.objects.create(
+            parameter_type=other, parameter_code="P", parameter_name="P", standard_value="-"
+        )
+        resp = manager.post(url, {"name": "B", "values": [{"parameter_id": stray.id, "value": "1"}]},
+                            format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("values", resp.data)
+
+        detail = reverse("production-qc-default-detail", args=[created["id"]])
+        resp = manager.put(detail, {"name": "1 L PET Canola", "values": [
+            {"parameter_id": self.weight.id, "min_value": "905", "max_value": "900"},
+        ]}, format="json")
+        self.assertEqual(resp.status_code, 400)  # max below min
+        resp = manager.put(detail, {"name": "1 L PET Canola", "values": [
+            {"parameter_id": self.weight.id, "min_value": "995", "max_value": "1005"},
+        ]}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["name"], "1 L PET Canola")
+        self.assertEqual(len(resp.data["values"]), 1)
+
+        self.assertEqual(manager.delete(detail).status_code, 204)
+        self.assertEqual(manager.get(url).data, [])
+
+    def test_an_entry_carries_its_default_and_is_found_by_it(self):
+        default = self._default(name="5 L Jar Mustard")
+        client = _client(self.company, VIEW, FILL)
+        resp = client.post(reverse("production-qc-entries"), {
+            "parameter_type_id": self.type.id, "default_id": default.id, "remarks": "",
+            "results": [{"parameter_id": pid, **data} for pid, data in self._readings().items()],
+        }, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual((resp.data["default_id"], resp.data["default_name"]), (default.id, "5 L Jar Mustard"))
+        found = client.get(reverse("production-qc-entries"), {"search": "jar mus"}).data
+        self.assertEqual([row["id"] for row in found], [resp.data["id"]])
+
+
+class SubmissionTests(ProductionQCBase):
+    """Several samples filled together: separate entries, one decision."""
+
+    def _create_many(self, *samples, **kwargs):
+        return service.create_entries(
+            self.company, self.user, parameter_type_id=self.type.id,
+            samples=list(samples), **kwargs,
+        )
+
+    def test_samples_filled_together_are_separate_entries_of_one_submission(self):
+        entries = self._create_many(self._readings(weight="911"), self._readings(weight="909"))
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(len({e.pk for e in entries}), 2)
+        self.assertEqual(len({e.submission_id for e in entries}), 1)
+        self.assertEqual(entries[0].checked_at, entries[1].checked_at)
+        self.assertEqual(
+            [e.results.get(parameter_master=self.weight).result_value for e in entries],
+            ["911", "909"],
+        )
+
+    def test_a_sample_short_of_a_value_is_named(self):
+        with self.assertRaises(ProductionQCError) as caught:
+            self._create_many(self._readings(), self._readings(weight=""))
+        self.assertIn("Sample 2", str(caught.exception))
+        self.assertFalse(ProductionQCEntry.objects.exists())
+
+    def test_one_remark_is_needed_when_any_sample_is_out_of_spec(self):
+        with self.assertRaises(ProductionQCError) as caught:
+            self._create_many(self._readings(), self._readings(weight="890"))
+        self.assertEqual(caught.exception.field, "remarks")
+
+        entries = self._create_many(self._readings(), self._readings(weight="890"), remarks="Mould 2 light")
+        self.assertEqual({e.remarks for e in entries}, {"Mould 2 light"})
+
+    def test_approving_or_sending_back_one_decides_them_all(self):
+        first, second = self._create_many(self._readings(), self._readings())
+        service.send_back_entry(second, self.user, "Recheck both")
+        self.assertEqual(
+            set(ProductionQCEntry.objects.values_list("status", flat=True)), {"SENT_BACK"}
+        )
+        service.update_entries(first, self.user, readings_by_entry={
+            first.pk: self._readings(weight="912"), second.pk: self._readings(weight="908"),
+        })
+        service.approve_entry(first, self.user)
+        self.assertEqual(
+            set(ProductionQCEntry.objects.values_list("status", flat=True)), {"APPROVED"}
+        )
+
+    def test_an_entry_sent_with_others_is_corrected_with_them(self):
+        first, second = self._create_many(self._readings(), self._readings())
+        with self.assertRaises(ProductionQCError) as caught:
+            service.update_entry(first, self.user, readings=self._readings(weight="912"))
+        self.assertEqual(caught.exception.field, "samples")
+
+    def test_an_entry_on_its_own_is_a_submission_of_one(self):
+        entry = self._create()
+        self.assertEqual(entry.submission.entries.count(), 1)
+        corrected = service.update_entry(entry, self.user, readings=self._readings(weight="912"))
+        self.assertEqual(corrected.status, "PENDING")
+
+    def test_the_api_takes_samples_and_names_the_entries_sent_together(self):
+        client = _client(self.company, VIEW, FILL)
+        payload = {
+            "parameter_type_id": self.type.id, "remarks": "",
+            "samples": [
+                {"results": [{"parameter_id": pid, **d} for pid, d in self._readings().items()]}
+                for _ in range(3)
+            ],
+        }
+        resp = client.post(reverse("production-qc-entries"), payload, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        ids = resp.data["submission_entry_ids"]
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(resp.data["id"], ids[0])
+
+        sent = client.get(
+            reverse("production-qc-entries"),
+            {"submission_id": resp.data["submission_id"], "include": "results"},
+        ).data
+        self.assertEqual([e["id"] for e in sent], ids)
+        self.assertEqual(len(sent[0]["results"]), 3)
+
+        resp = client.patch(reverse("production-qc-entry-detail", args=[ids[1]]), {
+            "remarks": "", "samples": [
+                {"entry_id": i, "results": [{"parameter_id": pid, **d} for pid, d in self._readings().items()]}
+                for i in ids
+            ],
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+        lead = _client(self.company, VIEW, APPROVE)
+        resp = lead.post(reverse("production-qc-entry-approve", args=[ids[2]]), {}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(
+            list(ProductionQCEntry.objects.filter(pk__in=ids).values_list("status", flat=True)),
+            ["APPROVED"] * 3,
+        )
+
+    def test_results_and_samples_cannot_both_be_sent(self):
+        resp = _client(self.company, FILL).post(reverse("production-qc-entries"), {
+            "parameter_type_id": self.type.id,
+            "results": [], "samples": [],
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("samples", resp.data)
+
+
+class OwnSubmissionMigrationTests(ProductionQCBase):
+    """0075: an entry made before submissions gets one of its own."""
+
+    migration = importlib.import_module(
+        "quality_control.migrations.0075_own_submission_for_older_entries"
+    )
+
+    class _Editor:
+        connection = connection
+
+    def test_each_older_entry_gets_its_own(self):
+        a, b = self._create(), self._create()
+        ProductionQCEntry.objects.update(submission=None)
+        ProductionQCSubmission.objects.all().delete()
+
+        self.migration.forwards(global_apps, self._Editor())
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertIsNotNone(a.submission_id)
+        self.assertNotEqual(a.submission_id, b.submission_id)
+        self.migration.forwards(global_apps, self._Editor())  # nothing left to do
+        self.assertEqual(ProductionQCSubmission.objects.count(), 2)

@@ -57,6 +57,8 @@ from .views_production_qc import (
     ProductionParameterTypeDetailAPI,
     ProductionParameterListCreateAPI,
     ProductionParameterDetailAPI,
+    ProductionParameterTypeDefaultDetailAPI,
+    ProductionParameterTypeDefaultListCreateAPI,
 )
 from .views_qc_document_file import (
     QCDocumentFileListCreateAPI,
@@ -89,6 +91,10 @@ urlpatterns = [
          ProductionParameterListCreateAPI.as_view(), name="production-qc-parameters"),
     path("production-qc/parameters/<int:parameter_id>/", ProductionParameterDetailAPI.as_view(),
          name="production-qc-parameter-detail"),
+    path("production-qc/parameter-types/<int:type_id>/defaults/",
+         ProductionParameterTypeDefaultListCreateAPI.as_view(), name="production-qc-type-defaults"),
+    path("production-qc/defaults/<int:default_id>/", ProductionParameterTypeDefaultDetailAPI.as_view(),
+         name="production-qc-default-detail"),
 
     # ==================== QC PDF Document Library ====================
     path(

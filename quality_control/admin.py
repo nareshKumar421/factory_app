@@ -564,7 +564,9 @@ class QCDocumentFileAuditLogAdmin(admin.ModelAdmin):
 
 from .models import (  # noqa: E402
     ProductionParameter,
+    ProductionParameterDefaultValue,
     ProductionParameterType,
+    ProductionParameterTypeDefault,
     ProductionQCEntry,
     ProductionQCResult,
 )
@@ -583,6 +585,22 @@ class ProductionParameterTypeAdmin(admin.ModelAdmin):
     list_filter = ("company", "is_active")
     search_fields = ("code", "name")
     inlines = [ProductionParameterInline]
+
+
+class ProductionParameterDefaultValueInline(admin.TabularInline):
+    model = ProductionParameterDefaultValue
+    extra = 0
+    fields = ("parameter", "standard_value", "min_value", "max_value", "value")
+    raw_id_fields = ("parameter",)
+
+
+@admin.register(ProductionParameterTypeDefault)
+class ProductionParameterTypeDefaultAdmin(admin.ModelAdmin):
+    list_display = ("name", "parameter_type", "is_active")
+    list_filter = ("is_active", "parameter_type__company")
+    search_fields = ("name", "parameter_type__code", "parameter_type__name")
+    raw_id_fields = ("parameter_type",)
+    inlines = [ProductionParameterDefaultValueInline]
 
 
 class ProductionQCResultInline(admin.TabularInline):

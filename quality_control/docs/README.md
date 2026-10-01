@@ -181,7 +181,20 @@ number is its Print Documents row (`QCPrintDocument` PRODUCTION_QC_SHEET, one pe
 Types are not tied to products (the link table was dropped in `0069`) and there are no
 vendor-specific sets.
 
-1. **Pick the report** — any active type of the company (`GET parameter-types/`).
+**Defaults** (`0073`): standards differ by SKU, so a type keeps named defaults
+(`ProductionParameterTypeDefault`, e.g. "1 L PET Canola"; the name is unique among the
+type's active ones). Per parameter (`ProductionParameterDefaultValue`) a default may
+set the spec — standard, min and max, which replace the parameter's together when any
+of the three is set (a blank standard then reads "-"; all three blank keeps the
+parameter's) — and a `value` the form pre-fills, which stays editable. Anyone who
+reads the types reads them (`GET parameter-types/<id>/defaults/`); MANAGE creates,
+replaces (`PUT defaults/<id>/`, the whole default) and soft-removes them.
+
+1. **Pick the report** — any active type of the company (`GET parameter-types/`) —
+   and, optionally, one of its defaults (`default_id`). An entry made with one is
+   snapshotted with the default's spec where it sets one, and keeps `default` and
+   `default_name`; a default of another type, or a removed one, is refused on
+   `default_id`.
 2. **Fill and save** — `POST entries/` with `parameter_type_id` and one reading per
    parameter. Saving sends it for approval (PENDING); there are no drafts. Every
    mandatory parameter needs a value, and an out-of-spec reading needs an entry remark
@@ -192,13 +205,21 @@ vendor-specific sets.
    sent-back entry is corrected with `PATCH entries/<id>/` and goes back to PENDING;
    an approved one is final.
 
-A form checking several samples at once is filled once per sample (net content: one
-entry per bottle; blown bottle: one per mould), so the day's sheet shows them as
-columns, as the paper does.
+**Several samples in one go** (`0074`, `0075`): a form checking several samples at once
+(net content: one per bottle; blown bottle: one per mould) is filled in one go —
+`POST entries/` with `samples: [{results}, …]` instead of `results`. Each sample is
+its own `ProductionQCEntry` (its own row in the list, its own column on the sheet and
+the print), and they share one `ProductionQCSubmission`: the default, the time, the
+remark, and the decision. Approving or sending back any of them does all of them; a
+correction sends every one (`PATCH entries/<id>/` with `samples: [{entry_id,
+results}, …]`) and a lone one is refused on `samples`. A missing value is reported as
+"Sample N: …". Every entry has a submission (`0075` gave each older entry its own);
+`submission_entry_ids` on an entry lists them all, and `?submission_id=` lists them
+whatever their date.
 
 Lists: `?date=` gives one day, every status; otherwise PENDING and SENT_BACK entries show
 whatever the date and a search spans all dates. `?parameter_type_id=` narrows to one
-report; `?search=` matches the entry no., the report's code / name, and any value
+report; `?search=` matches the entry no., the report's code / name, the default's name, and any value
 entered (an `Exists` subquery, so the out-of-spec count is not inflated).
 
 ---

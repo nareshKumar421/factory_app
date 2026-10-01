@@ -11,8 +11,15 @@ parameters it records (:class:`ProductionParameter`, with the spec each must
 meet). It is not tied to lines, runs or products — whatever the paper header
 asks for (product, line, batch...) is one of its parameters.
 
+A type keeps named defaults (:class:`ProductionParameterTypeDefault`, one per
+SKU, say): the standards an entry is judged against and values it pre-fills,
+per parameter (:class:`ProductionParameterDefaultValue`).
+
 An entry is a :class:`ProductionQCEntry`: one filled-in copy of the form at a
-time, holding one :class:`ProductionQCResult` per parameter. Saving it sends it
+time, made with one of the type's defaults or none, holding one
+:class:`ProductionQCResult` per parameter. Entries filled together (a check
+across several moulds, say) share a :class:`ProductionQCSubmission`: separate
+everywhere, but approved, sent back and corrected as one. Saving it sends it
 for approval; a QC lead approves it or sends it back with a remark, and a
 sent-back entry is corrected and saved again.
 """
@@ -83,10 +90,93 @@ class ProductionParameter(BaseModel):
         return f"{self.parameter_type.code} - {self.parameter_name}"
 
 
+class ProductionParameterTypeDefault(BaseModel):
+    """A named set of values for one report type, e.g. "1 L PET Canola".
+
+    The standards on a QA report are per SKU, so a report type keeps one default
+    per SKU (or whatever the QC manager splits it by). Picked when an entry is
+    made, it sets the standards that entry is judged against and pre-fills
+    values; an entry can also be made with none, on the type's own standards.
+    """
+
+    parameter_type = models.ForeignKey(
+        ProductionParameterType, on_delete=models.CASCADE, related_name="defaults"
+    )
+    name = models.CharField(max_length=200)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["parameter_type", "name"],
+                condition=models.Q(is_active=True),
+                name="uq_production_type_default_name",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.parameter_type.code} - {self.name}"
+
+
+class ProductionParameterDefaultValue(models.Model):
+    """What one default sets for one parameter.
+
+    The spec — standard, min, max — replaces the parameter's own when any of the
+    three is set (a blank standard then reads "-"); all three blank keeps the
+    parameter's. ``value`` pre-fills the reading, which stays editable.
+    """
+
+    default = models.ForeignKey(
+        ProductionParameterTypeDefault, on_delete=models.CASCADE, related_name="values"
+    )
+    parameter = models.ForeignKey(
+        ProductionParameter, on_delete=models.CASCADE, related_name="default_values"
+    )
+    standard_value = models.CharField(max_length=200, blank=True)
+    min_value = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    max_value = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    value = models.CharField(max_length=200, blank=True)
+
+    class Meta:
+        unique_together = ("default", "parameter")
+
+    @property
+    def sets_spec(self):
+        return bool(self.standard_value.strip()) or self.min_value is not None or self.max_value is not None
+
+    def __str__(self):
+        return f"{self.default} - {self.parameter.parameter_code}"
+
+
 class ProductionQCStatus(models.TextChoices):
     PENDING = "PENDING", "Pending Approval"
     SENT_BACK = "SENT_BACK", "Sent Back"
     APPROVED = "APPROVED", "Approved"
+
+
+class ProductionQCSubmission(models.Model):
+    """Entries filled and sent for approval together — e.g. a blown-bottle check
+    across its moulds, one entry per mould.
+
+    Each entry stays its own: a row in the list, a column on the sheet and the
+    print. Only the decision is shared: they are approved, sent back and
+    corrected as one.
+    """
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="production_qc_submissions"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="production_qc_submissions",
+    )
+
+    def __str__(self):
+        return f"QA report submission #{self.pk}"
 
 
 class ProductionQCEntry(BaseModel):
@@ -102,6 +192,25 @@ class ProductionQCEntry(BaseModel):
     )
     parameter_type = models.ForeignKey(
         ProductionParameterType, on_delete=models.PROTECT, related_name="entries"
+    )
+    # The default the entry was made with, if any; its name is kept too, so the
+    # entry reads the same if the default is renamed or removed.
+    default = models.ForeignKey(
+        ProductionParameterTypeDefault,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="entries",
+    )
+    default_name = models.CharField(max_length=200, blank=True)
+    # The entries sent with it, decided with it. Set on every entry (0075 gave
+    # each older one its own); null only for a row made outside the service.
+    submission = models.ForeignKey(
+        ProductionQCSubmission,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="entries",
     )
     checked_at = models.DateTimeField()
     status = models.CharField(
