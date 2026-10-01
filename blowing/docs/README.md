@@ -33,6 +33,34 @@ per_bottle_cost = blowing/bottle + packing_rate_per_bottle
 
 Verified against Linear.xlsx row 1 in `blowing/tests.py`.
 
+## Shift sheet (`services/shift_sheet.py`)
+
+The person who books runs is not at the machine for every shift — the line runs
+through the night — so a missed shift reaches them as the floor's Excel: a date
+line, a header (`sku · shift · total production · labour company/outside · total
+electricity · utility · wastage`), then a SKU line with a day / night line under it.
+FactoryFlow's **Blowing Shift Sheet** page takes it in those columns, typed or
+uploaded, many dates and SKUs at once, and books each row as a COMPLETED run.
+
+- `POST shift-sheet/parse/` reads an uploaded `file` into rows (SKU matched to a
+  preform spec by make + gram). Figures with no shift are listed as `ignored`, never
+  guessed. The workbook is read *not* read-only: read-only mode returns values hidden
+  under a merged cell, and the floor's reused file keeps an old date under its merged
+  date line.
+- `POST shift-sheet/` with `{machine_id, rows}` plans without writing — run number,
+  meter readings, cost, duplicates. With `commit: true` it re-plans under a lock on
+  the machine and books every NEW row, or nothing if any row needs fixing (400 with
+  the plan). Needs both `can_create_blowing_run` and `can_complete_blowing_run`.
+
+Rules: a shift the app already has (same date, shift and preform) is skipped — the
+floor's figures outrank the sheet's — unless the row says `add_anyway`. A run's shift
+is read off its remarks (`… night shift`), else its first segment's start (06:00–18:00
+IST = day), else when it was opened; **never its run number**, which is a per-date
+sequence (29 Sep 2026's night shift is run 1). The sheet gives units, so a row starts
+the meter where the run before it (date, then shift order) stopped. `created_at` is
+09:00 IST for a day shift and 20:00 IST for a night shift; the warehouse status is
+APPROVED, since there is no preform request for a shift that has already run.
+
 ## SAP (v1 = read-only)
 
 `services/sap_reader.BlowingItemReader` reuses `production_execution`'s

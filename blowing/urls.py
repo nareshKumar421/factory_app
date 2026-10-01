@@ -16,6 +16,7 @@ from .views import (
     BreakdownCategoryListCreateAPI, BreakdownCategoryDetailAPI,
     SubmitPreformRequestAPI,
 )
+from .views_shift_sheet import ShiftSheetAPI, ShiftSheetParseAPI
 
 urlpatterns = [
     # Master data
@@ -32,6 +33,10 @@ urlpatterns = [
     path('runs/<int:run_id>/', RunDetailAPI.as_view(), name='blowing-run-detail'),
     path('runs/<int:run_id>/complete/', CompleteRunAPI.as_view(), name='blowing-run-complete'),
     path('runs/<int:run_id>/cost/', RunCostAPI.as_view(), name='blowing-run-cost'),
+
+    # Shift sheet — the floor's Excel booked as completed runs
+    path('shift-sheet/', ShiftSheetAPI.as_view(), name='blowing-shift-sheet'),
+    path('shift-sheet/parse/', ShiftSheetParseAPI.as_view(), name='blowing-shift-sheet-parse'),
 
     # Run lifecycle
     path('runs/<int:run_id>/start-production/', StartProductionAPI.as_view(), name='blowing-start-production'),
