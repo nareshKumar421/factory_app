@@ -190,7 +190,9 @@ saved, so they are recorded here.
 ## Open business decisions
 
 - GRPO without a PO (D4): not available in JI; decide once its use is measured.
-- Re-deciding an approval that is already decided: the portal allowed it, JI refuses.
+- Re-deciding an approval that is already decided: decided 2026-10-01. The SAP
+  approvals inbox lets whoever decided a request change it until the document
+  posts (`sap_approvals/docs/README.md`); the warehouse and invoice queues still refuse.
 - Receiving a rejected quantity from production: the portal wrote SAP's `IGN1`
   directly; JI does not, so rejects go through the SAP client unless the
   Service Layer proves to accept a transaction type on the receipt line.

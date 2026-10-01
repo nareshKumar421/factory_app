@@ -393,6 +393,69 @@ class ApprovalWriterPortalPathTests(SimpleTestCase):
         with self.assertRaises(SAPValidationError):
             self.writer.cancel(10, "USER12", password="orig-pass")
 
+    # ---- changing a decision already taken (decide(change=True)) ----
+
+    @patch("sap_client.service_layer.approval_writer.requests.patch")
+    @patch("sap_client.service_layer.approval_writer.requests.get")
+    def test_a_change_sends_the_other_decision_as_the_decider(self, get, patch_):
+        for current, approve, sent, word in (
+            ("arsApproved", False, "ardNotApproved", "rejected"),
+            ("arsNotApproved", True, "ardApproved", "approved"),
+        ):
+            with self.subTest(current=current):
+                get.return_value = _response(200, {"Status": current})
+                patch_.return_value = _response(204, None, content=b"")
+                result = self.writer.decide(
+                    10, approve, "why", approver="USER37", subject="Credit note", change=True
+                )
+                decision = patch_.call_args[1]["json"]["ApprovalRequestDecisions"][0]
+                self.assertEqual(decision["Status"], sent)
+                self.assertEqual(decision["ApproverUserName"], "USER37")
+                self.assertEqual(decision["ApproverPassword"], "stored-pass")
+                self.assertTrue(patch_.call_args[0][0].endswith("/b1s/v2/ApprovalRequests(10)"))
+                self.assertEqual(result["message"], f"Credit note changed to {word} in SAP.")
+                self.assertEqual(result["signed_as"], "USER37")
+
+    @patch("sap_client.service_layer.approval_writer.requests.patch")
+    @patch("sap_client.service_layer.approval_writer.requests.get")
+    def test_a_change_is_refused_before_sap_unless_there_is_something_to_change(self, get, patch_):
+        for current, approve, says in (
+            ("arsApproved", True, "nothing to change"),
+            ("arsNotApproved", False, "nothing to change"),
+            ("arsPending", False, "still pending"),
+            ("arsGenerated", False, "already posted"),
+            ("arsCancelled", True, "cancelled"),
+        ):
+            with self.subTest(current=current, approve=approve):
+                get.return_value = _response(200, {"Status": current})
+                with self.assertRaises(SAPValidationError) as raised:
+                    self.writer.decide(10, approve, "why", approver="USER37", change=True)
+                self.assertIn(says, str(raised.exception))
+        patch_.assert_not_called()
+
+    @patch("sap_client.service_layer.approval_writer.requests.patch")
+    @patch("sap_client.service_layer.approval_writer.requests.get")
+    def test_without_change_a_decided_request_is_still_refused(self, get, patch_):
+        """The warehouse and invoice queues never pass change: they stay pending-only."""
+        for current in ("arsApproved", "arsNotApproved"):
+            with self.subTest(current=current):
+                get.return_value = _response(200, {"Status": current})
+                with self.assertRaises(SAPValidationError) as raised:
+                    self.writer.decide(10, True, approver="USER37")
+                self.assertIn("can no longer be decided", str(raised.exception))
+        patch_.assert_not_called()
+
+    @patch("sap_client.service_layer.approval_writer.requests.patch")
+    @patch("sap_client.service_layer.approval_writer.requests.get")
+    def test_a_change_sap_refuses_surfaces_sap_s_words(self, get, patch_):
+        get.return_value = _response(200, {"Status": "arsApproved"})
+        patch_.return_value = _response(
+            400, {"error": {"code": -2028, "message": {"value": "No matching records found"}}}
+        )
+        with self.assertRaises(SAPValidationError) as raised:
+            self.writer.decide(10, False, "why", approver="USER37", change=True)
+        self.assertIn("-2028", str(raised.exception))
+
 
 # ---------------------------------------------------------------------------
 # Attachment download client

@@ -117,8 +117,10 @@ None of these is a secret. Set `SAP_FILE_SERVICE_BASE_URL` in the server's
 * **Setting Complete/Reject on a receipt from production by updating SAP's
   `IGN1` table directly.** JI never writes SAP tables. If the Service Layer
   accepts a transaction type on receipt lines, add it to the receipt payload.
-* **Re-deciding a request that is already decided.** JI's writer refuses
-  anything that isn't pending, as before.
+* **Re-deciding a request that is already decided** — ported since, for the
+  SAP approvals inbox only: `ApprovalRequestWriter.decide(change=True)` accepts
+  an approved or rejected request and the other decision. Every other caller
+  is still pending-only. See `sap_approvals/docs/README.md`.
 
 ## Verify on the sandbox before relying on it
 
@@ -132,6 +134,9 @@ Run with `--settings=config.sap_sandbox_settings` (real SAP hosts from `.env`,
 4. `BUDGET` create / PATCH with `B1S-ReplaceCollectionsOnPatch` / delete.
 5. `BusinessPartners` create with the payload `partner_onboarding` builds.
 6. HANA reads on the sandbox schema need a grant for JI's HANA user.
+7. `decide_approval_request(change=True)`: change an approved request to
+   rejected and back, and see whether SAP accepts each change and what it does
+   to `OWDD.Status` and the `WDD1` line. Never proven against SAP yet.
 
 ## Tests
 

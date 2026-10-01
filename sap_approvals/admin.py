@@ -9,9 +9,9 @@ class SapApprovalDecisionAdmin(admin.ModelAdmin):
 
     list_display = (
         "created_at", "company", "wdd_code", "object_type", "action",
-        "signed_as", "typed_password", "confirmed_duplicate", "created_by",
+        "changed_from", "signed_as", "typed_password", "confirmed_duplicate", "created_by",
     )
-    list_filter = ("company", "action", "typed_password", "confirmed_duplicate")
+    list_filter = ("company", "action", "changed_from", "typed_password", "confirmed_duplicate")
     search_fields = ("wdd_code", "signed_as", "draft_entry")
     readonly_fields = [f.name for f in SapApprovalDecision._meta.fields]
 

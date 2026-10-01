@@ -530,8 +530,10 @@ class HanaApprovalInboxReader:
         ``authorizer_codes`` lists every user still undecided at the current
         stage — the accounts SAP will take a decision from.
 
-        ``with_duplicates`` adds ``posted_duplicates`` for a pending request and,
-        unlike on a list, raises if that read fails: it gates an approval.
+        ``with_duplicates`` adds ``posted_duplicates`` for a request that can
+        still be approved — pending, or rejected and about to be changed to
+        approved — and, unlike on a list, raises if that read fails: it gates
+        an approval.
         ``with_item_lines`` adds the draft's item lines with their
         Without Qty Posting flag (``DRF1.NoInvtryMv``).
         """
@@ -595,7 +597,7 @@ class HanaApprovalInboxReader:
                 ]
 
             stage["posted_duplicates"] = []
-            if with_duplicates and stage["status"] == "PENDING":
+            if with_duplicates and stage["status"] in ("PENDING", "REJECTED"):
                 # No try/except: a check that gates the approval fails closed.
                 self._attach_duplicates(session, [stage])
                 stage["posted_duplicates"] = posted_duplicates(stage)

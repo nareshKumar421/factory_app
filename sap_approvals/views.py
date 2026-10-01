@@ -4,7 +4,8 @@
 
 * ``GET requests/`` — requests that involve the caller, any document type.
 * ``GET requests/<wdd_code>/`` — one request, every stage, the draft's lines.
-* ``POST requests/<wdd_code>/decision/`` — approve or reject.
+* ``POST requests/<wdd_code>/decision/`` — approve or reject, or change a
+  decision already taken.
 * ``POST requests/<wdd_code>/withdraw/`` — the originator cancels a pending one.
 * ``GET pending-count/`` — how many wait on the caller (the sidebar badge).
 
@@ -18,16 +19,20 @@ Ported from SAP Portal's ``routes/sap.js`` ``/approval-requests`` routes
   still BE the stage's authorizer (or the request's originator, to withdraw);
   the password only replaces the stored ``SAP_APPROVER_CREDENTIALS`` entry for
   that one Service Layer call. It is never stored, logged, cached or returned.
-* **Re-deciding is refused.** The portal let an approver on a decided request
-  send another decision; JI refuses anything that is not pending (an open
-  business decision, recorded in the README).
+* **A decision can be changed by whoever took it.** As in the portal, an
+  approved request can be changed to rejected and a rejected one to approved,
+  until the document is posted. Unlike the portal, only the SAP user SAP
+  records as having decided it (``decided_by``) may change it, and SAP itself
+  still accepts or refuses the change.
 
 The decision guards run in this order, each before SAP is called: pending by
-the effective rule (409 ``STALE_REQUEST``), the caller is mapped (403) and is an
-authorizer of the current stage (403), approving a document SAP already posted
-(409 ``DUPLICATE_DOCUMENT`` unless ``confirm_duplicate``), a password to sign
-with — typed or stored (400). The portal asked for the password last for the
-same reason: a leftover or a duplicate is reported before anyone types one.
+the effective rule — or, to change a decision, approved or rejected and not a
+leftover, with the other decision asked for (409 ``STALE_REQUEST``) — the
+caller is mapped (403) and is an authorizer of the current stage, or the one
+who decided it (403), approving a document SAP already posted (409
+``DUPLICATE_DOCUMENT`` unless ``confirm_duplicate``), a password to sign with —
+typed or stored (400). The portal asked for the password last for the same
+reason: a leftover or a duplicate is reported before anyone types one.
 """
 
 import logging
@@ -60,6 +65,20 @@ logger = logging.getLogger(__name__)
 
 STALE_REQUEST = "STALE_REQUEST"
 DUPLICATE_DOCUMENT = "DUPLICATE_DOCUMENT"
+
+# The outcomes a decision can still be changed from. Posted (GENERATED) and
+# withdrawn (CANCELLED) requests are final.
+CHANGEABLE_STATUSES = ("APPROVED", "REJECTED")
+
+
+def decided_by_caller(row: dict, mine: str | None) -> bool:
+    """The caller is the SAP user SAP records as having decided ``row``."""
+    return bool(mine and (row.get("decided_by") or "").upper() == mine.upper())
+
+
+def changeable(row: dict) -> bool:
+    """Approved or rejected by SAP's own say — not a leftover still at 'W'."""
+    return row.get("status") in CHANGEABLE_STATUSES and not row.get("stale_pending")
 
 
 class _InboxView(SapApprovalViewBase):
@@ -126,6 +145,10 @@ class _InboxView(SapApprovalViewBase):
             # The only account the caller can ever sign as is their own.
             row["credentials_configured"] = stored
             row["can_decide"] = bool(can_decide and row["is_mine"])
+            # Approved → rejected or back, by the one who decided it.
+            row["can_change_decision"] = bool(
+                can_decide and changeable(row) and decided_by_caller(row, mine)
+            )
             row["can_withdraw"] = bool(can_withdraw and pending and row["is_originator"])
         return rows
 
@@ -142,7 +165,8 @@ class _InboxView(SapApprovalViewBase):
         )
 
     def write_audit(self, stage: dict, action: str, signed_as: str, remarks: str,
-                    typed: bool, confirmed_duplicate: bool = False) -> None:
+                    typed: bool, confirmed_duplicate: bool = False,
+                    changed_from: str = "") -> None:
         """After SAP accepted. A bookkeeping failure never undoes SAP's record."""
         try:
             SapApprovalDecision.objects.create(
@@ -155,6 +179,7 @@ class _InboxView(SapApprovalViewBase):
                 remarks=remarks or "",
                 typed_password=typed,
                 confirmed_duplicate=confirmed_duplicate,
+                changed_from=changed_from,
                 created_by=self.request.user,
             )
         except Exception:
@@ -348,7 +373,11 @@ class ApprovalRequestAttachmentDownloadAPI(_VisibleRequestView):
 
 class ApprovalRequestDecisionAPI(_InboxView):
     """POST {approve, remarks, sap_password?, confirm_duplicate?} — approve or reject,
-    signed as the caller's own SAP account. Guards: see the module docstring."""
+    signed as the caller's own SAP account. Guards: see the module docstring.
+
+    The same call on an approved or rejected request changes that decision:
+    ``approve: false`` on an approved one, ``approve: true`` on a rejected one.
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanDecideSapApprovals]
 
@@ -365,16 +394,22 @@ class ApprovalRequestDecisionAPI(_InboxView):
         stage = client.approval_inbox_stage(wdd_code, with_duplicates=approve)
         if stage is None:
             return self.not_found(wdd_code)
+        change = stage["status"] != "PENDING"
 
-        # 1. Still pending, by the draft's say — not just OWDD's.
-        if stage["status"] != "PENDING":
-            return self.stale_response(stage)
-
-        # 2. The caller IS an authorizer of the stage now waiting.
-        refusal = self._refuse_identity(stage)
+        # 1. Still pending, by the draft's say — not just OWDD's. Or, to change
+        #    a decision: approved or rejected, and the other decision asked for.
+        if change:
+            refusal = self._refuse_change(stage, approve)
+            if refusal is not None:
+                return refusal
+        # 2. The caller IS an authorizer of the stage now waiting — or, to
+        #    change a decision, the one who took it.
+        refusal = (
+            self._refuse_changer(stage) if change else self._refuse_identity(stage)
+        )
         if refusal is not None:
             return refusal
-        signer = self._signer(stage)
+        signer = stage["decided_by"] if change else self._signer(stage)
 
         # 3. Approving a document SAP already posted posts it again.
         posted = stage.get("posted_duplicates") or []
@@ -409,13 +444,19 @@ class ApprovalRequestDecisionAPI(_InboxView):
                 request.user.pk,
                 signer,
             )
+        if change:
+            logger.info(
+                "SAP approval request %s: user %s changing the decision from %s as %s",
+                wdd_code, request.user.pk, stage["status"], signer,
+            )
         result = client.decide_approval_request(
             wdd_code,
             approve=approve,
-            remarks=self._remarks(approve, remarks),
+            remarks=self._remarks(approve, remarks, change=change),
             approver=signer,
             password=typed,
             subject=stage.get("object_type_label") or "Document",
+            change=change,
         )
         signed_as = result.get("signed_as") or signer
         self.write_audit(
@@ -425,13 +466,58 @@ class ApprovalRequestDecisionAPI(_InboxView):
             remarks,
             typed=typed is not None,
             confirmed_duplicate=bool(approve and posted),
+            changed_from=stage["status"] if change else "",
         )
         return Response({
             "message": result.get("message") or "Decision recorded in SAP.",
             "signed_as": signed_as,
             "wdd_code": stage["wdd_code"],
             "action": "APPROVE" if approve else "REJECT",
+            "changed_from": stage["status"] if change else None,
         })
+
+    def _refuse_change(self, stage: dict, approve: bool) -> Response | None:
+        """409 unless the request's decision can be changed to ``approve``."""
+        if not changeable(stage):
+            # Posted, withdrawn, or a leftover SAP never closed: final.
+            return self.stale_response(stage)
+        if (stage["status"] == "APPROVED") == approve:
+            word = "approved" if approve else "rejected"
+            return Response(
+                {
+                    "error": (
+                        f"Approval request #{stage['wdd_code']} is already {word} in "
+                        "SAP, so there is nothing to change."
+                    ),
+                    "code": STALE_REQUEST,
+                    "status": stage["status"],
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return None
+
+    def _refuse_changer(self, stage: dict) -> Response | None:
+        """403 unless the caller is the SAP user who took the decision."""
+        mine = self.my_sap_code()
+        if not mine:
+            return Response({"error": self.unmapped_message()}, status=status.HTTP_403_FORBIDDEN)
+        if decided_by_caller(stage, mine):
+            return None
+        decider = stage.get("decided_by")
+        name = stage.get("decided_by_name")
+        word = str(stage["status"]).lower()
+        if not decider:
+            error = (
+                f"SAP does not say who {word} this request, so its decision cannot be "
+                "changed from the app."
+            )
+        else:
+            who = f"{decider} ({name})" if name else decider
+            error = (
+                f"This request was {word} by {who}. You act as {mine}, and only the "
+                "person who took a decision can change it."
+            )
+        return Response({"error": error}, status=status.HTTP_403_FORBIDDEN)
 
     def _refuse_identity(self, stage: dict) -> Response | None:
         mine = self.my_sap_code()
@@ -468,8 +554,13 @@ class ApprovalRequestDecisionAPI(_InboxView):
         mine = self.my_sap_code().upper()
         return next(c for c in stage["authorizer_codes"] if c.upper() == mine)
 
-    def _remarks(self, approve: bool, remarks: str) -> str:
+    def _remarks(self, approve: bool, remarks: str, change: bool = False) -> str:
         """SAP stamps the SAP account; the app user rides in the remarks."""
+        if change:
+            # SAP keeps only the latest decision on the line: say it was changed.
+            word = "approved" if approve else "rejected"
+            done = f"changed to {word} by {self.acting_name()} (Factory app)"
+            return f"{remarks} — {done}" if remarks else done[0].upper() + done[1:]
         if approve and remarks:
             return f"{remarks} — approved by {self.acting_name()} (Factory app)"
         return self.decision_remarks(approve, remarks)

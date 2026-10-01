@@ -10,6 +10,9 @@ right. SAP is mocked where the views look ``SAPClient`` up. What is pinned:
   else's, and rows carry the flags the page follows;
 * the decision guards run in the ported order — 409 stale, 403 unmapped, 403
   not the authorizer, 409 duplicate, 400 nothing to sign with — each before SAP;
+* a decision already taken can be changed (approved ↔ rejected) only by the
+  SAP user who took it, never on a posted, withdrawn or leftover request, with
+  the same duplicate and password guards, and the audit says what it changed;
 * a typed SAP password reaches ``SAPClient`` and nothing else: not the
   response, not the audit row, not a log line;
 * the withdraw rules, the audit trail, the rights and the group command.
@@ -211,25 +214,48 @@ class ListApiTests(SapApprovalsTestCase):
         others = _row(wdd_code=2, waiting_on_me=False, approver_code="USER24")
         raised = _row(wdd_code=3, waiting_on_me=False, originator_code="user37")
         decided = _row(wdd_code=4, status="APPROVED", waiting_on_me=True, originator_code="USER37")
-        sap.return_value.list_approval_inbox.return_value = [mine, others, raised, decided]
+        approved_by_me = _row(wdd_code=5, status="APPROVED", waiting_on_me=False, decided_by="user37")
+        rejected_by_me = _row(wdd_code=6, status="REJECTED", waiting_on_me=False, decided_by="USER37")
+        approved_by_other = _row(wdd_code=7, status="APPROVED", waiting_on_me=False, decided_by="USER24")
+        posted_by_me = _row(wdd_code=8, status="GENERATED", waiting_on_me=False, decided_by="USER37")
+        leftover = _row(wdd_code=9, status="APPROVED", stale_pending=True, waiting_on_me=False,
+                        decided_by="USER37")
+        sap.return_value.list_approval_inbox.return_value = [
+            mine, others, raised, decided,
+            approved_by_me, rejected_by_me, approved_by_other, posted_by_me, leftover,
+        ]
         rows = self.client.get(f"{BASE}requests/", **self.headers).data["results"]
-        flags = [(r["is_mine"], r["can_decide"], r["is_originator"], r["can_withdraw"]) for r in rows]
+        flags = [
+            (r["is_mine"], r["can_decide"], r["can_change_decision"],
+             r["is_originator"], r["can_withdraw"])
+            for r in rows
+        ]
         self.assertEqual(flags, [
-            (True, True, False, False),
-            (False, False, False, False),
-            (False, False, True, True),
-            # Decided: nothing left to decide or withdraw (re-deciding is refused).
-            (False, False, True, False),
+            (True, True, False, False, False),
+            (False, False, False, False, False),
+            (False, False, False, True, True),
+            # Decided, but SAP names nobody as the decider: nothing to change.
+            (False, False, False, True, False),
+            # Only the one who decided may change it, and only until it posts.
+            (False, False, True, False, False),
+            (False, False, True, False, False),
+            (False, False, False, False, False),
+            (False, False, False, False, False),
+            (False, False, False, False, False),
         ])
         self.assertTrue(all(r["credentials_configured"] for r in rows))
 
     def test_viewing_does_not_imply_deciding_or_withdrawing(self, sap):
         self.revoke("can_decide_sap_approvals", "can_withdraw_own_sap_approvals")
-        sap.return_value.list_approval_inbox.return_value = [_row(originator_code="USER37")]
-        row = self.client.get(f"{BASE}requests/", **self.headers).data["results"][0]
-        self.assertTrue(row["is_mine"])
-        self.assertFalse(row["can_decide"])
-        self.assertFalse(row["can_withdraw"])
+        sap.return_value.list_approval_inbox.return_value = [
+            _row(originator_code="USER37"),
+            _row(wdd_code=2, status="APPROVED", waiting_on_me=False, decided_by="USER37"),
+        ]
+        pending, approved = self.client.get(f"{BASE}requests/", **self.headers).data["results"]
+        self.assertTrue(pending["is_mine"])
+        self.assertFalse(pending["can_decide"])
+        self.assertFalse(pending["can_withdraw"])
+        self.assertFalse(approved["can_change_decision"])
 
     def test_a_full_page_says_it_may_be_truncated(self, sap):
         sap.return_value.list_approval_inbox.return_value = [_row(wdd_code=n) for n in range(2)]
@@ -373,10 +399,12 @@ class DecisionGuardTests(SapApprovalsTestCase):
         self.assertIn("was cancelled", response.data["error"])
         sap.return_value.decide_approval_request.assert_not_called()
 
-    def test_re_deciding_an_approved_request_is_refused(self, sap):
-        """The portal allowed it; JI does not (open business decision)."""
-        sap.return_value.approval_inbox_stage.return_value = _stage(status="APPROVED")
-        response = self._post({"approve": False, "remarks": "changed my mind"})
+    def test_approving_an_approved_request_again_is_409(self, sap):
+        """Changing a decision needs the other decision; the same one changes nothing."""
+        sap.return_value.approval_inbox_stage.return_value = _stage(
+            status="APPROVED", decided_by="USER37"
+        )
+        response = self._post({"approve": True})
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertIn("already approved", response.data["error"])
         sap.return_value.decide_approval_request.assert_not_called()
@@ -540,6 +568,245 @@ class DecisionGuardTests(SapApprovalsTestCase):
             with self.assertLogs("sap_approvals.views", level="ERROR"):
                 response = self._post({"approve": True})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Changing a decision already taken (approved ↔ rejected)
+# ---------------------------------------------------------------------------
+
+
+@override_settings(SAP_APPROVER_CREDENTIALS={"JIVO_OIL": {"USER37": "stored"}})
+@patch("sap_approvals.views.SAPClient")
+class ChangeDecisionTests(SapApprovalsTestCase):
+    """SAP Portal let an approver change a decision (routes/sap.js, a280164).
+
+    JI lets the SAP user SAP records as the decider change it, through the same
+    decision endpoint, while the request is approved or rejected — never once
+    the document is posted, withdrawn, or a leftover SAP never closed.
+    """
+
+    def _decided(self, outcome="APPROVED", **overrides):
+        # A decided request: no stage waits, so no authorizer is undecided.
+        values = dict(
+            status=outcome, waiting_on_me=False, authorizer_codes=[],
+            approver_code=None, approver_name=None,
+            decided_by="USER37", decided_by_name="HONEY SINGH",
+            decided_at="2026-09-17T11:00:00",
+        )
+        values.update(overrides)
+        return _stage(**values)
+
+    def _post(self, body, code=75424):
+        return self.client.post(decision_url(code), body, format="json", **self.headers)
+
+    def _sap_accepts(self, sap, message="A/R Credit Note changed to rejected in SAP."):
+        sap.return_value.decide_approval_request.return_value = {
+            "message": message, "signed_as": "USER37",
+        }
+
+    def test_the_approver_changes_approved_to_rejected(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
+        self._sap_accepts(sap)
+        response = self._post({"approve": False, "remarks": "wrong party"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["action"], "REJECT")
+        self.assertEqual(response.data["changed_from"], "APPROVED")
+        self.assertEqual(response.data["signed_as"], "USER37")
+        kwargs = sap.return_value.decide_approval_request.call_args.kwargs
+        self.assertTrue(kwargs["change"])
+        self.assertFalse(kwargs["approve"])
+        self.assertEqual(kwargs["approver"], "USER37")
+        self.assertIsNone(kwargs["password"])
+        self.assertEqual(
+            kwargs["remarks"], "wrong party — changed to rejected by Honey Singh (Factory app)"
+        )
+        # Rejecting never needs the duplicate read.
+        self.assertFalse(sap.return_value.approval_inbox_stage.call_args.kwargs["with_duplicates"])
+        audit = SapApprovalDecision.objects.get()
+        self.assertEqual(
+            (audit.action, audit.changed_from, audit.signed_as, audit.remarks),
+            ("REJECT", "APPROVED", "USER37", "wrong party"),
+        )
+        self.assertEqual(audit.created_by, self.user)
+
+    def test_the_rejecter_changes_rejected_to_approved(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided(
+            "REJECTED", rejection_reason="rate wrong"
+        )
+        self._sap_accepts(sap, "A/R Credit Note changed to approved in SAP.")
+        response = self._post({"approve": True})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["changed_from"], "REJECTED")
+        self.assertEqual(response.data["message"], "A/R Credit Note changed to approved in SAP.")
+        kwargs = sap.return_value.decide_approval_request.call_args.kwargs
+        self.assertTrue(kwargs["change"])
+        self.assertTrue(kwargs["approve"])
+        self.assertEqual(kwargs["remarks"], "Changed to approved by Honey Singh (Factory app)")
+        # Approving asks the reader for the posted-duplicate check.
+        self.assertTrue(sap.return_value.approval_inbox_stage.call_args.kwargs["with_duplicates"])
+        audit = SapApprovalDecision.objects.get()
+        self.assertEqual((audit.action, audit.changed_from), ("APPROVE", "REJECTED"))
+
+    def test_a_first_decision_is_not_recorded_as_a_change(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = _stage()
+        self._sap_accepts(sap, "ok")
+        response = self._post({"approve": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["changed_from"])
+        self.assertFalse(sap.return_value.decide_approval_request.call_args.kwargs["change"])
+        self.assertEqual(SapApprovalDecision.objects.get().changed_from, "")
+
+    def test_asking_for_the_same_decision_is_409(self, sap):
+        for outcome, approve, word in (("APPROVED", True, "approved"), ("REJECTED", False, "rejected")):
+            with self.subTest(outcome=outcome):
+                sap.return_value.approval_inbox_stage.return_value = self._decided(outcome)
+                response = self._post({"approve": approve, "remarks": "again"})
+                self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+                self.assertEqual(response.data["code"], "STALE_REQUEST")
+                self.assertIn(f"already {word}", response.data["error"])
+        sap.return_value.decide_approval_request.assert_not_called()
+
+    def test_a_posted_or_withdrawn_request_is_final(self, sap):
+        for outcome in ("GENERATED", "CANCELLED"):
+            with self.subTest(outcome=outcome):
+                sap.return_value.approval_inbox_stage.return_value = self._decided(outcome)
+                for approve in (True, False):
+                    response = self._post({"approve": approve, "remarks": "change"})
+                    self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+                    self.assertEqual(response.data["code"], "STALE_REQUEST")
+        sap.return_value.decide_approval_request.assert_not_called()
+        self.assertFalse(SapApprovalDecision.objects.exists())
+
+    def test_a_leftover_sap_never_closed_cannot_be_changed(self, sap):
+        """OWDD still says 'W' but the draft was approved: there is no decision line to change."""
+        sap.return_value.approval_inbox_stage.return_value = self._decided(
+            "APPROVED", stale_pending=True
+        )
+        response = self._post({"approve": False, "remarks": "change"})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("nothing left to approve or reject", response.data["error"])
+        sap.return_value.decide_approval_request.assert_not_called()
+
+    def test_only_the_one_who_decided_may_change_it_even_with_a_typed_password(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided(
+            "APPROVED", decided_by="USER24", decided_by_name="PANKAJ"
+        )
+        response = self._post({"approve": False, "remarks": "change", "sap_password": TYPED})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("approved by USER24 (PANKAJ)", response.data["error"])
+        self.assertIn("You act as USER37", response.data["error"])
+        sap.return_value.decide_approval_request.assert_not_called()
+
+    def test_being_on_the_originator_side_is_not_enough(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided(
+            "APPROVED", decided_by="USER24", originator_code="USER37"
+        )
+        response = self._post({"approve": False, "remarks": "change"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        sap.return_value.decide_approval_request.assert_not_called()
+
+    def test_no_recorded_decider_is_403(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided(
+            "REJECTED", decided_by=None, decided_by_name=None
+        )
+        response = self._post({"approve": True})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("SAP does not say who rejected", response.data["error"])
+        sap.return_value.decide_approval_request.assert_not_called()
+
+    def test_an_unmapped_user_is_403(self, sap):
+        self.unmap()
+        sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
+        response = self._post({"approve": False, "remarks": "change"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("SAP Identities", response.data["error"])
+        sap.return_value.decide_approval_request.assert_not_called()
+
+    def test_the_decider_is_matched_whatever_the_case_and_signs_as_sap_spells_it(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided(
+            "APPROVED", decided_by="User37"
+        )
+        self._sap_accepts(sap)
+        self.assertEqual(
+            self._post({"approve": False, "remarks": "change"}).status_code, status.HTTP_200_OK
+        )
+        self.assertEqual(
+            sap.return_value.decide_approval_request.call_args.kwargs["approver"], "User37"
+        )
+
+    def test_changing_to_approved_over_a_posted_duplicate_needs_confirmation(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided(
+            "REJECTED", posted_duplicates=[POSTED]
+        )
+        response = self._post({"approve": True})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data["code"], "DUPLICATE_DOCUMENT")
+        sap.return_value.decide_approval_request.assert_not_called()
+
+        self._sap_accepts(sap, "ok")
+        with self.assertLogs("sap_approvals.views", level="WARNING"):
+            response = self._post({"approve": True, "confirm_duplicate": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        audit = SapApprovalDecision.objects.get()
+        self.assertEqual((audit.confirmed_duplicate, audit.changed_from), (True, "REJECTED"))
+
+    def test_changing_to_rejected_needs_a_reason(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
+        response = self._post({"approve": False})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("remarks", response.data)
+        sap.return_value.decide_approval_request.assert_not_called()
+
+    @override_settings(SAP_APPROVER_CREDENTIALS={})
+    def test_nothing_to_sign_with_is_400_and_a_typed_password_signs(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
+        response = self._post({"approve": False, "remarks": "change"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("No SAP password is stored for USER37", response.data["error"])
+        sap.return_value.decide_approval_request.assert_not_called()
+
+        self._sap_accepts(sap)
+        response = self._post({"approve": False, "remarks": "change", "sap_password": TYPED})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            sap.return_value.decide_approval_request.call_args.kwargs["password"], TYPED
+        )
+        self.assertNotIn(TYPED, response.content.decode())
+        self.assertTrue(SapApprovalDecision.objects.get().typed_password)
+
+    def test_a_change_sap_refuses_is_400_with_sap_s_words_and_no_audit(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
+        sap.return_value.decide_approval_request.side_effect = SAPValidationError(
+            "(-2028) No matching records found"
+        )
+        response = self._post({"approve": False, "remarks": "change"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("-2028", response.data["error"])
+        self.assertFalse(SapApprovalDecision.objects.exists())
+
+    def test_changing_needs_the_decide_right(self, sap):
+        self.revoke("can_decide_sap_approvals")
+        sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
+        response = self._post({"approve": False, "remarks": "change"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        sap.return_value.approval_inbox_stage.assert_not_called()
+
+    def test_the_detail_offers_the_change_to_the_decider_only(self, sap):
+        stages = [{"step_code": 20, "user_code": "USER37", "status": "APPROVED", "is_current": True}]
+        sap.return_value.approval_inbox_detail.return_value = self._decided(
+            "APPROVED", stages=stages, lines=[], lines_available=True
+        )
+        data = self.client.get(f"{BASE}requests/75424/", **self.headers).data
+        self.assertTrue(data["can_change_decision"])
+        self.assertFalse(data["can_decide"])
+
+        sap.return_value.approval_inbox_detail.return_value = self._decided(
+            "APPROVED", decided_by="USER24", stages=stages, lines=[], lines_available=True
+        )
+        data = self.client.get(f"{BASE}requests/75424/", **self.headers).data
+        self.assertFalse(data["can_change_decision"])
 
 
 # ---------------------------------------------------------------------------

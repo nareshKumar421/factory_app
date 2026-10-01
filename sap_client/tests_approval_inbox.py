@@ -498,6 +498,31 @@ class CurrentStageTests(SimpleTestCase):
         with self.assertRaises(SAPDataError):
             reader.current_stage(75424, with_duplicates=True)
 
+    def test_a_rejected_request_gets_the_duplicate_check_an_approval_needs(self):
+        """Changing a rejection to an approval posts the document: check it first."""
+        reader, fake = _reader(
+            [self._stage_header(OwddStatus="N", EffStatus="N", DraftStatus="N",
+                                DecidedBy="USER37")],
+            [],
+            [{"Kind": "TWIN", "ObjType": "14", "DraftEntry": 57198, "FromDraft": 57100,
+              "PostedEntry": 1963, "PostedDocNum": 626096824, "PostedTotal": 17455.0,
+              "PostedCurrency": "INR", "PostedDate": date(2026, 9, 16)}],
+        )
+        stage = reader.current_stage(75424, with_duplicates=True)
+        self.assertEqual(stage["status"], "REJECTED")
+        self.assertEqual(stage["decided_by"], "USER37")
+        self.assertEqual([p["doc_entry"] for p in stage["posted_duplicates"]], [1963])
+        self.assertEqual(len(fake.statements), 3)
+
+    def test_an_approved_request_needs_no_duplicate_read(self):
+        reader, fake = _reader(
+            [self._stage_header(OwddStatus="Y", EffStatus="Y", DraftStatus="Y")], [],
+        )
+        stage = reader.current_stage(75424, with_duplicates=True)
+        self.assertEqual(stage["status"], "APPROVED")
+        self.assertEqual(stage["posted_duplicates"], [])
+        self.assertEqual(len(fake.statements), 2)
+
     def test_duplicates_are_reported_on_the_stage(self):
         reader, _ = _reader(
             [self._stage_header()],

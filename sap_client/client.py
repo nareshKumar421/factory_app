@@ -660,14 +660,17 @@ class SAPClient:
         approver: str | None = None,
         password: str | None = None,
         subject: str = "Document",
+        change: bool = False,
     ) -> dict:
         """Approve or reject one request, signed as ``approver``.
 
         ``password`` is the approver's own SAP password when they typed it;
         without it the stored ``SAP_APPROVER_CREDENTIALS`` entry is used.
+        ``change=True`` changes a decision already taken instead of a pending one.
         """
         return ApprovalRequestWriter(self.context).decide(
-            wdd_code, approve, remarks, approver=approver, subject=subject, password=password
+            wdd_code, approve, remarks, approver=approver, subject=subject,
+            password=password, change=change,
         )
 
     def withdraw_approval_request(

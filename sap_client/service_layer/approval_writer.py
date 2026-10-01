@@ -29,6 +29,9 @@ REQUEST_PENDING = "arsPending"
 REQUEST_CANCELLED = "arsCancelled"
 DECISION_APPROVED = "ardApproved"
 DECISION_REJECTED = "ardNotApproved"
+# The two outcomes a decision may be changed from (``decide(change=True)``).
+REQUEST_APPROVED = "arsApproved"
+REQUEST_REJECTED = "arsNotApproved"
 
 _REQUEST_STATUS_LABELS = {
     "arsApproved": "already approved",
@@ -101,6 +104,7 @@ class ApprovalRequestWriter:
         approver: str | None = None,
         subject: str = "Invoice",
         password: str | None = None,
+        change: bool = False,
     ) -> dict:
         """Record a decision on approval request ``wdd_code``.
 
@@ -109,7 +113,10 @@ class ApprovalRequestWriter:
         names the document in the success message.
 
         Pre-checks that the request is still pending so a stale page gets a
-        clean validation error instead of a raw SAP one.
+        clean validation error instead of a raw SAP one. ``change=True`` instead
+        changes a decision already taken: the request must be approved or
+        rejected (never posted or cancelled) and the new decision the other one.
+        The PATCH is the same; SAP itself still accepts or refuses the change.
         """
         approver_user, approver_password = self._approver_credentials(approver, password)
         # Log the Service Layer session in AS the approver, so both the session
@@ -122,7 +129,9 @@ class ApprovalRequestWriter:
         current = self._get_request(wdd_code, cookies, approver_user)
 
         status = current.get("Status")
-        if status != REQUEST_PENDING:
+        if change:
+            self._check_changeable(wdd_code, status, approve)
+        elif status != REQUEST_PENDING:
             label = _REQUEST_STATUS_LABELS.get(status, f"in state {status}")
             raise SAPValidationError(
                 f"Approval request {wdd_code} is {label}; it can no longer be decided."
@@ -154,10 +163,15 @@ class ApprovalRequestWriter:
         if response.status_code in (200, 204):
             action = "approved" if approve else "rejected"
             logger.info(
-                "Approval request %s %s in SAP by %s", wdd_code, action, approver_user
+                "Approval request %s %s%s in SAP by %s",
+                wdd_code, "changed to " if change else "", action, approver_user,
             )
             return {
-                "message": f"{subject} {action} in SAP.",
+                "message": (
+                    f"{subject} changed to {action} in SAP."
+                    if change
+                    else f"{subject} {action} in SAP."
+                ),
                 "signed_as": approver_user,
             }
 
@@ -237,6 +251,26 @@ class ApprovalRequestWriter:
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_changeable(wdd_code: int, status: str, approve: bool) -> None:
+        """Refuse a change SAP has no earlier decision for, or one that changes nothing."""
+        if status == REQUEST_PENDING:
+            raise SAPValidationError(
+                f"Approval request {wdd_code} is still pending in SAP, so there is no "
+                "decision to change yet."
+            )
+        if status not in (REQUEST_APPROVED, REQUEST_REJECTED):
+            label = _REQUEST_STATUS_LABELS.get(status, f"in state {status}")
+            raise SAPValidationError(
+                f"Approval request {wdd_code} is {label}; its decision can no longer "
+                "be changed."
+            )
+        if (status == REQUEST_APPROVED) == approve:
+            raise SAPValidationError(
+                f"Approval request {wdd_code} is {_REQUEST_STATUS_LABELS[status]}; "
+                "there is nothing to change."
+            )
 
     def _get_request(self, wdd_code: int, cookies, approver_user: str = "") -> dict:
         url = (

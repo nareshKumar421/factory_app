@@ -29,7 +29,7 @@ overridden. It never holds a password.
 |--|--|--|
 | GET | `requests/` `?scope=waiting_on_me\|raised_by_me\|all` `?status=PENDING\|APPROVED\|REJECTED\|GENERATED\|CANCELLED\|ALL` `?object_type ?date_from ?date_to ?search ?limit` | `can_view_sap_approval_inbox` |
 | GET | `requests/<wdd_code>/` | `can_view_sap_approval_inbox` |
-| POST | `requests/<wdd_code>/decision/` `{approve, remarks, sap_password?, confirm_duplicate?}` | `can_decide_sap_approvals` |
+| POST | `requests/<wdd_code>/decision/` `{approve, remarks, sap_password?, confirm_duplicate?}` — on an approved or rejected request, changes that decision | `can_decide_sap_approvals` |
 | POST | `requests/<wdd_code>/withdraw/` `{sap_password?}` | `can_withdraw_own_sap_approvals` |
 | GET | `requests/<wdd_code>/document/` → `{type, document, attachment_sources}`: the draft as the document browser shapes it (lines with UDFs, TDS, journal preview, base documents), ODRF or, for object types 24/46, OPDF | `can_view_sap_approval_inbox` + on the request |
 | GET | `requests/<wdd_code>/attachments/<abs_entry>/` → the files of one of this request's attachment entries | `can_view_sap_approval_inbox` + on the request |
@@ -54,7 +54,8 @@ currency, date, comments), siblings (`request_count`, `pending_request_count`,
 `already_posted_as`), plus the caller's flags: `is_mine` (pending at a stage of
 theirs), `is_originator`, `can_decide`, `can_withdraw` and
 `credentials_configured` (a stored password exists for their account, so no
-password needs typing). The page shows buttons from these flags only.
+password needs typing), plus `can_change_decision` (they decided it and it can
+still be changed, below). The page shows buttons from these flags only.
 
 The detail adds `stages` (every `WDD1` line: step, stage name, user, status,
 remarks, decided at, `is_current`) and the draft's `lines` (item or account,
@@ -88,6 +89,33 @@ password=<typed or None>)`, with remarks naming the app user ("… — approved 
 Honey Singh (Factory app)"), then the audit row. The duplicate read that gates
 an approval fails closed (502); on a list the same read is decoration and fails
 soft.
+
+### Changing a decision
+
+The same `decision/` call on a request that is no longer pending changes the
+decision SAP holds: `approve: false` on an approved request, `approve: true` on
+a rejected one. SAP Portal allowed this (`routes/sap.js`, a280164); JI allows
+it more narrowly. Guards, in this order, each before SAP is called:
+
+1. **Approved or rejected** by the effective rule and not a leftover, else 409
+   `STALE_REQUEST`: a posted (`GENERATED`) or withdrawn (`CANCELLED`) request is
+   final. Asking for the decision it already has is 409 too.
+2. **Mapped** (403) and **the one who decided it**: the caller's code is the
+   request's `decided_by` (the user whose line at `CurrStep` holds the
+   outcome), else 403 naming them. Having some other line on the request, or
+   having raised it, is not enough; the portal let anyone with a line try.
+3. **Not a posted duplicate** when changing to approved, the same 409
+   `DUPLICATE_DOCUMENT` / `confirm_duplicate` as a first approval.
+4. **Something to sign with** (400), signed as `decided_by`.
+
+Then `SAPClient.decide_approval_request(..., change=True)`: the writer re-reads
+the request and refuses unless SAP says `arsApproved` / `arsNotApproved` with
+the other decision asked for, then sends the same `ApprovalRequestDecisions`
+PATCH. **SAP is the final authority** and may still refuse; its words come back
+as a 400. The remarks say "… — changed to rejected by <name> (Factory app)",
+and the audit row carries `changed_from` (the earlier outcome). Changing to
+rejected needs a reason, as rejecting does. The warehouse and invoice queues
+never pass `change` and still refuse anything that is not pending.
 
 Withdrawing: pending (409 `STALE_REQUEST`), mapped (403), the originator —
 `OWDD.OwnerID` → `OUSR` — (403), something to sign with (400), then
@@ -135,6 +163,9 @@ Two rules together (`approval_inbox_reader.inbox_status` /
 * **The stored password is a fallback**: the portal always demanded a typed one.
 * **Object labels**: 59 is Goods Receipt and 60 Goods Issue (the portal had them
   swapped); `1470000113`, which matches no request, is gone; 24 is labelled.
+* **Changing a decision only by the one who took it** (`decided_by`); the
+  portal let anyone with a decision line try, and offered it on posted and
+  cancelled requests too, leaving SAP to refuse.
 * **Not ported**: the Service Layer fallback list when HANA is down (the list
   answers 503 instead); the `originatorId` filter (replaced by the "raised by
   me" scope); a company-wide listing of other people's requests (the
@@ -144,13 +175,12 @@ Two rules together (`approval_inbox_reader.inbox_status` /
   visibility rule, so an approver needs no document-browser right to see what
   they sign; files are limited to this request's attachment entries.
 
-## Open business decision
+## Decided: changing a decision (O-2)
 
-**Re-deciding an already decided request.** The portal let an approver who sat
-on a decided request send another decision and left SAP to accept or refuse the
-reversal. JI refuses anything that is not pending, in this inbox as in the
-warehouse queues. If the business wants reversals, that is a deliberate change
-to both, not a port.
+Decided 2026-10-01 for this inbox: the one who approved or rejected a request
+may change it until the document is posted (above). The warehouse queues
+(transfer, credit note) and the invoice queue still refuse it; a credit note
+can be changed here, since the inbox lists every document type.
 
 ## Setting it up on a live database
 
@@ -172,12 +202,14 @@ already read live, and is unit-tested against a fake cursor only. Before
 relying on it, on the sandbox or a read-only session: the list and badge for a
 real approver (compare with SAP's own pendency report), a payment request
 (`OPDF` join and columns), the `OWST` stage names, and a posted-duplicate case.
+On the sandbox only: change an approved request to rejected and back, and
+confirm what SAP does to the request status and the stage line each time.
 
 ## Tests
 
 `sap_approvals/tests.py` (the permission stack per endpoint, identity scoping,
-row flags, the guard order, the typed-password path, withdraw rules, audit,
-badge, group command, permission surface) and
+row flags, the guard order, the typed-password path, changing a decision,
+withdraw rules, audit, badge, group command, permission surface) and
 `sap_client/tests_approval_inbox.py` (the pending rule with the portal's own
 cases, the superseded rule, bound SQL, siblings, the three duplicate shapes,
 fail-soft decoration versus the fail-closed gate, stage and line reads, the

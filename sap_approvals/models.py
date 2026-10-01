@@ -28,7 +28,9 @@ class SapApprovalDecision(BaseModel):
 
     ``created_by`` (``BaseModel``) is the app user; ``signed_as`` the SAP
     account SAP recorded it against. Never holds a password — ``typed_password``
-    only says whether one was typed instead of the stored one.
+    only says whether one was typed instead of the stored one. A changed
+    decision is a row of its own with ``changed_from`` set; the row it changed
+    stays as it was.
     """
 
     company = models.ForeignKey(
@@ -47,6 +49,14 @@ class SapApprovalDecision(BaseModel):
     confirmed_duplicate = models.BooleanField(
         default=False,
         help_text="Approved although SAP already held a posted copy of the document.",
+    )
+    # Set when this decision changed one already taken: the request's status
+    # just before (APPROVED or REJECTED). Blank for a first decision or a withdraw.
+    changed_from = models.CharField(
+        max_length=10,
+        blank=True,
+        default="",
+        help_text="The request's earlier outcome, when this decision changed it.",
     )
 
     class Meta:
