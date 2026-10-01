@@ -135,17 +135,20 @@ class WarehouseItemsView(ARInvoiceBaseView):
 
 class LineDefaultsView(ARInvoiceBaseView):
     """GET /api/v1/ar-invoices/line-defaults/?customer_code=&item_code= — the
-    price and tax code the customer last paid for the item, to prefill a line."""
+    price and tax code to prefill a line with, what the price came from (the
+    customer's price list, else their last bill), and the item's latest bills
+    to anyone."""
 
     def get(self, request):
         query = LineDefaultsQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         client = SAPClient(company_code=request.company.company.code)
-        defaults = client.ar_last_sale_defaults(
-            query.validated_data["customer_code"],
-            [query.validated_data["item_code"]],
+        return Response(
+            client.ar_line_price_guide(
+                query.validated_data["customer_code"],
+                query.validated_data["item_code"],
+            )
         )
-        return Response(defaults.get(query.validated_data["item_code"], {}))
 
 
 class ARInvoiceListCreateView(ARInvoiceBaseView):

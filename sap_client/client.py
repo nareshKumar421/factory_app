@@ -328,10 +328,11 @@ class SAPClient:
         reader = HanaCustomerReader(self.context)
         return reader.get_credit_status(card_code)
 
-    def ar_last_sale_defaults(self, card_code: str, item_codes: list) -> dict:
-        """Item -> {price, tax_code} from the customer's latest invoice line."""
+    def ar_line_price_guide(self, card_code: str, item_code: str) -> dict:
+        """A direct-sale line's prefill (price list, else the customer's last
+        bill) and the item's latest bills to anyone."""
         reader = HanaARInvoiceReader(self.context)
-        return reader.last_sale_defaults(card_code, list(item_codes))
+        return reader.line_price_guide(card_code, item_code)
 
     def open_so_lines_for_invoicing(
         self, card_code: str, search: str | None = None, limit: int = 300

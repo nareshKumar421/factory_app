@@ -575,15 +575,31 @@ class ARInvoiceEndpointTests(APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_line_defaults_endpoint(self):
-        self.sap.ar_last_sale_defaults.return_value = {
-            "FG0000030": {"price": 133.3333, "tax_code": "CG+SG@5"},
+        recent = {
+            "doc_entry": 78181, "doc_num": 626080206, "doc_date": "2026-08-08",
+            "customer_code": "CUSTA000236", "customer_name": "AKAL ROZGAR YOJANA",
+            "quantity": 120.0, "price": 152.381, "price_incl_tax": 160.0001,
+            "tax_code": "IGST@5", "warehouse_code": "BH-BT",
+        }
+        self.sap.ar_line_price_guide.return_value = {
+            "price": 133.3333,
+            "tax_code": "CG+SG@5",
+            "source": "last_sale",
+            "price_list": None,
+            "last_sale": {**recent, "doc_date": "2025-07-02", "price": 133.3333},
+            "recent": [recent],
         }
         resp = self.client.get(
             f"{BASE}line-defaults/?customer_code=CUSTA000893&item_code=FG0000030",
             HTTP_COMPANY_CODE=COMPANY_CODE,
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.json()["tax_code"], "CG+SG@5")
+        body = resp.json()
+        self.assertEqual(body["tax_code"], "CG+SG@5")
+        self.assertEqual(body["source"], "last_sale")
+        self.assertEqual(body["last_sale"]["doc_date"], "2025-07-02")
+        self.assertEqual(body["recent"][0]["price_incl_tax"], 160.0001)
+        self.sap.ar_line_price_guide.assert_called_once_with("CUSTA000893", "FG0000030")
 
     # ── customer credit ─────────────────────────────────────────────────────
     def _credit(self, **over):

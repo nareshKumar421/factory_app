@@ -226,40 +226,132 @@ class HanaARInvoiceReader:
             for line_num, item_code, quantity, whs_code in rows
         ]
 
-    def last_sale_defaults(self, card_code: str, item_codes: list[str]) -> dict:
-        """Item -> {price, tax_code} from the customer's most recent invoice
-        line for it — the defaults a direct (cash) sale line starts from."""
-        codes = [c for c in {str(c) for c in item_codes} if c]
+    def line_price_guide(
+        self, card_code: str, item_code: str, recent_limit: int = 8
+    ) -> dict:
+        """What a direct (cash) sale line's price starts from, and the bills
+        around it.
+
+        ``price`` (pre-tax) prefills the line: the customer's price list when it
+        prices the item, else what the customer last paid. ``recent`` is the
+        item's latest bills to anyone, so the operator sees the going rate next
+        to the prefill — the customer's own last bill can be long out of date
+        (a ₹140 pouch from July 2025 was prefilling counter sales that now go
+        at ₹160). The tax code still comes from the customer's last bill: it
+        follows their place of supply, which another customer's bill does not.
+        """
         card_code = (card_code or "").strip()
-        if not codes or not card_code:
-            return {}
-        placeholders = ", ".join(["?"] * len(codes))
-        rows = self._query(
-            f"""
-            SELECT "ItemCode", "Price", "TaxCode" FROM (
-                SELECT
-                    L."ItemCode", L."Price",
-                    IFNULL(NULLIF(L."TaxCode", ''), IFNULL(L."VatGroup", '')) AS "TaxCode",
-                    ROW_NUMBER() OVER (
-                        PARTITION BY L."ItemCode"
-                        ORDER BY H."DocDate" DESC, H."DocEntry" DESC
-                    ) AS "rn"
-                FROM "{{schema}}"."OINV" H
-                JOIN "{{schema}}"."INV1" L ON L."DocEntry" = H."DocEntry"
-                WHERE H."CardCode" = ?
-                  AND IFNULL(H."CANCELED", 'N') = 'N'
-                  AND L."ItemCode" IN ({placeholders})
-            ) WHERE "rn" = 1
-            """,
-            tuple([card_code] + codes),
-        )
-        return {
-            row[0]: {
-                "price": float(row[1]) if row[1] is not None else None,
-                "tax_code": row[2] or "",
-            }
-            for row in rows
+        item_code = (item_code or "").strip()
+        guide = {
+            "price": None,
+            "tax_code": "",
+            "source": None,
+            "price_list": None,
+            "last_sale": None,
+            "recent": [],
         }
+        if not card_code or not item_code:
+            return guide
+        safe_limit = max(1, min(int(recent_limit or 8), 50))
+
+        # The item's latest lines to anyone, plus this customer's latest even
+        # when it is older than all of those.
+        rows = self._query(
+            """
+            SELECT
+                "DocEntry", "DocNum", "DocDate", "CardCode", "CardName",
+                "Quantity", "Price", "PriceAfVAT", "TaxCode", "WhsCode",
+                "rn_all", "rn_bp"
+            FROM (
+                SELECT
+                    H."DocEntry", H."DocNum", H."DocDate", H."CardCode",
+                    IFNULL(H."CardName", '') AS "CardName",
+                    IFNULL(L."Quantity", 0) AS "Quantity",
+                    L."Price", L."PriceAfVAT",
+                    IFNULL(NULLIF(L."TaxCode", ''), IFNULL(L."VatGroup", '')) AS "TaxCode",
+                    IFNULL(L."WhsCode", '') AS "WhsCode",
+                    ROW_NUMBER() OVER (
+                        ORDER BY H."DocDate" DESC, H."DocEntry" DESC, L."LineNum" DESC
+                    ) AS "rn_all",
+                    ROW_NUMBER() OVER (
+                        PARTITION BY H."CardCode"
+                        ORDER BY H."DocDate" DESC, H."DocEntry" DESC, L."LineNum" DESC
+                    ) AS "rn_bp"
+                FROM "{schema}"."OINV" H
+                JOIN "{schema}"."INV1" L ON L."DocEntry" = H."DocEntry"
+                WHERE L."ItemCode" = ?
+                  AND IFNULL(H."CANCELED", 'N') = 'N'
+            )
+            WHERE "rn_all" <= ? OR ("CardCode" = ? AND "rn_bp" = 1)
+            ORDER BY "rn_all"
+            """,
+            (item_code, safe_limit, card_code),
+        )
+        for (
+            doc_entry, doc_num, doc_date, row_card, row_name, quantity,
+            price, price_incl_tax, tax_code, whs_code, rn_all, rn_bp,
+        ) in rows:
+            sale = {
+                "doc_entry": int(doc_entry),
+                "doc_num": int(doc_num) if doc_num is not None else None,
+                "doc_date": self._date(doc_date),
+                "customer_code": row_card or "",
+                "customer_name": row_name or "",
+                "quantity": float(quantity or 0),
+                "price": float(price) if price is not None else None,
+                "price_incl_tax": (
+                    float(price_incl_tax) if price_incl_tax is not None else None
+                ),
+                "tax_code": tax_code or "",
+                "warehouse_code": whs_code or "",
+            }
+            if int(rn_all) <= safe_limit:
+                guide["recent"].append(sale)
+            if row_card == card_code and int(rn_bp) == 1:
+                guide["last_sale"] = sale
+                guide["tax_code"] = sale["tax_code"]
+
+        # The customer's price list, and the tax rate a tax-inclusive list's
+        # price has to come off.
+        list_rows = self._query(
+            """
+            SELECT C."ListNum", IFNULL(P."ListName", ''), IFNULL(P."IsGrossPrc", 'N'),
+                   I."Price", T."Rate"
+            FROM "{schema}"."OCRD" C
+            LEFT JOIN "{schema}"."OPLN" P ON P."ListNum" = C."ListNum"
+            LEFT JOIN "{schema}"."ITM1" I
+                   ON I."PriceList" = C."ListNum" AND I."ItemCode" = ?
+            LEFT JOIN "{schema}"."OSTC" T ON T."Code" = ?
+            WHERE C."CardCode" = ?
+            """,
+            (item_code, guide["tax_code"], card_code),
+        )
+        if list_rows:
+            list_num, list_name, gross, list_price, rate = list_rows[0]
+            # SAP leaves an unpriced item at 0 on every list, not NULL.
+            if list_price is not None and float(list_price) > 0:
+                includes_tax = (gross or "N") == "Y"
+                if not includes_tax:
+                    net_price = float(list_price)
+                elif rate is not None:
+                    net_price = round(float(list_price) / (1 + float(rate) / 100), 4)
+                else:
+                    net_price = None  # no tax code to take it off
+                guide["price_list"] = {
+                    "list_num": int(list_num),
+                    "list_name": list_name or "",
+                    "price": float(list_price),
+                    "includes_tax": includes_tax,
+                    "net_price": net_price,
+                }
+
+        if guide["price_list"] and guide["price_list"]["net_price"] is not None:
+            guide["price"] = guide["price_list"]["net_price"]
+            guide["source"] = "price_list"
+        elif guide["last_sale"] and guide["last_sale"]["price"] is not None:
+            guide["price"] = guide["last_sale"]["price"]
+            guide["source"] = "last_sale"
+        return guide
 
     def cash_sale_invoices(
         self,

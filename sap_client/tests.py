@@ -2,6 +2,7 @@ import os
 import tempfile
 from unittest.mock import patch, MagicMock, call
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import requests
 from django.test import SimpleTestCase, TestCase, override_settings
@@ -1657,3 +1658,114 @@ class CreditNotePrintReaderTests(SimpleTestCase):
         reader = self._reader(HanaCreditNotePrintReader, rows=[])
 
         self.assertIsNone(reader.document_print(99999))
+
+
+class LinePriceGuideTests(SimpleTestCase):
+    """The prefill for a direct (cash) sale line and the bills shown beside it."""
+
+    CASH = "CUSTA000025"
+
+    def _reader(self, sales, price_list):
+        from .hana.ar_invoice_reader import HanaARInvoiceReader
+
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [sales, price_list]
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        with patch.object(HanaARInvoiceReader, "__init__", lambda self, context: None):
+            reader = HanaARInvoiceReader(None)
+        reader.connection = MagicMock()
+        reader.connection.connect.return_value = conn
+        reader.connection.schema = "JIVO_OIL_HANADB"
+        return reader, cursor
+
+    @staticmethod
+    def _sale(doc_entry, day, card, price, incl, rn_all, rn_bp=1, tax="IGST@5"):
+        return (
+            doc_entry, 626000000 + doc_entry, datetime(2026, 9, day), card,
+            f"NAME {card}", 1200, price, incl, tax, "BH-PTD", rn_all, rn_bp,
+        )
+
+    def _sales(self):
+        # Two distributor bills this month, and the counter's last sale of the
+        # pouch — July 2025, at ₹140 incl. tax — older than both.
+        return [
+            self._sale(2, 30, "CUSTA001041", 156.19, 163.9995, 1, 1),
+            self._sale(1, 8, "CUSTA000236", 152.381, 160.0001, 2, 1),
+            (
+                54234, 625070136, datetime(2025, 7, 2), self.CASH,
+                "HARPREET SINGH CASH SALE", 1, 133.3333, 140.0, "CG+SG@5",
+                "BH-FU", 1873, 1,
+            ),
+        ]
+
+    def test_an_old_last_bill_prefills_but_stays_out_of_the_recent_bills(self):
+        reader, cursor = self._reader(
+            self._sales(), [(1, "Price List 0", "N", 0, Decimal("5"))]
+        )
+
+        guide = reader.line_price_guide(self.CASH, "FG0000106", recent_limit=2)
+
+        self.assertEqual(guide["source"], "last_sale")
+        self.assertEqual(guide["price"], 133.3333)
+        self.assertEqual(guide["last_sale"]["doc_date"], "2025-07-02")
+        self.assertEqual(guide["last_sale"]["price_incl_tax"], 140.0)
+        # The tax code is the customer's own, not a distributor's IGST.
+        self.assertEqual(guide["tax_code"], "CG+SG@5")
+        # A list that leaves the item at 0 does not price it.
+        self.assertIsNone(guide["price_list"])
+        self.assertEqual(
+            [sale["customer_code"] for sale in guide["recent"]],
+            ["CUSTA001041", "CUSTA000236"],
+        )
+        # The rate is looked up for the tax code the customer's bill carried.
+        self.assertEqual(cursor.execute.call_args_list[1][0][1][1], "CG+SG@5")
+
+    def test_the_price_list_outranks_the_last_bill(self):
+        reader, _ = self._reader(
+            self._sales(), [(4, "COUNTER", "N", Decimal("152.381"), Decimal("5"))]
+        )
+
+        guide = reader.line_price_guide(self.CASH, "FG0000106")
+
+        self.assertEqual(guide["source"], "price_list")
+        self.assertEqual(guide["price"], 152.381)
+        self.assertEqual(guide["price_list"]["list_name"], "COUNTER")
+        self.assertFalse(guide["price_list"]["includes_tax"])
+        # The last bill is still reported, for the operator to compare.
+        self.assertEqual(guide["last_sale"]["doc_num"], 625070136)
+
+    def test_a_tax_inclusive_list_is_taken_back_to_pre_tax(self):
+        reader, _ = self._reader(
+            self._sales(), [(4, "COUNTER", "Y", Decimal("160"), Decimal("5"))]
+        )
+
+        guide = reader.line_price_guide(self.CASH, "FG0000106")
+
+        self.assertEqual(guide["price_list"]["price"], 160.0)
+        self.assertEqual(guide["price"], 152.381)
+        self.assertEqual(guide["source"], "price_list")
+
+    def test_a_tax_inclusive_list_without_a_tax_code_does_not_prefill(self):
+        # No past bill for this customer, so no tax code and no rate to take
+        # off: the list is shown, but its gross is not passed off as pre-tax.
+        sales = [self._sale(2, 30, "CUSTA001041", 156.19, 163.9995, 1, 1)]
+        reader, _ = self._reader(sales, [(4, "COUNTER", "Y", Decimal("160"), None)])
+
+        guide = reader.line_price_guide(self.CASH, "FG0000106")
+
+        self.assertIsNone(guide["price"])
+        self.assertIsNone(guide["source"])
+        self.assertIsNone(guide["price_list"]["net_price"])
+        self.assertIsNone(guide["last_sale"])
+        self.assertEqual(guide["tax_code"], "")
+        self.assertEqual(len(guide["recent"]), 1)
+
+    def test_an_item_never_billed_has_nothing_to_offer(self):
+        reader, _ = self._reader([], [(1, "Price List 0", "N", None, None)])
+
+        guide = reader.line_price_guide(self.CASH, "FG0000106")
+
+        self.assertIsNone(guide["price"])
+        self.assertIsNone(guide["source"])
+        self.assertEqual(guide["recent"], [])
