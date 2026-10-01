@@ -7,7 +7,7 @@ Reads from SAP B1 HANA tables: OITW (Item Warehouses), OITM (Item Master).
 
 import logging
 from datetime import date
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from hdbcli import dbapi
 
@@ -109,9 +109,17 @@ class HanaStockDashboardReader:
         }
 
     def get_warehouse_occupancy(
-        self, warehouse: str, item_groups: Optional[List[int]] = None
+        self,
+        warehouse: Union[str, Sequence[str], None],
+        item_groups: Optional[List[int]] = None,
     ) -> List[Dict]:
-        """One row per SKU holding stock in `warehouse`, with the two pack fields.
+        """One row per (SKU, warehouse) holding stock, with the two pack fields.
+
+        `warehouse` is one code, a list of them, or None for every warehouse in
+        the company -- the last is what the operations board's settings screen
+        reads to offer each finished-goods floor with its tonnage beside it.
+        Each row says which warehouse it stands in, so a caller reading several
+        can tell them apart.
 
         The Production Control board has to turn SAP's piece count into pallets,
         and SAP has no pallet unit anywhere to lean on: of the item master's four
@@ -160,6 +168,20 @@ class HanaStockDashboardReader:
             codes = ", ".join(str(int(code)) for code in item_groups)
             group_clause = f'AND i."ItmsGrpCod" IN ({codes})'
 
+        # Warehouse codes are strings from a request, so they are bound, one
+        # placeholder each, never inlined. The list is a handful of ticked
+        # floors, so the statement cache sees few distinct lengths.
+        if isinstance(warehouse, str):
+            warehouse = [warehouse]
+        params: List = []
+        warehouse_clause = ""
+        if warehouse is not None:
+            codes = [code for code in warehouse if code]
+            if not codes:
+                return []
+            warehouse_clause = f'AND w."WhsCode" IN ({", ".join("?" for _ in codes)})'
+            params.extend(codes)
+
         query = f"""
             SELECT
                 w."ItemCode",
@@ -170,15 +192,18 @@ class HanaStockDashboardReader:
                 COALESCE(w."StockValue", 0)   AS "StockValue",
                 COALESCE(i."U_Sub_Group", '') AS "SubGroup",
                 COALESCE(i."InvntryUom", '')  AS "Uom",
-                {gross_weight_expr}           AS "GrossWeightPerCase"
+                {gross_weight_expr}           AS "GrossWeightPerCase",
+                w."WhsCode"                   AS "WhsCode",
+                COALESCE(h."WhsName", '')     AS "WhsName"
             FROM "{schema}"."OITW" w
             JOIN "{schema}"."OITM" i ON i."ItemCode" = w."ItemCode"
-            WHERE w."WhsCode" = ?
-              AND COALESCE(w."OnHand", 0) <> 0
+            LEFT JOIN "{schema}"."OWHS" h ON h."WhsCode" = w."WhsCode"
+            WHERE COALESCE(w."OnHand", 0) <> 0
+              {warehouse_clause}
               {group_clause}
             ORDER BY COALESCE(w."OnHand", 0) DESC
         """
-        rows = self._execute(query, [warehouse])
+        rows = self._execute(query, params)
         return [self._map_occupancy_row(r) for r in rows]
 
     def _table_columns(self, table_name: str) -> Set[str]:
@@ -256,6 +281,8 @@ class HanaStockDashboardReader:
             # `_gross_weight_expr`. The caller must disclose those rows rather
             # than treat them as weightless.
             "gross_weight_per_case": float(row[8]) if row[8] is not None else None,
+            "warehouse": (row[9] or "").strip(),
+            "warehouse_name": row[10] or "",
         }
 
     def get_item_batches(self, item_code: str, warehouse: str) -> List[Dict]:

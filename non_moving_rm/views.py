@@ -16,7 +16,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from company.permissions import HasCompanyContext
+from company.permissions import HasBoardCompanyContext, HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .permissions import CanViewNonMovingRM
@@ -46,9 +46,13 @@ class NonMovingRMReportAPI(APIView):
                            Defaults true, the board's standing rule. Pass false to age every
                            row on its last Goods Receipt PO instead, so that only a purchase
                            counts as movement.
+
+    Under `HasBoardCompanyContext`: the operations board reads Oil's and Mart's
+    idle stock with the header pinned to each, and a login outside Mart would
+    otherwise have Mart's half 403 and the tile report Oil alone.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewNonMovingRM]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewNonMovingRM]
 
     def get(self, request):
         filter_serializer = NonMovingRMFilterSerializer(data=request.query_params)

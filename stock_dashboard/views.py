@@ -31,6 +31,8 @@ from .serializers import (
     StockDashboardAsOfFilterSerializer,
     StockDashboardExportFilterSerializer,
     StockDashboardFilterSerializer,
+    BoardWarehouseSerializer,
+    BoardWarehousesFilterSerializer,
     LogisticsBoardSettingsSerializer,
     StockDashboardResponseSerializer,
     WarehouseBoardSettingsSerializer,
@@ -287,12 +289,18 @@ class WarehouseOccupancyAPI(APIView):
     before trusting the total. Both are counts of stock the tonnage cannot see.
 
     GET /api/v1/dashboards/stock/occupancy/?warehouse=BH-PF
+    GET /api/v1/dashboards/stock/occupancy/?warehouse=BH-BT,BH-PF
 
     Query parameters:
-        warehouse - one SAP warehouse code (required)
+        warehouse - one SAP warehouse code, or several comma-separated (required)
+
+    Under `HasBoardCompanyContext`, like the board's other feeds: the operations
+    board reads Mart's ticked warehouses with the header pinned to Mart, and a
+    login outside Mart would otherwise see the warehouse band quietly drop half
+    its stock.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewStockDashboard]
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewStockDashboard]
 
     def get(self, request):
         filter_serializer = WarehouseOccupancyFilterSerializer(data=request.query_params)
@@ -425,6 +433,98 @@ class WarehouseBoardSettingsAPI(APIView):
 
         serializer.save(updated_by=request.user)
         return Response(serializer.data)
+
+
+class BoardWarehousesAPI(APIView):
+    """Every warehouse the operations board could count, with its settings.
+
+    GET /api/v1/dashboards/stock/board-warehouses/?item_groups=102
+    GET /api/v1/dashboards/stock/board-warehouses/?on_board=true
+
+    For the company in the `Company-Code` header. The full list is what the
+    settings screen offers to tick: every warehouse holding stock in
+    `item_groups` according to SAP, with its tonnage today, plus any ticked
+    warehouse that has since emptied so it can still be unticked. Ticking is a
+    PUT of `on_board` to `warehouse-settings/`.
+
+    `on_board=true` answers the ticked warehouses only, straight from Postgres
+    -- what the board reads each refresh, so it costs no SAP call.
+
+    Deliberately does not create settings rows for the warehouses it lists:
+    creating one per finished-goods warehouse on every read of the screen would
+    fill the table with rows nobody configured. Unconfigured ones are served as
+    nulls, the same as `warehouse-settings/` answers before its first write.
+
+    Where SAP cannot be read the settings rows still come back, stock fields
+    null and `stock_error` saying why, so the ticks stay editable.
+    """
+
+    permission_classes = [IsAuthenticated, HasBoardCompanyContext, CanViewStockDashboard]
+
+    def get(self, request):
+        filters = BoardWarehousesFilterSerializer(data=request.query_params)
+        if not filters.is_valid():
+            return Response(
+                {"detail": "Invalid query parameters.", "errors": filters.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        company_code = request.company.company.code
+        settings_rows = {
+            row.warehouse: row
+            for row in WarehouseBoardSettings.objects.filter(
+                company_code=company_code
+            ).select_related("updated_by")
+        }
+        ticked = {code for code, row in settings_rows.items() if row.on_board}
+
+        if filters.validated_data["on_board"]:
+            rows = [settings_rows[code] for code in sorted(ticked)]
+            return Response(
+                {
+                    "company_code": company_code,
+                    "warehouses": BoardWarehouseSerializer(rows, many=True).data,
+                    "stock_error": None,
+                }
+            )
+
+        stock_error = None
+        try:
+            stock = StockDashboardService(
+                company_code=company_code
+            ).get_finished_goods_by_warehouse(
+                filters.validated_data.get("item_groups") or None
+            )
+        except SAPConnectionError:
+            stock, stock_error = {}, "SAP is unavailable, so stock could not be read."
+        except SAPDataError as e:
+            stock, stock_error = {}, f"SAP data error: {e}"
+
+        rows = []
+        for code in set(stock) | ticked:
+            row = settings_rows.get(code) or WarehouseBoardSettings(
+                company_code=company_code, warehouse=code
+            )
+            summary = stock.get(code)
+            # Read fine and nothing there is zero; not read at all is unknown.
+            empty = None if stock_error else 0
+            row.name = summary["name"] if summary else ""
+            row.items = summary["items"] if summary else empty
+            row.tonnes = round(summary["tonnes"], 3) if summary else empty
+            row.unweighed_items = summary["unweighed_items"] if summary else empty
+            rows.append(row)
+
+        # Ticked first, then heaviest, so what the board counts is on top and
+        # the candidates run down from the ones worth considering.
+        rows.sort(key=lambda row: (not row.on_board, -(row.tonnes or 0), row.warehouse))
+
+        return Response(
+            {
+                "company_code": company_code,
+                "warehouses": BoardWarehouseSerializer(rows, many=True).data,
+                "stock_error": stock_error,
+            }
+        )
 
 
 class LogisticsBoardSettingsAPI(APIView):

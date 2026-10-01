@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    BoardWarehousesAPI,
     ItemBatchAPI,
     LogisticsBoardSettingsAPI,
     OwnedVehicleStatusAPI,
@@ -40,6 +41,11 @@ urlpatterns = [
         "warehouse-settings/",
         WarehouseBoardSettingsAPI.as_view(),
         name="warehouse-board-settings",
+    ),
+    path(
+        "board-warehouses/",
+        BoardWarehousesAPI.as_view(),
+        name="board-warehouses",
     ),
     path("<str:item_code>/batches/", ItemBatchAPI.as_view(), name="stock-item-batches"),
     path("<str:item_code>/warehouses/", StockItemDetailAPI.as_view(), name="stock-item-detail"),

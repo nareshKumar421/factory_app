@@ -7,7 +7,7 @@ Calculates stock health ratios and categorizes items by urgency.
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from sap_client.context import CompanyContext
 
@@ -41,6 +41,54 @@ def _is_piece_uom(uom: str) -> bool:
     caller's disclosure count, where somebody can see them.
     """
     return bool((uom or "").strip()) and (uom or "").strip().upper() not in _MASS_OR_VOLUME_UOMS
+
+
+def _row_kilograms(row: Dict) -> Optional[float]:
+    """Kilograms on one occupancy row, or None where it cannot be weighed.
+
+    The operations board's own weight chain (`rowKilograms` in FactoryFlow's
+    logistics-control tonnage utils), repeated here only so the settings screen
+    can print each warehouse's tonnage beside its tick. The board still weighs
+    its own rows; this figure only has to help somebody choose.
+    """
+    if not _is_piece_uom(row.get("uom", "")):
+        return None
+    per_case = row.get("gross_weight_per_case")
+    pieces_per_case = row.get("pieces_per_box")
+    if not per_case or per_case <= 0 or not pieces_per_case or pieces_per_case <= 0:
+        return None
+    return row["on_hand"] * per_case / pieces_per_case
+
+
+def summarise_warehouse_stock(rows: List[Dict]) -> Dict[str, Dict]:
+    """Occupancy rows rolled up per warehouse: items, tonnes, and what is unweighed.
+
+    Keyed on the warehouse code. `unweighed_items` counts rows the tonnage could
+    not see -- no case weight, no pack factor, or a mass or volume balance -- so
+    a warehouse whose figure is a floor says so.
+    """
+    summary: Dict[str, Dict] = {}
+    for row in rows:
+        code = row.get("warehouse") or ""
+        if not code:
+            continue
+        entry = summary.setdefault(
+            code,
+            {
+                "warehouse": code,
+                "name": row.get("warehouse_name") or "",
+                "items": 0,
+                "tonnes": 0.0,
+                "unweighed_items": 0,
+            },
+        )
+        entry["items"] += 1
+        kilograms = _row_kilograms(row)
+        if kilograms is None:
+            entry["unweighed_items"] += 1
+        else:
+            entry["tonnes"] += kilograms / 1000
+    return summary
 
 
 class StockDashboardService:
@@ -185,9 +233,12 @@ class StockDashboardService:
         }
 
     def get_warehouse_occupancy(
-        self, warehouse: str, item_groups: Optional[List[int]] = None
+        self, warehouse: Union[str, List[str]], item_groups: Optional[List[int]] = None
     ) -> Dict:
-        """One warehouse's stock with the pack fields needed to count pallets.
+        """One or more warehouses' stock with the pack fields needed to count pallets.
+
+        A list reads several warehouses in one query, each row naming its own;
+        `meta.warehouse` then lists them comma-separated.
 
         Deliberately does NO pallet arithmetic. The pieces-per-pallet figures are
         board policy, not SAP fact -- the boxes-per-pallet divisor came from
@@ -213,7 +264,7 @@ class StockDashboardService:
         return {
             "data": rows,
             "meta": {
-                "warehouse": warehouse,
+                "warehouse": warehouse if isinstance(warehouse, str) else ",".join(warehouse),
                 "item_groups": list(item_groups or []),
                 "item_count": len(rows),
                 "total_on_hand": sum(r["on_hand"] for r in rows),
@@ -229,6 +280,16 @@ class StockDashboardService:
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             },
         }
+
+    def get_finished_goods_by_warehouse(self, item_groups: Optional[List[int]] = None) -> Dict[str, Dict]:
+        """Every warehouse in the company holding stock in `item_groups`, summarised.
+
+        One SAP read across the whole chart of warehouses. For the operations
+        board's settings screen, which offers each floor to tick with its tonnage
+        today beside it -- see `summarise_warehouse_stock`.
+        """
+        rows = self.reader.get_warehouse_occupancy(None, item_groups=item_groups)
+        return summarise_warehouse_stock(rows)
 
     def get_stock_levels_for_export(self, filters: Dict[str, Any]) -> List[Dict]:
         """

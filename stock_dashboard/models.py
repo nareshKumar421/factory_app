@@ -71,6 +71,13 @@ class WarehouseBoardSettings(models.Model):
     all, so a date inferred from the movement log would really mean "the last
     count that found a discrepancy", which is not the question anybody asks.
 
+    ``on_board`` — whether the operations board counts this warehouse. The
+    warehouse band reports Oil and Mart side by side across whichever of their
+    warehouses are ticked, rather than one pinned floor. A tick and not "every
+    warehouse holding finished goods", because that list takes in C&F agents'
+    stock in Punjab, goods-return floors and in-transit warehouses whose
+    tonnage the transport band already reports as stock on the road.
+
     One row per (company, warehouse), created on first read so the board never
     404s on a warehouse nobody has configured yet. Both figures are nullable and
     must stay that way — an unset capacity has to read as "not configured"
@@ -95,6 +102,14 @@ class WarehouseBoardSettings(models.Model):
         null=True,
         blank=True,
         help_text="When stock in this warehouse was last physically verified.",
+    )
+    # `db_default` as well as `default`: the column reaches the live database
+    # before every server runs code that knows it, and a server that does not
+    # still inserts rows here (get_or_create on first read) without naming it.
+    on_board = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text="Counted on the operations board's warehouse band.",
     )
 
     updated_at = models.DateTimeField(auto_now=True)

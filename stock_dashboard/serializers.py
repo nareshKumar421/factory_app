@@ -212,11 +212,20 @@ class ItemDetailResponseSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 
+#: How many warehouses one occupancy read may name. The operations board sends
+#: the floors ticked for one company, a handful; this only stops a request from
+#: building an unbounded IN list.
+MAX_OCCUPANCY_WAREHOUSES = 40
+
+
 class WarehouseOccupancyFilterSerializer(serializers.Serializer):
     warehouse = serializers.CharField(
         required=True,
-        max_length=8,
-        help_text="One SAP warehouse code, e.g. BH-PF",
+        max_length=400,
+        help_text=(
+            "One SAP warehouse code, e.g. BH-PF, or several comma-separated, "
+            "e.g. BH-BT,BH-PF. Always validated to a list."
+        ),
     )
 
     item_groups = serializers.CharField(
@@ -229,10 +238,23 @@ class WarehouseOccupancyFilterSerializer(serializers.Serializer):
     )
 
     def validate_warehouse(self, value):
-        cleaned = value.strip().upper()
-        if not cleaned:
+        codes = []
+        for part in value.split(","):
+            code = part.strip().upper()
+            if not code:
+                continue
+            # SAP's OWHS.WhsCode is eight characters.
+            if len(code) > 8:
+                raise serializers.ValidationError(f"'{code}' is not a warehouse code.")
+            if code not in codes:
+                codes.append(code)
+        if not codes:
             raise serializers.ValidationError("A warehouse code is required.")
-        return cleaned
+        if len(codes) > MAX_OCCUPANCY_WAREHOUSES:
+            raise serializers.ValidationError(
+                f"At most {MAX_OCCUPANCY_WAREHOUSES} warehouses can be read at once."
+            )
+        return codes
 
     def validate_item_groups(self, value):
         """A list of integer group codes, or empty for "no restriction".
@@ -279,6 +301,9 @@ class WarehouseOccupancyItemSerializer(serializers.Serializer):
     # such user-defined field at all; either way the caller must disclose the row
     # rather than count it as weightless.
     gross_weight_per_case = serializers.FloatField(allow_null=True)
+    # Which warehouse the row stands in -- a read can name several.
+    warehouse = serializers.CharField(allow_blank=True, default="")
+    warehouse_name = serializers.CharField(allow_blank=True, default="")
 
 
 class WarehouseOccupancyMetaSerializer(serializers.Serializer):
@@ -386,6 +411,7 @@ class WarehouseBoardSettingsSerializer(serializers.ModelSerializer):
             "warehouse",
             "capacity_tonnes",
             "last_audit_date",
+            "on_board",
             "updated_at",
             "updated_by_name",
         ]
@@ -486,3 +512,36 @@ class LogisticsBoardSettingsSerializer(serializers.ModelSerializer):
 
     def validate_transport_salary_monthly(self, value):
         return self._non_negative(value, "Salary")
+
+
+class BoardWarehouseSerializer(WarehouseBoardSettingsSerializer):
+    """One warehouse on the board's settings screen: its settings and its stock.
+
+    The stock fields come from SAP and are null where SAP could not be read or
+    holds nothing there today -- a ticked warehouse that has emptied stays on
+    the list so it can be unticked.
+    """
+
+    name = serializers.CharField(allow_blank=True, default="")
+    items = serializers.IntegerField(allow_null=True, default=None)
+    tonnes = serializers.FloatField(allow_null=True, default=None)
+    unweighed_items = serializers.IntegerField(allow_null=True, default=None)
+
+    class Meta(WarehouseBoardSettingsSerializer.Meta):
+        fields = WarehouseBoardSettingsSerializer.Meta.fields + [
+            "name",
+            "items",
+            "tonnes",
+            "unweighed_items",
+        ]
+
+
+class BoardWarehousesFilterSerializer(serializers.Serializer):
+    """Query parameters for the board's warehouse list."""
+
+    item_groups = serializers.CharField(required=False, allow_blank=True)
+    # Ticked warehouses only, read from Postgres with no SAP call -- what the
+    # board itself asks for on every refresh.
+    on_board = serializers.BooleanField(required=False, default=False)
+
+    validate_item_groups = WarehouseOccupancyFilterSerializer.validate_item_groups
