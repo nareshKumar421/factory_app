@@ -1004,15 +1004,13 @@ class DispatchPlansService:
 
         if doc_num:
             plan.sap_invoice_doc_num = doc_num
-        elif not plan.sap_invoice_doc_num:
-            # No DocNum supplied and none stored yet -- snapshot it from SAP so the
-            # bill never displays as its raw DocEntry. Callers like set-dispatch-date
-            # create a plan with only a date and would otherwise leave this blank
-            # forever. Best-effort: a SAP hiccup just falls back to the old behaviour.
-            plan.sap_invoice_doc_num = self._resolve_doc_num(sap_invoice_doc_entry)
 
         for field, value in data.items():
             setattr(plan, field, value)
+
+        # Whatever of the DocNum and the customer the caller did not supply, and
+        # the plan does not already hold, comes from the SAP invoice.
+        self._snapshot_invoice_from_sap(plan)
 
         if created and not plan.booking_status:
             plan.booking_status = DispatchPlanStatus.PENDING
@@ -1029,16 +1027,61 @@ class DispatchPlansService:
         self._link_completed_empty_in(plan)
         return plan
 
-    def _resolve_doc_num(self, sap_invoice_doc_entry: int) -> str:
-        """SAP DocNum for a DocEntry, or "" if SAP is unreachable / not found."""
+    #: What a plan must not be saved without, and the SAP bill field it is copied
+    #: from when the caller did not supply it.
+    _INVOICE_SNAPSHOT_FIELDS = {
+        "sap_invoice_doc_num": "doc_num",
+        "customer_code": "card_code",
+        "customer_name": "card_name",
+    }
+
+    def _snapshot_invoice_from_sap(self, plan: DispatchPlan) -> None:
+        """Fill a plan's DocNum and customer from its SAP invoice, where blank.
+
+        The DocNum, so the bill never displays as its raw DocEntry: callers like
+        set-dispatch-date create a plan with only a date.
+
+        The customer, because the single-bill save never carried one. The Plan
+        page saves through `DispatchPlanUpdateSerializer`, which has no customer
+        field, and only a batch link wrote it (`_invoice_defaults_from_bill`). So
+        every bill only ever saved on its own kept a blank customer for good --
+        1,809 plans on live by 30 September 2026, printed as "Unnamed customer"
+        by every view that groups by it, although SAP will not raise an invoice
+        without one.
+
+        One SAP read, and only while something is missing: a plan holding all
+        three costs SAP nothing. Only blanks are filled, never a value a caller
+        supplied. Best-effort: a SAP hiccup leaves the plan as it was, and its
+        next save tries again.
+        """
+        missing = [
+            field
+            for field in self._INVOICE_SNAPSHOT_FIELDS
+            if not (getattr(plan, field) or "").strip()
+        ]
+        if not missing:
+            return
+
         try:
-            bills = self.reader.list_bills_by_doc_entries([sap_invoice_doc_entry])
+            bills = self.reader.list_bills_by_doc_entries([plan.sap_invoice_doc_entry])
         except Exception:
-            return ""
-        for bill in bills:
-            if bill.get("doc_entry") == sap_invoice_doc_entry:
-                return bill.get("doc_num") or ""
-        return ""
+            logger.warning(
+                "Could not read SAP invoice %s to fill %s",
+                plan.sap_invoice_doc_entry,
+                ", ".join(missing),
+                exc_info=True,
+            )
+            return
+
+        bill = next(
+            (row for row in bills if row.get("doc_entry") == plan.sap_invoice_doc_entry),
+            None,
+        )
+        if bill is None:
+            return
+
+        for field in missing:
+            setattr(plan, field, str(bill.get(self._INVOICE_SNAPSHOT_FIELDS[field]) or ""))
 
     @staticmethod
     def _shared_batch_link_data(data: Dict[str, Any]) -> Dict[str, Any]:
