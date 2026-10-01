@@ -27,7 +27,7 @@ class QCPrintDocument(BaseModel):
         )
         PRODUCTION_QC_SHEET = (
             "PRODUCTION_QC_SHEET",
-            "QC Document Sheet",
+            "QA Report Sheet",
         )
 
     company = models.ForeignKey(
@@ -75,7 +75,7 @@ class QCPrintDocument(BaseModel):
     @property
     def label(self):
         if self.production_parameter_type_id:
-            return f"Document — {self.production_parameter_type.name}"
+            return f"QA Report — {self.production_parameter_type.name}"
         return self.get_document_key_display()
 
     def __str__(self):

@@ -1,5 +1,5 @@
 # quality_control/services/production_qc.py
-"""QC Documents: saving an entry of a document, and approving or sending it back."""
+"""QA Reports: saving an entry of a report, and approving or sending it back."""
 
 from decimal import Decimal, InvalidOperation
 
@@ -85,15 +85,15 @@ def _parameters_of(parameter_type):
 
 @transaction.atomic
 def create_entry(company, user, *, parameter_type_id, readings, remarks=""):
-    """Save a new entry of one of the company's documents and send it for approval.
+    """Save a new entry of one of the company's reports and send it for approval.
 
-    A document is not tied to production: there is no line or run to pick.
+    A report is not tied to production: there is no line or run to pick.
     """
     parameter_type = ProductionParameterType.objects.filter(
         company=company, pk=parameter_type_id, is_active=True
     ).first()
     if parameter_type is None:
-        raise ProductionQCError("Pick a document.", "parameter_type_id")
+        raise ProductionQCError("Pick a report.", "parameter_type_id")
 
     parameters = _parameters_of(parameter_type)
     _check_readings(

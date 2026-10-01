@@ -70,7 +70,7 @@ from .views_qc_document_file_audit import (
 )
 
 urlpatterns = [
-    # ==================== QC Documents ("production QC" in code) ====================
+    # ==================== QA Reports ("production QC" in code) ====================
     path("production-qc/entries/", ProductionQCEntryListCreateAPI.as_view(),
          name="production-qc-entries"),
     path("production-qc/entries/counts/", ProductionQCEntryCountsAPI.as_view(),

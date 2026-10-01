@@ -116,7 +116,7 @@ class MaterialTypeSAPItemLinkSerializer(serializers.Serializer):
 # ==================== QC Print Document Serializers ====================
 
 class QCPrintDocumentSerializer(serializers.ModelSerializer):
-    # The form's name: the key's, or "Document — <type>" for a QC document's sheet.
+    # The form's name: the key's, or "QA Report — <type>" for a QA report's sheet.
     document_key_label = serializers.CharField(source="label", read_only=True)
 
     class Meta:

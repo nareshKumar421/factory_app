@@ -1,4 +1,4 @@
-"""QC Documents ("production QC" in code): saving an entry, approving it, and the groups."""
+"""QA Reports ("production QC" in code): saving an entry, approving it, and the groups."""
 
 import importlib
 from datetime import timedelta
@@ -409,7 +409,7 @@ class ProductionFormNumberTests(ProductionQCBase):
         labels = [option["label"] for option in resp.data]
         self.assertEqual(
             labels,
-            ["Arrival Slip Inspection Print", "Arrival Slip QC Parameters Print", "Document — PET 1 L"],
+            ["Arrival Slip Inspection Print", "Arrival Slip QC Parameters Print", "QA Report — PET 1 L"],
         )
         self.assertEqual(resp.data[2]["production_parameter_type"], self.type.id)
 
@@ -417,7 +417,7 @@ class ProductionFormNumberTests(ProductionQCBase):
         resp = self._set(document_key="PRODUCTION_QC_SHEET",
                          production_parameter_type=self.type.id, document_id="QA-FRM-14-01-05-02")
         self.assertEqual(resp.status_code, 201, resp.data)
-        self.assertEqual(resp.data["document_key_label"], "Document — PET 1 L")
+        self.assertEqual(resp.data["document_key_label"], "QA Report — PET 1 L")
 
         resp = _client(self.company, VIEW).get(
             reverse("production-qc-parameter-type-detail", args=[self.type.id])
@@ -433,7 +433,7 @@ class ProductionFormNumberTests(ProductionQCBase):
         listed = self.admin.get(reverse("qc-print-document-list-create")).data
         self.assertEqual(
             [(row["document_key_label"], row["document_id"]) for row in listed],
-            [("Document — PET 1 L", "QA-FRM-14-01-05-02")],
+            [("QA Report — PET 1 L", "QA-FRM-14-01-05-02")],
         )
 
         # Changed in Print Documents, the type reads the change.
@@ -554,4 +554,34 @@ class DocumentsRenameMigrationTests(TestCase):
         self.assertEqual(lead.name, "Production QC Lead")
         self.assertEqual(
             Permission.objects.get(codename=VIEW).name, "Can view production QC entries"
+        )
+
+
+class QAReportsRenameMigrationTests(TestCase):
+    """0072: the lead's group and the permission labels say QA Reports now."""
+
+    class _Editor:
+        connection = connection
+
+    migration = importlib.import_module(
+        "quality_control.migrations.0072_rename_documents_to_qa_reports"
+    )
+
+    def test_the_lead_group_is_renamed_and_keeps_its_members(self):
+        Group.objects.filter(name="QA Reports Lead").delete()
+        lead = Group.objects.create(name="QC Documents Lead")
+        member = _user(Company.objects.create(code="JIVO_BEV", name="Bev"))
+        member.groups.add(lead)
+
+        self.migration.forwards(global_apps, self._Editor())
+        lead.refresh_from_db()
+        self.assertEqual(lead.name, "QA Reports Lead")
+        self.assertTrue(lead.user_set.filter(pk=member.pk).exists())
+        self.assertEqual(Permission.objects.get(codename=APPROVE).name, "Can approve QA report entries")
+
+        self.migration.backwards(global_apps, self._Editor())
+        lead.refresh_from_db()
+        self.assertEqual(lead.name, "QC Documents Lead")
+        self.assertEqual(
+            Permission.objects.get(codename=APPROVE).name, "Can approve QC document entries"
         )

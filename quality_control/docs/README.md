@@ -45,7 +45,7 @@ was in use; they are to be rebuilt around what happens on the floor rather than
 around the paper reports. The line-clearance perms moved off `ProductionQCSession`
 onto `RawMaterialInspection` in that migration, keeping their codenames and grants.
 
-**Production QC, rebuilt (migrations `0063`, `0064`; types unlinked from products in `0069`), now "Documents" and cut loose from production (`0070`, `0071`)** — see [Flow D](#flow-d--qc-documents).
+**Production QC, rebuilt (migrations `0063`, `0064`; types unlinked from products in `0069`), cut loose from production (`0070`) and now "QA Reports" (`0071` named it Documents, `0072` QA Reports)** — see [Flow D](#flow-d--qa-reports).
 Nothing of the removed version is reused: new tables, new permission codenames.
 
 ---
@@ -163,25 +163,25 @@ OneToOne** so a fresh inspection can be created later). Slip → DRAFT, entry �
 `ARRIVAL_SLIP_REJECTED`, guard notified. If the inspection has already been
 submitted to the chemist, send-back is refused ("use inspection rejection instead").
 
-### Flow D — QC Documents
+### Flow D — QA Reports
 
 The records QC maintains — on-line monitoring, water and RO testing, net content,
 checklists, hold & release… — each a paper form QA keeps. In the app the area is
-**Documents**; the code keeps its first name, *production QC* (`models/production_qc.py`,
+**QA Reports** (briefly "Documents"); the code keeps its first name, *production QC* (`models/production_qc.py`,
 `services/production_qc.py`, `views_production_qc.py`, all under `production-qc/`).
 
 **Not tied to production** (since `0070`): an entry has no line, run or product.
 Whatever the paper header asks for (product, SKU, line, shift, batch…) is one of the
-document's parameters, and the entry search looks through the values entered.
+report's parameters, and the entry search looks through the values entered.
 
-**Masters**: a `ProductionParameterType` is a *document type* — one form — carrying its
+**Masters**: a `ProductionParameterType` is a *report type* — one form — carrying its
 `ProductionParameter`s (spec as free text plus optional min/max, `value_type`
 NUMERIC/TEXT/BOOLEAN/RANGE, uom, mandatory, sequence) and the form's revision; its
 number is its Print Documents row (`QCPrintDocument` PRODUCTION_QC_SHEET, one per type).
 Types are not tied to products (the link table was dropped in `0069`) and there are no
 vendor-specific sets.
 
-1. **Pick the document** — any active type of the company (`GET parameter-types/`).
+1. **Pick the report** — any active type of the company (`GET parameter-types/`).
 2. **Fill and save** — `POST entries/` with `parameter_type_id` and one reading per
    parameter. Saving sends it for approval (PENDING); there are no drafts. Every
    mandatory parameter needs a value, and an out-of-spec reading needs an entry remark
@@ -198,7 +198,7 @@ columns, as the paper does.
 
 Lists: `?date=` gives one day, every status; otherwise PENDING and SENT_BACK entries show
 whatever the date and a search spans all dates. `?parameter_type_id=` narrows to one
-document; `?search=` matches the entry no., the document's code / name, and any value
+report; `?search=` matches the entry no., the report's code / name, and any value
 entered (an `Exists` subquery, so the out-of-spec count is not inflated).
 
 ---
@@ -389,12 +389,13 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
 - `qc_manager` — **all** `quality_control` permissions (the QAM).
 - The "Production QC" group (the line QC staff, from before `0064`) carries the
   line-clearance perms; the front-end QC nav is gated on them too, so that group sees
-  the module. Migration `0064` also gives it view + fill on document entries. It keeps
+  the module. Migration `0064` also gives it view + fill on report entries. It keeps
   its name.
-- "QC Documents Lead" (made by `0064` as "Production QC Lead", renamed by `0071`) —
-  view + approve entries, and manage the document types. `qc_manager` gets all four
-  document perms. `0071` also rewrote the four permissions' stored names
-  ("Can view QC document entries"…); the codenames are unchanged.
+- "QA Reports Lead" (made by `0064` as "Production QC Lead", renamed by `0071` to
+  "QC Documents Lead" and by `0072` to this) — view + approve entries, and manage the
+  report types. `qc_manager` gets all four report perms. `0071` and then `0072`
+  rewrote the four permissions' stored names ("Can view QA report entries"…); the
+  codenames are unchanged.
 
 ---
 
@@ -406,13 +407,13 @@ role-string based. Custom permissions live on the model `Meta.permissions`.
   `raw_material_inspection.py` (+ `InspectionManagerDecisionLog`),
   `inspection_parameter_result.py`, `inspection_attachment.py`,
   `qc_document_file.py` + `qc_document_file_audit.py` (QA Procedures PDF library),
-  `production_qc.py` (QC document types, their entries and readings).
+  `production_qc.py` (QA report types, their entries and readings).
   (`models.py` is an empty stub.)
 - `enums.py` — arrival-slip/inspection/decision/workflow/parameter enums.
 - `services/rules.py` — gate-status computation + QC-completed notification.
 - `services/spec_evaluation.py` — free-text spec → `is_within_spec`.
-- `services/production_qc.py` — saving / correcting / deciding a document entry.
-- `views_production_qc.py`, `serializers_production_qc.py` — the QC Documents API.
+- `services/production_qc.py` — saving / correcting / deciding a report entry.
+- `views_production_qc.py`, `serializers_production_qc.py` — the QA Reports API.
 - `views.py` — master data, arrival slips, inspections, approvals, status-based lists.
 - `serializers.py` — all read/write serializers (incl. `_safe_related` FK guard).
 - `permissions.py` — DRF permission classes.

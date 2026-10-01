@@ -83,10 +83,10 @@ App label: `quality_control`
 | 8 | `can_reject_inspection` | Can reject inspection | `RawMaterialInspection` |
 | 9 | `can_view_line_clearance_qc` | Can view line clearance QC | `RawMaterialInspection` |
 | 10 | `can_approve_line_clearance_qc` | Can approve line clearance QC | `RawMaterialInspection` |
-| 11 | `can_view_production_qc_entries` | Can view QC document entries | `ProductionQCEntry` |
-| 12 | `can_fill_production_qc_entries` | Can fill and correct QC document entries | `ProductionQCEntry` |
-| 13 | `can_approve_production_qc_entries` | Can approve QC document entries | `ProductionQCEntry` |
-| 14 | `can_manage_production_qc_parameters` | Can manage QC document types | `ProductionQCEntry` |
+| 11 | `can_view_production_qc_entries` | Can view QA report entries | `ProductionQCEntry` |
+| 12 | `can_fill_production_qc_entries` | Can fill and correct QA report entries | `ProductionQCEntry` |
+| 13 | `can_approve_production_qc_entries` | Can approve QA report entries | `ProductionQCEntry` |
+| 14 | `can_manage_production_qc_parameters` | Can manage QA report types | `ProductionQCEntry` |
 
 **Django default permissions also used in views:**
 

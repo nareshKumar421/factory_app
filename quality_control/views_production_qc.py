@@ -1,5 +1,5 @@
 # quality_control/views_production_qc.py
-"""QC Documents API (still under `production-qc/`): entries, their approval, and the document types."""
+"""QA Reports API (still under `production-qc/`): entries, their approval, and the report types."""
 
 from datetime import date
 
@@ -151,7 +151,7 @@ class ProductionQCEntryListCreateAPI(APIView):
 
         search = (params.get("search") or "").strip()
         if search:
-            # A document's header (product, batch, line...) is among its
+            # A report's header (product, batch, line...) is among its
             # readings, so a search looks there too.
             match = (
                 Q(parameter_type__name__icontains=search)
