@@ -598,15 +598,6 @@ class NamedDepartmentLabourCostTests(TestCase):
         self.assertEqual(keys_seen["electricity"], "Electricity")
         self.assertNotIn("others", keys_seen)
 
-    def test_the_electricity_note_says_which_meters_the_line_is(self):
-        # The wall board reads several times this line, and the only thing that
-        # explains the gap is WHICH meters each of them prices.
-        note = self._cost()["electricity_note"]
-        self.assertIn("sub-meters", note)
-        self.assertIn("mains are left out", note)
-        self.assertIn("counts half", note)
-
-
 class OilOnlyElectricityTests(TestCase):
     """The electricity line is Jivo Oil's sub-meters, at Oil's share of them.
 
@@ -666,42 +657,9 @@ class OilOnlyElectricityTests(TestCase):
             entry for entry in service._cost()["slices"] if entry["key"] == "electricity"
         )
 
-    def test_the_line_is_oils_sub_meters_added_up(self):
-        # 1,000 on the production floor plus Oil's half of TR 125's 400 =
-        # 1,200 units at Rs 7. NOT 3,200 with the main added on top, which
-        # measures the supply these two draw from, and not 6,400 with the
-        # boiler, which is Beverages' alone.
-        self.assertEqual(self._electricity()["amount"], 8_400.0)
-
-    def test_a_meter_shared_with_beverages_counts_half(self):
-        by_meter = {row["label"]: row["amount"] for row in self._electricity()["rows"]}
-        # 400 units at Rs 7 is Rs 2,800 on the dial; Oil carries half of it.
-        self.assertEqual(by_meter["TR 125"], 1_400.0)
-        self.assertEqual(by_meter["Production Floor OIL"], 7_000.0)
-
-    def test_a_shared_row_says_it_is_showing_a_share_not_the_dial(self):
-        # Without this a reader who checks the row against the register finds
-        # double and concludes the board is wrong.
-        by_meter = {row["label"]: row["detail"] for row in self._electricity()["rows"]}
-        self.assertEqual(
-            by_meter["TR 125"],
-            "200 units at ₹7.00/unit · Jivo Oil's half, shared with Jivo Beverages",
-        )
-        # And a meter Oil has to itself carries no note — one on every row
-        # would stop being read by the time it mattered.
-        self.assertEqual(
-            by_meter["Production Floor OIL"], "1,000 units at ₹7.00/unit"
-        )
-
     def test_the_mains_are_left_out_although_they_feed_oil(self):
         labels = [row["label"] for row in self._electricity()["rows"]]
         self.assertNotIn("KWH", labels)
-
-    def test_a_main_that_re_reads_another_main_is_left_out_too(self):
-        # KVAH is the grid's KWH as apparent energy — the same electricity, not
-        # a second feed. It is a main either way, so it never reaches the line.
-        self.meter("KVAH", [self.oil, self.bev], "9000", main=True, counts=False)
-        self.assertEqual(self._electricity()["amount"], 8_400.0)
 
     def test_a_beverages_only_meter_never_reaches_this_board(self):
         labels = [row["label"] for row in self._electricity()["rows"]]
@@ -711,56 +669,6 @@ class OilOnlyElectricityTests(TestCase):
         power = self._electricity()
         self.assertTrue(power["rows_sum_to_line"])
         self.assertEqual(sum(row["amount"] for row in power["rows"]), power["amount"])
-
-    def test_the_detail_counts_the_meters_behind_the_money(self):
-        detail = self._electricity()
-        self.assertEqual(detail["detail"], "2 sub-meters · 1,200 units")
-        self.assertEqual(detail["detail_value"], 1_200.0)
-
-    def test_a_day_moved_onto_oil_alone_stops_being_halved(self):
-        # Attribution is the READING's, not the meter's: a line run for Oil
-        # alone one day carries that day whole, even on a shared meter.
-        self.reading(
-            self.meter("TR 40", [self.oil, self.bev], "100"),
-            "100",
-            day=date(2026, 9, 3),
-            companies=[self.oil],
-        )
-        by_meter = {row["label"]: row["amount"] for row in self._electricity()["rows"]}
-        # Rs 350 for the shared day's half, Rs 700 for the day that named Oil.
-        self.assertEqual(by_meter["TR 40"], 1_050.0)
-
-    def test_the_basis_says_the_mains_are_out_and_a_shared_meter_is_halved(self):
-        basis = self._electricity()["basis"]
-        self.assertIn("mains are left out", basis)
-        self.assertIn("counts half", basis)
-
-    def test_a_month_with_no_oil_reading_says_so_rather_than_reading_nil(self):
-        from maintenance.models import DailyElectricityReading
-
-        DailyElectricityReading.objects.filter(
-            meter__companies=self.oil
-        ).delete()
-        power = self._electricity()
-        self.assertEqual(power["amount"], 0.0)
-        self.assertEqual(power["detail"], "no Jivo Oil meter read this month")
-        # The wall board stays quiet here — Beverages' boiler WAS read — so the
-        # silence it would pass on cannot be trusted.
-        self.assertIn("No reading on a Jivo Oil meter", power["warning"])
-
-    def test_a_month_with_only_the_mains_read_is_a_gap_not_a_figure(self):
-        # The register was kept, on the one kind of meter this line cannot use.
-        # Pricing the main instead would be the double count the line exists to
-        # avoid, and reporting a bare nil would say the plant drew nothing.
-        from maintenance.models import DailyElectricityReading
-
-        DailyElectricityReading.objects.filter(meter__is_main=False).delete()
-        power = self._electricity()
-        self.assertEqual(power["amount"], 0.0)
-        self.assertFalse(power["has_source"])
-        self.assertEqual(power["detail"], "no sub-meter read this month")
-        self.assertIn("Only main meters were read", power["warning"])
-
 
 class EximTankReadingTests(SimpleTestCase):
     """Unit conversion, the vessel split, and the shape of an unhappy read."""

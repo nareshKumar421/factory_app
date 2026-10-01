@@ -255,50 +255,44 @@ def salary_costs(companies, on_date, cost_type_code=SALARY_COST_TYPE_CODE):
 # ---------------------------------------------------------------------------
 
 def electricity_costs(companies, dates, settings_row, focus=None):
-    """Units and cost from the Daily Electricity register.
+    """Units and cost from Daily Electricity++, per date and (over ``focus``) per meter.
 
     ``focus`` is the span the per-meter breakdown covers; the per-date series
     always spans ``dates`` so the trend can be drawn either way.
 
-    **Each reading is counted once, however many of the selected companies its
-    meter serves.** Four of the campus meters — HTP, KVAH, KWH and LP-196 —
-    feed both Oil and Beverages, so adding up per-company boards would report
-    twice the electricity the factory actually used. The ``__in`` + ``distinct``
-    pair is what keeps a shared meter from being billed to the board twice.
+    **Electricity++, each unit once.** It knows the meter tree, so a main is
+    never added to the sub-meters that measure the same supply, and a meter
+    two companies draw on is split by the share it has there rather than
+    counted for each. Until 2026-10-01 this summed the register itself, mains
+    included.
 
-    Who a day's units belong to is read off the reading, which carries its own
-    attribution from the day it was entered; a reading from before that names
-    nobody and falls back to its meter. A day attributed only to a non-company
-    consumer (Sidle draws off the same supply) belongs to no company board and
-    drops out of all of them — which is the point of tagging it.
+    ``settings_row.electricity_only_company_meters`` keeps the selected
+    companies' share only; without it the wall is the whole metered campus —
+    every company, every consumer (Sidle) and what nobody was set to pay for.
+    Returns ``(per_date, meters, warnings)``.
     """
-    readings = DailyElectricityReading.objects.filter(date__in=dates, is_active=True)
-    if settings_row.electricity_only_company_meters:
-        readings = readings.filter(
-            Q(companies__in=companies)
-            | (
-                Q(companies__isnull=True)
-                & Q(consumers__isnull=True)
-                & Q(meter__companies__in=companies)
-            )
-        )
-    readings = readings.select_related("meter").distinct()
+    from maintenance.electricity import boards
+
+    result = boards.breakdown(min(dates), max(dates))
+    parties = (boards.parties_of(c.code for c in companies)
+               if settings_row.electricity_only_company_meters else None)
+    picked = boards.for_parties(result, parties)
 
     per_date = {day: {"cost": ZERO, "units": ZERO} for day in dates}
+    for day in dates:
+        part = picked["by_day"].get(day)
+        if part:
+            per_date[day]["cost"] = part["cost"]
+            per_date[day]["units"] = part["units"]
+
     meters = defaultdict(lambda: {"units": ZERO, "cost": ZERO, "rate": ZERO})
-    focus = set(focus or [max(dates)])
-
-    for reading in readings:
-        bucket = per_date[reading.date]
-        bucket["cost"] += reading.total_cost or ZERO
-        bucket["units"] += reading.units_consumed or ZERO
-        if reading.date in focus:
-            name = reading.meter.name
-            meters[name]["units"] += reading.units_consumed or ZERO
-            meters[name]["cost"] += reading.total_cost or ZERO
-            meters[name]["rate"] = reading.rate_per_unit or ZERO
-
-    return per_date, meters
+    for day in set(focus or [max(dates)]):
+        for name, part in (picked["by_day_meter"].get(day) or {}).items():
+            meters[name]["units"] += part["units"]
+            meters[name]["cost"] += part["cost"]
+    for part in meters.values():
+        part["rate"] = part["cost"] / part["units"] if part["units"] else ZERO
+    return per_date, meters, boards.warnings(result)
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +486,7 @@ def build_board(
         warnings.append(salary_warning)
 
     # --- electricity -----------------------------------------------------
-    electricity_per_date, meters = electricity_costs(
+    electricity_per_date, meters, electricity_problems = electricity_costs(
         companies, all_dates, settings_row, focus
     )
     electricity_range = sum((electricity_per_date[day]["cost"] for day in span), ZERO)
@@ -501,9 +495,15 @@ def build_board(
     electricity_warning = None
     if not electricity_units:
         electricity_warning = (
-            "No meter reading entered "
+            "No electricity in Daily Electricity++ "
             + ("today" if len(span) == 1 else "in this range")
-            + " — Maintenance › Daily Electricity."
+            + " — Maintenance › Daily Electricity++."
+        )
+        warnings.append(electricity_warning)
+    elif electricity_problems:
+        electricity_warning = (
+            f"Electricity++ flags {len(electricity_problems)} reading "
+            f"problem{'' if len(electricity_problems) == 1 else 's'}: {electricity_problems[0]}"
         )
         warnings.append(electricity_warning)
 

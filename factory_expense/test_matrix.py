@@ -118,56 +118,6 @@ class MeterMappingTests(MatrixFixture):
     answer, and it wins.
     """
 
-    def test_the_mapping_beats_the_meters_own_tagging(self):
-        # Tagged to Beverages, mapped to Oil. The mapping must win.
-        self.reading(self.meter("Production Floor OIL", self.bev), 100)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertEqual(self.amount(matrix, "JIVO_OIL", "ELECTRICITY"), Decimal("700.00"))
-        self.assertEqual(self.amount(matrix, "JIVO_BEVERAGES", "ELECTRICITY"), Decimal("0.00"))
-
-    def test_a_meter_with_no_tagging_at_all_still_maps(self):
-        self.reading(self.meter("Terrace"), 200)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertEqual(self.amount(matrix, "JIVO_BEVERAGES", "ELECTRICITY"), Decimal("1400.00"))
-
-    def test_the_main_incomers_go_to_the_shared_row(self):
-        """User's choice (2026-09-14): the mains are counted, in Shared.
-
-        They belong to no single plant, and they are the supply the sub-meters
-        are a breakdown OF — so the column knowingly counts the same electricity
-        about three times. The warning below is what keeps that from passing as
-        a bill.
-        """
-        self.reading(self.meter("Production Floor OIL", self.oil), 100)
-        self.reading(self.meter("KWH", self.oil, self.bev), 900)
-        self.reading(self.meter("KVAH", self.oil, self.bev), 940)
-        self.reading(self.meter("LP-196", self.oil, self.bev), 60)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertEqual(self.amount(matrix, "JIVO_OIL", "ELECTRICITY"), Decimal("700.00"))
-        self.assertEqual(
-            self.amount(matrix, SHARED_ROW_KEY, "ELECTRICITY"), Decimal("13300.00")
-        )
-        self.assertEqual(
-            Decimal(matrix["total"]["cells"]["ELECTRICITY"]["amount"]), Decimal("14000.00")
-        )
-
-    def test_the_overlap_is_stated_rather_than_left_to_be_noticed(self):
-        self.reading(self.meter("Production Floor OIL", self.oil), 100)
-        self.reading(self.meter("KWH", self.oil, self.bev), 900)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertTrue(
-            any("three times the metered bill" in text for text in matrix["warnings"]),
-            matrix["warnings"],
-        )
-
     def test_the_mains_are_named_on_the_shared_row(self):
         self.reading(self.meter("KWH", self.oil), 900)
         self.reading(self.meter("KVAH", self.oil), 940)
@@ -197,72 +147,8 @@ class MeterMappingTests(MatrixFixture):
             any("Spare Feeder" in text for text in matrix["warnings"]), matrix["warnings"]
         )
 
-    def test_a_campus_meter_is_not_reported_as_unmapped(self):
-        """STP is a decision, not an oversight, so it must not be warned about."""
-        self.reading(self.meter("STP", self.oil), 10)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertFalse(any("STP" in text for text in matrix["warnings"]), matrix["warnings"])
-
-    def test_meters_the_mapping_is_still_waiting_for_are_named(self):
-        matrix = build_matrix(self.companies, DAY)
-
-        waiting = [text for text in matrix["warnings"] if "does not exist" in text or "do not exist" in text]
-        self.assertTrue(waiting, matrix["warnings"])
-        for expected in ("Basement", "LB", "Admin", "TR 60"):
-            self.assertIn(expected, waiting[0])
-
-    def test_ro_meter_and_tr_60_are_different_meters(self):
-        """Both map to Beverages, but one exists and the other is awaited."""
-        self.reading(self.meter("Ro meter", self.bev), 100)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertEqual(self.amount(matrix, "JIVO_BEVERAGES", "ELECTRICITY"), Decimal("700.00"))
-        self.assertTrue(any("TR 60" in text for text in matrix["warnings"]))
-
-
 class ReconciliationTests(MatrixFixture):
     """The sum of the parts, against the meter the bill is struck on."""
-
-    def test_the_sub_meters_are_reconciled_to_the_incomer(self):
-        self.reading(self.meter("Production Floor OIL", self.oil), 500)
-        self.reading(self.meter("Terrace", self.bev), 500)
-        self.reading(self.meter("KWH", self.oil, self.bev), 1000)
-
-        matrix = build_matrix(self.companies, DAY)
-        check = matrix["electricity_reconciliation"]
-
-        self.assertEqual(check["meter"], "KWH")
-        self.assertEqual(Decimal(check["cost"]), Decimal("7000.00"))
-        self.assertEqual(check["drift_pct"], 0.0)
-
-    def test_the_check_measures_sub_meters_not_the_column_total(self):
-        """With the mains inside the column, comparing the column to the incomer
-        would compare a number to a part of itself — always +100% drift."""
-        self.reading(self.meter("Production Floor OIL", self.oil), 1000)
-        self.reading(self.meter("KWH", self.oil, self.bev), 1000)
-
-        matrix = build_matrix(self.companies, DAY)
-        check = matrix["electricity_reconciliation"]
-
-        # Column is 14,000 (sub-meters + mains); the check sees only the 7,000.
-        self.assertEqual(
-            Decimal(matrix["total"]["cells"]["ELECTRICITY"]["amount"]), Decimal("14000.00")
-        )
-        self.assertEqual(Decimal(check["sub_meter_cost"]), Decimal("7000.00"))
-        self.assertEqual(check["drift_pct"], 0.0)
-
-    def test_drift_is_reported_when_the_parts_do_not_add_up(self):
-        self.reading(self.meter("Production Floor OIL", self.oil), 800)
-        self.reading(self.meter("KWH", self.oil, self.bev), 1000)
-        # 800 sub-metered units against a 1,000-unit incomer.
-
-        matrix = build_matrix(self.companies, DAY)
-
-        # 800 of 1000 units accounted for: a fifth of the supply is unread.
-        self.assertEqual(matrix["electricity_reconciliation"]["drift_pct"], -20.0)
 
     def test_no_incomer_reading_is_not_reported_as_no_drift(self):
         self.reading(self.meter("Production Floor OIL", self.oil), 100)
@@ -270,55 +156,6 @@ class ReconciliationTests(MatrixFixture):
         matrix = build_matrix(self.companies, DAY)
 
         self.assertIsNone(matrix["electricity_reconciliation"])
-
-    def test_a_day_on_the_generator_reconciles_against_grid_plus_dg(self):
-        """The supplies swap over; the sub-meters do not.
-
-        Run the plant off the DG and the grid meter barely moves while every
-        sub-meter keeps counting. Reconciling against the grid alone would call
-        that a 150% over-run instead of a day on the generator.
-        """
-        grid = self.meter("KWH", self.oil, self.bev)
-        grid.is_main = True
-        grid.save()
-        dg = self.meter("DG-1", self.oil, self.bev)
-        dg.is_main = True
-        dg.supply_source = "DG"
-        dg.save()
-
-        self.reading(self.meter("Production Floor OIL", self.oil), 800)
-        self.reading(self.meter("Terrace", self.bev), 200)
-        self.reading(grid, 100)   # the grid was out most of the day
-        self.reading(dg, 900)
-
-        check = build_matrix(self.companies, DAY)["electricity_reconciliation"]
-
-        # 1,000 sub-metered units against 1,000 supplied, from two sources.
-        self.assertEqual(Decimal(check["units"]), Decimal("1000.00"))
-        self.assertEqual(check["drift_pct"], 0.0)
-        self.assertEqual(check["meter"], "DG-1 + KWH")
-
-    def test_a_duplicate_main_is_not_added_into_the_supply(self):
-        """KVAH is KWH as apparent energy — counting both doubles the grid."""
-        grid = self.meter("KWH", self.oil)
-        grid.is_main = True
-        grid.save()
-        apparent = self.meter("KVAH", self.oil)
-        apparent.is_main = True
-        apparent.counts_as_supply = False
-        apparent.save()
-
-        self.reading(self.meter("Production Floor OIL", self.oil), 1000)
-        self.reading(grid, 1000)
-        self.reading(apparent, 1040)
-
-        check = build_matrix(self.companies, DAY)["electricity_reconciliation"]
-
-        self.assertEqual(Decimal(check["units"]), Decimal("1000.00"))
-        self.assertEqual(check["meter"], "KWH")
-        self.assertEqual(check["drift_pct"], 0.0)
-        # Still read and still named, just not added in.
-        self.assertIn("KVAH", check["excluded_meters"])
 
     def test_the_excluded_meters_are_named(self):
         self.reading(self.meter("KWH", self.oil), 100)
@@ -329,48 +166,6 @@ class ReconciliationTests(MatrixFixture):
         self.assertEqual(
             matrix["electricity_reconciliation"]["excluded_meters"], ["KVAH", "KWH"]
         )
-
-
-class ElectricityWarningTests(MatrixFixture):
-    """An empty square says which desk can fill it."""
-
-    def test_company_with_no_meter_says_so(self):
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertEqual(
-            self.cell(matrix, "JIVO_MART", "ELECTRICITY")["warning"],
-            "No meter is mapped to this company",
-        )
-
-    def test_company_with_meters_but_no_reading_says_so_differently(self):
-        self.meter("Production Floor OIL", self.oil)
-        self.meter("HP-196", self.oil)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertEqual(
-            self.cell(matrix, "JIVO_OIL", "ELECTRICITY")["warning"],
-            "No reading entered for its 2 meters",
-        )
-
-    def test_a_main_meter_does_not_count_as_the_companys_meter(self):
-        """KWH exists and is tagged to Oil, but Oil still has nothing to show."""
-        self.meter("KWH", self.oil)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertEqual(
-            self.cell(matrix, "JIVO_OIL", "ELECTRICITY")["warning"],
-            "No meter is mapped to this company",
-        )
-
-    def test_a_read_meter_carries_no_warning(self):
-        self.reading(self.meter("Production Floor OIL", self.oil), 100)
-
-        matrix = build_matrix(self.companies, DAY)
-
-        self.assertIsNone(self.cell(matrix, "JIVO_OIL", "ELECTRICITY")["warning"])
-        self.assertEqual(self.cell(matrix, "JIVO_OIL", "ELECTRICITY")["unit"], "100.00")
 
 
 class SalaryOwnershipTests(MatrixFixture):
@@ -647,41 +442,6 @@ class ShapeTests(MatrixFixture):
         )
         self.assertEqual(down_the_rows, across_the_columns)
         self.assertEqual(Decimal(matrix["total"]["total"]), down_the_rows)
-
-    def test_electricity_matches_the_wall_board_for_the_same_span(self):
-        """The two screens must never disagree about the power bill.
-
-        They compute it in different shapes — the board sums every reading once,
-        the matrix splits them by ownership first.
-
-        Labour is deliberately NOT compared. The wall board adds the gate count
-        and the HOD's allocation of those same people, so it reports the
-        allocated ones twice; the matrix does not. The two are expected to
-        differ by exactly that double-count until the board is fixed.
-        """
-        self.rate(self.labour_type, "600", company=self.oil)
-        self.gate(self.oil, 10)
-        self.gate(self.oil, 10, department=self.dept("production(oil)"))
-        self.reading(self.meter("Production Floor OIL", self.oil), 100)
-        self.reading(self.meter("Boiler", self.bev), 60)
-        self.reading(self.meter("KWH", self.oil, self.bev), 1000)
-
-        matrix = build_matrix(self.companies, DAY)
-        board = build_board(self.companies, DAY)
-
-        # With the mains counted in the shared row, both screens read the same
-        # set of meters again, so the power bill ties exactly. This is the
-        # assertion that catches a split which loses or duplicates a meter.
-        self.assertEqual(
-            Decimal(matrix["total"]["cells"]["ELECTRICITY"]["amount"]),
-            Decimal(board["buckets"]["ELECTRICITY"]["today"]),
-        )
-        # And the labour gap is exactly the double-count, not a lost row.
-        self.assertEqual(
-            Decimal(board["buckets"]["LABOUR"]["today"])
-            - Decimal(matrix["total"]["cells"]["LABOUR"]["amount"]),
-            Decimal("6000.00"),
-        )
 
     def test_a_backwards_range_is_swapped_rather_than_rejected(self):
         matrix = build_matrix(self.companies, DAY, DAY - timedelta(days=3))

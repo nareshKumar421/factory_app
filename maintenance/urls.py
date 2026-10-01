@@ -9,6 +9,7 @@ from .views_manager import (
 )
 
 from .views_electricity import (
+    ElectricityBoardAPI,
     ElectricityAllocationAPI,
     ElectricityDaySheetAPI,
     ElectricityMeterSetupViewSet,
@@ -228,6 +229,8 @@ urlpatterns = [
         ElectricityDaySheetAPI.as_view(),
         name="maintenance-electricity-day-sheet",
     ),
+    path("electricity-board/", ElectricityBoardAPI.as_view(),
+         name="maintenance-electricity-board"),
     path(
         "electricity-allocation/",
         ElectricityAllocationAPI.as_view(),

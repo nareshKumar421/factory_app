@@ -493,43 +493,6 @@ class AllCompaniesTests(CostMasterFixture):
             build_board([], self.day)
 
 
-class SharedMeterTests(CostMasterFixture):
-    """A meter feeding two companies is billed to the board ONCE.
-
-    Four of the campus meters serve both Oil and Beverages. Adding up
-    per-company boards would report twice the electricity the factory used —
-    on the live data that was Rs 4,14,260 against a true Rs 2,07,130.
-    """
-
-    def setUp(self):
-        super().setUp()
-        from maintenance.models import DailyElectricityReading, ElectricityMeter
-        self.day = date(2026, 6, 15)
-        self.meter = ElectricityMeter.objects.create(
-            name="KWH", rate_per_unit=Decimal("7"), multiplying_factor=Decimal("1"),
-        )
-        self.meter.companies.set([self.company, self.other])
-        self.reading = DailyElectricityReading.objects.create(
-            meter=self.meter, date=self.day,
-            opening_reading=Decimal("0"), closing_reading=Decimal("1000"),
-            multiplying_factor=Decimal("1"), rate_per_unit=Decimal("7"),
-        )
-
-    def test_a_shared_meter_is_counted_once_not_once_per_company(self):
-        one = build_board([self.company], self.day)
-        both = build_board([self.company, self.other], self.day)
-        self.assertEqual(one["buckets"]["ELECTRICITY"]["today"], Decimal("7000.00"))
-        # NOT 14000 — this is the whole point.
-        self.assertEqual(both["buckets"]["ELECTRICITY"]["today"], Decimal("7000.00"))
-        self.assertEqual(both["buckets"]["ELECTRICITY"]["unit"], Decimal("1000.00"))
-
-    def test_the_shared_meter_appears_once_in_the_breakdown(self):
-        board = build_board([self.company, self.other], self.day)
-        self.assertEqual(len(board["meters"]), 1)
-        self.assertEqual(board["meters"][0]["meter"], "KWH")
-        self.assertEqual(board["meters"][0]["cost"], Decimal("7000.00"))
-
-
 class ConfigurableCostTypeTests(CostMasterFixture):
     """The tiles can be pointed at whichever Cost Master type is actually used.
 

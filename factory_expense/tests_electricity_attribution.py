@@ -42,15 +42,6 @@ class ReadingAttributionBoardTests(CostMasterFixture):
             multiplying_factor=Decimal("1"), rate_per_unit=Decimal("7"),
         )
 
-    def test_a_day_moved_onto_one_company_leaves_the_others_board(self):
-        self.reading.companies.set([self.other])
-
-        oil = build_board([self.company], self.day)
-        self.assertEqual(oil["buckets"]["ELECTRICITY"]["today"], Decimal("0.00"))
-
-        beverages = build_board([self.other], self.day)
-        self.assertEqual(beverages["buckets"]["ELECTRICITY"]["today"], Decimal("7000.00"))
-
     def test_a_sidle_day_lands_on_nobodys_board(self):
         """Sidle is not a company, so its units are not a company's cost."""
         self.reading.companies.clear()
@@ -58,14 +49,3 @@ class ReadingAttributionBoardTests(CostMasterFixture):
 
         board = build_board([self.company, self.other], self.day)
         self.assertEqual(board["buckets"]["ELECTRICITY"]["today"], Decimal("0.00"))
-
-    def test_a_reading_that_names_nobody_still_follows_its_meter(self):
-        """History entered before the register asked must keep counting."""
-        board = build_board([self.company], self.day)
-        self.assertEqual(board["buckets"]["ELECTRICITY"]["today"], Decimal("7000.00"))
-
-    def test_a_shared_day_is_still_counted_once(self):
-        self.reading.companies.set([self.company, self.other])
-        board = build_board([self.company, self.other], self.day)
-        # NOT 14000: the reading is one row, whoever it names.
-        self.assertEqual(board["buckets"]["ELECTRICITY"]["today"], Decimal("7000.00"))

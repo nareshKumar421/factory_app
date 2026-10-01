@@ -520,6 +520,78 @@ class ElectricityAllocationAPI(APIView):
         return Response(service.report(date_from, date_to))
 
 
+class ElectricityBoardAPI(APIView):
+    """The Electricity dashboard: one company's (or the campus's) Electricity++.
+
+    ``?date_from=&date_to=&company=`` — company is a company code, or blank for
+    the whole metered campus (every company, consumer and unassigned unit, each
+    once). Totals, each meter at the company's share of it, and each day by
+    meter; plus what Electricity++ says is wrong with the readings. Worked out
+    by ``maintenance.electricity.boards``, as every other board's electricity is.
+    """
+
+    permission_classes = [IsAuthenticated, CanViewDailyElectricity]
+
+    def get(self, request):
+        from .electricity import boards
+        from .electricity.service import money
+
+        today = timezone.localdate()
+        date_to = _date_param(request, "date_to", today)
+        date_from = _date_param(request, "date_from", date_to.replace(day=1))
+        if date_to < date_from:
+            date_from, date_to = date_to, date_from
+        if (date_to - date_from).days + 1 > MAX_SPAN_DAYS:
+            raise ValidationError({"date_from": f"Pick at most {MAX_SPAN_DAYS} days at a time."})
+
+        code = (request.GET.get("company") or "").strip()
+        result = boards.breakdown(date_from, date_to)
+        picked = boards.company(result, code) if code else boards.for_parties(result, None)
+
+        def days_of(name):
+            return sum(1 for meters in picked["by_day_meter"].values()
+                       if meters.get(name, {}).get("units"))
+
+        meters = []
+        for name, part in picked["by_meter"].items():
+            share = boards.meter_share(result, part["units"], name) if code else None
+            meters.append({
+                "name": name,
+                "units": money(part["units"]),
+                "cost": money(part["cost"]),
+                "rate": money(part["cost"] / part["units"]) if part["units"] else None,
+                # The company's part of the meter's own units; None when it is all of it.
+                "share_pct": money(share * 100) if share is not None else None,
+                "days": days_of(name),
+            })
+        meters.sort(key=lambda row: -float(row["cost"]))
+
+        days = []
+        for day in sorted(picked["by_day"]):
+            part = picked["by_day"][day]
+            days.append({
+                "date": day.isoformat(),
+                "units": money(part["units"]),
+                "cost": money(part["cost"]),
+                "by_meter": {name: money(m["units"])
+                             for name, m in (picked["by_day_meter"].get(day) or {}).items()},
+            })
+
+        supply = result.get("supply") or {}
+        return Response({
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "company": code,
+            "units": money(picked["units"]),
+            "cost": money(picked["cost"]),
+            "days_with_units": sum(1 for d in days if float(d["units"])),
+            "meters": meters,
+            "days": days,
+            "supply": {"units": money(supply.get("units", 0)), "cost": money(supply.get("cost", 0))},
+            "warnings": boards.warnings(result),
+        })
+
+
 class ElectricityRunSourcesAPI(APIView):
     """The production lines and blowing machines a run-hours split can follow."""
 

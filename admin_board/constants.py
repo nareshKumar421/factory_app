@@ -193,17 +193,6 @@ LABOUR_DEPARTMENTS = [
     "Boiling Floor 1",
 ]
 
-#: Whose meters the electricity slice prices.
-#:
-#: The Daily Electricity register is CAMPUS-WIDE — Beverages' boiler, ETP, RO
-#: and terrace meters are entered on the same page as Oil's — and the factory
-#: expense wall deliberately prices every one of them. This board is Jivo Oil's,
-#: so its electricity line reads Oil's meters only, and of those the SUB-meters
-#: alone: a main measures the supply they slice up, so a total holding both
-#: counts the same electricity twice. A sub-meter shared with Beverages counts
-#: half. See ``AdminBoardService._electricity_oil`` for both rules.
-ELECTRICITY_COMPANY = "JIVO_OIL"
-
 #: The opening words of the factory expense wall's "nobody read a meter"
 #: warning, so this board can drop it and raise its own. The wall's fires only
 #: when NO meter on the campus was read; a Beverages reading is not evidence

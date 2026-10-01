@@ -16,11 +16,10 @@ board three times would silently invent the split:
   is a sub-meter *of* that incomer: in September the sub-meters summed to
   1.035 × KWH and tracked it day by day. Summing the register therefore reports
   about three times the electricity the factory used — ₹19.87 L against a real
-  ₹6.63 L. The board reads the sub-meters only, attributed by
-  ``constants.ELECTRICITY_METER_COMPANY`` rather than by the meter's
-  many-to-many company tagging, which leaves 69% of the bill on meters that
-  "feed both companies" and so attributes nothing. The incomer is still read and
-  served back as a reconciliation figure.
+  ₹6.63 L. Since 2026-10-01 the board takes each company's electricity from
+  Daily Electricity++, which knows that tree and the share each company has
+  of a meter they both draw on, so every unit is counted once. The incomer is
+  still read and served back as a reconciliation figure.
 
 * **Salary.** A Cost Master row with no company set applies to every company
   (see ``rates.load_rates_by_company``), so a factory-wide ₹30 L blanket
@@ -52,16 +51,12 @@ from datetime import date
 from decimal import Decimal
 
 from labour_gate.models import LabourGateEntry
-from maintenance.models import DailyElectricityReading, ElectricityMeter
+from maintenance.models import ElectricityMeter
 
 from .constants import (
-    ELECTRICITY_EXPECTED_METERS,
     MATRIX_ROW_LABELS,
     ELECTRICITY_MAIN_METERS,
-    ELECTRICITY_MAINS_IN_SHARED,
-    ELECTRICITY_METER_COMPANY,
     ELECTRICITY_PRIMARY_INCOMER,
-    ELECTRICITY_SHARED_METERS,
     LABOUR_COST_TYPE_CODE,
     LABOUR_DEPARTMENT_COMPANY,
     LABOUR_SHARED_DEPARTMENTS,
@@ -150,150 +145,75 @@ def supply_meter_keys():
     return {normalise_meter(name) for name in counted}
 
 
-def mapped_meter_counts(companies):
-    """How many existing meters the mapping gives each company.
+def _power_warning(power):
+    """Why a company's electricity square is empty, or None.
 
-    Read from the meter master rather than inferred from the readings, because
-    the two failures look identical in a reading-derived count and need opposite
-    fixes: a company with no meter mapped to it can never show a power figure,
-    while a company with meters but no reading in the span is simply waiting for
-    the operator to type one in.
-
-    Only meters that actually exist are counted. The mapping deliberately names
-    four that do not yet (``Basement``, ``LB``, ``Admin``, ``TR 60``), and
-    counting those would promise a figure the register cannot produce.
-    """
-    by_code = {company.code: company for company in companies}
-    counts = {company.id: 0 for company in companies}
-    mains = main_meter_keys()
-    for meter in ElectricityMeter.objects.all():
-        key = normalise_meter(meter.name)
-        if key in mains:
-            continue
-        code = ELECTRICITY_METER_COMPANY.get(key)
-        company = by_code.get(code) if code else None
-        if company is not None:
-            counts[company.id] += 1
-    return counts
-
-
-def _power_warning(power, sole_meters):
-    """Why a company's electricity square cannot be read, or None.
-
-    Two different failures, two different desks: no meter mapped is fixed in
-    ``constants.ELECTRICITY_METER_COMPANY``, an unread meter by the operator who
-    enters the day's figures. ``₹0`` would be a lie for both — the factory does
-    not stop drawing power because nobody wrote the reading down.
+    ``₹0`` would be a lie: the factory does not stop drawing power because
+    Electricity++ had nothing to allocate — a meter unread, or not in its tree.
     """
     if power:
         return None
-    if not sole_meters:
-        return "No meter is mapped to this company"
-    return (
-        f"No reading entered for its {sole_meters} meter"
-        f"{'s' if sole_meters != 1 else ''}"
-    )
+    return "No electricity in Daily Electricity++ for this span"
 
 
 def electricity_by_company(companies, dates, settings_row):
-    """Sub-meter cost split by the mapping, with the incomer kept aside.
+    """Each company's electricity from Daily Electricity++, the rest as shared.
 
-    Returns ``(per_company, shared, incomer, notes)``.
+    Returns ``(per_company, shared, incomer, allocated_cost, notes)``.
 
-    The main meters — :func:`main_meter_keys`, i.e. the names in
-    ``ELECTRICITY_MAIN_METERS`` plus any meter ticked *Main* on the Daily
-    Electricity page — measure the incoming supply that every other meter is a
-    part of. They are always summed separately into ``incomer`` so the
-    sub-meters can be checked against the meter the bill is struck on, and
-    ``ELECTRICITY_MAINS_IN_SHARED`` decides whether they ALSO land in the shared
-    row and so in the column total. They do today, by the user's choice, which
-    means the column counts the same electricity about three times; the returned
-    notes say so.
+    **Electricity++ decides who a meter's units belong to** — the meter tree,
+    the fixed shares and the run-hour splits — so a company's column is its
+    allocation there, each unit once. Until 2026-10-01 this mapped meters to
+    companies from a list in code and, by choice, added the mains on top of
+    the sub-meters they feed: a column about three times the metered bill.
 
-    ``sub_meter_cost`` is the columns without the mains — the figure the
-    reconciliation is meaningful against, whichever way that flag is set.
-
-    ``settings_row.electricity_only_company_meters`` is deliberately ignored
-    here. It filters on ``meter__companies``, which this board no longer uses;
-    honouring it would silently drop meters the mapping has already placed.
+    ``shared`` is what belongs to no company on the matrix: a consumer such as
+    Sidle, a company not shown, and what nobody was set to pay for.
+    ``incomer`` is what the main meters measured, kept aside for
+    :func:`reconcile_against_incomer`; ``allocated_cost`` is the columns'
+    total, the figure that reconciliation is meaningful against.
+    ``settings_row`` is no longer read here: Electricity++'s tree is the
+    mapping.
     """
-    readings = (
-        DailyElectricityReading.objects.filter(date__in=dates, is_active=True)
-        .select_related("meter")
-    )
+    from maintenance.electricity import boards
+    from maintenance.electricity.sources import company_party
+
+    days = set(dates)
+    result = boards.breakdown(min(dates), max(dates))
 
     def blank():
         return {"cost": ZERO, "units": ZERO, "meters": set()}
 
-    by_code = {company.code: company for company in companies}
+    party_company = {company_party(c.code): c for c in companies}
     per_company = defaultdict(blank)
     shared = blank()
+    allocated = ZERO
+    for day, parties in result["by_day"].items():
+        if day not in days:
+            continue
+        for party, part in parties.items():
+            company = party_company.get(party)
+            bucket = per_company[company.id] if company else shared
+            bucket["cost"] += part["cost"]
+            bucket["units"] += part["units"]
+            allocated += part["cost"]
+    for day, parties in result["by_day_meter"].items():
+        if day not in days:
+            continue
+        for party, meters in parties.items():
+            company = party_company.get(party)
+            bucket = per_company[company.id] if company else shared
+            bucket["meters"].update(name for name, part in meters.items() if part["units"])
+
     incomer = defaultdict(blank)
-    unmapped = set()
-    notes = []
-    sub_meter_cost = ZERO
-    mains = main_meter_keys()
+    for name, part in (result.get("supply_by_meter") or {}).items():
+        main = incomer[normalise_meter(name)]
+        main["cost"] += part["cost"]
+        main["units"] += part["units"]
+        main["meters"].add(name)
 
-    for reading in readings:
-        name = reading.meter.name
-        key = normalise_meter(name)
-        cost = reading.total_cost or ZERO
-        units = reading.units_consumed or ZERO
-
-        if key in mains:
-            # Always tracked on its own, so the reconciliation survives whichever
-            # way the flag is set; ALSO added to the shared row when it is on.
-            main = incomer[key]
-            main["cost"] += cost
-            main["units"] += units
-            main["meters"].add(name)
-            if not ELECTRICITY_MAINS_IN_SHARED:
-                continue
-            bucket = shared
-        else:
-            sub_meter_cost += cost
-            code = ELECTRICITY_METER_COMPANY.get(key)
-            company = by_code.get(code) if code else None
-            if company is not None:
-                bucket = per_company[company.id]
-            else:
-                bucket = shared
-                if code is None and key not in ELECTRICITY_SHARED_METERS:
-                    unmapped.add(name)
-
-        bucket["cost"] += cost
-        bucket["units"] += units
-        bucket["meters"].add(name)
-
-    if unmapped:
-        notes.append(
-            "Not in the meter mapping, counted as shared: " + ", ".join(sorted(unmapped)) + "."
-        )
-
-    # Meters the mapping is waiting on. Named so a reader knows the column is
-    # incomplete by configuration rather than wrong by accident.
-    existing = {normalise_meter(name) for name in ElectricityMeter.objects.values_list("name", flat=True)}
-    awaited = sorted(
-        label for key, label in ELECTRICITY_EXPECTED_METERS.items() if key not in existing
-    )
-    if awaited:
-        notes.append(
-            "The mapping names "
-            + ", ".join(awaited)
-            + ", which "
-            + ("do" if len(awaited) > 1 else "does")
-            + " not exist on the Daily Electricity page yet."
-        )
-
-    if ELECTRICITY_MAINS_IN_SHARED and incomer:
-        notes.append(
-            "Electricity counts the mains ("
-            + ", ".join(sorted(name for b in incomer.values() for name in b["meters"]))
-            + ") alongside the sub-meters that measure the same supply, so the "
-            "column is roughly three times the metered bill."
-        )
-
-    return per_company, shared, dict(incomer), sub_meter_cost, notes
+    notes = boards.warnings(result, limit=3)
+    return per_company, shared, dict(incomer), allocated, notes
 
 
 def reconcile_against_incomer(sub_meter_cost, incomer):
@@ -616,7 +536,6 @@ def build_matrix(
         sub_meter_cost,
         power_notes,
     ) = electricity_by_company(companies, span, settings_row)
-    sole_meters = mapped_meter_counts(companies)
     warnings.extend(power_notes)
 
     # --- labour ----------------------------------------------------------
@@ -664,7 +583,7 @@ def build_matrix(
                         power["cost"] if power else ZERO,
                         unit=str(_money(power["units"])) if power else None,
                         unit_label="units",
-                        warning=_power_warning(power, sole_meters.get(company.id, 0)),
+                        warning=_power_warning(power),
                         note=(
                             f"{len(power['meters'])} meter"
                             f"{'s' if len(power['meters']) != 1 else ''}"

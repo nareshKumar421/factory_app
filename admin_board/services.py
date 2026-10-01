@@ -46,7 +46,6 @@ from .alerts import build_alerts
 from .constants import (
     COST_SLICES,
     DISPATCH_COMPANIES,
-    ELECTRICITY_COMPANY,
     ELECTRICITY_WALL_WARNING_PREFIX,
     FG_STORES,
     INTERCOMPANY_CARD_CODES,
@@ -1095,7 +1094,7 @@ class AdminBoardService:
 
         buckets = board.get("buckets") or {}
         labour = self._labour_departments()
-        power = self._electricity_oil()
+        power = self._electricity()
         details = {
             "labour": labour["detail"],
             "electricity": power["detail"],
@@ -1173,10 +1172,8 @@ class AdminBoardService:
             extra = extras.get(spec["key"]) or {}
             basis = None
             if spec["key"] == "electricity":
-                # NOT the wall board's bucket. The wall adds up every meter
-                # on the campus, mains included; this board is Jivo Oil's and
-                # prices Oil's SUB-meters, each at Oil's share of one shared
-                # with Beverages. See _electricity_oil.
+                # The company's own Electricity++ figure, not the wall's
+                # campus-wide bucket. See _electricity.
                 amount = power["cost"]
                 warning = power["warning"]
                 # Off the tile's face, onto the line itself. The user took the
@@ -1616,255 +1613,103 @@ class AdminBoardService:
             "warning": warning,
         }
 
-    def _oil_readings(self, company, start: date, end: date):
-        """The register rows a Jivo Oil board may read over a span.
+    def _electricity(self) -> Dict[str, Any]:
+        """Month-to-date electricity of the signed-in company, from Electricity++.
 
-        Attribution is read off the READING, which carries its own copy taken
-        from the meter the day it was entered — a line run for Beverages this
-        week moves that week's units with it. Only a reading that names nobody
-        falls back to its meter's standing list. This is the same rule the
-        factory expense wall applies in ``electricity_costs``; it is restated
-        here rather than borrowed because that function aggregates by meter and
-        throws away the per-reading attribution this line needs to split on.
+        **ELECTRICITY++, NOT THE REGISTER.** Daily Electricity++ is where it is
+        settled who a meter's units belong to: the meter tree (a main measures
+        what its sub-meters slice up, so it is never added to them), the fixed
+        shares on a shared meter, the run-hour split of a line's meter, and a
+        reading chain that notices a dial that jumped. This line takes the
+        company's share of that, so it agrees with Electricity++ and with every
+        other board — until 2026-10-01 it summed the register itself, halving a
+        shared meter by convention, for Jivo Oil only.
+
+        **The signed-in company's.** Oil's board shows Oil's electricity and
+        Beverages' Beverages'; a meter both draw on shows each its share.
+
+        **The rows behind the line ARE the line, split** by meter, at the
+        company's share, and they add up to it. A meter the company shares says
+        what share it is.
+
+        **What Electricity++ cannot place is said, not guessed.** A reading
+        that does not follow on from the one before, or a meter outside the
+        tree, comes through as the line's warning.
         """
-        from django.db.models import Q
-        from maintenance.models import DailyElectricityReading
+        from maintenance.electricity import boards
 
-        return (
-            DailyElectricityReading.objects.filter(
-                date__gte=start, date__lte=end, is_active=True
-            )
-            .filter(
-                Q(companies=company)
-                | (
-                    Q(companies__isnull=True)
-                    & Q(consumers__isnull=True)
-                    & Q(meter__companies=company)
-                )
-            )
-            # A reading attributed to two companies matches the join twice.
-            .distinct()
-        )
-
-    def _electricity_meters(
-        self, company, start: date, end: date
-    ) -> Dict[str, Dict[str, Any]]:
-        """Jivo Oil's sub-meters over a span, each already cut to Oil's share.
-
-        Keyed by meter name. Every figure in here is apportioned, so the
-        buckets add up to the line and nothing downstream re-weights them.
-
-        **Mains are not in here.** A main measures the supply these same
-        sub-meters slice up, so a total holding both counts the same
-        electricity twice. ``is_main`` is the whole test: ``counts_as_supply``
-        marks one main that re-measures another (KVAH against KWH) and
-        ``ElectricityMeter.save`` forces it back to True on a sub-meter, so
-        filtering on it here would drop nothing and mislead whoever read it.
-
-        **A reading shared with Beverages is halved.** The share is an equal
-        split across the companies the reading is attributed to — half each
-        where a meter feeds Oil and Beverages, a third each across three. That
-        split is a convention, not a measurement: the register keeps one
-        reading a day per meter and holds nothing that divides it. It is
-        applied to the money and the units only; the dials are untouched,
-        because half a dial reading is not a thing.
-        """
-        readings = (
-            self._oil_readings(company, start, end)
-            .filter(meter__is_main=False)
-            .select_related("meter")
-            .prefetch_related(
-                "companies", "consumers", "meter__companies", "meter__consumers"
-            )
-        )
-
-        meters: Dict[str, Dict[str, Any]] = {}
-        for reading in readings:
-            attributed, _consumers = reading.attribution()
-            splits = len(attributed) or 1
-            share = Decimal(1) / Decimal(splits) if splits > 1 else Decimal(1)
-            bucket = meters.setdefault(
-                reading.meter.name,
-                {
-                    "units": Decimal("0"),
-                    "cost": Decimal("0"),
-                    "rate": Decimal("0"),
-                    "splits": 1,
-                    "shared_with": set(),
-                },
-            )
-            bucket["units"] += (reading.units_consumed or Decimal("0")) * share
-            bucket["cost"] += (reading.total_cost or Decimal("0")) * share
-            bucket["rate"] = reading.rate_per_unit or Decimal("0")
-            if splits > 1:
-                # The widest split the meter saw in the span, and who it was
-                # shared with — a meter reattributed mid-month is shared on the
-                # days it was, and the row has to be able to say so.
-                bucket["splits"] = max(bucket["splits"], splits)
-                bucket["shared_with"].update(
-                    row.name for row in attributed if row.pk != company.pk
-                )
-        return meters
-
-    @staticmethod
-    def _share_note(bucket: Dict[str, Any], company) -> str:
-        """How a shared meter's row says it is showing a share, not the dial.
-
-        Empty on a meter Oil has to itself, which is most of them — a note on
-        every row would stop being read by the time it mattered.
-        """
-        splits = bucket.get("splits", 1)
-        shared_with = bucket.get("shared_with") or set()
-        if splits <= 1 or not shared_with:
-            return ""
-        fraction = "half" if splits == 2 else f"1/{splits}"
-        return (
-            f" · {company.name}'s {fraction}, shared with "
-            f"{', '.join(sorted(shared_with))}"
-        )
-
-    def _electricity_oil(self) -> Dict[str, Any]:
-        """Month-to-date electricity on Jivo Oil's sub-meters, at Oil's share.
-
-        **THE SUB-METERS, NOT THE MAIN.** The Daily Electricity register keeps
-        a reading per meter per day, and a handful of those meters are mains:
-        the supply comes in on them and every other meter measures a slice of
-        what they already measured whole. This line adds up the SLICES and
-        leaves the mains out — the two are the same electricity, so a figure
-        holding both prices it twice. Until 2026-09-24 the line was the other
-        way round (the biggest main, alone), which answered "what came in on
-        the campus" rather than "what did Oil's plant draw", and could not be
-        cut to Oil at all: the mains feed both companies as one undivided
-        number.
-
-        **The campus is not one company.** Beverages' boiler, ETP, RO and
-        terrace meters are entered on the same page as Oil's, and the factory
-        expense wall prices every one of them on purpose, because what the
-        campus spent is a campus question. This board is Jivo Oil's, so a
-        Beverages-only meter never reaches it.
-
-        **A meter shared with Beverages counts HALF.** Several sub-meters feed
-        both companies. The register holds one reading a day per meter with no
-        division behind it, so the half is a convention this board applies and
-        says out loud on the line, not something anybody metered. See
-        ``_electricity_meters``; the Electricity dashboard splits the same way.
-
-        **The rows behind the line ARE the line, split.** One row per Oil
-        sub-meter, each at Oil's share, and they add up — which is why this
-        line no longer sets ``rows_sum_to_line=False``. Where the rows and the
-        line disagree, the panel now shows it instead of hiding it.
-
-        **A month with only mains read is a gap, not a nil.** Where the
-        register holds Oil readings but every one of them is on a main, this
-        reports zero with a warning rather than quietly pricing the main: a
-        main in this headline would be the double count the line exists to
-        avoid.
-        """
-        company = Company.objects.filter(code=ELECTRICITY_COMPANY).first()
+        company = Company.objects.filter(code=self.company_code).first()
         if company is None:
             return self._electricity_nil(
-                f"No '{ELECTRICITY_COMPANY}' company on this deployment, so "
-                "the electricity line has no meters to read."
+                f"No '{self.company_code}' company on this deployment, so the "
+                "electricity line has nothing to read."
             )
 
-        meters = self._electricity_meters(company, self.month_first, self.today)
-        if not meters:
-            # Two different silences, and the reader has to be told which.
-            # "Nobody read a meter" is a register that is behind; "only the
-            # mains were read" is a register that was kept, on the one kind of
-            # meter this line cannot use.
-            if self._oil_readings(company, self.month_first, self.today).exists():
-                return self._electricity_nil(
-                    f"Only main meters were read on {company.name} this month "
-                    "— a main measures the supply the sub-meters slice up, so "
-                    "this line has nothing it can add. Maintenance › Daily "
-                    "Electricity.",
-                    detail="no sub-meter read this month",
-                )
+        result = boards.breakdown(self.month_first, self.today)
+        mine = boards.company(result, company.code)
+        if not mine["units"] and not mine["cost"]:
             return self._electricity_nil(
-                f"No reading on a {company.name} meter this month — "
-                "Maintenance › Daily Electricity.",
-                detail=f"no {company.name} meter read this month",
+                f"Electricity++ has no {company.name} units this month — "
+                "Maintenance › Daily Electricity++.",
+                detail=f"no {company.name} electricity this month",
             )
 
-        # Today on its own, so the line can say what it cost today beside what
-        # it has cost all month. A second pass over ONE day, not another
-        # month-wide one.
-        today_meters = self._electricity_meters(company, self.today, self.today)
-
-        cost = sum(_f(bucket["cost"]) for bucket in meters.values())
-        units = sum(_f(bucket["units"]) for bucket in meters.values())
-        today_cost = sum(_f(bucket["cost"]) for bucket in today_meters.values())
-        today_units = sum(_f(bucket["units"]) for bucket in today_meters.values())
+        today = mine["by_day"].get(self.today) or {"units": Decimal("0"), "cost": Decimal("0")}
+        today_meters = mine["by_day_meter"].get(self.today) or {}
 
         rows = []
-        for meter_name, bucket in meters.items():
-            meter_units = _f(bucket["units"])
-            meter_rate = _f(bucket["rate"])
-            share_note = self._share_note(bucket, company)
-            today_bucket = today_meters.get(meter_name)
+        for meter_name, part in mine["by_meter"].items():
+            meter_units = _f(part["units"])
+            meter_cost = _f(part["cost"])
+            rate = meter_cost / meter_units if meter_units else 0
+            share = boards.meter_share(result, part["units"], meter_name)
+            share_note = (
+                f" · {company.name}'s {float(share) * 100:.0f}% of the meter" if share else ""
+            )
+            today_part = today_meters.get(meter_name)
             rows.append(
                 {
                     "label": meter_name,
-                    # The units are Oil's share of the dial, not the dial, so a
-                    # shared meter says so here — otherwise a reader checking
-                    # the row against the register finds double and assumes the
-                    # board is wrong.
                     "detail": (
-                        f"{meter_units:,.0f} units at ₹{meter_rate:,.2f}/unit{share_note}"
-                        if meter_units and meter_rate
-                        else (
-                            f"{meter_units:,.0f} units{share_note}"
-                            if meter_units
-                            else None
-                        )
-                    ),
-                    "amount": round(_f(bucket["cost"]), 2),
-                    # None, not zero, on a meter nobody read today. A meter
-                    # carries on drawing power whether or not somebody wrote
-                    # the number down, and nil here would say it did not.
-                    "today": (
-                        round(_f(today_bucket["cost"]), 2)
-                        if today_bucket is not None
+                        f"{meter_units:,.0f} units at ₹{rate:,.2f}/unit{share_note}"
+                        if meter_units
                         else None
                     ),
+                    "amount": round(meter_cost, 2),
+                    # None, not zero, on a meter nobody read today: a meter
+                    # draws power whether or not somebody wrote the number down.
+                    "today": round(_f(today_part["cost"]), 2) if today_part else None,
                 }
             )
         rows.sort(key=lambda row: row["amount"], reverse=True)
 
+        units = _f(mine["units"])
+        today_units = _f(today["units"])
+        problems = boards.warnings(result)
         return {
-            "cost": round(cost, 2),
-            "today": round(today_cost, 2),
-            # The reason rather than the figure where there is no figure: the
-            # plant does not stop drawing power because the register is behind.
+            "cost": round(_f(mine["cost"]), 2),
+            "today": round(_f(today["cost"]), 2),
             "today_detail": (
-                f"{today_units:,.0f} units today"
-                if today_units
-                else "no reading entered today"
+                f"{today_units:,.0f} units today" if today_units else "no reading entered today"
             ),
             "today_units": round(today_units, 2),
             "rows": rows,
             "detail": {
                 "value": round(units, 2),
-                # The meter COUNT, not a meter name: the line is no longer one
-                # meter, and the names are one click away in the panel.
-                "text": (
-                    f"{len(rows)} sub-meter{'' if len(rows) == 1 else 's'} · "
-                    f"{units:,.0f} units"
-                    if units
-                    else f"{len(rows)} sub-meter{'' if len(rows) == 1 else 's'}"
-                ),
+                "text": f"{len(rows)} meter{'' if len(rows) == 1 else 's'} · {units:,.0f} units",
             },
-            "warning": None,
+            "warning": (
+                f"Electricity++ flags {len(problems)} reading "
+                f"problem{'' if len(problems) == 1 else 's'} this month: {problems[0]}"
+                if problems
+                else None
+            ),
         }
 
     def _electricity_note(self) -> str:
-        """Which meters the electricity figure is, and which it is not."""
+        """Which meters the electricity figure is."""
         return (
-            "Jivo Oil's sub-meters, added up — the mains are left out because "
-            "the supply they measure is the same electricity these meters "
-            "slice up, so counting both would price it twice. A sub-meter "
-            "shared with Beverages counts half: the register keeps one reading "
-            "a day per meter with no split behind it, so the load is divided "
-            "equally between the companies it feeds."
+            "This company's share of every meter, from Daily Electricity++: a "
+            "main is never added to the sub-meters it feeds, and a meter shared "
+            "with another company counts at the share Electricity++ gives it."
         )
