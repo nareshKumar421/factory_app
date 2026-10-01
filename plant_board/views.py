@@ -31,6 +31,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from admin_board.carousel import CanViewBoardCarousel
+from control_boards.months import as_of_for_month
 from control_boards.permissions import CanReadBoard
 from company.permissions import HasCompanyContext
 
@@ -71,9 +72,15 @@ class PlantBoardAPI(APIView):
 
     def get(self, request):
         company_code = request.company.company.code
+        # ?month=YYYY-MM steps the board back to an ended month; none, or the
+        # current one, reads now as it always has. See control_boards.months.
+        try:
+            as_of = as_of_for_month(request.query_params.get("month"))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         try:
             board = PlantBoardService(
-                company_code=company_code, user=request.user
+                company_code=company_code, user=request.user, as_of=as_of
             ).build()
         except Exception as exc:  # noqa: BLE001
             # Only reached if the composition itself fails — every band already

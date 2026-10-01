@@ -128,6 +128,25 @@ def _as_date(value) -> Optional[date]:
     return None
 
 
+def _plan_covers(plan: Dict[str, Any], day: date) -> bool:
+    """Whether a SAP plan's own dates contain ``day``.
+
+    The plan list hands back dates, a serialised copy hands back ISO strings;
+    both are read here.
+    """
+
+    def _day(value) -> Optional[date]:
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                return None
+        return _as_date(value)
+
+    start, end = _day(plan.get("start_date")), _day(plan.get("end_date"))
+    return bool(start and end and start <= day <= end)
+
+
 class AdminBoardService:
     """Builds the whole admin board for one company context.
 
@@ -446,19 +465,24 @@ class AdminBoardService:
     def _resolve_plan(self) -> Optional[Dict[str, Any]]:
         """The plan this month reports against.
 
-        The one whose dates contain today; failing that the newest, with a
-        warning. A board silently reporting last month's plan as though it were
-        this month's is the worst of the available outcomes.
+        The one whose dates contain the board's date; failing that the newest,
+        with a warning. A board silently reporting last month's plan as though
+        it were this month's is the worst of the available outcomes.
+
+        Matched on the board's own ``today`` rather than the plan list's
+        ``is_current``, which is decided against the real date: a board read as
+        of 30 September has to report against September's plan, and on the 1st
+        of October ``is_current`` names October's.
         """
         plans = (self._plan_service().list_plans(limit=24) or {}).get("data") or []
         if not plans:
             return None
-        current = next((row for row in plans if row.get("is_current")), None)
+        current = next((row for row in plans if _plan_covers(row, self.today)), None)
         if current is None:
             current = plans[0]
             self._warnings.append(
-                "No SAP plan covers today; showing the most recent plan "
-                f"({current.get('name') or current.get('code')})."
+                f"No SAP plan covers {self.today:%d %b %Y}; showing the most recent "
+                f"plan ({current.get('name') or current.get('code')})."
             )
         return current
 

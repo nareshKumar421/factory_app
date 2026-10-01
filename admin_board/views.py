@@ -39,6 +39,7 @@ from rest_framework.views import APIView
 from company.models import UserCompany
 from company.permissions import HasCompanyContext
 
+from control_boards.months import as_of_for_month
 from control_boards.permissions import CanReadBoard
 
 from .carousel import CanViewBoardCarousel
@@ -83,9 +84,15 @@ class AdminBoardAPI(APIView):
 
     def get(self, request):
         company_code = request.company.company.code
+        # ?month=YYYY-MM steps the board back to an ended month; none, or the
+        # current one, reads now as it always has. See control_boards.months.
+        try:
+            as_of = as_of_for_month(request.query_params.get("month"))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         try:
             board = AdminBoardService(
-                company_code=company_code, user=request.user
+                company_code=company_code, user=request.user, today=as_of
             ).build()
         except Exception as exc:  # noqa: BLE001
             # Only reached if the composition itself fails — every tile already
@@ -109,8 +116,9 @@ class AdminDispatchBillsAPI(APIView):
 
     ``GET /api/v1/dashboards/admin-board/dispatch-bills/?company=JIVO_OIL``
 
-    Same window as the board — the calendar month to today — and the same
-    gate-out rows as the tile, one row per bill per truck.
+    Same window as the board — the calendar month to today, or the whole of an
+    ended month asked for with ``?month=`` — and the same gate-out rows as the
+    tile, one row per bill per truck.
 
     NARROWER THAN THE BOARD, ON PURPOSE. Only the dispatch feed opens it: the
     board's stock or expense rights do not, because those readers never see the
@@ -146,5 +154,11 @@ class AdminDispatchBillsAPI(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        today = timezone.localdate()
+        # The board's own month: ?month=YYYY-MM for an ended one, so the rows
+        # opened from a board on September are September's bills.
+        try:
+            as_of = as_of_for_month(request.query_params.get("month"))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        today = as_of or timezone.localdate()
         return Response(company_bills(company_id, code, today.replace(day=1), today))

@@ -129,6 +129,13 @@ def _as_date(value) -> Optional[date]:
     return value.date() if hasattr(value, "date") else value
 
 
+def _plan_covers(plan: Dict[str, Any], day: date) -> bool:
+    """Whether a SAP plan's own dates contain ``day``."""
+    start = _as_date(plan.get("start_date"))
+    end = _as_date(plan.get("end_date"))
+    return bool(start and end and start <= day <= end)
+
+
 def _f_or_none(value) -> Optional[float]:
     """A float, or None. Distinct from ``_f``, which turns None into 0.0."""
     return None if value is None else float(value)
@@ -182,13 +189,23 @@ class PlantBoardService:
         packing: Optional[PackingMaterialService] = None,
         plan_reader: Optional[HanaProductionPlanReader] = None,
         today: Optional[date] = None,
+        as_of: Optional[date] = None,
         user=None,
     ):
         #: Who is reading, for per-feed withholding. ``None`` withholds nothing,
         #: so a service built without a request behaves exactly as it always has.
         self.user = user
         self.company_code = company_code
+        #: The day the LIVE tiles read: what came in, ran, was declared and
+        #: shipped today, and how old an audit is now.
         self.today = today or timezone.localdate()
+        #: The day the MONTH figures run to: the plan, the blowing month, the
+        #: wage bill. ``today`` unless the board was stepped back to an ended
+        #: month, when it is that month's last day — and the live tiles go on
+        #: reading today, tagged on the wall as "now". Two dates rather than one
+        #: because the board answers two kinds of question, and only one of
+        #: them has a history to go back to.
+        self.as_of = as_of or self.today
 
         # The SAP context is built only if something actually needs it. A test
         # that injects every reader must not have to own a company's HANA
@@ -253,6 +270,9 @@ class PlantBoardService:
             "meta": {
                 "company_code": self.company_code,
                 "date": self.today.isoformat(),
+                # Where the month figures stop: ``date`` on the current month,
+                # an ended month's last day when the board was stepped back.
+                "as_of": self.as_of.isoformat(),
                 "plan": plan,
                 "refresh_seconds": REFRESH_SECONDS,
                 "generated_at": timezone.now().isoformat(),
@@ -301,7 +321,7 @@ class PlantBoardService:
         # page appears on the wall without a second list having to learn about
         # it. Built-ins first, then whatever the plant has grown.
         catalogue = workforce_departments(self.company_code)
-        days_in_month = calendar.monthrange(self.today.year, self.today.month)[1]
+        days_in_month = calendar.monthrange(self.as_of.year, self.as_of.month)[1]
 
         bands: Dict[str, Dict[str, Any]] = {
             band: {
@@ -443,26 +463,31 @@ class PlantBoardService:
         dates decide what "so far" means on every tile in the Purchase and
         Production bands.
 
-        The current plan is the one whose dates contain today. Failing that the
-        newest is used and a warning says so — a board silently reporting last
-        month's plan as though it were this month's is the worst of the
-        available outcomes.
+        The current plan is the one whose dates contain the board's date.
+        Failing that the newest is used and a warning says so — a board silently
+        reporting last month's plan as though it were this month's is the worst
+        of the available outcomes.
+
+        Matched on the board's own ``today`` rather than the plan list's
+        ``is_current``, which is decided against the real date: a board read as
+        of 30 September has to report against September's plan, and on the 1st
+        of October ``is_current`` names October's.
         """
         plans = (self.plans.list_plans(limit=24) or {}).get("data") or []
         if not plans:
             return None
 
-        current = next((row for row in plans if row.get("is_current")), None)
+        current = next((row for row in plans if _plan_covers(row, self.as_of)), None)
         if current is None:
             current = plans[0]
             self._warnings.append(
-                "No SAP plan covers today; showing the most recent plan "
-                f"({current.get('name') or current.get('code')})."
+                f"No SAP plan covers {self.as_of:%d %b %Y}; showing the most recent "
+                f"plan ({current.get('name') or current.get('code')})."
             )
 
         start = _as_date(current.get("start_date"))
         end = _as_date(current.get("end_date"))
-        elapsed_end = min(self.today, end) if end else self.today
+        elapsed_end = min(self.as_of, end) if end else self.as_of
 
         return {
             "abs_id": current.get("abs_id"),
@@ -470,7 +495,9 @@ class PlantBoardService:
             "name": current.get("name") or "",
             "start_date": start.isoformat() if start else None,
             "end_date": end.isoformat() if end else None,
-            "is_current": bool(current.get("is_current")),
+            # Whether the plan covers the board's date — "this month's plan"
+            # for the month on the board, which is not always the real one.
+            "is_current": _plan_covers(current, self.as_of),
             # Plan-to-date, which is what "purchased so far" is measured over.
             "days_total": (end - start).days + 1 if (start and end) else None,
             "days_elapsed": (elapsed_end - start).days + 1 if start else None,
@@ -480,9 +507,9 @@ class PlantBoardService:
         """Plan start through today, or the calendar month if there is no plan."""
         if plan and plan.get("start_date"):
             start = date.fromisoformat(plan["start_date"])
-            end = date.fromisoformat(plan["end_date"]) if plan.get("end_date") else self.today
-            return start, min(self.today, end)
-        return self.today.replace(day=1), self.today
+            end = date.fromisoformat(plan["end_date"]) if plan.get("end_date") else self.as_of
+            return start, min(self.as_of, end)
+        return self.as_of.replace(day=1), self.as_of
 
     # ------------------------------------------------------------------
     # Band 1: Purchase
@@ -926,12 +953,12 @@ class PlantBoardService:
         # `date__month`), so the two screens agree; and it cannot be dragged
         # onto a past month by a plan that has not been created yet, which the
         # plan window legitimately can.
-        month_from = self.today.replace(day=1)
+        month_from = self.as_of.replace(day=1)
         return {
             "stock_space": self._stock_space(),
             "non_moving": non_moving_snapshot(self.company_code, STORE_WAREHOUSES),
             "pm_vehicles_today": self._pm_vehicles_today(),
-            "blowing": self._blowing(month_from, self.today),
+            "blowing": self._blowing(month_from, self.as_of),
         }
 
     def _stock_space(self) -> Dict[str, Any]:
