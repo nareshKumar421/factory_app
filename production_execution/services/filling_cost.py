@@ -151,7 +151,7 @@ class Production:
     wastage: Decimal = ZERO            # rupees
     wastage_logs: int = 0
     scrap_kg: Decimal = ZERO
-    #: (product, bottles a case) -> cases: what the shift filled, SKU by SKU.
+    #: (product, bottles a case, litres a bottle) -> cases: what was filled, SKU by SKU.
     skus: Dict[tuple, Decimal] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -250,7 +250,7 @@ def production(company, day, shift='', line=None, now=None):
         cases = part.total * part.fraction
         result.cases += cases
         result.run_count += 1
-        sku = ((run.product or run.line.name).strip(), run.pieces_per_case)
+        sku = ((run.product or run.line.name).strip(), run.pieces_per_case, run.litres_per_piece)
         result.skus[sku] = result.skus.get(sku, ZERO) + cases
         if run.pieces_per_case:
             bottles = cases * run.pieces_per_case
@@ -311,6 +311,25 @@ def production(company, day, shift='', line=None, now=None):
             "No SAP price for " + ', '.join(sorted(no_price)) +
             ": that waste is left out of Wastage.")
     return result
+
+
+def sku_label(product, litres_per_piece):
+    """'1000 ML' — how the sheet names a SKU: its bottle; the product when that is unknown."""
+    if litres_per_piece:
+        ml = (Decimal(litres_per_piece) * 1000).quantize(ONE, rounding=ROUND_HALF_UP)
+        return f"{ml} ML"
+    return product
+
+
+def sku_rows(made):
+    """What the runs filled, biggest first: SKU, box size and boxes."""
+    return [
+        {'product': product, 'sku': sku_label(product, litres), 'pieces_per_case': pieces,
+         'litres_per_piece': str(litres) if litres is not None else None,
+         'cases': str(_money(cases))}
+        for (product, pieces, litres), cases in sorted(made.skus.items(), key=lambda kv: -kv[1])
+        if cases > 0
+    ]
 
 
 def _electricity(company, day):
@@ -459,6 +478,7 @@ def defaults(company, day, shift='', line=None, now=None):
         'run_count': made.run_count,
         'bottles': str(made.bottles.quantize(ONE, rounding=ROUND_HALF_UP)),
         'litres': str(made.litres.quantize(ONE, rounding=ROUND_HALF_UP)),
+        'skus': sku_rows(made),
         'running_hours': str(made.hours.quantize(PAISE, rounding=ROUND_HALF_UP)),
         'entries': entries,
         'warnings': made.warnings,

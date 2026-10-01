@@ -407,6 +407,9 @@ class FillingCostDefaultsTests(APITestCase):
         data = self._open('NIGHT')
 
         self.assertEqual(data['produced_cases'], '5655.00')
+        # The sheet's head: SKU (its bottle), box size, boxes.
+        self.assertEqual([(s['sku'], s['pieces_per_case'], s['cases']) for s in data['skus']],
+                         [('500 ML', 24, '5655.00')])
         self.assertEqual(data['bottles'], '135720')          # 5,655 x 24
         self.assertEqual(data['litres'], '67860')            # x 0.5 L
         self.assertEqual(self._amounts(data), {

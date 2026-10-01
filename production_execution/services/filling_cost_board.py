@@ -23,7 +23,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from cost_master.codes import FILLING_COST_HEAD_ALIASES
 
 from ..models import FillingCostSheet, FillingCostShift
-from .filling_cost import production
+from .filling_cost import production, sku_rows
 
 ZERO = Decimal('0')
 PAISE = Decimal('0.01')
@@ -134,12 +134,7 @@ def _made(company, day, shift=''):
     """``(bottles a case, SKUs)`` of what ``day``'s (``shift``'s) runs filled."""
     made = production(company, day, shift)
     ratio = made.bottles / made.cases if made.cases > 0 and made.bottles > 0 else None
-    skus = [
-        {'product': product, 'pieces_per_case': pieces, 'cases': _q(cases)}
-        for (product, pieces), cases in sorted(made.skus.items(), key=lambda kv: -kv[1])
-        if cases > 0
-    ]
-    return ratio, skus
+    return ratio, sku_rows(made)
 
 
 def _bottles_a_case(company, day, shift=''):

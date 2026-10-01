@@ -131,7 +131,8 @@ class FillingCostBoardTests(APITestCase):
         night = {s['shift']: s for s in day['shifts']}['NIGHT']
         # The SKU and box size the shift filled, from its runs.
         self.assertEqual(night['skus'], [
-            {'product': 'Sidel', 'pieces_per_case': 12, 'cases': '5655.00'}])
+            {'product': 'Sidel', 'sku': 'Sidel', 'pieces_per_case': 12,
+             'litres_per_piece': None, 'cases': '5655.00'}])
         # Its own heads, in the order the sheet was written.
         self.assertEqual([(h['head'], h['amount'], h['per_case']) for h in night['heads']],
                          [('Fixed Manpower', '5655.00', '1.00')])
