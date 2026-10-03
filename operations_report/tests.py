@@ -122,7 +122,6 @@ class ProductionTests(ReportTestCase):
 
         self.assertEqual(self.day(report)["lines"][0]["cases"], 150.0)
         self.assertIsNone(self.day(report)["lines"][0]["litres"])
-        self.assertTrue(any("1 run (14 Sep)" in w for w in report["meta"]["warnings"]))
 
     def test_another_companys_runs_stay_out(self):
         self.make_run(1, company=self.bev, line=ProductionLine.objects.create(company=self.bev, name="Sidel"))
@@ -218,7 +217,7 @@ class LabourTests(ReportTestCase):
         report = self.report()
 
         self.assertIsNone(self.day(report)["labour"][0]["cost"])
-        self.assertTrue(any("no 'factory-labour' rate" in w for w in report["meta"]["warnings"]))
+        self.assertEqual(self.day(report)["labour"][0]["heads"], 40)
 
 
 class PowerTests(ReportTestCase):

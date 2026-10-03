@@ -193,7 +193,6 @@ class OperationsReportService(SectionBuilder):
         )
 
         rows: Dict[date, Dict[str, Dict]] = defaultdict(dict)
-        no_volume = []
         for run in runs:
             if run.status == RunStatus.COMPLETED and run.total_production:
                 cases = Decimal(run.total_production)
@@ -212,24 +211,10 @@ class OperationsReportService(SectionBuilder):
             elif cases:
                 # Unknown, not short: a line-day's litres missing one run's
                 # volume would understate it and overstate its cost per litre.
+                # Said by the null itself, day by day -- the page counts the
+                # days inside the period it shows, which a sentence about the
+                # whole span (comparison month included) cannot do.
                 row["litres"] = None
-                no_volume.append(run)
-
-        if no_volume:
-            first = min(run.date for run in no_volume)
-            last = max(run.date for run in no_volume)
-            when = (
-                first.strftime("%-d %b")
-                if first == last
-                else f"{first.strftime('%-d %b')} to {last.strftime('%-d %b')}"
-            )
-            count = len(no_volume)
-            self.warn(
-                f"{count} run{'s' if count != 1 else ''} ({when}) "
-                f"{'have' if count != 1 else 'has'} no bottle size or litres a bottle, "
-                "so the litres of those lines and days are not known. Their cases are "
-                "counted."
-            )
 
         return {
             day: [
@@ -374,16 +359,15 @@ class OperationsReportService(SectionBuilder):
         )
         rates = load_rates(code, self.company, self.date_to)
 
+        # A day with no rate in force is uncosted: its rows carry a null cost,
+        # and the page says how many such days fall in the period it shows.
         out: Dict[date, List[Dict]] = {}
-        unpriced_days = []
         for day, groups in by_day.items():
             day_heads = sum(row["heads"] for row in groups.values())
             rate = resolve(rates, None, day)
             # Priced for the whole day and then shared out by heads, so a flat
             # daily charge lands once rather than once per contractor.
             amount = _price_labour(rate, day_heads) if rate is not None else None
-            if amount is None:
-                unpriced_days.append(day)
             out[day] = [
                 {
                     **row,
@@ -402,12 +386,6 @@ class OperationsReportService(SectionBuilder):
                 f"No contract labour was booked through the labour gate under "
                 f"{self.company.name} in this span, so labour reads as nil."
             )
-        if unpriced_days:
-            self.warn(
-                f"{len(unpriced_days)} day{'s' if len(unpriced_days) != 1 else ''} of "
-                f"labour have no '{code}' rate in the Cost Master on that date, so "
-                "their people are counted but not costed."
-            )
         return out
 
     # ------------------------------------------------------------ electricity
@@ -420,13 +398,12 @@ class OperationsReportService(SectionBuilder):
         entered = set(result.get("entered_days") or [])
 
         out: Dict[date, Optional[List[Dict]]] = {}
-        unread = []
         for day in self.days:
             meters = mine["by_day_meter"].get(day)
             if not meters and day not in entered:
                 # Nobody entered the register that day: a gap, not zero units.
+                # The page counts these within the period it shows.
                 out[day] = None
-                unread.append(day)
                 continue
             out[day] = [
                 {"area": name, "kwh": _num(part["units"]), "cost": _num(part["cost"])}
@@ -436,13 +413,7 @@ class OperationsReportService(SectionBuilder):
                 if part["units"]
             ]
 
-        if unread:
-            self.warn(
-                f"No meter readings were entered for {len(unread)} "
-                f"day{'s' if len(unread) != 1 else ''} in this span; those days show "
-                "no electricity rather than zero."
-            )
-        if not mine["units"] and len(unread) < len(self.days):
+        if not mine["units"] and any(out[day] is not None for day in self.days):
             self.warn(
                 f"Daily Electricity++ has no units for {self.company.name} in this span."
             )
