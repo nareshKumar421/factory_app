@@ -88,10 +88,27 @@ def _replace_list(fetch, key, search_text):
     return refresh
 
 
+def _fetch_vendors(company_code):
+    from dataclasses import asdict
+
+    from sap_client.context import CompanyContext
+    from sap_client.hana.vendor_reader import HanaVendorReader
+
+    # use_copy=False: a HANA failure half-way fails this run, not the copy.
+    reader = HanaVendorReader(CompanyContext(company_code), use_copy=False)
+    return [asdict(vendor) for vendor in reader.get_active_vendors()]
+
+
 def _refresh_bills(company, state, now):
     from . import bills
 
     return bills.refresh(company, state, now)
+
+
+def _refresh_purchase_orders(company, state, now):
+    from . import purchase_orders
+
+    return purchase_orders.refresh(company, state, now)
 
 
 @dataclass(frozen=True)
@@ -106,6 +123,8 @@ class Dataset:
 FG_ITEMS = "fg_items"
 WAREHOUSES = "warehouses"
 PRODUCTION_BOMS = "boms"
+VENDORS = "vendors"
+PURCHASE_ORDERS = "purchase_orders"
 BILLS = "bills"
 
 DATASETS = {
@@ -139,6 +158,22 @@ DATASETS = {
                 f"{row['item']['ItemCode']} {row['item'].get('ItemName') or ''}".lower()
             ),
         ),
+    ),
+    # The gate: the supplier a truck comes from...
+    VENDORS: Dataset(
+        label="Active vendors",
+        refresh=_replace_list(
+            fetch=lambda code: _fetch_vendors(code),
+            key=lambda row: row["vendor_code"],
+            search_text=lambda row: f"{row['vendor_code']} {row['vendor_name'] or ''}".lower(),
+        ),
+    ),
+    # ...and its open POs, which change through the day as they are raised and
+    # received against: due at every run, like the bills. See ``purchase_orders``.
+    PURCHASE_ORDERS: Dataset(
+        label="Open purchase orders",
+        refresh=lambda company, state, now: _refresh_purchase_orders(company, state, now),
+        every=timedelta(minutes=10),
     ),
     # Dispatch: the last 30 days of A/R bills. Booked the same day they load, so
     # due at every 15-minute run -- a little under 15, so timer jitter never

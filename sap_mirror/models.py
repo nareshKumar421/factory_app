@@ -106,6 +106,37 @@ class MirroredBill(models.Model):
         return f"{self.company_id} bill {self.doc_num}"
 
 
+class MirroredPurchaseOrder(models.Model):
+    """One purchase order with open lines, as the PO reader reads it.
+
+    ``rows`` are its open lines in the reader's own row shape
+    (``po_reader.OPEN_LINE_COLUMNS`` plus a finished-goods flag), packed by
+    ``codec``, so a copied answer goes through the same transform as a live one.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.CASCADE, related_name="sap_mirror_purchase_orders"
+    )
+    doc_entry = models.PositiveIntegerField()
+    doc_num = models.CharField(max_length=30)
+    supplier_code = models.CharField(max_length=50)
+    #: ``UpdateDate|UpdateTS|open qty|open lines`` when copied.
+    version = models.CharField(max_length=80, blank=True)
+    rows = models.JSONField(default=list)
+    copied_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["company", "doc_entry"], name="unique_sap_mirror_po"),
+        ]
+        indexes = [
+            models.Index(fields=["company", "supplier_code"], name="sap_mirror_po_supplier"),
+            models.Index(fields=["company", "doc_num"], name="sap_mirror_po_doc_num"),
+        ]
+
+    def __str__(self):
+        return f"{self.company_id} PO {self.doc_num}"
+
 class ServedBillOutcome(models.TextChoices):
     PENDING = "PENDING", "Not checked yet"
     UNCHANGED = "UNCHANGED", "Unchanged in SAP"
