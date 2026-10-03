@@ -29,6 +29,10 @@ WHERE EACH FIGURE COMES FROM
   and no overtime anywhere to report.
 - **Electricity** -- Daily Electricity++, the company's share of each meter's
   own units (reading less sub-meters), which is what every board now reads.
+- **Goods Return (GR)** -- customer returns, counted the way the Customer
+  Returns board counts them: on the day the truck arrived, or the day the
+  return was booked if it has not; cancelled returns left out. Valued at the
+  invoice price, which only invoice-basis lines carry.
 
 A section that could not be read is ``None`` on every day and named in
 ``meta.degraded``; one this reader may not see is ``None`` and named in
@@ -89,6 +93,10 @@ WASTE_KINDS = (
     ("TAPE", "Tape"),
 )
 OTHER_WASTE = "Other packing"
+
+#: A return's conditions, worst first: the part that cost money leads, and
+#: LEAKED before DAMAGED because a leak points at one fixable cause.
+GR_CONDITION_ORDER = ("LEAKED", "DAMAGED", "EXPIRED", "OTHER", "GOOD")
 
 #: The register's units, as the page prints them.
 UNITS = {
@@ -153,6 +161,9 @@ class OperationsReportService(SectionBuilder):
         )
         labour = self.section("labour", self._labour, needs_sap=False, feed="factory_expense")
         power = self.section("power", self._power, needs_sap=False, feed="factory_expense")
+        returns = self.section(
+            "returns", self._returns, needs_sap=False, feed="goods_return"
+        )
 
         def day_of(section, day):
             # None for the whole section when it was not read; for a day inside
@@ -173,6 +184,7 @@ class OperationsReportService(SectionBuilder):
                     "wastage": day_of(wastage, day),
                     "labour": day_of(labour, day),
                     "power": day_of(power, day),
+                    "returns": day_of(returns, day),
                 }
                 for day in self.days
             ],
@@ -418,3 +430,74 @@ class OperationsReportService(SectionBuilder):
                 f"Daily Electricity++ has no units for {self.company.name} in this span."
             )
         return out
+
+    # ---------------------------------------------------------- goods return
+
+    def _returns(self) -> Dict[date, List[Dict]]:
+        from django.db.models.functions import Coalesce
+
+        from goods_return.models import (
+            GoodsReturn,
+            GoodsReturnItem,
+            GoodsReturnItemCondition,
+            GoodsReturnStatus,
+        )
+
+        # The Customer Returns board's day for a return (goods_return/analytics.py):
+        # the day it arrived, or the day it was booked if it is still on the road.
+        headers = {
+            row["id"]: row
+            for row in GoodsReturn.objects.filter(is_active=True, company=self.company)
+            .exclude(status=GoodsReturnStatus.CANCELLED)
+            .annotate(arrived_on=Coalesce("gated_in_at", "created_at"))
+            .filter(arrived_on__date__range=(self.date_from, self.date_to))
+            .values("id", "entry_no", "arrived_on")
+        }
+        lines = GoodsReturnItem.objects.filter(
+            is_active=True, goods_return_id__in=headers.keys()
+        ).values("goods_return_id", "condition", "return_quantity", "unit_price")
+
+        labels = dict(GoodsReturnItemCondition.choices)
+        rows: Dict[date, Dict[str, Dict]] = defaultdict(dict)
+        for line in lines:
+            header = headers[line["goods_return_id"]]
+            day = timezone.localtime(header["arrived_on"]).date()
+            condition = line["condition"] or GoodsReturnItemCondition.OTHER
+            row = rows[day].setdefault(
+                condition,
+                {
+                    "condition": condition,
+                    "label": labels.get(condition, condition.title()),
+                    "entries": set(),
+                    "lines": 0,
+                    "quantity": ZERO,
+                    "value": ZERO,
+                    "unpriced": 0,
+                },
+            )
+            qty = Decimal(line["return_quantity"] or 0)
+            price = Decimal(line["unit_price"] or 0)
+            row["entries"].add(header["entry_no"])
+            row["lines"] += 1
+            row["quantity"] += qty
+            if price:
+                row["value"] += qty * price
+            elif qty:
+                # Only a line returned against an invoice carries its price; a
+                # debit-note or letter-pad line is counted, and its value is not
+                # known -- never zero.
+                row["unpriced"] += 1
+
+        order = {key: index for index, key in enumerate(GR_CONDITION_ORDER)}
+        return {
+            day: [
+                {
+                    **row,
+                    "entries": sorted(row["entries"]),
+                    "quantity": _num(row["quantity"], 3),
+                    "value": _num(row["value"]),
+                }
+                for row in sorted(by_condition.values(), key=lambda r: order.get(r["condition"], 99))
+            ]
+            for day, by_condition in rows.items()
+        }

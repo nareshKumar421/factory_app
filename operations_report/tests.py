@@ -30,6 +30,7 @@ from accounts.models import Department as PlantDepartment
 from company.models import Company, UserCompany, UserRole
 from cost_master.models import CostRate, CostType
 from factory_expense.constants import LABOUR_COST_TYPE_CODE
+from goods_return.models import GoodsReturn, GoodsReturnItem
 from labour_gate.models import LabourGateEntry
 from person_gatein.models import Contractor
 from production_execution.models import (
@@ -246,6 +247,46 @@ class PowerTests(ReportTestCase):
         self.assertIsNone(self.day(report, DAY + timedelta(days=1))["power"])
 
 
+class GoodsReturnTests(ReportTestCase):
+    def gr(self, entry_no, *, arrived=None, status="POSTED", company=None, lines=()):
+        header = GoodsReturn.objects.create(
+            company=company or self.oil, entry_no=entry_no, basis="INVOICE", status=status,
+            gated_in_at=arrived,
+        )
+        for condition, qty, price in lines:
+            GoodsReturnItem.objects.create(
+                goods_return=header, item_code="FG1", item_name="Oil 1 L", uom="PCS",
+                return_quantity=Decimal(qty), unit_price=Decimal(price), condition=condition,
+            )
+        return header
+
+    def test_returns_count_on_the_day_they_arrived_by_condition_worst_first(self):
+        arrived = timezone.make_aware(datetime(2026, 9, 14, 11))
+        self.gr("GR-1", arrived=arrived, lines=[("DAMAGED", "10", "150"), ("LEAKED", "4", "150")])
+        self.gr("GR-2", arrived=arrived, lines=[("DAMAGED", "6", "0")])
+        self.gr("GR-3", arrived=arrived, status="CANCELLED", lines=[("DAMAGED", "99", "150")])
+        # Arrived the day after the span: not in it, whenever it was booked.
+        self.gr("GR-4", arrived=arrived + timedelta(days=1), lines=[("GOOD", "5", "150")])
+
+        returns = self.day(self.report())["returns"]
+
+        self.assertEqual(
+            returns,
+            [
+                {"condition": "LEAKED", "label": "Leaked", "entries": ["GR-1"], "lines": 1,
+                 "quantity": 4.0, "value": 600.0, "unpriced": 0},
+                {"condition": "DAMAGED", "label": "Damaged", "entries": ["GR-1", "GR-2"], "lines": 2,
+                 "quantity": 16.0, "value": 1500.0, "unpriced": 1},
+            ],
+        )
+
+    def test_another_companys_returns_stay_out(self):
+        self.gr("GR-9", arrived=timezone.make_aware(datetime(2026, 9, 14, 11)), company=self.bev,
+                lines=[("DAMAGED", "10", "150")])
+
+        self.assertEqual(self.day(self.report())["returns"], [])
+
+
 class AccessTests(ReportTestCase):
     def user_with(self, *perms):
         user = User.objects.create_user(email=f"u{User.objects.count()}@x.test", full_name="U", password="x")
@@ -274,7 +315,9 @@ class AccessTests(ReportTestCase):
         response = self.get(user, **{"from": "2026-09-14", "to": "2026-09-14"})
 
         self.assertEqual(response.status_code, 200, response.content[:300])
-        self.assertEqual(sorted(response.data["meta"]["withheld"]), ["production", "wastage"])
+        self.assertEqual(
+            sorted(response.data["meta"]["withheld"]), ["production", "returns", "wastage"]
+        )
         self.assertIsNone(response.data["days"][0]["lines"])
         self.assertEqual(response.data["days"][0]["labour"], [])
 
@@ -284,7 +327,7 @@ class AccessTests(ReportTestCase):
         response = self.get(user, **{"from": "2026-09-14", "to": "2026-09-14"})
 
         self.assertEqual(response.status_code, 200, response.content[:300])
-        self.assertEqual(sorted(response.data["meta"]["withheld"]), ["labour", "power"])
+        self.assertEqual(sorted(response.data["meta"]["withheld"]), ["labour", "power", "returns"])
 
     def test_neither_right_is_refused(self):
         response = self.get(self.user_with(), **{"from": "2026-09-14", "to": "2026-09-14"})

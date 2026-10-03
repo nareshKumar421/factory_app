@@ -11,6 +11,8 @@ its own, so nothing has to be created on the live database before it opens.
 
 Per section the service withholds what the reader may not see, so a reader
 with only one of the two rights gets that half and is told about the other.
+Goods Return (GR) is shown only to a holder of the goods return right (or its
+board feed) -- the same right the Customer Returns board reads it under.
 
 Same contract as the other boards: a section that could not be read is
 reported inside a 200 (``meta.degraded``); only a failure that leaves no report
