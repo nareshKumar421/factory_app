@@ -41,6 +41,7 @@ from .models import (
     MaintenanceChecklistResult,
     MaintenanceChecklistTemplateItem,
     MaintenanceSpare,
+    MaintenanceSparePhoto,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
@@ -49,6 +50,7 @@ from .models import (
     MaterialIndent,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
+    SpareCategory,
     SpareMovement,
     SpareRequest,
 )
@@ -3094,6 +3096,111 @@ class StoreSpareAPITests(APITestCase):
             f"{self.SPARES_URL}{spare_id}/give-out/", {"quantity": "1", "given_to": "Ramesh"}, format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@override_settings(MEDIA_ROOT=TEST_MEDIA_ROOT)
+class StoreSparePhotoAPITests(APITestCase):
+    """Photos of a store item, added from the Store page's Add item / Edit form."""
+
+    PHOTOS_URL = "/api/v1/maintenance/spare-photos/"
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(TEST_MEDIA_ROOT, ignore_errors=True)
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = get_user_model().objects.create_user(
+            email="store@example.com", password="x", full_name="Store User", employee_code="ST-1",
+        )
+        UserCompany.objects.create(
+            user=self.user, company=self.company, role=UserRole.objects.create(name="Store"),
+            is_default=True, is_active=True,
+        )
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="maintenance")
+        )
+        self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_COMPANY_CODE=self.company.code)
+        self.spare_id = self.client.post(
+            "/api/v1/maintenance/spares/", {"name": "Oil bottle", "uom": "NOS"}, format="json"
+        ).data["id"]
+
+    def _upload(self, spare_id, name="bottle.jpg", content_type="image/jpeg"):
+        return self.client.post(
+            self.PHOTOS_URL,
+            {"spare": spare_id, "photo": SimpleUploadedFile(name, b"photo-bytes", content_type=content_type)},
+            format="multipart",
+        )
+
+    def test_photos_are_added_listed_by_item_and_removed(self):
+        first = self._upload(self.spare_id, "front.jpg")
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED, first.data)
+        # An absolute url, so the page can show it from any origin.
+        self.assertTrue(
+            first.data["photo"].startswith("http://testserver/media/maintenance/spares/photos/front"),
+            first.data["photo"],
+        )
+        self.assertEqual(first.data["created_by"], self.user.id)
+        second = self._upload(self.spare_id, "back.png", "image/png")
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED, second.data)
+        other_item = self.client.post(
+            "/api/v1/maintenance/spares/", {"name": "Bearing", "uom": "NOS"}, format="json"
+        ).data["id"]
+        self._upload(other_item)
+
+        listed = self.client.get(self.PHOTOS_URL, {"spare": self.spare_id})
+        self.assertEqual(listed.status_code, status.HTTP_200_OK)
+        self.assertEqual([photo["id"] for photo in listed.data], [first.data["id"], second.data["id"]])
+
+        removed = self.client.delete(f"{self.PHOTOS_URL}{first.data['id']}/")
+        self.assertEqual(removed.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(
+            list(MaintenanceSparePhoto.objects.filter(spare_id=self.spare_id).values_list("id", flat=True)),
+            [second.data["id"]],
+        )
+
+    def test_only_a_picture_is_taken(self):
+        response = self._upload(self.spare_id, "rates.pdf", "application/pdf")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("photo", response.data)
+        self.assertFalse(MaintenanceSparePhoto.objects.exists())
+
+    def test_another_companys_item_is_out_of_reach(self):
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        theirs = MaintenanceSpare.objects.create(
+            company=mart,
+            category=SpareCategory.objects.create(company=mart, name="General"),
+            name="Mart bottle",
+            part_number="MART BOTTLE",
+        )
+        refused = self._upload(theirs.id)
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("spare", refused.data)
+
+        their_photo = MaintenanceSparePhoto.objects.create(
+            spare=theirs, photo=SimpleUploadedFile("mart.jpg", b"x", content_type="image/jpeg")
+        )
+        self.assertEqual(self.client.get(self.PHOTOS_URL, {"spare": theirs.id}).data, [])
+        self.assertEqual(
+            self.client.delete(f"{self.PHOTOS_URL}{their_photo.id}/").status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_seeing_the_store_is_not_enough_to_add_or_remove_a_photo(self):
+        photo_id = self._upload(self.spare_id).data["id"]
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="maintenance", codename="can_view_spare")
+        )
+        self.user = get_user_model().objects.get(pk=self.user.pk)  # drop the permission cache
+        self.client.force_authenticate(self.user)
+
+        self.assertEqual(self.client.get(self.PHOTOS_URL, {"spare": self.spare_id}).status_code, status.HTTP_200_OK)
+        self.assertEqual(self._upload(self.spare_id).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            self.client.delete(f"{self.PHOTOS_URL}{photo_id}/").status_code, status.HTTP_403_FORBIDDEN
+        )
 
 
 class DailyRegisterAPITests(APITestCase):

@@ -64,6 +64,7 @@ from .models import (
     MaintenanceFire,
     MaintenanceSpare,
     MaintenanceGateLink,
+    MaintenanceSparePhoto,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
@@ -507,6 +508,27 @@ class MaintenanceSpareSerializer(CompanyScopedModelSerializer):
                 {"reorder_level": "Reorder level must be greater than or equal to minimum stock."}
             )
         return attrs
+
+
+class MaintenanceSparePhotoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MaintenanceSparePhoto
+        fields = ["id", "spare", "photo", "created_by", "created_at"]
+        read_only_fields = ["created_by", "created_at"]
+
+    def validate_spare(self, value):
+        request = self.context.get("request")
+        company = request.company.company if request and hasattr(request, "company") else None
+        if company and value.company_id != company.id:
+            raise serializers.ValidationError("Item must belong to current company.")
+        return value
+
+    def validate_photo(self, value):
+        # The browser says what it sent; a PDF or a spreadsheet here would show
+        # as a broken picture on the Store page.
+        if not (getattr(value, "content_type", "") or "").startswith("image/"):
+            raise serializers.ValidationError("Choose a photo.")
+        return value
 
 
 class AssetPhotoSerializer(serializers.ModelSerializer):

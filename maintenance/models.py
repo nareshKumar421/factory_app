@@ -349,6 +349,21 @@ class MaintenanceSpare(BaseModel):
         return self.reorder_level - self.current_stock
 
 
+class MaintenanceSparePhoto(BaseModel):
+    """A picture of a store item, so whoever fetches it knows it on the shelf."""
+
+    spare = models.ForeignKey(MaintenanceSpare, on_delete=models.CASCADE, related_name="photos")
+    photo = models.FileField(upload_to="maintenance/spares/photos/")
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        verbose_name = "Maintenance Spare Photo"
+        verbose_name_plural = "Maintenance Spare Photos"
+
+    def __str__(self):
+        return f"{self.spare.name} photo"
+
+
 class AssetPhoto(BaseModel):
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name="photos")
     photo = models.FileField(upload_to="maintenance/assets/photos/")

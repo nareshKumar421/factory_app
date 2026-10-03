@@ -67,6 +67,7 @@ from .models import (
     MaintenanceFire,
     MaintenanceSpare,
     MaintenanceGateLink,
+    MaintenanceSparePhoto,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
@@ -164,6 +165,7 @@ from .serializers import (
     MaintenanceSpareSerializer,
     MaintenanceFireSerializer,
     MaintenanceGateLinkSerializer,
+    MaintenanceSparePhotoSerializer,
     MaintenanceSpareReceiptSerializer,
     MaintenanceVendorVisitSerializer,
     MaintenanceWorkOrderApprovalSerializer,
@@ -3046,6 +3048,32 @@ class MaintenanceSpareViewSet(CompanyScopedViewSet):
             )
         spare.refresh_from_db()
         return Response(self.get_serializer(spare).data, status=status.HTTP_200_OK)
+
+
+class MaintenanceSparePhotoViewSet(viewsets.ModelViewSet):
+    """Pictures of store items: seen by whoever sees the store, added and
+    removed by whoever keeps it. A wrong photo is deleted, not edited."""
+
+    serializer_class = MaintenanceSparePhotoSerializer
+    http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated(), HasCompanyContext()]
+        if self.action in ["create", "destroy"]:
+            permissions.append(CanManageSpare())
+        else:
+            permissions.append(CanViewSpare())
+        return permissions
+
+    def get_queryset(self):
+        qs = MaintenanceSparePhoto.objects.filter(spare__company=_company(self.request))
+        spare = self.request.query_params.get("spare")
+        if spare:
+            qs = qs.filter(spare_id=spare)
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user, updated_by=self.request.user)
 
 
 class SpareRequestViewSet(CompanyScopedViewSet):

@@ -46,6 +46,7 @@ from .views import (
     MaintenanceScanLookupAPI,
     MaintenanceScanWorkOrderAPI,
     MaintenanceChecklistTemplateItemViewSet,
+    MaintenanceSparePhotoViewSet,
     MaintenanceSpareViewSet,
     MaintenanceSpareStockAPI,
     MaintenanceSpareReceiptViewSet,
@@ -90,6 +91,7 @@ router.register(
 )
 router.register("spare-categories", SpareCategoryViewSet, basename="maintenance-spare-category")
 router.register("spares", MaintenanceSpareViewSet, basename="maintenance-spare")
+router.register("spare-photos", MaintenanceSparePhotoViewSet, basename="maintenance-spare-photo")
 router.register("spare-requests", SpareRequestViewSet, basename="maintenance-spare-request")
 router.register("spare-movements", SpareMovementViewSet, basename="maintenance-spare-movement")
 router.register("fire-categories", FireCategoryViewSet, basename="maintenance-fire-category")

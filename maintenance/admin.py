@@ -29,6 +29,7 @@ from .models import (
     MaintenanceFire,
     MaintenanceSpare,
     MaintenanceGateLink,
+    MaintenanceSparePhoto,
     MaintenanceSpareReceipt,
     MaintenanceVendorVisit,
     MaintenanceWorkOrder,
@@ -90,6 +91,13 @@ class AssetDocumentInline(admin.TabularInline):
     extra = 0
 
 
+class MaintenanceSparePhotoInline(admin.TabularInline):
+    model = MaintenanceSparePhoto
+    extra = 0
+    fields = ("photo", "created_by", "created_at")
+    readonly_fields = ("created_by", "created_at")
+
+
 @admin.register(Asset)
 class AssetAdmin(admin.ModelAdmin):
     list_display = (
@@ -123,6 +131,7 @@ class MaintenanceSpareAdmin(admin.ModelAdmin):
     list_filter = ("company", "category", "is_critical", "is_active")
     search_fields = ("part_number", "name", "sap_item_code", "storage_location")
     filter_horizontal = ("compatible_assets",)
+    inlines = [MaintenanceSparePhotoInline]
 
 
 @admin.register(AssetPhoto)

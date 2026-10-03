@@ -70,6 +70,9 @@ sequence is the exception — see below).
 - `MaintenanceSpare` (`part_number` unique per company, optional `sap_item_code`,
   `is_critical`, `current_stock`, `reorder_level`, `minimum_stock`,
   `compatible_assets`). `is_low_stock`/`is_below_minimum` are computed.
+- `MaintenanceSparePhoto` — pictures of an item, added from the Store page's
+  Add item / Edit form (`spare-photos/`, `?spare=<id>` to list one item's).
+  Viewing needs the store's view right; adding or removing needs manage.
 - `SpareRequest` — raised against a work order; running `issued/consumed/returned`
   quantities and a `refresh_status()` that derives REQUESTED→PARTIALLY_ISSUED→
   ISSUED→PARTIALLY_CONSUMED→CLOSED.
