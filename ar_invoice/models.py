@@ -7,6 +7,7 @@ post into, and keep SO lines locked while an invoice for them is in flight —
 a draft pending approval does not reduce ``RDR1.OpenQty``, so SAP alone cannot
 show that a line is already spoken for.
 """
+from django.conf import settings
 from django.db import models
 
 from company.models import Company
@@ -104,6 +105,12 @@ class ARInvoicePosting(BaseModel):
             (
                 "create_ar_invoice_from_sales_order",
                 "Can raise A/R invoices from Sales Orders",
+            ),
+            # The Ledger tab: without this a user sees only the customers
+            # linked to them (UserCustomer) — with it, any customer.
+            (
+                "view_all_customer_ledgers",
+                "Can view every customer's ledger",
             ),
         ]
 
@@ -357,3 +364,63 @@ class ARInvoicePayment(BaseModel):
 
     def __str__(self):
         return f"{self.company.code} invoice {self.sap_doc_num or self.sap_doc_entry}: {self.status}"
+
+
+class UserCustomer(models.Model):
+    """This user is this SAP customer, in this company.
+
+    Some of the app's users are also customers in SAP — a counter's own cash
+    sale account is the plain case — and the Ledger tab shows such a user
+    their own account and nobody else's. Shaped like
+    ``warehouse.UserWarehouse``: a code, not a foreign key, because customers
+    live in SAP (``OCRD``), and a code is only unique within a company. A user
+    may hold several accounts, so there is no "primary" flag.
+
+    Read it through ``ar_invoice.ledger_access``: the right to see every
+    customer, and "no link means no customer", live there.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="sap_customer_links",
+    )
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="user_customer_links",
+    )
+    customer_code = models.CharField(max_length=50)
+    # As SAP named the customer when the link was made — a label for the
+    # picker and the admin list; the ledger itself reads SAP's current name.
+    customer_name = models.CharField(max_length=200, blank=True, default="")
+    # Switching a link off keeps the record of who could see the account.
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ar_invoice_user_customer"
+        verbose_name = "customer ledger link"
+        verbose_name_plural = "customer ledger links"
+        ordering = ["company", "customer_name", "customer_code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "company", "customer_code"],
+                name="uniq_user_company_customer",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "company"]),
+            models.Index(fields=["company", "customer_code"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} → {self.company.code} {self.customer_code}"

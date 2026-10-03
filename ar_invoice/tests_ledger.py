@@ -1,20 +1,22 @@
 """Tests for the customer ledger on the A/R Invoices page.
 
-The reader tests mock the HANA cursor; the endpoint tests mock the reader.
-Nothing here reaches SAP.
+The reader tests mock the HANA cursor; the endpoint and admin-form tests mock
+the readers. Nothing here reaches SAP.
 """
 from datetime import date
 from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError
 from sap_client.hana.customer_ledger_reader import HanaCustomerLedgerReader
+
+from .models import UserCustomer
 
 User = get_user_model()
 COMPANY_CODE = "TC001"
@@ -134,30 +136,56 @@ class CustomerLedgerReaderTests(SimpleTestCase):
         self.assertIsNone(self.reader.ledger("  "))
 
 
+def _perm(codename):
+    return Permission.objects.get(content_type__app_label="ar_invoice", codename=codename)
+
+
 class CustomerLedgerEndpointTests(APITestCase):
+    """The ledger endpoint and whose ledger each user may open.
+
+    ``accounts`` holds the all-ledgers right; ``counter`` can view A/R invoices
+    and is linked to CUSTOMER only; ``unlinked`` can view A/R invoices and is
+    linked to nobody; ``stranger`` holds nothing.
+    """
+
     @classmethod
     def setUpTestData(cls):
         cls.company = Company.objects.create(name="Ledger Co", code=COMPANY_CODE)
+        cls.other_company = Company.objects.create(name="Other Co", code="TC002")
         role = UserRole.objects.create(name="Billing")
-        cls.viewer = User.objects.create_user(
-            email="ar-ledger@example.com", password="pass12345",
-            full_name="Ledger Viewer", employee_code="AR-LDG",
-        )
-        cls.stranger = User.objects.create_user(
-            email="ar-ledger-none@example.com", password="pass12345",
-            full_name="No Rights", employee_code="AR-NONE",
-        )
-        for user in (cls.viewer, cls.stranger):
-            UserCompany.objects.create(user=user, company=cls.company, role=role, is_active=True)
-        cls.viewer.user_permissions.add(
-            Permission.objects.get(
-                content_type__app_label="ar_invoice", codename="view_ar_invoice_posting"
+
+        def user(email, code):
+            u = User.objects.create_user(
+                email=email, password="pass12345", full_name=email, employee_code=code
             )
+            UserCompany.objects.create(user=u, company=cls.company, role=role, is_active=True)
+            return u
+
+        cls.accounts = user("ar-ledger-accounts@example.com", "AR-ACC")
+        cls.counter = user("ar-ledger-counter@example.com", "AR-CTR")
+        cls.unlinked = user("ar-ledger-unlinked@example.com", "AR-UNL")
+        cls.stranger = user("ar-ledger-none@example.com", "AR-NONE")
+        for u in (cls.accounts, cls.counter, cls.unlinked):
+            u.user_permissions.add(_perm("view_ar_invoice_posting"))
+        cls.accounts.user_permissions.add(_perm("view_all_customer_ledgers"))
+
+        UserCustomer.objects.create(
+            user=cls.counter, company=cls.company,
+            customer_code=CUSTOMER, customer_name="WAL MART INDIA PVT LTD",
+        )
+        # Neither of these opens anything in this company.
+        UserCustomer.objects.create(
+            user=cls.counter, company=cls.company,
+            customer_code="CUSTA000999", customer_name="Old account", is_active=False,
+        )
+        UserCustomer.objects.create(
+            user=cls.counter, company=cls.other_company,
+            customer_code="CUSTA000777", customer_name="Other company's account",
         )
 
     def setUp(self):
         self.client = APIClient()
-        self.client.force_authenticate(user=self.viewer)
+        self.client.force_authenticate(user=self.accounts)
         # The test company has no SAP config to build a context from.
         context_patcher = mock.patch("ar_invoice.views_ledger.CompanyContext")
         self.addCleanup(context_patcher.stop)
@@ -167,10 +195,17 @@ class CustomerLedgerEndpointTests(APITestCase):
         self.reader = patcher.start().return_value
         self.reader.ledger.return_value = {"customer_code": CUSTOMER, "lines": []}
 
-    def _get(self, query):
-        return self.client.get(f"{URL}?{query}", HTTP_COMPANY_CODE=COMPANY_CODE)
+    def _get(self, query, url=URL):
+        return self.client.get(f"{url}?{query}", HTTP_COMPANY_CODE=COMPANY_CODE)
 
-    def test_a_viewer_reads_the_ledger_for_the_dates_asked(self):
+    def _customers(self, user):
+        self.client.force_authenticate(user=user)
+        resp = self.client.get(f"{URL}customers/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        return resp.json()
+
+    # ── reading a ledger ────────────────────────────────────────────────────
+    def test_the_ledger_is_read_for_the_dates_asked(self):
         resp = self._get(f"customer_code={CUSTOMER}&date_from=2026-04-01&date_to=2026-10-03")
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
         self.assertEqual(resp.json()["customer_code"], CUSTOMER)
@@ -207,3 +242,118 @@ class CustomerLedgerEndpointTests(APITestCase):
         self.assertEqual(
             self._get(f"customer_code={CUSTOMER}").status_code, status.HTTP_403_FORBIDDEN
         )
+
+    # ── whose ledger ────────────────────────────────────────────────────────
+    def test_the_all_ledgers_right_opens_any_customer(self):
+        self.assertEqual(self._get("customer_code=CUSTA000001").status_code, status.HTTP_200_OK)
+
+    def test_a_linked_user_reads_their_own_ledger(self):
+        self.client.force_authenticate(user=self.counter)
+        self.assertEqual(self._get(f"customer_code={CUSTOMER}").status_code, status.HTTP_200_OK)
+
+    def test_a_linked_user_is_refused_any_other_customer_before_sap_is_read(self):
+        self.client.force_authenticate(user=self.counter)
+        for code in ("CUSTA000001", "CUSTA000999", "CUSTA000777"):  # other, inactive, other company
+            with self.subTest(code=code):
+                resp = self._get(f"customer_code={code}")
+                self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.reader.ledger.assert_not_called()
+
+    def test_no_link_means_no_customer_not_every_customer(self):
+        self.client.force_authenticate(user=self.unlinked)
+        self.assertEqual(
+            self._get(f"customer_code={CUSTOMER}").status_code, status.HTTP_403_FORBIDDEN
+        )
+
+    # ── what the picker offers ──────────────────────────────────────────────
+    def test_the_picker_offers_a_linked_user_their_active_links_in_this_company(self):
+        self.assertEqual(
+            self._customers(self.counter),
+            {
+                "all_customers": False,
+                "customers": [
+                    {"customer_code": CUSTOMER, "customer_name": "WAL MART INDIA PVT LTD"}
+                ],
+            },
+        )
+
+    def test_the_picker_offers_an_unlinked_user_nothing(self):
+        self.assertEqual(
+            self._customers(self.unlinked), {"all_customers": False, "customers": []}
+        )
+
+    def test_the_picker_offers_any_customer_with_the_right_or_to_a_superuser(self):
+        self.assertEqual(self._customers(self.accounts), {"all_customers": True, "customers": []})
+        boss = User.objects.create_superuser(
+            email="ar-ledger-boss@example.com", password="pass12345",
+            full_name="Boss", employee_code="AR-BOSS",
+        )
+        UserCompany.objects.create(
+            user=boss, company=self.company, role=UserRole.objects.first(), is_active=True
+        )
+        self.assertTrue(self._customers(boss)["all_customers"])
+
+
+class UserCustomerFormTests(TestCase):
+    """The admin form names a customer only once SAP confirms it."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Ledger Co", code=COMPANY_CODE)
+        cls.user = User.objects.create_user(
+            email="ar-ledger-link@example.com", password="pass12345",
+            full_name="Counter", employee_code="AR-LNK",
+        )
+
+    def setUp(self):
+        patcher = mock.patch("ar_invoice.admin.HanaCustomerReader")
+        self.addCleanup(patcher.stop)
+        self.reader = patcher.start().return_value
+        context_patcher = mock.patch("ar_invoice.admin.CompanyContext")
+        self.addCleanup(context_patcher.stop)
+        context_patcher.start()
+
+    def _form(self, code):
+        from .admin import UserCustomerForm
+
+        return UserCustomerForm(
+            data={
+                "user": self.user.pk, "company": self.company.pk,
+                "customer_code": code, "is_active": True,
+            }
+        )
+
+    def test_a_customer_sap_knows_is_saved_as_sap_spells_it(self):
+        self.reader.get_customer.return_value = {
+            "customer_code": CUSTOMER, "customer_name": "WAL MART INDIA PVT LTD",
+        }
+        form = self._form(" custa000486 ")
+        self.assertTrue(form.is_valid(), form.errors)
+        link = form.save()
+        self.assertEqual(link.customer_code, CUSTOMER)
+        self.assertEqual(link.customer_name, "WAL MART INDIA PVT LTD")
+        self.reader.get_customer.assert_called_once_with("custa000486")
+
+    def test_a_code_typed_in_lower_case_is_found_in_upper_case(self):
+        self.reader.get_customer.side_effect = [
+            None, {"customer_code": CUSTOMER, "customer_name": "WAL MART INDIA PVT LTD"},
+        ]
+        form = self._form("custa000486")
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.save().customer_code, CUSTOMER)
+        self.assertEqual(
+            [call.args[0] for call in self.reader.get_customer.call_args_list],
+            ["custa000486", CUSTOMER],
+        )
+
+    def test_a_code_sap_does_not_know_is_refused(self):
+        self.reader.get_customer.return_value = None
+        form = self._form("CUSTA000000")
+        self.assertFalse(form.is_valid())
+        self.assertIn("customer_code", form.errors)
+
+    def test_sap_down_refuses_rather_than_link_blind(self):
+        self.reader.get_customer.side_effect = SAPConnectionError("down")
+        form = self._form(CUSTOMER)
+        self.assertFalse(form.is_valid())
+        self.assertIn("SAP could not be read", str(form.errors))
