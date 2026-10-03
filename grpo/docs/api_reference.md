@@ -467,7 +467,9 @@ knowing before reading the payload:
   `grand_total`. `hsn_summary` covers the goods only, so its tax can be lower:
   a charge has no HSN code to file it under.
 - **`approval.approver` is the document's own approver**, off the SAP approval
-  chain — not the name typed into the Beverages Crystal layout.
+  chain — not the name typed into the Beverages Crystal layout — unless the
+  order's company has set `PO print settings` to a typed name, which then
+  replaces it (see below). `approval.is_approved` is always SAP's.
 
 **Endpoint:** `GET /api/v1/grpo/po-receipt/<po_receipt_id>/print/`
 
@@ -507,3 +509,38 @@ already looking at is not a capability beyond seeing it listed.
 | NO_ARRIVAL_SLIP | Arrival slip not created |
 | ARRIVAL_SLIP_PENDING | Arrival slip not submitted |
 | INSPECTION_PENDING | Inspection not created |
+
+---
+
+## PO print settings
+
+Where the printed Purchase Order's approver comes from, for the active company
+(`Company-Code` header). One `POPrintSettings` row per company; a company with
+no row prints SAP's approver.
+
+**Endpoint:** `GET /api/v1/grpo/po-print-settings/` — any permission that can
+print the order. `PATCH` (or `PUT`) — `grpo.can_manage_po_print_settings`.
+
+**Request (PATCH):**
+
+```json
+{ "approver_source": "MANUAL", "approver_name": "Vishal/Gagandeep Singh" }
+```
+
+`approver_source` is `SAP` or `MANUAL`; both fields are optional. A `MANUAL`
+source with a blank name is refused with 400. Switching back to `SAP` keeps the
+name for next time.
+
+**Response:**
+
+```json
+{
+  "approver_source": "MANUAL",
+  "approver_name": "Vishal/Gagandeep Singh",
+  "updated_by_name": "Jashan",
+  "updated_at": "2026-10-03T10:00:00+05:30"
+}
+```
+
+The print endpoints (`po-receipt/<id>/print/` here and the PM requirement
+board's order) apply it using the order's own company.

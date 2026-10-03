@@ -30,6 +30,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from company.permissions import HasCompanyContext
+from grpo.po_print_settings import apply_to_payload
 from sap_client.exceptions import (
     SAPConnectionError,
     SAPDataError,
@@ -242,8 +243,9 @@ class PackingMaterialPurchaseOrderAPI(_PackingMaterialAPI):
             )
         # Passed through as the print reader shaped it. A serializer here would
         # be a second copy of a layout that is already pinned field by field to
-        # a SAP-printed sheet, and the two would drift.
-        return Response(order)
+        # a SAP-printed sheet, and the two would drift. Only the approver is the
+        # company's to choose, as on the gate's "Print PO".
+        return Response(apply_to_payload(order, request.company.company))
 
 
 class PackingMaterialRequirementAPI(_PackingMaterialAPI):

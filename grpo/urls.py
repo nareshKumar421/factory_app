@@ -12,6 +12,7 @@ from .views import (
     GRPOPostingDetailAPI,
     GRPOPrintAPI,
     POPrintAPI,
+    POPrintSettingsAPI,
     GRPOInspectionReportAPI,
     GRPOAttachmentListCreateAPI,
     GRPOAttachmentDeleteAPI,
@@ -131,6 +132,12 @@ urlpatterns = [
         "po-receipt/<int:po_receipt_id>/print/",
         POPrintAPI.as_view(),
         name="grpo-po-print",
+    ),
+    # Whether the printed PO's approver is SAP's or a name typed in here.
+    path(
+        "po-print-settings/",
+        POPrintSettingsAPI.as_view(),
+        name="grpo-po-print-settings",
     ),
 
     # GRPO attachment endpoints

@@ -346,3 +346,62 @@ class ServiceGRPOAttachment(ControlledDocumentMixin, models.Model):
             f"Attachment for Service GRPO {self.service_grpo_posting_id} - "
             f"{self.original_filename}"
         )
+
+
+class POApproverSource(models.TextChoices):
+    SAP = "SAP", "From SAP"
+    MANUAL = "MANUAL", "Entered here"
+
+
+class POPrintSettings(models.Model):
+    """How one company's printed Purchase Order names its approver.
+
+    SAP's own layout types the approver's name into the layout rather than
+    reading it off the document, so the name on the sheet the vendor holds is
+    whoever the company says signs for its orders, not who cleared the SAP
+    approval chain. ``SAP`` keeps the reader's answer (``OWDD``/``WDD1``);
+    ``MANUAL`` prints ``approver_name`` as typed. The "Approved" stamp is SAP's
+    either way: it says the order cleared its chain, which only SAP knows.
+
+    A company without a row prints the SAP approver, as it always has.
+    """
+
+    company = models.OneToOneField(
+        "company.Company",
+        on_delete=models.CASCADE,
+        related_name="po_print_settings",
+    )
+    approver_source = models.CharField(
+        max_length=10,
+        choices=POApproverSource.choices,
+        default=POApproverSource.SAP,
+    )
+    approver_name = models.CharField(
+        max_length=120,
+        blank=True,
+        default="",
+        help_text="Printed as the approver when the source is 'Entered here'.",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="po_print_settings_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "PO Print Settings"
+        verbose_name_plural = "PO Print Settings"
+        # Reading rides on printing the order; only the write is gated.
+        default_permissions = ()
+        permissions = [
+            ("can_manage_po_print_settings", "Can change the PO print settings"),
+        ]
+
+    def __str__(self):
+        if self.approver_source == POApproverSource.MANUAL:
+            return f"{self.company_id}: approver '{self.approver_name}'"
+        return f"{self.company_id}: approver from SAP"

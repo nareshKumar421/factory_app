@@ -22,6 +22,7 @@ from .pagination import (
     paginate_queryset,
     build_page,
 )
+from . import po_print_settings
 from . import sap_posting as grpo_sap_posting
 from .services import GRPOService, ServiceGRPOAlreadyInSAP
 from .serializers import (
@@ -40,8 +41,11 @@ from .serializers import (
     ServiceGRPOOptionsSerializer,
     ServiceGRPOPostingSerializer,
     ServiceGRPOPostResponseSerializer,
+    POPrintSettingsSerializer,
+    POPrintSettingsUpdateSerializer,
 )
 from .permissions import (
+    CanManagePOPrintSettings,
     CanPrintPurchaseOrder,
     CanViewPendingGRPO,
     CanPreviewGRPO,
@@ -1394,8 +1398,42 @@ class POPrintAPI(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        po_print_settings.apply_to_payload(payload, po_receipt.vehicle_entry.company)
         payload["po_receipt_id"] = po_receipt.id
         return Response(payload)
+
+
+class POPrintSettingsAPI(APIView):
+    """GET / PATCH how the active company's printed PO names its approver.
+
+    GET /api/grpo/po-print-settings/
+    PATCH /api/grpo/po-print-settings/  {approver_source, approver_name}
+
+    Anyone who can print the order can see where its approver comes from; only
+    ``can_manage_po_print_settings`` changes it.
+    """
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [IsAuthenticated(), HasCompanyContext(), CanPrintPurchaseOrder()]
+        return [IsAuthenticated(), HasCompanyContext(), CanManagePOPrintSettings()]
+
+    def get(self, request):
+        row = po_print_settings.get_settings(request.company.company)
+        return Response(POPrintSettingsSerializer(row).data)
+
+    def patch(self, request):
+        serializer = POPrintSettingsUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            row = po_print_settings.update_settings(
+                request.company.company, serializer.validated_data, request.user,
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(POPrintSettingsSerializer(row).data)
+
+    put = patch
 
 
 class GRPOAttachmentListCreateAPI(APIView):

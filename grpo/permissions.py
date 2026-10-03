@@ -71,3 +71,10 @@ class CanManageGRPOAttachments(BasePermission):
 
     def has_permission(self, request, view):
         return request.user.has_perm("grpo.add_grpoattachment")
+
+
+class CanManagePOPrintSettings(BasePermission):
+    """Permission to change how the printed Purchase Order names its approver."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("grpo.can_manage_po_print_settings")

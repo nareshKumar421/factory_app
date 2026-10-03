@@ -134,6 +134,11 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
    `CRYSTAL_PURCHASE_ORDER_ITEM`; see `sap_client/hana/po_print_reader.py`,
    whose docstring also records where the three companies' copies of that
    procedure disagree and which reading won.
+   The approver is the one field the company chooses: `POPrintSettings` (one
+   row per company, edited from "PO print settings" on the Material GRPO page)
+   either keeps SAP's approval-chain name or prints a typed one, e.g.
+   "Vishal/Gagandeep Singh". The order's own company decides, not the
+   viewer's; the "Approved" stamp stays SAP's either way. No row = SAP.
 
 ### Flow B — Material GRPO failure & retry
 
@@ -274,6 +279,8 @@ absent ⇒ not blocked — see `_get_qc_blocking_reason`).
 | `GET <posting_id>/` | `GRPOPostingDetailAPI` | `view_grpoposting` |
 | `GET <posting_id>/print/` | `GRPOPrintAPI` | `can_view_grpo_history` |
 | `GET po-receipt/<po_receipt_id>/print/` | `POPrintAPI` | any of `can_view_pending_grpo` / `can_preview_grpo` / `can_view_grpo_history` |
+| `GET po-print-settings/` | `POPrintSettingsAPI` | same as `POPrintAPI` |
+| `PATCH po-print-settings/` | `POPrintSettingsAPI` | `can_manage_po_print_settings` |
 | `GET/POST <posting_id>/attachments/` | `GRPOAttachmentListCreateAPI` | `add_grpoattachment` |
 | `DELETE <posting_id>/attachments/<id>/` | `GRPOAttachmentDeleteAPI` | `add_grpoattachment` |
 | `POST <posting_id>/attachments/<id>/retry/` | `GRPOAttachmentRetryAPI` | `add_grpoattachment` |

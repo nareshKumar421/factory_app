@@ -12,6 +12,8 @@ from .models import (
     ServiceGRPOPosting,
     ServiceGRPOLinePosting,
     ServiceGRPOAttachment,
+    POApproverSource,
+    POPrintSettings,
 )
 
 MONTH_INPUT_FORMATS = ["%Y-%m", "%Y-%m-%d"]
@@ -1052,3 +1054,26 @@ class ServiceGRPOPostResponseSerializer(serializers.Serializer):
     )
     message = serializers.CharField()
     attachments = ServiceGRPOAttachmentSerializer(many=True, read_only=True)
+
+
+class POPrintSettingsSerializer(serializers.ModelSerializer):
+    """One company's PO print settings, as the Material GRPO page shows them."""
+
+    updated_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = POPrintSettings
+        fields = ["approver_source", "approver_name", "updated_by_name", "updated_at"]
+
+    def get_updated_by_name(self, obj):
+        user = obj.updated_by
+        if not user:
+            return ""
+        return user.full_name or user.email
+
+
+class POPrintSettingsUpdateSerializer(serializers.Serializer):
+    approver_source = serializers.ChoiceField(choices=POApproverSource.choices, required=False)
+    approver_name = serializers.CharField(
+        max_length=120, required=False, allow_blank=True, trim_whitespace=True,
+    )

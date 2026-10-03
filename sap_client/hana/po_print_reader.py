@@ -84,6 +84,8 @@ The rest of the mapping worth knowing before changing anything:
   rows are keyed by ``DocEntry`` *and* ``ObjType``: DocEntry 4131 exists as an
   invoice, a transfer and an A/P invoice in the same company, so the draft key
   is what picks out the purchase order's own chain.
+  A company that would rather print a fixed signatory, as that layout does,
+  sets one in ``grpo.po_print_settings``, which swaps it in after this read.
 """
 
 import logging
