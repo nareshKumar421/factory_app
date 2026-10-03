@@ -205,17 +205,20 @@ replaces (`PUT defaults/<id>/`, the whole default) and soft-removes them.
    sent-back entry is corrected with `PATCH entries/<id>/` and goes back to PENDING;
    an approved one is final.
 
-**Several samples in one go** (`0074`, `0075`): a form checking several samples at once
-(net content: one per bottle; blown bottle: one per mould) is filled in one go —
-`POST entries/` with `samples: [{results}, …]` instead of `results`. Each sample is
-its own `ProductionQCEntry` (its own row in the list, its own column on the sheet and
-the print), and they share one `ProductionQCSubmission`: the default, the time, the
-remark, and the decision. Approving or sending back any of them does all of them; a
-correction sends every one (`PATCH entries/<id>/` with `samples: [{entry_id,
+**Several samples in one entry** (`0074`, `0075`): a form checking several samples at
+once (net content: one per bottle; blown bottle: one per mould) is filled in one go —
+`POST entries/` with `samples: [{results}, …]` instead of `results`. To the people using
+it that is **one entry** — one row in the list, one number (its first sample's), one
+detail page, one decision, counted once (`entries/counts/` counts submissions) — and
+only the sheet and its print lay the samples out as separate columns. In the data each
+sample is its own `ProductionQCEntry` sharing one `ProductionQCSubmission` (the default,
+the time, the remark, the decision): approving or sending back any of them does all of
+them; a correction sends every one (`PATCH entries/<id>/` with `samples: [{entry_id,
 results}, …]`) and a lone one is refused on `samples`. A missing value is reported as
 "Sample N: …". Every entry has a submission (`0075` gave each older entry its own);
-`submission_entry_ids` on an entry lists them all, and `?submission_id=` lists them
-whatever their date.
+`submission_entry_ids` lists the samples (the first is the entry's number), and
+`?submission_id=` lists them whatever their date. The list endpoint still returns one
+row per sample; the frontend groups them.
 
 Lists: `?date=` gives one day, every status; otherwise PENDING and SENT_BACK entries show
 whatever the date and a search spans all dates. `?parameter_type_id=` narrows to one

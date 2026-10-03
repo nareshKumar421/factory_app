@@ -807,6 +807,17 @@ class SubmissionTests(ProductionQCBase):
             ["APPROVED"] * 3,
         )
 
+    def test_a_set_of_samples_counts_once(self):
+        self._create_many(self._readings(), self._readings(), self._readings())
+        self._create()
+        client = _client(self.company, VIEW)
+        resp = client.get(reverse("production-qc-entry-counts"))
+        self.assertEqual(resp.data["pending"], 2)
+        resp = client.get(
+            reverse("production-qc-entry-counts"), {"date": timezone.localdate().isoformat()}
+        )
+        self.assertEqual(resp.data["pending"], 2)
+
     def test_results_and_samples_cannot_both_be_sent(self):
         resp = _client(self.company, FILL).post(reverse("production-qc-entries"), {
             "parameter_type_id": self.type.id,

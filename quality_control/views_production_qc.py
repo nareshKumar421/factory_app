@@ -235,6 +235,9 @@ class ProductionQCEntryCountsAPI(APIView):
 
     Without it: waiting and sent-back cover every date; approved covers the
     picked range, or today (the sidebar badge reads `pending` this way).
+
+    Samples sent together are one entry to the people using it, so a set counts
+    once: these count submissions, not sample rows.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewProductionQC]
@@ -247,17 +250,21 @@ class ProductionQCEntryCountsAPI(APIView):
             return _bad_day(exc.args[0])
         if day:
             on_day = Q(checked_at__date=day)
+
+            def sets(status_):
+                return Count("submission", distinct=True, filter=on_day & Q(status=status_))
+
             counts = qs.aggregate(
-                pending=Count("id", filter=on_day & Q(status=ProductionQCStatus.PENDING)),
-                sent_back=Count("id", filter=on_day & Q(status=ProductionQCStatus.SENT_BACK)),
-                approved=Count("id", filter=on_day & Q(status=ProductionQCStatus.APPROVED)),
+                pending=sets(ProductionQCStatus.PENDING),
+                sent_back=sets(ProductionQCStatus.SENT_BACK),
+                approved=sets(ProductionQCStatus.APPROVED),
             )
             # A per-day page must not hide a check still waiting on another day.
             elsewhere = (
                 qs.filter(status__in=UNFINISHED)
                 .exclude(on_day)
                 .annotate(day=TruncDate("checked_at"))
-                .aggregate(count=Count("id"), first=Min("day"))
+                .aggregate(count=Count("submission", distinct=True), first=Min("day"))
             )
             counts["waiting_elsewhere"] = elsewhere["count"]
             counts["waiting_elsewhere_first_date"] = elsewhere["first"]
@@ -267,10 +274,13 @@ class ProductionQCEntryCountsAPI(APIView):
         from_date = request.query_params.get("from_date") or today
         to_date = request.query_params.get("to_date") or today
         counts = qs.aggregate(
-            pending=Count("id", filter=Q(status=ProductionQCStatus.PENDING)),
-            sent_back=Count("id", filter=Q(status=ProductionQCStatus.SENT_BACK)),
+            pending=Count("submission", distinct=True, filter=Q(status=ProductionQCStatus.PENDING)),
+            sent_back=Count(
+                "submission", distinct=True, filter=Q(status=ProductionQCStatus.SENT_BACK)
+            ),
             approved=Count(
-                "id",
+                "submission",
+                distinct=True,
                 filter=Q(
                     status=ProductionQCStatus.APPROVED,
                     checked_at__date__gte=from_date,
