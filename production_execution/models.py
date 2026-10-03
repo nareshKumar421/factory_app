@@ -196,6 +196,32 @@ class BreakdownCategory(models.Model):
         return self.name
 
 
+class BreakdownSubCategory(models.Model):
+    """The specific fault under a main breakdown — Filler › Cap stuck.
+
+    A main breakdown with active sub-breakdowns must be logged with one of
+    them; a main with none (Power cut, Manpower) is logged on its own, with
+    the typed reason as its only detail.
+    """
+    category = models.ForeignKey(
+        BreakdownCategory, on_delete=models.PROTECT,
+        related_name='sub_categories'
+    )
+    name = models.CharField(max_length=100)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        unique_together = ('category', 'name')
+        verbose_name = 'Breakdown Sub-category'
+        verbose_name_plural = 'Breakdown Sub-categories'
+
+    def __str__(self):
+        return f"{self.category.name} › {self.name}"
+
+
 class LineSkuConfig(models.Model):
     """
     Predefined configuration preset for a production line.
@@ -659,6 +685,12 @@ class MachineBreakdown(models.Model):
         null=True, blank=True,
         help_text="Configurable breakdown type"
     )
+    breakdown_subcategory = models.ForeignKey(
+        BreakdownSubCategory, on_delete=models.PROTECT,
+        related_name='breakdowns',
+        null=True, blank=True,
+        help_text="The specific fault under breakdown_category, where it has any"
+    )
     is_active = models.BooleanField(
         default=True, help_text="True if breakdown is ongoing"
     )
@@ -668,7 +700,8 @@ class MachineBreakdown(models.Model):
                   "not from a live breakdown."
     )
     is_unrecovered = models.BooleanField(default=False)
-    reason = models.CharField(max_length=500)
+    # Required unless a sub-breakdown is picked — enforced in the service.
+    reason = models.CharField(max_length=500, blank=True)
     remarks = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -678,9 +711,24 @@ class MachineBreakdown(models.Model):
         verbose_name = 'Breakdown'
         verbose_name_plural = 'Breakdowns'
 
-    def __str__(self):
+    @property
+    def type_label(self):
+        """'Filler › Cap stuck', or just the main breakdown where there is no sub."""
         category = self.breakdown_category.name if self.breakdown_category else "Breakdown"
-        return f"{category} - {self.reason[:50]}"
+        if self.breakdown_subcategory_id:
+            return f"{category} › {self.breakdown_subcategory.name}"
+        return category
+
+    @property
+    def problem(self):
+        """What stopped the line: the sub-breakdown names the fault, a typed
+        reason adds to it; with no sub, the reason is the whole story."""
+        if not self.breakdown_subcategory_id:
+            return self.reason
+        return f"{self.type_label} — {self.reason}" if self.reason else self.type_label
+
+    def __str__(self):
+        return f"{self.type_label} - {self.reason[:50]}"
 
 
 class ProductionMaterialUsage(models.Model):

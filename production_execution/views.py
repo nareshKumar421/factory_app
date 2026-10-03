@@ -2,7 +2,7 @@ import logging
 from collections import defaultdict, deque
 
 from django.db import IntegrityError, transaction
-from django.db.models import Q, Sum
+from django.db.models import Prefetch, Q, Sum
 from django.utils.dateparse import parse_date
 
 from rest_framework.views import APIView
@@ -18,6 +18,7 @@ from .services import ProductionExecutionService, ProductionMovementService
 from .services import filling_cost, filling_cost_board
 from .models import (
     ProductionLine, ProductionRun, MachineBreakdown, WasteLog, BreakdownCategory,
+    BreakdownSubCategory,
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, InProcessQCCheck, FinalQCCheck,
@@ -281,7 +282,11 @@ class BreakdownCategoryListCreateAPI(APIView):
         service = _get_service(request)
         categories = BreakdownCategory.objects.filter(
             company=service.company, is_active=True
-        ).order_by('name')
+        ).order_by('name').prefetch_related(Prefetch(
+            'sub_categories',
+            queryset=BreakdownSubCategory.objects.filter(is_active=True).order_by('name'),
+            to_attr='active_sub_categories',
+        ))
         return Response(BreakdownCategorySerializer(categories, many=True).data)
 
     def post(self, request):
@@ -2250,13 +2255,24 @@ class DowntimeAnalyticsAPI(APIView):
             qs = qs.filter(machine_id=machine_id)
 
         from django.db.models import Sum, Count
-        agg = qs.values('reason').annotate(
+        rows = qs.values(
+            'reason', 'breakdown_category__name', 'breakdown_subcategory__name',
+        ).annotate(
             count=Count('id'),
             total_minutes=Sum('breakdown_minutes')
-        ).order_by('-total_minutes')
+        )
+        # A sub-breakdown names the fault, so its entries are one cause whatever
+        # was typed beside them; the rest still group on the typed reason.
+        by_cause = {}
+        for r in rows:
+            sub = r['breakdown_subcategory__name']
+            label = f"{r['breakdown_category__name']} › {sub}" if sub else r['reason']
+            cause = by_cause.setdefault(label, {'reason': label, 'count': 0, 'total_minutes': 0})
+            cause['count'] += r['count']
+            cause['total_minutes'] += r['total_minutes'] or 0
 
         return Response({
-            'breakdowns': list(agg),
+            'breakdowns': sorted(by_cause.values(), key=lambda c: -c['total_minutes']),
             'total_count': qs.count(),
             'total_minutes': qs.aggregate(t=Sum('breakdown_minutes'))['t'] or 0,
         })

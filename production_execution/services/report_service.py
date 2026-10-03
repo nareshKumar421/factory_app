@@ -675,22 +675,31 @@ class ReportService:
         # Reasons are free text on MachineBreakdown, so they are grouped per
         # category in one pass here rather than by a follow-up request per
         # category — the row count is small (one row per distinct reason) and
-        # it keeps the drill-down instant.
-        reasons_by_category = {}
+        # it keeps the drill-down instant. Where a sub-breakdown was picked it
+        # is the cause, and the text typed beside it is only detail.
+        causes = {}
         reason_rows = (
-            bd_qs.values('breakdown_category__name', 'reason')
+            bd_qs.values('breakdown_category__name', 'breakdown_subcategory__name', 'reason')
             .annotate(count=Count('id'), total_minutes=Sum('breakdown_minutes'))
-            .order_by('-total_minutes')
         )
         for r in reason_rows:
             key = r['breakdown_category__name'] or 'Uncategorized'
-            mins = r['total_minutes'] or 0
-            reasons_by_category.setdefault(key, []).append({
-                'reason': (r['reason'] or '').strip() or 'No reason recorded',
-                'count': r['count'],
-                'total_minutes': mins,
-                'avg_minutes': round(mins / r['count'], 1) if r['count'] else 0,
+            label = (
+                r['breakdown_subcategory__name']
+                or (r['reason'] or '').strip()
+                or 'No reason recorded'
+            )
+            cause = causes.setdefault((key, label), {
+                'reason': label, 'count': 0, 'total_minutes': 0,
             })
+            cause['count'] += r['count']
+            cause['total_minutes'] += r['total_minutes'] or 0
+        reasons_by_category = {}
+        for (key, _), cause in sorted(causes.items(), key=lambda kv: -kv[1]['total_minutes']):
+            cause['avg_minutes'] = (
+                round(cause['total_minutes'] / cause['count'], 1) if cause['count'] else 0
+            )
+            reasons_by_category.setdefault(key, []).append(cause)
 
         by_category = list(
             bd_qs.values('breakdown_category__name')

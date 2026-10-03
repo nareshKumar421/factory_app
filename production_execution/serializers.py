@@ -7,7 +7,7 @@ from maintenance.constants import MaintenancePriority
 
 from .models import (
     ProductionLine, Machine, MachineChecklistTemplate,
-    BreakdownCategory, LineSkuConfig,
+    BreakdownCategory, BreakdownSubCategory, LineSkuConfig,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem, LineClearanceAttachment,
@@ -90,11 +90,27 @@ class ChecklistTemplateCreateSerializer(serializers.Serializer):
 # Breakdown Categories
 # ---------------------------------------------------------------------------
 
+class BreakdownSubCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BreakdownSubCategory
+        fields = ['id', 'name', 'is_active']
+
+
 class BreakdownCategorySerializer(serializers.ModelSerializer):
+    # Active only: a retired sub-breakdown stays on the breakdowns that used
+    # it, but is no longer offered.
+    sub_categories = serializers.SerializerMethodField()
+
     class Meta:
         model = BreakdownCategory
-        fields = ['id', 'name', 'is_active', 'created_at', 'updated_at']
+        fields = ['id', 'name', 'is_active', 'sub_categories', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
+
+    def get_sub_categories(self, obj):
+        subs = getattr(obj, 'active_sub_categories', None)
+        if subs is None:
+            subs = obj.sub_categories.filter(is_active=True)
+        return BreakdownSubCategorySerializer(subs, many=True).data
 
 
 class BreakdownCategoryCreateSerializer(serializers.Serializer):
@@ -342,6 +358,9 @@ class MachineBreakdownSerializer(serializers.ModelSerializer):
     breakdown_category_name = serializers.CharField(
         source='breakdown_category.name', read_only=True, default=''
     )
+    breakdown_subcategory_name = serializers.CharField(
+        source='breakdown_subcategory.name', read_only=True, default=''
+    )
     maintenance_work_order_id = serializers.SerializerMethodField()
     maintenance_work_order_no = serializers.SerializerMethodField()
     maintenance_work_order_status = serializers.SerializerMethodField()
@@ -354,6 +373,7 @@ class MachineBreakdownSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'production_run', 'machine', 'machine_name', 'start_time', 'end_time',
             'breakdown_minutes', 'breakdown_category', 'breakdown_category_name',
+            'breakdown_subcategory', 'breakdown_subcategory_name',
             'is_active', 'is_manual', 'is_unrecovered',
             'maintenance_work_order_id', 'maintenance_work_order_no',
             'maintenance_work_order_status', 'maintenance_asset_id',
@@ -442,6 +462,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
             obj.breakdowns.select_related(
                 'machine',
                 'breakdown_category',
+                'breakdown_subcategory',
                 'maintenance_work_order',
                 'maintenance_work_order__asset',
             ).all(),
@@ -456,6 +477,7 @@ class ProductionRunDetailSerializer(serializers.ModelSerializer):
 class AddBreakdownSerializer(serializers.Serializer):
     """Used when operator clicks 'Add Breakdown' on the timeline."""
     breakdown_category_id = serializers.IntegerField()
+    breakdown_subcategory_id = serializers.IntegerField(required=False, allow_null=True)
     machine_id = serializers.IntegerField(required=False, allow_null=True)
     maintenance_asset_id = serializers.IntegerField(required=False, allow_null=True)
     create_maintenance_work_order = serializers.BooleanField(required=False, default=True)
@@ -464,7 +486,8 @@ class AddBreakdownSerializer(serializers.Serializer):
         required=False,
         default=MaintenancePriority.CRITICAL,
     )
-    reason = serializers.CharField(max_length=500)
+    # Required unless a sub-breakdown is picked — the service says which.
+    reason = serializers.CharField(max_length=500, required=False, allow_blank=True, default='')
     produced_cases = serializers.DecimalField(
         max_digits=12, decimal_places=1, required=False, default=0,
         help_text="Cases produced in the running segment being closed"
@@ -517,6 +540,7 @@ class AddManualBreakdownSerializer(serializers.Serializer):
     start_time = serializers.DateTimeField()
     end_time = serializers.DateTimeField()
     breakdown_category_id = serializers.IntegerField()
+    breakdown_subcategory_id = serializers.IntegerField(required=False, allow_null=True)
     machine_id = serializers.IntegerField(required=False, allow_null=True)
     maintenance_asset_id = serializers.IntegerField(required=False, allow_null=True)
     create_maintenance_work_order = serializers.BooleanField(required=False, default=False)
@@ -525,7 +549,8 @@ class AddManualBreakdownSerializer(serializers.Serializer):
         required=False,
         default=MaintenancePriority.CRITICAL,
     )
-    reason = serializers.CharField(max_length=500)
+    # Required unless a sub-breakdown is picked — the service says which.
+    reason = serializers.CharField(max_length=500, required=False, allow_blank=True, default='')
     remarks = serializers.CharField(required=False, allow_blank=True, default='')
 
     def validate(self, attrs):

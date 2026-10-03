@@ -5,7 +5,7 @@ from django.utils import timezone
 
 from ..models import (
     ProductionLine, LineSkuConfig, Machine, MachineChecklistTemplate,
-    BreakdownCategory,
+    BreakdownCategory, BreakdownSubCategory,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem, LineClearanceAttachment,
@@ -230,6 +230,32 @@ class ProductionExecutionService:
             return BreakdownCategory.objects.get(id=category_id, company=self.company)
         except BreakdownCategory.DoesNotExist:
             raise ValueError(f"Breakdown category {category_id} not found.")
+
+    def _get_breakdown_subcategory_or_raise(self, category, subcategory_id: int) -> BreakdownSubCategory:
+        try:
+            return BreakdownSubCategory.objects.get(id=subcategory_id, category=category)
+        except BreakdownSubCategory.DoesNotExist:
+            name = category.name if category else 'this breakdown'
+            raise ValueError(f"Sub-breakdown {subcategory_id} is not one of {name}'s.")
+
+    def _resolve_breakdown_type(self, data: dict):
+        """The main breakdown, its sub-breakdown and the typed reason, checked
+        together. A main with active sub-breakdowns needs one of them; without
+        a sub the reason is the only detail, so then it is required."""
+        category = self._get_breakdown_category_or_raise(data['breakdown_category_id'])
+        reason = (data.get('reason') or '').strip()
+        subcategory = None
+        if data.get('breakdown_subcategory_id'):
+            subcategory = self._get_breakdown_subcategory_or_raise(
+                category, data['breakdown_subcategory_id']
+            )
+            if not subcategory.is_active:
+                raise ValueError(f"{subcategory.name} is no longer used under {category.name}.")
+        elif category.sub_categories.filter(is_active=True).exists():
+            raise ValueError(f"Pick a sub-breakdown under {category.name}.")
+        elif not reason:
+            raise ValueError("Reason is required.")
+        return category, subcategory, reason
 
     # ==================================================================
     # PRODUCTION RUNS
@@ -955,10 +981,10 @@ class ProductionExecutionService:
             area=asset.area,
             line=asset.line or run.line.name,
             title=title,
-            problem_statement=breakdown.reason,
+            problem_statement=breakdown.problem,
             impact=WorkImpact.STOPPAGE,
             impact_notes=impact_notes,
-            downtime_reason=breakdown.reason,
+            downtime_reason=breakdown.problem,
             production_run=run,
             production_breakdown=breakdown,
             reported_by=reporter,
@@ -1073,15 +1099,16 @@ class ProductionExecutionService:
         machine = None
         if data.get('machine_id'):
             machine = self._get_machine_or_raise(data['machine_id'])
-        category = self._get_breakdown_category_or_raise(data['breakdown_category_id'])
+        category, subcategory, reason = self._resolve_breakdown_type(data)
 
         breakdown = MachineBreakdown.objects.create(
             production_run=run,
             machine=machine,
             start_time=now,
             breakdown_category=category,
+            breakdown_subcategory=subcategory,
             is_active=True,
-            reason=data['reason'],
+            reason=reason,
             remarks=data.get('remarks', ''),
         )
 
@@ -1091,7 +1118,7 @@ class ProductionExecutionService:
 
         self._recompute_run_totals(run)
         self._create_maintenance_work_order_for_breakdown(run, breakdown, data, user=user)
-        logger.info(f"Breakdown added for run {run_id}: {category.name}")
+        logger.info(f"Breakdown added for run {run_id}: {breakdown.type_label}")
         return breakdown
 
     @transaction.atomic
@@ -1304,7 +1331,7 @@ class ProductionExecutionService:
         machine = None
         if data.get('machine_id'):
             machine = self._get_machine_or_raise(data['machine_id'])
-        category = self._get_breakdown_category_or_raise(data['breakdown_category_id'])
+        category, subcategory, reason = self._resolve_breakdown_type(data)
 
         breakdown = MachineBreakdown.objects.create(
             production_run=run,
@@ -1313,9 +1340,10 @@ class ProductionExecutionService:
             end_time=end_time,
             breakdown_minutes=int((end_time - start_time).total_seconds() / 60),
             breakdown_category=category,
+            breakdown_subcategory=subcategory,
             is_active=False,
             is_manual=True,
-            reason=data['reason'],
+            reason=reason,
             remarks=data.get('remarks', ''),
         )
 
@@ -1333,7 +1361,7 @@ class ProductionExecutionService:
                 breakdown, 'stop_production', user=user,
             )
 
-        logger.info(f"Manual breakdown added for run {run_id}: {category.name}")
+        logger.info(f"Manual breakdown added for run {run_id}: {breakdown.type_label}")
         return breakdown
 
     @transaction.atomic
@@ -1463,6 +1491,7 @@ class ProductionExecutionService:
             run.breakdowns.select_related(
                 'machine',
                 'breakdown_category',
+                'breakdown_subcategory',
                 'maintenance_work_order',
                 'maintenance_work_order__asset',
             ).all()
@@ -1524,6 +1553,7 @@ class ProductionExecutionService:
         return run.breakdowns.select_related(
             'machine',
             'breakdown_category',
+            'breakdown_subcategory',
             'maintenance_work_order',
             'maintenance_work_order__asset',
         ).all()
@@ -1549,6 +1579,17 @@ class ProductionExecutionService:
         if 'breakdown_category_id' in data:
             breakdown.breakdown_category = self._get_breakdown_category_or_raise(
                 data['breakdown_category_id']
+            )
+            # A sub-breakdown only means something under its own main.
+            if (breakdown.breakdown_subcategory_id and breakdown.breakdown_subcategory.category_id
+                    != breakdown.breakdown_category_id):
+                breakdown.breakdown_subcategory = None
+        if 'breakdown_subcategory_id' in data:
+            breakdown.breakdown_subcategory = (
+                self._get_breakdown_subcategory_or_raise(
+                    breakdown.breakdown_category, data['breakdown_subcategory_id']
+                )
+                if data['breakdown_subcategory_id'] else None
             )
         for field in ['start_time', 'end_time', 'breakdown_minutes',
                       'is_unrecovered', 'reason', 'remarks']:

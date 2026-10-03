@@ -63,7 +63,8 @@ Models live in `models.py`, organised in three levels plus resource/cost/QC grou
 | `ProductionLine` | A packing/production line. Unique per `(company, name)`. Soft-deleted via `is_active`. |
 | `Machine` | Physical machine on a line; typed by `MachineType` (FILLER, CAPPER, LABELER, …). |
 | `MachineChecklistTemplate` | Reusable maintenance task per `machine_type` + `frequency` (DAILY/WEEKLY/MONTHLY). |
-| `BreakdownCategory` | Configurable breakdown type (replaces the legacy `BreakdownType` enum). |
+| `BreakdownCategory` | The **main breakdown** (Filler, Power cut, …), per company (replaces the legacy `BreakdownType` enum). The run page offers the active ones; manage them, and their sub-breakdowns, in Django admin. |
+| `BreakdownSubCategory` | A **sub-breakdown**: the specific fault under a main (Filler › Cap stuck). Unique per `(category, name)`; retire with `is_active`. Beverages' list is seeded by migration `0051`; Oil has none. |
 | `LineSkuConfig` | Preset for a line (rated speed, labour count, cost rates, supervisor/operators). Auto-fill priority: exact `sku_code` match → line-level default (blank `sku_code`). Presets are **copied** onto a run at creation, not referenced live. |
 
 ### Level 2 — The run and its timeline
@@ -71,7 +72,7 @@ Models live in `models.py`, organised in three levels plus resource/cost/QC grou
 |-------|---------|
 | `ProductionRun` | **Central entity.** Unique per `(company, date, run_number)`; `run_number` auto-increments per company/day. Holds `sap_doc_entry` (optional OWOR link), `product`, `required_qty`, `warehouse_approval_status`, `rated_speed`, `machines` (M2M), summary totals, `rejected_qty`/`reworked_qty`, SAP receipt/sync fields, and `status` (`DRAFT`→`IN_PROGRESS`→`COMPLETED`). All 31 module permissions are declared on its `Meta`. |
 | `ProductionSegment` | One **running period**. `is_active=True` while producing; closed on stop/breakdown with `produced_cases`. `duration_minutes` is derived. |
-| `MachineBreakdown` | A stoppage keyed to a `BreakdownCategory` (+ optional `machine`). `is_active` while ongoing; `is_unrecovered` when stopped unfixed; reverse-links to a `MaintenanceWorkOrder`. |
+| `MachineBreakdown` | A stoppage keyed to a `BreakdownCategory`, its `breakdown_subcategory` where the main has any, and an optional `machine`. `is_active` while ongoing; `is_unrecovered` when stopped unfixed; reverse-links to a `MaintenanceWorkOrder`. |
 | `ProductionMaterialUsage` | Per-material yield row: `opening/issued/closing`, and `wastage_qty = opening + issued − closing`. |
 | `MachineRuntime` | Runtime/downtime minutes per machine type. |
 | `ProductionManpower` | Worker count per `shift` (unique per `run+shift`). |
@@ -153,7 +154,10 @@ On success: create the first active `ProductionSegment`, flip `DRAFT`→`IN_PROG
 - **Stop** (`stop_production`): close the active segment, record `produced_cases`,
   recompute totals.
 - **Add breakdown** (`add_breakdown`): close the active segment, open a breakdown by
-  `breakdown_category` (+ optional machine). If `create_maintenance_work_order`
+  `breakdown_category` (+ optional machine). A main with active sub-breakdowns
+  needs `breakdown_subcategory_id`; without a sub, `reason` is required (with one
+  it is optional detail). The same rule holds for a past breakdown
+  (`add_manual_breakdown`). If `create_maintenance_work_order`
   (default true) and an asset resolves, a `MaintenanceWorkOrder` is created and the
   asset set to `BREAKDOWN`.
 - **Resolve breakdown** (`resolve_breakdown`) — three actions:

@@ -1,7 +1,7 @@
 from django.contrib import admin
 from .models import (
     ProductionLine, Machine, MachineChecklistTemplate,
-    BreakdownCategory,
+    BreakdownCategory, BreakdownSubCategory,
     ProductionRun, ProductionSegment, MachineBreakdown,
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem,
@@ -36,11 +36,20 @@ class MachineChecklistTemplateAdmin(admin.ModelAdmin):
     search_fields = ['task']
 
 
+class BreakdownSubCategoryInline(admin.TabularInline):
+    model = BreakdownSubCategory
+    extra = 1
+    fields = ['name', 'is_active']
+    # Logged breakdowns hold their sub-breakdown; retire one with is_active.
+    can_delete = False
+
+
 @admin.register(BreakdownCategory)
 class BreakdownCategoryAdmin(admin.ModelAdmin):
     list_display = ['id', 'name', 'company', 'is_active', 'created_at']
     list_filter = ['is_active', 'company']
     search_fields = ['name']
+    inlines = [BreakdownSubCategoryInline]
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +70,7 @@ class MachineBreakdownInline(admin.TabularInline):
     extra = 0
     readonly_fields = [
         'start_time', 'end_time', 'breakdown_minutes',
-        'breakdown_category', 'reason',
+        'breakdown_category', 'breakdown_subcategory', 'reason',
     ]
     can_delete = False
 
@@ -101,9 +110,10 @@ class ProductionSegmentAdmin(admin.ModelAdmin):
 class MachineBreakdownAdmin(admin.ModelAdmin):
     list_display = [
         'id', 'production_run', 'start_time', 'end_time',
-        'breakdown_minutes', 'breakdown_category', 'reason',
+        'breakdown_minutes', 'breakdown_category', 'breakdown_subcategory', 'reason',
     ]
     list_filter = ['breakdown_category']
+    list_select_related = ['breakdown_category', 'breakdown_subcategory__category']
 
 
 # ---------------------------------------------------------------------------
