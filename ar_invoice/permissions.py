@@ -26,3 +26,5 @@ CanCreateARInvoiceFromSalesOrder = _perm("ar_invoice.create_ar_invoice_from_sale
 # it is held apart from CREATE so accounts can mark receipts without also
 # gaining the power to raise invoices.
 CanMarkARInvoicePayment = _perm("ar_invoice.mark_ar_invoice_payment")
+# Admin › Customer Ledger Links: whose ledger each user may read.
+CanManageCustomerLedgerLinks = _perm("ar_invoice.manage_customer_ledger_links")

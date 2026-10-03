@@ -72,7 +72,13 @@ class ARInvoiceBaseView(APIView):
 
 
 class CustomerSearchView(ARInvoiceBaseView):
-    """GET /api/v1/ar-invoices/customers/?search=jivo — type-ahead picker feed."""
+    """GET /api/v1/ar-invoices/customers/?search=jivo — type-ahead picker feed.
+
+    Also feeds the customer picker on Admin › Customer Ledger Links, whose
+    users need not hold any A/R invoice right.
+    """
+
+    read_perms = [ar_perms.CanViewARInvoice | ar_perms.CanManageCustomerLedgerLinks]
 
     def get(self, request):
         query = CustomerSearchQuerySerializer(data=request.query_params)

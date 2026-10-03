@@ -421,6 +421,15 @@ class UserCustomer(models.Model):
             models.Index(fields=["user", "company"]),
             models.Index(fields=["company", "customer_code"]),
         ]
+        permissions = [
+            # The Admin › Customer Ledger Links screen. Its own right, like
+            # warehouse managers: it decides whose account a user may read,
+            # so seeing a ledger must not be enough to widen one's own.
+            (
+                "manage_customer_ledger_links",
+                "Can link users to their SAP customer accounts",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.user} → {self.company.code} {self.customer_code}"

@@ -1,14 +1,14 @@
 """Tests for the customer ledger on the A/R Invoices page.
 
-The reader tests mock the HANA cursor; the endpoint and admin-form tests mock
-the readers. Nothing here reaches SAP.
+The reader tests mock the HANA cursor; the endpoint tests mock the readers.
+Nothing here reaches SAP.
 """
 from datetime import date
 from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -16,6 +16,7 @@ from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError
 from sap_client.hana.customer_ledger_reader import HanaCustomerLedgerReader
 
+from .ledger_access import may_view_ledger, resolve_sap_customer
 from .models import UserCustomer
 
 User = get_user_model()
@@ -294,53 +295,31 @@ class CustomerLedgerEndpointTests(APITestCase):
         self.assertTrue(self._customers(boss)["all_customers"])
 
 
-class UserCustomerFormTests(TestCase):
-    """The admin form names a customer only once SAP confirms it."""
-
-    @classmethod
-    def setUpTestData(cls):
-        cls.company = Company.objects.create(name="Ledger Co", code=COMPANY_CODE)
-        cls.user = User.objects.create_user(
-            email="ar-ledger-link@example.com", password="pass12345",
-            full_name="Counter", employee_code="AR-LNK",
-        )
+class ResolveSapCustomerTests(SimpleTestCase):
+    """A link names a customer only once SAP confirms it."""
 
     def setUp(self):
-        patcher = mock.patch("ar_invoice.admin.HanaCustomerReader")
+        self.company = mock.Mock(code=COMPANY_CODE)
+        self.company.name = "Ledger Co"
+        patcher = mock.patch("ar_invoice.ledger_access.HanaCustomerReader")
         self.addCleanup(patcher.stop)
         self.reader = patcher.start().return_value
-        context_patcher = mock.patch("ar_invoice.admin.CompanyContext")
+        context_patcher = mock.patch("ar_invoice.ledger_access.CompanyContext")
         self.addCleanup(context_patcher.stop)
         context_patcher.start()
 
-    def _form(self, code):
-        from .admin import UserCustomerForm
-
-        return UserCustomerForm(
-            data={
-                "user": self.user.pk, "company": self.company.pk,
-                "customer_code": code, "is_active": True,
-            }
-        )
-
-    def test_a_customer_sap_knows_is_saved_as_sap_spells_it(self):
+    def test_a_customer_sap_knows_comes_back_as_sap_spells_it(self):
         self.reader.get_customer.return_value = {
             "customer_code": CUSTOMER, "customer_name": "WAL MART INDIA PVT LTD",
         }
-        form = self._form(" custa000486 ")
-        self.assertTrue(form.is_valid(), form.errors)
-        link = form.save()
-        self.assertEqual(link.customer_code, CUSTOMER)
-        self.assertEqual(link.customer_name, "WAL MART INDIA PVT LTD")
-        self.reader.get_customer.assert_called_once_with("custa000486")
+        self.assertEqual(resolve_sap_customer(self.company, f" {CUSTOMER} ")["customer_code"], CUSTOMER)
+        self.reader.get_customer.assert_called_once_with(CUSTOMER)
 
     def test_a_code_typed_in_lower_case_is_found_in_upper_case(self):
         self.reader.get_customer.side_effect = [
             None, {"customer_code": CUSTOMER, "customer_name": "WAL MART INDIA PVT LTD"},
         ]
-        form = self._form("custa000486")
-        self.assertTrue(form.is_valid(), form.errors)
-        self.assertEqual(form.save().customer_code, CUSTOMER)
+        self.assertEqual(resolve_sap_customer(self.company, "custa000486")["customer_code"], CUSTOMER)
         self.assertEqual(
             [call.args[0] for call in self.reader.get_customer.call_args_list],
             ["custa000486", CUSTOMER],
@@ -348,12 +327,135 @@ class UserCustomerFormTests(TestCase):
 
     def test_a_code_sap_does_not_know_is_refused(self):
         self.reader.get_customer.return_value = None
-        form = self._form("CUSTA000000")
-        self.assertFalse(form.is_valid())
-        self.assertIn("customer_code", form.errors)
+        with self.assertRaisesMessage(ValueError, "not a customer in Ledger Co's SAP"):
+            resolve_sap_customer(self.company, "CUSTA000000")
 
-    def test_sap_down_refuses_rather_than_link_blind(self):
+    def test_sap_down_is_not_swallowed(self):
         self.reader.get_customer.side_effect = SAPConnectionError("down")
-        form = self._form(CUSTOMER)
-        self.assertFalse(form.is_valid())
-        self.assertIn("SAP could not be read", str(form.errors))
+        with self.assertRaises(SAPConnectionError):
+            resolve_sap_customer(self.company, CUSTOMER)
+
+
+class CustomerLinkEndpointTests(APITestCase):
+    """Admin › Customer Ledger Links: list, link and unlink, per company."""
+
+    LINKS = "/api/v1/ar-invoices/customer-links/"
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Ledger Co", code=COMPANY_CODE)
+        cls.other_company = Company.objects.create(name="Other Co", code="TC002")
+        role = UserRole.objects.create(name="Admin")
+
+        def user(email, code, *companies):
+            u = User.objects.create_user(
+                email=email, password="pass12345", full_name=email.split("@")[0], employee_code=code
+            )
+            for company in companies:
+                UserCompany.objects.create(user=u, company=company, role=role, is_active=True)
+            return u
+
+        cls.it = user("ar-link-it@example.com", "AR-IT", cls.company)
+        cls.it.user_permissions.add(_perm("manage_customer_ledger_links"))
+        # Can read ledgers, but must not be able to widen their own.
+        cls.biller = user("ar-link-biller@example.com", "AR-BIL", cls.company)
+        cls.biller.user_permissions.add(_perm("view_ar_invoice_posting"))
+        cls.counter = user("ar-link-counter@example.com", "AR-CTR", cls.company)
+        cls.outsider = user("ar-link-outsider@example.com", "AR-OUT", cls.other_company)
+
+        cls.elsewhere = UserCustomer.objects.create(
+            user=cls.counter, company=cls.other_company, customer_code="CUSTA000777"
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.it)
+        patcher = mock.patch("ar_invoice.views_ledger.resolve_sap_customer")
+        self.addCleanup(patcher.stop)
+        self.resolve = patcher.start()
+        self.resolve.return_value = {
+            "customer_code": CUSTOMER, "customer_name": "WAL MART INDIA PVT LTD",
+        }
+
+    def _post(self, user, code=CUSTOMER):
+        return self.client.post(
+            self.LINKS, {"user": user.pk, "customer_code": code}, format="json",
+            HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+
+    def _list(self):
+        resp = self.client.get(self.LINKS, HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        return resp.json()
+
+    def test_linking_names_the_customer_as_sap_does_and_opens_their_ledger(self):
+        resp = self._post(self.counter, "custa000486")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        body = resp.json()
+        self.assertEqual((body["customer_code"], body["customer_name"]), (CUSTOMER, "WAL MART INDIA PVT LTD"))
+        self.assertEqual(body["user_name"], "ar-link-counter")
+        link = UserCustomer.objects.get(pk=body["id"])
+        self.assertEqual(link.company, self.company)
+        self.assertEqual(link.created_by, self.it)
+        self.assertTrue(may_view_ledger(self.counter, self.company, CUSTOMER))
+
+    def test_the_list_holds_only_this_company(self):
+        self._post(self.counter)
+        self.assertEqual([row["customer_code"] for row in self._list()], [CUSTOMER])
+
+    def test_unlinking_switches_the_link_off_and_closes_the_ledger(self):
+        link_id = self._post(self.counter).json()["id"]
+        resp = self.client.delete(f"{self.LINKS}{link_id}/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(UserCustomer.objects.get(pk=link_id).is_active)
+        self.assertFalse(may_view_ledger(self.counter, self.company, CUSTOMER))
+
+    def test_linking_again_after_an_unlink_brings_the_same_row_back(self):
+        link_id = self._post(self.counter).json()["id"]
+        self.client.delete(f"{self.LINKS}{link_id}/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        resp = self._post(self.counter)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.json()["id"], link_id)
+        self.assertTrue(resp.json()["is_active"])
+
+    def test_another_company_s_link_cannot_be_touched_from_here(self):
+        resp = self.client.delete(f"{self.LINKS}{self.elsewhere.pk}/", HTTP_COMPANY_CODE=COMPANY_CODE)
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        self.elsewhere.refresh_from_db()
+        self.assertTrue(self.elsewhere.is_active)
+
+    def test_a_code_sap_does_not_know_is_refused(self):
+        self.resolve.side_effect = ValueError("CUSTA000000 is not a customer in Ledger Co's SAP.")
+        resp = self._post(self.counter, "CUSTA000000")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not a customer", resp.json()["detail"])
+        self.assertFalse(UserCustomer.objects.filter(user=self.counter, company=self.company).exists())
+
+    def test_sap_down_links_nothing(self):
+        self.resolve.side_effect = SAPConnectionError("down")
+        self.assertEqual(self._post(self.counter).status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertFalse(UserCustomer.objects.filter(user=self.counter, company=self.company).exists())
+
+    def test_a_user_outside_this_company_is_refused_before_sap_is_asked(self):
+        resp = self._post(self.outsider)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("no access to Ledger Co", resp.json()["detail"])
+        self.resolve.assert_not_called()
+
+    def test_it_needs_the_manage_right_even_to_look(self):
+        self.client.force_authenticate(user=self.biller)
+        self.assertEqual(
+            self.client.get(self.LINKS, HTTP_COMPANY_CODE=COMPANY_CODE).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(self._post(self.biller).status_code, status.HTTP_403_FORBIDDEN)
+
+    @mock.patch("ar_invoice.views.SAPClient")
+    def test_the_link_manager_can_search_customers_without_any_invoice_right(self, SAPClient):
+        SAPClient.return_value.search_customers.return_value = [
+            {"customer_code": CUSTOMER, "customer_name": "WAL MART INDIA PVT LTD"}
+        ]
+        resp = self.client.get(
+            "/api/v1/ar-invoices/customers/?search=wal", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)

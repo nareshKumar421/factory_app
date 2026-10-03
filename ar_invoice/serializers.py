@@ -15,6 +15,7 @@ from .models import (
     ARInvoiceWarehouseApproval,
     ARPaymentStatus,
     ARWarehouseApprovalStatus,
+    UserCustomer,
 )
 
 
@@ -104,6 +105,35 @@ class CustomerLedgerQuerySerializer(serializers.Serializer):
                 {"date_to": "The end date is before the start date."}
             )
         return attrs
+
+
+class UserCustomerSerializer(serializers.ModelSerializer):
+    """One customer ledger link, with enough about the user to render a row."""
+
+    user_name = serializers.CharField(source="user.full_name", read_only=True)
+    user_email = serializers.CharField(source="user.email", read_only=True)
+    user_code = serializers.CharField(source="user.employee_code", read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UserCustomer
+        fields = [
+            "id", "user", "user_name", "user_email", "user_code",
+            "customer_code", "customer_name", "is_active",
+            "created_by_name", "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_created_by_name(self, obj) -> str:
+        user = obj.created_by
+        return (user.full_name or user.email) if user else ""
+
+
+class UserCustomerCreateSerializer(serializers.Serializer):
+    """Link one user to one SAP customer in the active company."""
+
+    user = serializers.IntegerField()
+    customer_code = serializers.CharField(max_length=50)
 
 
 class SapCashSaleQuerySerializer(serializers.Serializer):

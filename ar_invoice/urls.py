@@ -17,7 +17,12 @@ from .views import (
     OpenSOLinesView,
     WarehouseItemsView,
 )
-from .views_ledger import CustomerLedgerAccessView, CustomerLedgerView
+from .views_ledger import (
+    CustomerLedgerAccessView,
+    CustomerLedgerView,
+    CustomerLinkDetailView,
+    CustomerLinkListView,
+)
 
 urlpatterns = [
     path("customers/", CustomerSearchView.as_view(), name="ar-invoice-customers"),
@@ -35,6 +40,13 @@ urlpatterns = [
         "customer-ledger/customers/",
         CustomerLedgerAccessView.as_view(),
         name="ar-invoice-customer-ledger-customers",
+    ),
+    # Admin › Customer Ledger Links: which SAP customer each user is.
+    path("customer-links/", CustomerLinkListView.as_view(), name="ar-invoice-customer-links"),
+    path(
+        "customer-links/<int:pk>/",
+        CustomerLinkDetailView.as_view(),
+        name="ar-invoice-customer-link-detail",
     ),
     path("open-so-lines/", OpenSOLinesView.as_view(), name="ar-invoice-open-so-lines"),
     path("items/", WarehouseItemsView.as_view(), name="ar-invoice-items"),

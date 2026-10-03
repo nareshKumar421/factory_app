@@ -8,7 +8,13 @@ Two rules, kept here so the picker and the ledger itself cannot drift apart:
   (``UserCustomer``, active links only). **No link means no customer**, not
   every customer: a user nobody linked yet must not fall through to the
   whole book.
+
+Links are made on Admin › Customer Ledger Links, which names a customer only
+once SAP confirms it (``resolve_sap_customer``).
 """
+from sap_client.context import CompanyContext
+from sap_client.hana.customer_reader import HanaCustomerReader
+
 from .models import UserCustomer
 
 VIEW_ALL_LEDGERS = "ar_invoice.view_all_customer_ledgers"
@@ -39,3 +45,25 @@ def may_view_ledger(user, company, customer_code: str) -> bool:
         customer_code=(customer_code or "").strip(),
         is_active=True,
     ).exists()
+
+
+def resolve_sap_customer(company, customer_code: str) -> dict:
+    """The customer as that company's SAP holds it — code as SAP spells it,
+    and its name — or ``ValueError`` when SAP has no such customer.
+
+    A mistyped code would link the user to nobody (or to somebody else), and
+    their ledger would then say "not linked" with no hint why. SAP matches
+    codes case-sensitively and ours are upper case, so a code typed in lower
+    case is tried again in upper case. SAP being unreachable raises its own
+    error: a link is never made blind.
+    """
+    code = (customer_code or "").strip()
+    if not code:
+        raise ValueError("Name the customer's SAP code.")
+    reader = HanaCustomerReader(CompanyContext(company.code))
+    customer = reader.get_customer(code)
+    if customer is None and code != code.upper():
+        customer = reader.get_customer(code.upper())
+    if customer is None:
+        raise ValueError(f"{code} is not a customer in {company.name}'s SAP.")
+    return customer
