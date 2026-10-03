@@ -17,6 +17,7 @@ from .views import (
     OpenSOLinesView,
     WarehouseItemsView,
 )
+from .views_ledger import CustomerLedgerView
 
 urlpatterns = [
     path("customers/", CustomerSearchView.as_view(), name="ar-invoice-customers"),
@@ -24,6 +25,11 @@ urlpatterns = [
         "customer-credit/",
         CustomerCreditView.as_view(),
         name="ar-invoice-customer-credit",
+    ),
+    path(
+        "customer-ledger/",
+        CustomerLedgerView.as_view(),
+        name="ar-invoice-customer-ledger",
     ),
     path("open-so-lines/", OpenSOLinesView.as_view(), name="ar-invoice-open-so-lines"),
     path("items/", WarehouseItemsView.as_view(), name="ar-invoice-items"),

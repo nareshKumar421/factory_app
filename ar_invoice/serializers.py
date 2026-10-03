@@ -90,6 +90,22 @@ class CustomerCreditQuerySerializer(serializers.Serializer):
     customer_code = serializers.CharField(max_length=50)
 
 
+class CustomerLedgerQuerySerializer(serializers.Serializer):
+    """One customer's ledger between two posting dates (both inclusive)."""
+
+    customer_code = serializers.CharField(max_length=50)
+    date_from = serializers.DateField(required=False, allow_null=True)
+    date_to = serializers.DateField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        date_from, date_to = attrs.get("date_from"), attrs.get("date_to")
+        if date_from and date_to and date_from > date_to:
+            raise serializers.ValidationError(
+                {"date_to": "The end date is before the start date."}
+            )
+        return attrs
+
+
 class SapCashSaleQuerySerializer(serializers.Serializer):
     """Filters for the SAP-side cash-sale history (all optional)."""
 
