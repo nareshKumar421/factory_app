@@ -142,6 +142,12 @@ urlpatterns = [
         "api/v1/dashboards/accounts-board/",
         include("accounts_board.urls"),
     ),
+    # The Operations Report -- production, wastage, labour and electricity by
+    # day, for the page that adds them up into a cost per litre.
+    path(
+        "api/v1/dashboards/operations-report/",
+        include("operations_report.urls"),
+    ),
     # The dashboard builder: the card palette, the saved boards, and the one
     # composed read every built board is served through.
     path("api/v1/dashboards/builder/", include("board_builder.urls")),

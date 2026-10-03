@@ -270,6 +270,11 @@ INSTALLED_APPS = [
     # call anywhere in it -- and like the other boards owns no data, so no
     # migration and no permission row of its own on a live database.
     'accounts_board.apps.AccountsBoardConfig',
+    # The Operations Report. A company's production, wastage, labour and
+    # electricity a day at a time, for the page that works out what each litre
+    # cost. Reads the runs, the waste register, the labour gate and Daily
+    # Electricity++; owns no data, so no migration and no permission row.
+    'operations_report.apps.OperationsReportConfig',
     # The control boards' shared access layer: one read right per DATA FEED
     # a board consumes, so a Dashboards group can grant a board without
     # granting the operational module behind it (which would reveal that
