@@ -1135,6 +1135,39 @@ class ShiftTests(TreeFixture):
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(Decimal(response.data["opening_reading"]), Decimal("160"))
 
+    def test_the_old_page_enters_a_night_on_the_days_closing(self):
+        self.read(self.first, day(1), 0, 100)
+        response = self.client.post(
+            OLD_READINGS_URL,
+            {"meter": self.first.id, "date": str(day(1)), "shift": "NIGHT", "closing_reading": "160"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["shift"], "NIGHT")
+        self.assertEqual(Decimal(response.data["opening_reading"]), Decimal("100"))
+
+    def test_the_old_page_refuses_a_second_night_by_name(self):
+        self.read(self.first, day(1), 0, 100)
+        self.night(self.first, day(1), 160)
+        refused = self.client.post(
+            OLD_READINGS_URL,
+            {"meter": self.first.id, "date": str(day(1)), "shift": "NIGHT", "closing_reading": "170"},
+            format="json",
+        )
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("night reading", str(refused.data["date"]))
+
+    def test_the_old_page_lists_a_meters_night_on_its_day(self):
+        self.read(self.first, day(1), 0, 100)
+        self.read(self.kwh, day(1), 0, 1000)
+        self.night(self.first, day(1), 160)
+        self.night(self.kwh, day(1), 1500)
+        rows = self.client.get(OLD_READINGS_URL, {"date": str(day(1))}).data
+        self.assertEqual(
+            [(row["meter_name"], row["shift"]) for row in rows],
+            [("First Floor", "NIGHT"), ("First Floor", "DAY"), ("KWH", "NIGHT"), ("KWH", "DAY")],
+        )
+
 
 class SplitReportTests(TreeFixture):
     def split(self, date_from=D1, date_to=D1):

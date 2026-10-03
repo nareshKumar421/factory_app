@@ -3498,6 +3498,7 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "consumer_codes",
             "attribution_display",
             "date",
+            "shift",
             "reading_time",
             "opening_reading",
             "closing_reading",
@@ -3520,6 +3521,10 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+        # One reading per meter per round is checked in validate(), which says
+        # which round already has one; DRF's own check, built from the model's
+        # constraint now that shift is a field here, cannot.
+        validators = []
 
     def get_meter_companies_display(self, obj) -> str:
         """What the METER is configured with — the default the form offers."""
@@ -3534,17 +3539,27 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
         meter = attrs.get("meter") or (self.instance.meter if self.instance else None)
         date = attrs.get("date") or (self.instance.date if self.instance else None)
 
-        # Friendly duplicate check (UniqueConstraint would 500 otherwise).
-        # This page enters one reading a day, the day reading; Daily
-        # Electricity++ may add a night reading beside it, which is not a clash.
+        # A day is read twice, the day round then the night round, as on Daily
+        # Electricity++. Saying nothing is the day round, which is what this
+        # page entered before it asked.
+        shift = attrs.get("shift") or (
+            self.instance.shift if self.instance else ReadingShift.DAY
+        )
+
+        # Friendly duplicate check (UniqueConstraint would 500 otherwise): one
+        # reading per meter per round, so a night beside a day is not a clash.
         if meter and date:
-            shift = self.instance.shift if self.instance else ReadingShift.DAY
             clash = DailyElectricityReading.objects.filter(meter=meter, date=date, shift=shift)
             if self.instance:
                 clash = clash.exclude(pk=self.instance.pk)
             if clash.exists():
                 raise serializers.ValidationError(
-                    {"date": "A reading for this meter and date already exists."}
+                    {
+                        "date": (
+                            f"A {ReadingShift(shift).label.lower()} reading for this "
+                            "meter and date already exists."
+                        )
+                    }
                 )
 
         opening = attrs.get(
@@ -3552,11 +3567,13 @@ class DailyElectricityReadingSerializer(serializers.ModelSerializer):
             self.instance.opening_reading if self.instance else None,
         )
         if opening is None and meter and date:
-            previous = (
-                DailyElectricityReading.objects.filter(meter=meter, date__lt=date)
-                .order_by("-date", "-shift")
-                .first()
-            )
+            # The chain Daily Electricity++ keeps: a night opens on its day's
+            # closing, a day on the night before's — or on the day before's,
+            # when that night was not read.
+            # Imported here because that module imports this one.
+            from .serializers_electricity import previous_reading
+
+            previous = previous_reading(meter, date, shift)
             if previous is None:
                 raise serializers.ValidationError(
                     {

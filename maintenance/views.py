@@ -5734,7 +5734,8 @@ class DailyElectricityReadingViewSet(
         company = params.get("company")
         if company:
             qs = qs.filter(_attributed_to(company)).distinct()
-        return qs.order_by("-date", "meter__name")
+        # A meter's night sits on its day, newest first like the dates.
+        return qs.order_by("-date", "meter__name", "-shift")
 
     def perform_create(self, serializer):
         meter_scope.assert_can_record_for(

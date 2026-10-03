@@ -425,6 +425,15 @@ Company column and the `?company=<code>` filter on `electricity-meters/` and
 `daily-electricity-readings/` (codes, not ids — a company-filtered list drops
 untagged meters), not who may see the page.
 
+A day is read twice, as on Daily Electricity++: the day round, then the night
+round (`shift`: DAY or NIGHT), and both belong to `date`. `daily-electricity-readings/`
+takes `shift` on entry — a reading that sends none is the day round — and carries
+an omitted opening along the same chain Daily Electricity++ keeps: a night opens
+on its day's closing, a day on the night before's, or on the day before's when
+that night was not read. There is one reading per meter per round, so a night
+beside a day is not a duplicate. The page shows the round on every row and lists
+a meter's night next to its day.
+
 | Permission | Allows |
 |---|---|
 | `can_view_daily_electricity` | Read the register (and the meter master). |
