@@ -620,13 +620,6 @@ class DispatchPlansService:
                 if row["plan"]["booking_status"] in allowed_statuses
             ]
 
-        if filters.get("exclude_jivo_mart_transfer"):
-            data = [
-                row
-                for row in data
-                if not self._is_jivo_oil_to_jivo_mart_transfer(row)
-            ]
-
         search = (filters.get("search") or "").strip().lower()
         if search:
             data = [row for row in data if self._matches_search(row, search)]
@@ -1265,25 +1258,6 @@ class DispatchPlansService:
             plan.get("remarks"),
         ]
         return any(search in str(value or "").lower() for value in values)
-
-    def _is_jivo_oil_to_jivo_mart_transfer(self, row: Dict[str, Any]) -> bool:
-        if (self.company_code or "").upper() != "JIVO_OIL":
-            return False
-
-        destination_values = [
-            row.get("card_code"),
-            row.get("card_name"),
-            row.get("ship_to_code"),
-            row.get("ship_to_address"),
-            row.get("bp_gstin"),
-        ]
-        return any(self._looks_like_jivo_mart(value) for value in destination_values)
-
-    @staticmethod
-    def _looks_like_jivo_mart(value: Any) -> bool:
-        normalized = str(value or "").upper().replace("_", " ")
-        normalized = " ".join(normalized.split())
-        return "JIVO MART" in normalized or "JIVOMART" in normalized
 
     def _assert_link_not_locked(
         self,

@@ -15,7 +15,6 @@ from vehicle_management.models import Transporter, Vehicle, VehicleType
 from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan, SelectedDispatchBill
 from .serializers import (
-    DispatchBillFilterSerializer,
     DispatchBillSelectionSerializer,
     DispatchPlanBulkDateSerializer,
     DispatchPlanSerializer,
@@ -342,18 +341,6 @@ class DispatchPlanBulkDateTests(TestCase):
 
 
 class DispatchPlanUpdateSerializerTests(SimpleTestCase):
-    def test_bill_filter_accepts_jivo_mart_transfer_exclusion_flag(self):
-        serializer = DispatchBillFilterSerializer(
-            data={
-                "date_from": "2026-06-01",
-                "date_to": "2026-06-13",
-                "exclude_jivo_mart_transfer": "true",
-            },
-        )
-
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-        self.assertTrue(serializer.validated_data["exclude_jivo_mart_transfer"])
-
     def test_linked_invoice_doc_entries_accepts_json_integer_list(self):
         serializer = DispatchPlanUpdateSerializer(
             data={"linked_invoice_doc_entries": [72826, 72815]},
@@ -480,38 +467,6 @@ class DispatchPlanInvoiceDefaultsTests(SimpleTestCase):
         )
         self.assertEqual(defaults["customer_name"], "GOYAL KIRYANA STORE")
         self.assertEqual(defaults["customer_code"], "C0001")
-
-    def test_identifies_jivo_oil_to_jivo_mart_transfer(self):
-        service = DispatchPlansService.__new__(DispatchPlansService)
-        service.company_code = "JIVO_OIL"
-
-        self.assertTrue(
-            service._is_jivo_oil_to_jivo_mart_transfer(
-                {
-                    "card_code": "",
-                    "card_name": "JIVO MART PRIVATE LIMITED",
-                    "ship_to_code": "",
-                    "ship_to_address": "",
-                    "bp_gstin": "",
-                }
-            )
-        )
-
-    def test_transfer_filter_only_applies_to_jivo_oil_company(self):
-        service = DispatchPlansService.__new__(DispatchPlansService)
-        service.company_code = "JIVO_MART"
-
-        self.assertFalse(
-            service._is_jivo_oil_to_jivo_mart_transfer(
-                {
-                    "card_code": "",
-                    "card_name": "JIVO MART PRIVATE LIMITED",
-                    "ship_to_code": "",
-                    "ship_to_address": "",
-                    "bp_gstin": "",
-                }
-            )
-        )
 
 
 class DispatchPlanLinkedVehicleEntryTests(TestCase):

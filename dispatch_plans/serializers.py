@@ -137,7 +137,6 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     search = serializers.CharField(required=False, max_length=120, allow_blank=True)
     branch = serializers.CharField(required=False, max_length=80, allow_blank=True)
     limit = serializers.IntegerField(required=False, min_value=1, max_value=2000)
-    exclude_jivo_mart_transfer = serializers.BooleanField(required=False, default=False)
     # Only bills with a line in this warehouse. A bill's lines can span
     # warehouses, so this is "touches", not "belongs to".
     warehouse = serializers.CharField(required=False, max_length=20, allow_blank=True)
