@@ -17,7 +17,9 @@ only when SAP says it changed.
 Serving: :func:`list_bills`, :func:`list_bill_lines` and
 :func:`list_pickable_lines` answer the reader's reads of the same names, and
 return ``None`` -- "ask SAP", i.e. fail as SAP being unavailable -- for a bill
-the copy does not hold, rather than claim it does not exist.
+the copy does not hold, rather than claim it does not exist. A single bill
+read from the copy is recorded as a :class:`ServedBill`, for ``recheck`` to
+compare with SAP once it answers again.
 """
 
 import logging
@@ -27,7 +29,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from .codec import pack, unpack
-from .models import MirrorDataset, MirroredBill
+from .models import MirrorDataset, MirroredBill, ServedBill, ServedBillOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,14 @@ def refresh(company, state, now) -> int:
         "SAP bill copy for %s: %s bills, %s read again, %s dropped",
         company.code, len(versions), len(fetched), len(gone),
     )
+    # SAP has just answered, so anything handed out while it could not can now
+    # be checked against it. A failed check stays pending for the next run.
+    from .recheck import recheck_served
+
+    try:
+        recheck_served(company, reader, now)
+    except Exception:  # noqa: BLE001
+        logger.exception("Re-check of bills served from the SAP copy failed for %s", company.code)
     return len(versions)
 
 
@@ -167,6 +177,30 @@ def _as_of(state):
     return timezone.localtime(state.synced_at).isoformat()
 
 
+def _record_served(state, rows):
+    """Note that these bills were handed out from the copy, for the re-check.
+
+    Never allowed to fail the read: the bill was served either way, and an
+    outage is the worst moment to turn a working lookup into an error.
+    """
+    try:
+        now = timezone.now()
+        for row in rows:
+            pending = ServedBill.objects.filter(
+                company_id=row.company_id, doc_entry=row.doc_entry,
+                outcome=ServedBillOutcome.PENDING,
+            )
+            if pending.update(last_served_at=now):
+                continue
+            ServedBill.objects.create(
+                company_id=row.company_id, doc_entry=row.doc_entry, doc_num=row.doc_num,
+                served_at=now, last_served_at=now, copy_as_of=state.synced_at,
+                served={"bill": row.bill, "lines": row.lines},
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not record bills served from the SAP copy")
+
+
 def list_bills(company_code, filters):
     """The reader's ``list_bills``, from the copy; ``None`` when it cannot say."""
     state = _copy(company_code)
@@ -209,22 +243,28 @@ def list_bills(company_code, filters):
     raw_limit = filters.get("limit")
     limit = min(max(int(raw_limit) if raw_limit else MAX_BILL_ROWS, 1), MAX_BILL_ROWS)
     as_of = _as_of(state)
-    rows = bills.order_by("-create_date", "-create_time", "-doc_num_sort").values_list(
-        "bill", flat=True
-    )[:limit]
-    return [{**unpack(bill), "sap_copy_as_of": as_of} for bill in rows]
+    bills = bills.order_by("-create_date", "-create_time", "-doc_num_sort")
+    if doc_entries or invoice_doc_num:
+        # Particular bills, which is how a docking, a barcode session, a bill
+        # summary or a short dispatch takes one: worth checking afterwards.
+        rows = list(bills[:limit])
+        _record_served(state, rows)
+        return [{**unpack(row.bill), "sap_copy_as_of": as_of} for row in rows]
+    return [
+        {**unpack(bill), "sap_copy_as_of": as_of}
+        for bill in bills.values_list("bill", flat=True)[:limit]
+    ]
 
 
 def list_bill_lines(company_code, doc_entry):
     state = _copy(company_code)
     if state is None:
         return None
-    lines = (
-        MirroredBill.objects.filter(company_id=state.company_id, doc_entry=doc_entry)
-        .values_list("lines", flat=True)
-        .first()
-    )
-    return None if lines is None else unpack(lines)
+    row = MirroredBill.objects.filter(company_id=state.company_id, doc_entry=doc_entry).first()
+    if row is None:
+        return None
+    _record_served(state, [row])
+    return unpack(row.lines)
 
 
 def list_pickable_lines(company_code, doc_entries):
@@ -235,9 +275,9 @@ def list_pickable_lines(company_code, doc_entries):
     rows = list(
         MirroredBill.objects.filter(company_id=state.company_id, doc_entry__in=entries)
         .order_by("doc_num_sort")
-        .values_list("pickable_lines", flat=True)
     )
     if len(rows) < len(set(entries)):
         return None
+    _record_served(state, rows)
     # SAP's own order: by DocNum, then line.
-    return [line for lines in rows for line in unpack(lines)]
+    return [line for row in rows for line in unpack(row.pickable_lines)]

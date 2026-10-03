@@ -104,3 +104,59 @@ class MirroredBill(models.Model):
 
     def __str__(self):
         return f"{self.company_id} bill {self.doc_num}"
+
+
+class ServedBillOutcome(models.TextChoices):
+    PENDING = "PENDING", "Not checked yet"
+    UNCHANGED = "UNCHANGED", "Unchanged in SAP"
+    CHANGED = "CHANGED", "Changed in SAP"
+    CANCELLED = "CANCELLED", "Cancelled in SAP"
+    CREDITED = "CREDITED", "Credited in SAP"
+
+
+class ServedBill(models.Model):
+    """A bill the app handed out from the copy while HANA was down.
+
+    Recorded when a single bill is read from the copy -- looked up by number or
+    DocEntry, or its lines read -- which is what docking, barcode dispatch, a
+    bill summary or a short dispatch does with it; a list a page merely shows
+    is not. Once SAP answers again (``recheck``) it is compared with what SAP
+    now holds, and anything cancelled, credited or changed is told to the
+    people who started work on it.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.CASCADE, related_name="sap_mirror_served_bills"
+    )
+    doc_entry = models.PositiveIntegerField()
+    doc_num = models.CharField(max_length=30)
+    served_at = models.DateTimeField()
+    last_served_at = models.DateTimeField()
+    #: When the copy it was served from was taken.
+    copy_as_of = models.DateTimeField(null=True)
+    #: What was handed out: ``{"bill": ..., "lines": [...]}``, packed by ``codec``.
+    served = models.JSONField()
+    outcome = models.CharField(
+        max_length=20, choices=ServedBillOutcome.choices,
+        default=ServedBillOutcome.PENDING, db_index=True,
+    )
+    checked_at = models.DateTimeField(null=True, blank=True)
+    #: What differs from what was handed out, one line per difference.
+    differences = models.JSONField(default=list, blank=True)
+    #: The app records started from it, as the alert named them.
+    linked = models.JSONField(default=list, blank=True)
+    #: How many people were told.
+    notified = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "doc_entry"],
+                condition=models.Q(outcome="PENDING"),
+                name="unique_sap_mirror_pending_served_bill",
+            ),
+        ]
+        ordering = ["-served_at"]
+
+    def __str__(self):
+        return f"bill {self.doc_num} ({self.get_outcome_display()})"
