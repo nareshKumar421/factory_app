@@ -73,7 +73,10 @@ class ARInvoiceAttachmentTests(APITestCase):
         cls.creator.user_permissions.add(
             *Permission.objects.filter(
                 content_type__app_label="ar_invoice",
-                codename__in=["view_ar_invoice_posting", "create_ar_invoice_posting"],
+                codename__in=[
+                    "view_ar_invoice_posting", "create_ar_invoice_posting",
+                    "create_ar_invoice_from_sales_order",
+                ],
             )
         )
         # Billing from their own warehouse, so the bill goes straight to SAP
@@ -90,6 +93,15 @@ class ARInvoiceAttachmentTests(APITestCase):
         patcher = mock.patch("ar_invoice.services.SAPClient")
         self.SAPClient = patcher.start()
         self.addCleanup(patcher.stop)
+        # What a bill sends to SAP is tested here; who has to approve it first is
+        # tests_warehouse_approval's. A Sales Order bill always waits for its
+        # warehouse's manager, so the hold is lifted for these tests.
+        hold_patcher = mock.patch(
+            "ar_invoice.services.ARInvoiceService.warehouses_needing_approval",
+            return_value=[],
+        )
+        hold_patcher.start()
+        self.addCleanup(hold_patcher.stop)
         self.sap = self.SAPClient.return_value
         self.sap.open_so_lines_for_invoicing.return_value = [dict(SO_LINE)]
         self.sap.batch_managed_flags.return_value = {}

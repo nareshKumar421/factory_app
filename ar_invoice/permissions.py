@@ -19,6 +19,9 @@ def _perm(codename):
 
 CanViewARInvoice = _perm("ar_invoice.view_ar_invoice_posting")
 CanCreateARInvoice = _perm("ar_invoice.create_ar_invoice_posting")
+# Billing against open Sales Orders, on top of CanCreateARInvoice — the counter
+# raising cash sales does not get it with create.
+CanCreateARInvoiceFromSalesOrder = _perm("ar_invoice.create_ar_invoice_from_sales_order")
 # Recording that a bill was paid is the cashier's job, not the biller's —
 # it is held apart from CREATE so accounts can mark receipts without also
 # gaining the power to raise invoices.

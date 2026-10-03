@@ -144,6 +144,23 @@ class ARInvoiceEndpointTests(APITestCase):
         cls.creator.user_permissions.add(
             *Permission.objects.filter(
                 content_type__app_label="ar_invoice",
+                codename__in=[
+                    "view_ar_invoice_posting", "create_ar_invoice_posting",
+                    "create_ar_invoice_from_sales_order",
+                ],
+            )
+        )
+        # Raises cash sales, but has not been given billing against Sales Orders.
+        cls.cash_clerk = User.objects.create_user(
+            email="ar-cash@example.com", password="pass12345",
+            full_name="Cash Clerk", employee_code="AR-CASH",
+        )
+        UserCompany.objects.create(
+            user=cls.cash_clerk, company=cls.company, role=cls.role, is_active=True
+        )
+        cls.cash_clerk.user_permissions.add(
+            *Permission.objects.filter(
+                content_type__app_label="ar_invoice",
                 codename__in=["view_ar_invoice_posting", "create_ar_invoice_posting"],
             )
         )
@@ -182,6 +199,15 @@ class ARInvoiceEndpointTests(APITestCase):
         self.BillSummaryService = summary_patcher.start()
         self.addCleanup(summary_patcher.stop)
         self.bill_summary = self.BillSummaryService.return_value
+        # What a bill sends to SAP is tested here; who has to approve it first is
+        # tests_warehouse_approval's. A Sales Order bill always waits for its
+        # warehouse's manager, so the hold is lifted for these tests.
+        hold_patcher = mock.patch(
+            "ar_invoice.services.ARInvoiceService.warehouses_needing_approval",
+            return_value=[],
+        )
+        hold_patcher.start()
+        self.addCleanup(hold_patcher.stop)
         self.sap = self.SAPClient.return_value
         self.sap.open_so_lines_for_invoicing.return_value = [
             _so_line(7001, 0),
@@ -343,6 +369,33 @@ class ARInvoiceEndpointTests(APITestCase):
         ]))
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.sap.create_ar_invoice.assert_not_called()
+
+    # ── the Sales Order permission ──────────────────────────────────────────
+    def test_open_lines_need_the_sales_order_permission(self):
+        self.client.force_authenticate(user=self.cash_clerk)
+        resp = self.client.get(
+            f"{BASE}open-so-lines/?customer_code={CUSTOMER}", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.sap.open_so_lines_for_invoicing.assert_not_called()
+
+    def test_raising_from_a_sales_order_needs_its_permission(self):
+        self.client.force_authenticate(user=self.cash_clerk)
+        resp = self._post_create()
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(ARInvoicePosting.objects.exists())
+        self.sap.create_ar_invoice.assert_not_called()
+
+    def test_a_cash_sale_does_not_need_the_sales_order_permission(self):
+        self.sap.create_ar_invoice.return_value = {
+            "DocEntry": 91001, "DocNum": 1726090002, "DocTotal": 1260.0,
+        }
+        self.client.force_authenticate(user=self.cash_clerk)
+        resp = self.client.post(
+            f"{BASE}invoices/", self._direct_body(),
+            format="json", HTTP_COMPANY_CODE=COMPANY_CODE,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
 
     # ── direct (cash) sale ──────────────────────────────────────────────────
     def _direct_body(self, lines=None, **over):

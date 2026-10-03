@@ -6,11 +6,16 @@ Flow: pick a customer's open Sales Order lines (or build free cash-sale lines)
 
 Anyone may bill from any warehouse, but a line from a warehouse the raiser does
 not manage holds the whole bill here first (AWAITING_MANAGER, one
-``ARInvoiceWarehouseApproval`` per such warehouse). Nothing reaches SAP until
-every one of those managers approves it on the Invoice Approval page. SAP
-cannot be relied on for this: the Service Layer login is an originator only on
-*inactive* ObjType-13 approval templates (all 18 of them, as of 2026-09-29), so
-SAP adds whatever it is sent, and the app's bills went straight in.
+``ARInvoiceWarehouseApproval`` per such warehouse). A Sales Order bill is held
+for the manager of every warehouse on it, whoever raises it — a superuser or
+the warehouse's own manager included. Nothing reaches SAP until every one of
+those managers approves it on the Invoice Approval page. SAP cannot be relied
+on for this: the Service Layer login is an originator only on *inactive*
+ObjType-13 approval templates (all 18 of them, as of 2026-09-29), so SAP adds
+whatever it is sent, and the app's bills went straight in. Activating one is no
+answer either: the same login posts head-office OMS's Sales Order bills (~530
+in the 90 days to 2026-10-03), already approved in OMS, and every one of those
+would be held again.
 
 Should SAP ever hold a post as an approval draft (``pending_approval``, an ODRF
 draft), the record tracks the draft's approval request (the same requests the
@@ -594,17 +599,29 @@ class ARInvoiceService:
         wanted.discard("")
         return sorted(code for code in wanted if code not in managed)
 
+    def warehouses_needing_approval(self, user, lines) -> List[str]:
+        """The warehouses whose manager must approve this bill before it goes to SAP.
+
+        Every warehouse on a Sales Order bill, whoever raises it: SAP will not
+        hold it for approval (see the module docstring). Only the warehouses its
+        raiser does not manage on a counter sale.
+        """
+        codes = [line.warehouse_code for line in lines]
+        if any(line.base_entry is not None for line in lines):
+            wanted = {(code or "").strip().upper() for code in codes}
+            wanted.discard("")
+            return sorted(wanted)
+        return self.unmanaged_warehouses(user, codes)
+
     def _hold_for_warehouse_managers(self, posting: ARInvoicePosting, user) -> bool:
-        """Hold a new bill for the managers of the warehouses its raiser does not run.
+        """Hold a new bill for the managers who have to approve it first.
 
         True when it is held, and then nothing may be sent to SAP: one approval
         row is opened per such warehouse and the bill waits as AWAITING_MANAGER.
         Called inside the transaction that creates the bill, so a bill never
         exists, even for a moment, as a PENDING record that could be posted.
         """
-        unmanaged = self.unmanaged_warehouses(
-            user, [line.warehouse_code for line in posting.lines.all()]
-        )
+        unmanaged = self.warehouses_needing_approval(user, list(posting.lines.all()))
         if not unmanaged:
             return False
         ARInvoiceWarehouseApproval.objects.bulk_create(
@@ -632,23 +649,28 @@ class ARInvoiceService:
         """Refuse to send a bill to SAP for a warehouse nobody has answered for.
 
         Every warehouse on the bill must be one ``user`` manages, or one whose
-        manager has approved this bill. Checked on every post, not only when the
-        bill is created: a FAILED bill can be retried by someone other than the
-        person who raised it, and a bill raised before this rule existed carries
-        no approvals at all.
+        manager has approved this bill — and on a Sales Order bill, every one
+        approved. Checked on every post, not only when the bill is created: a
+        FAILED bill can be retried by someone other than the person who raised
+        it, and a bill raised before this rule existed carries no approvals at all.
         """
         approved = set(
             posting.warehouse_approvals.filter(
                 status=ARWarehouseApprovalStatus.APPROVED
             ).values_list("warehouse_code", flat=True)
         )
+        lines = list(posting.lines.all())
         missing = [
             code
-            for code in self.unmanaged_warehouses(
-                user, [line.warehouse_code for line in posting.lines.all()]
-            )
+            for code in self.warehouses_needing_approval(user, lines)
             if code not in approved
         ]
+        if missing and any(line.base_entry is not None for line in lines):
+            raise ValueError(
+                f"A Sales Order bill needs the approval of the manager of "
+                f"{', '.join(missing)}, and this one does not have it, so it cannot "
+                "be sent to SAP. Cancel it and raise it again to send it for approval."
+            )
         if missing:
             raise ValueError(
                 f"You do not manage {', '.join(missing)}, and its manager has not "

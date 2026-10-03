@@ -99,6 +99,12 @@ class ARInvoicePosting(BaseModel):
         permissions = [
             ("view_ar_invoice_posting", "Can view A/R invoice postings"),
             ("create_ar_invoice_posting", "Can create and post A/R invoices"),
+            # On top of create: billing against open Sales Orders is held apart
+            # from the counter's cash sales, so it is granted to fewer people.
+            (
+                "create_ar_invoice_from_sales_order",
+                "Can raise A/R invoices from Sales Orders",
+            ),
         ]
 
     def __str__(self):
@@ -124,13 +130,16 @@ class ARWarehouseApprovalStatus(models.TextChoices):
 
 
 class ARInvoiceWarehouseApproval(BaseModel):
-    """One warehouse's say on a bill raised by someone who does not manage it.
+    """One warehouse's say on a bill raised by someone who does not manage it,
+    or on any Sales Order bill.
 
     SAP will not stop these: the app posts as the shared Service Layer user, and
     every A/R approval template that user originates on is inactive, so a bill
     sent to SAP is simply added. The check therefore happens here, before
     anything is sent — anyone may bill from any warehouse, but a line from a
-    warehouse the raiser does not manage waits for that warehouse's manager.
+    warehouse the raiser does not manage waits for that warehouse's manager, and
+    a Sales Order bill waits for the manager of every warehouse on it, whoever
+    raised it.
 
     One row per such warehouse, not one per bill, because a bill can span
     several and each manager answers only for their own stock. The bill goes to

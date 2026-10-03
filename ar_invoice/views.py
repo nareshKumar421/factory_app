@@ -8,6 +8,7 @@ import json
 import logging
 
 from rest_framework import status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
 from rest_framework.response import Response
@@ -107,6 +108,8 @@ class CustomerCreditView(ARInvoiceBaseView):
 class OpenSOLinesView(ARInvoiceBaseView):
     """GET /api/v1/ar-invoices/open-so-lines/?customer_code=CUSTA000123&search="""
 
+    read_perms = [ar_perms.CanViewARInvoice, ar_perms.CanCreateARInvoiceFromSalesOrder]
+
     def get(self, request):
         query = OpenSOLinesQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
@@ -200,6 +203,8 @@ class ARInvoiceListCreateView(ARInvoiceBaseView):
                 **common,
             )
         else:
+            if not ar_perms.CanCreateARInvoiceFromSalesOrder().has_permission(request, self):
+                raise PermissionDenied("You may not raise A/R invoices from Sales Orders.")
             posting = self.service().create_invoice(line_keys=data["lines"], **common)
         return self.posting_response(posting, http_status=status.HTTP_201_CREATED)
 

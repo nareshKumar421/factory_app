@@ -3,7 +3,8 @@
 Anyone may bill from any warehouse. What changes with the warehouse is who has
 to agree first: a line from a warehouse the raiser does not manage holds the
 whole bill in the app — nothing is sent to SAP — until that warehouse's manager
-approves it on the Invoice Approval page, beside the OMS and SAP rows.
+approves it on the Invoice Approval page, beside the OMS and SAP rows. A Sales
+Order bill is held for every warehouse on it, whoever raises it.
 
 SAP is mocked at the same boundaries as ``ar_invoice.tests``.
 """
@@ -69,7 +70,10 @@ class WarehouseApprovalTests(APITestCase):
 
         ar_perms = Permission.objects.filter(
             content_type__app_label="ar_invoice",
-            codename__in=["view_ar_invoice_posting", "create_ar_invoice_posting"],
+            codename__in=[
+                "view_ar_invoice_posting", "create_ar_invoice_posting",
+                "create_ar_invoice_from_sales_order",
+            ],
         )
         approver_group, _ = Group.objects.get_or_create(name="Invoice Approval")
         approver_group.permissions.add(
@@ -145,6 +149,21 @@ class WarehouseApprovalTests(APITestCase):
         resp = self._bill(*[_line(w) for w in warehouses])
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
         return ARInvoicePosting.objects.get(pk=resp.json()["id"])
+
+    def _so_bill(self, warehouse, as_user=None):
+        """A bill against one open Sales Order line from ``warehouse``."""
+        self.sap.open_so_lines_for_invoicing.return_value = [{
+            "so_doc_entry": 7001, "so_doc_num": 1726097001, "so_doc_date": "2026-09-01",
+            "so_customer_ref": "", "so_comments": "", "branch_id": 2,
+            "customer_name": "ONENESS TRADERS", "line_num": 0, "item_code": ITEM,
+            "description": "SOYABEAN OIL 1 LTR POUCH 12 PCS", "open_qty": 10.0,
+            "price": 133.3333, "open_total": 1333.33, "tax_code": "CG+SG@5",
+            "warehouse_code": warehouse, "uom": "PCS",
+        }]
+        return self._bill(
+            as_user=as_user, direct_lines=[],
+            customer_code="CUSTA000123", lines=[{"so_doc_entry": 7001, "line_num": 0}],
+        )
 
     def _approval(self, posting, warehouse):
         return posting.warehouse_approvals.get(warehouse_code=warehouse)
@@ -251,6 +270,67 @@ class WarehouseApprovalTests(APITestCase):
             f"{AR}open-so-lines/?customer_code=CUSTA000123", HTTP_COMPANY_CODE=COMPANY_CODE
         )
         self.assertEqual(resp.json(), [])
+
+    # ── Sales Order bills: always held ──────────────────────────────────────
+    def test_a_sales_order_bill_from_their_own_warehouse_still_waits(self):
+        resp = self._so_bill(COUNTER_WH)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        self.assertEqual(resp.json()["status"], "AWAITING_MANAGER")
+        self.assertEqual(
+            [a["warehouse_code"] for a in resp.json()["warehouse_approvals"]], [COUNTER_WH]
+        )
+        self.sap.create_ar_invoice.assert_not_called()
+
+    def test_a_superusers_sales_order_bill_waits_too(self):
+        resp = self._so_bill(PTD, as_user=self.admin)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        self.assertEqual(resp.json()["status"], "AWAITING_MANAGER")
+        self.assertEqual(
+            [(a["warehouse_code"], a["approvers"]) for a in resp.json()["warehouse_approvals"]],
+            [(PTD, ["PTD Manager"])],
+        )
+        self.sap.create_ar_invoice.assert_not_called()
+
+    def test_a_held_sales_order_bill_cannot_be_pushed_to_sap_by_its_manager(self):
+        # The counter clerk runs GP-FG, so only the Sales Order rule holds this.
+        resp = self._so_bill(COUNTER_WH)
+        posting = ARInvoicePosting.objects.get(pk=resp.json()["id"])
+        resp = self.client.post(
+            f"{AR}invoices/{posting.id}/post/", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.sap.create_ar_invoice.assert_not_called()
+
+    def test_approving_a_sales_order_bill_creates_it_in_sap_from_the_order(self):
+        resp = self._so_bill(PTD, as_user=self.admin)
+        posting = ARInvoicePosting.objects.get(pk=resp.json()["id"])
+        [row] = self._get(f"{APPROVALS}?whs={PTD}&status=PENDING", self.ptd_manager).json()
+        self.assertEqual(row["so_number"], "1726097001")
+        self.assertFalse(row["is_counter_sale"])
+
+        resp = self._decide(self._approval(posting, PTD), self.ptd_manager)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(resp.json()["posting_status"], "POSTED")
+        [line] = self.sap.create_ar_invoice.call_args[0][0]["DocumentLines"]
+        self.assertEqual((line["BaseType"], line["BaseEntry"], line["BaseLine"]), (17, 7001, 0))
+
+    def test_a_failed_sales_order_bill_without_approval_cannot_be_retried(self):
+        # From before the rule: FAILED, from the raiser's own warehouse, no approvals.
+        posting = ARInvoicePosting.objects.create(
+            company=self.company, customer_code="CUSTA000123", branch_id=2,
+            status=ARInvoiceStatus.FAILED, created_by=self.counter,
+        )
+        ARInvoiceLine.objects.create(
+            ar_invoice=posting, base_entry=7001, base_line=0, base_doc_num=1726097001,
+            item_code=ITEM, quantity="10", price="133.3333", line_total="1333.33",
+            tax_code="CG+SG@5", warehouse_code=COUNTER_WH,
+        )
+        resp = self.client.post(
+            f"{AR}invoices/{posting.id}/post/", HTTP_COMPANY_CODE=COMPANY_CODE
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Sales Order", resp.json()["detail"])
+        self.sap.create_ar_invoice.assert_not_called()
 
     # ── the approval page ───────────────────────────────────────────────────
     def test_the_warehouse_manager_sees_it_on_the_invoice_approval_page(self):
