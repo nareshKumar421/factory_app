@@ -1,4 +1,5 @@
-"""A saved material GRPO, as a posting the SAP queue can send again.
+"""A saved material GRPO -- raw material or bought-in finished goods -- as a
+posting the SAP queue can send again.
 
 A try is ``GRPOService.post_saved_grpo``: the draft already holds the payload
 and the attachments, and posting it deletes the draft in favour of a new
@@ -25,7 +26,14 @@ def title_for(draft: GRPOPosting, po_numbers) -> str:
     return f"GRPO {draft.vehicle_entry.entry_no} (PO {', '.join(po_numbers)})"
 
 
+def _entry_type(draft: GRPOPosting) -> str:
+    return getattr(draft.vehicle_entry, "entry_type", "") or "RAW_MATERIAL"
+
+
 def draft_link(draft: GRPOPosting) -> str:
+    # Bought-in finished goods are received on their own screen.
+    if _entry_type(draft) == "FINISHED_GOODS":
+        return f"/warehouse/grpo/fg/preview/{draft.vehicle_entry_id}"
     return f"/warehouse/grpo/material/preview/{draft.vehicle_entry_id}?draft={draft.id}"
 
 
@@ -66,7 +74,11 @@ class MaterialGRPOHandler:
                 link=posted_link(draft.id),
             )
 
-        service = GRPOService(company_code=draft.vehicle_entry.company.code)
+        # Posted under its own gate entry's rules: a bought-in finished-goods
+        # GRPO has no QC slip, and the raw-material checks would refuse it.
+        service = GRPOService(
+            company_code=draft.vehicle_entry.company.code, entry_type=_entry_type(draft)
+        )
         receipts = service.draft_po_receipts(draft)
         user = posting.created_by
         try:
