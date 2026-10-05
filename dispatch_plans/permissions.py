@@ -177,10 +177,13 @@ class CanPostTransporterAPInvoice(BasePermission):
         )
 
 
-# --- Bill summary (the picking sheet handed to the floor) -------------------
-# Issuing and picking are separate permissions: the manager issues the sheet,
-# the floor confirms what came off it, and one person doing both silently is
-# exactly what the paper trail exists to prevent.
+# --- Bill summary (the picking sheet dispatch raises and the warehouse dates) -
+# Raising, approving and picking are three permissions because they are three
+# desks. Dispatch fills the sheet in; the warehouse gives it a dispatch date,
+# which is the moment SAP is written to; the floor confirms what came off it.
+# One person holding all three can date and pick a dispatch nobody checked,
+# which is exactly what the paper trail exists to prevent — so anyone who
+# genuinely needs more than one gets them deliberately and visibly.
 
 class CanViewBillSummary(BasePermission):
     def has_permission(self, request, view):
@@ -188,6 +191,7 @@ class CanViewBillSummary(BasePermission):
             request.user,
             "dispatch_plans.can_view_bill_summary",
             "dispatch_plans.can_create_bill_summary",
+            "dispatch_plans.can_approve_bill_summary",
             "dispatch_plans.can_pick_bill_summary",
         )
 
@@ -218,6 +222,37 @@ class CanCreateBillSummary(BasePermission):
         return request.user.has_perm("dispatch_plans.can_create_bill_summary")
 
 
+class CanApproveBillSummary(BasePermission):
+    """The warehouse desk: sets the dispatch date, or sends the sheet back.
+
+    Deliberately NOT implied by ``can_create_bill_summary``. The dispatch date is
+    the whole of what approval decides and the only thing SAP is really being
+    told; letting the desk that raised the sheet also date it puts the flow back
+    where it started.
+    """
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_approve_bill_summary")
+
+
+class CanReconcileBillSummaryWithSap(BasePermission):
+    """Retry the SAP posting for a sheet SAP refused.
+
+    Both desks, because either could be the one looking at the failure: the
+    warehouse's approval is what triggered the posting in the first place, and
+    the dispatch desk is who cancels a sheet — which is the other thing this
+    retries. Neither can decide anything with it; it only makes SAP agree with a
+    decision already recorded here.
+    """
+
+    def has_permission(self, request, view):
+        return has_any_permission(
+            request.user,
+            "dispatch_plans.can_create_bill_summary",
+            "dispatch_plans.can_approve_bill_summary",
+        )
+
+
 class CanPickBillSummary(BasePermission):
     def has_permission(self, request, view):
         return request.user.has_perm("dispatch_plans.can_pick_bill_summary")
@@ -246,3 +281,27 @@ class CanViewDispatchSheet(BasePermission):
 
     def has_permission(self, request, view):
         return request.user.has_perm("dispatch_plans.can_view_dispatch_sheet")
+
+
+class CanViewFreightBenchmarks(BasePermission):
+    """The benchmark freight table. Whoever may edit it may read it, and so may
+    the linking desk: Vehicle Linking picks each truck's destination from this
+    list and shows the benchmark beside the freight. Reading it is not the
+    Freight Benchmarks page, which keeps its own rights."""
+
+    def has_permission(self, request, view):
+        return has_any_permission(
+            request.user,
+            "dispatch_plans.can_view_freight_benchmarks",
+            "dispatch_plans.can_manage_freight_benchmarks",
+            "dispatch_plans.can_link_dispatch_vehicle",
+        )
+
+
+class CanManageFreightBenchmarks(BasePermission):
+    """Editing the benchmarks is a right of its own: the vehicle-linking
+    approval holds an actual freight against them, so whoever can move a
+    benchmark can move what counts as over it."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm("dispatch_plans.can_manage_freight_benchmarks")

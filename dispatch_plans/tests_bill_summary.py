@@ -11,6 +11,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.test import SimpleTestCase, TestCase
+from django.utils import timezone
 
 from accounts.models import User
 from company.models import Company
@@ -163,15 +164,30 @@ class BillSummaryTestBase(TestCase):
         return DispatchPlan.objects.create(**defaults)
 
     def generate(self, **overrides):
+        """Raise a sheet and send it to the warehouse. No dispatch date, no SAP."""
         data = dict(
             sap_invoice_doc_entry=DOC_ENTRY,
             sap_invoice_doc_num=DOC_NUM,
-            dispatch_date=DISPATCH_DATE,
             bilty_no="BLT-900",
         )
         data.update(overrides)
-        with patch.object(BillSummaryService, "post_to_sap"):
-            return self.service.generate(data)
+        return self.service.generate(data)
+
+    def approve(self, summary, dispatch_date=DISPATCH_DATE, service=None):
+        """The warehouse's half. `on_commit` does not fire inside a TestCase
+        transaction, so this approves without reaching the SAP posting; the tests
+        that care about the posting drive `post_to_sap` themselves."""
+        approved, refused = (service or self.service).approve(
+            [summary.id], dispatch_date
+        )
+        summary.refresh_from_db()
+        return approved, refused
+
+    def approved(self, **overrides):
+        """A sheet all the way through the warehouse, ready to print or post."""
+        summary = self.generate(**overrides)
+        self.approve(summary)
+        return summary
 
 
 class LookupTests(BillSummaryTestBase):
@@ -270,12 +286,27 @@ class GenerateTests(BillSummaryTestBase):
     def test_generates_one_numbered_sheet_for_the_bill(self):
         with self.stub([sap_line(), sap_line(line_num=1, item="FG2")]):
             summary = self.generate()
-        self.assertEqual(summary.entry_no, "BS-20260905-001")
+        # Numbered by the day it was RAISED, not the dispatch date: the sheet
+        # needs a number the dispatch desk can quote while it is still waiting,
+        # and there is no dispatch date yet to number it by.
+        self.assertEqual(
+            summary.entry_no, f"BS-{timezone.localdate():%Y%m%d}-001"
+        )
         self.assertEqual(summary.sap_invoice_doc_entry, DOC_ENTRY)
         self.assertEqual(summary.customer_name, "Goel Brothers")
         self.assertEqual(summary.warehouse_codes, "GP-FG")
-        self.assertEqual(summary.status, BillSummaryStatus.GENERATED)
+        self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
         self.assertEqual(summary.active_lines.count(), 2)
+
+    def test_raising_a_sheet_writes_nothing_to_sap(self):
+        """The dispatch date is the whole of the message, and the warehouse has
+        not given one yet. Nothing to say, so nothing is said."""
+        with self.stub():
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+                summary = self.generate()
+        patched.assert_not_called()
+        self.assertIsNone(summary.dispatch_date)
+        self.assertEqual(summary.sap_status, BillSummarySapStatus.NOT_POSTED)
 
     def test_dispatch_qty_defaults_to_the_full_billed_quantity(self):
         with self.stub([sap_line(qty="24")]):
@@ -295,18 +326,15 @@ class GenerateTests(BillSummaryTestBase):
                 self.generate(lines=[{"sap_line_num": 0, "dispatch_qty": "11"}])
         self.assertIn("only for", str(ctx.exception))
 
-    def test_a_bilty_is_required_because_sap_demands_one(self):
+    def test_a_sheet_can_be_raised_before_the_bilty_exists(self):
+        """The LR is raised once the truck is loaded, and the load is being put
+        together here. Refusing the sheet over it would push the desk back to
+        typing dispatches into SAP by hand; it is demanded at approval instead,
+        where SAP is actually being asked."""
         with self.stub():
-            with self.assertRaises(BillSummaryError) as ctx:
-                self.generate(bilty_no="")
-        self.assertIn("SAP will not accept", str(ctx.exception))
-
-    def test_a_dispatch_date_before_the_bill_date_is_refused(self):
-        """SAP rule 1300014 — caught here rather than at posting."""
-        with self.stub():
-            with self.assertRaises(BillSummaryError) as ctx:
-                self.generate(dispatch_date=date(2026, 8, 20))
-        self.assertIn("before the bill", str(ctx.exception))
+            summary = self.generate(bilty_no="")
+        self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
+        self.assertEqual(summary.bilty_no, "")
 
     def test_a_second_live_sheet_for_the_same_bill_is_refused(self):
         with self.stub():
@@ -321,7 +349,17 @@ class GenerateTests(BillSummaryTestBase):
             self.service.cancel(first.id, "wrong vehicle")
             second = self.generate()
         self.assertNotEqual(first.id, second.id)
-        self.assertEqual(second.status, BillSummaryStatus.GENERATED)
+        self.assertEqual(second.status, BillSummaryStatus.PENDING_APPROVAL)
+
+    def test_a_sheet_sent_back_still_holds_the_bill(self):
+        """A rejected sheet is the same sheet, in the dispatch desk's hands to
+        correct — not a dead one to raise a second sheet around."""
+        with self.stub():
+            first = self.generate()
+            self.service.reject(first.id, "wrong vehicle")
+            with self.assertRaises(BillSummaryError) as ctx:
+                self.generate()
+        self.assertIn(first.entry_no, str(ctx.exception))
 
     def test_transport_details_are_carried_onto_the_sheet(self):
         with self.stub():
@@ -346,7 +384,7 @@ class SapPostingTests(BillSummaryTestBase):
     def test_the_payload_carries_what_sap_demands(self):
         """Date, bilty and per-line dispatch qty — SAP refuses any subset."""
         with self.stub([sap_line(qty="10")]):
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.post_to_sap(summary.id)
         patched.assert_called_once()
@@ -357,7 +395,7 @@ class SapPostingTests(BillSummaryTestBase):
 
     def test_a_successful_post_is_recorded(self):
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])):
                 self.service.post_to_sap(summary.id)
         summary.refresh_from_db()
@@ -369,18 +407,18 @@ class SapPostingTests(BillSummaryTestBase):
         """The manager still needs something to hand the floor; a refusal is a
         thing to retry, not a reason to lose the document."""
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice",
                               side_effect=BillSummaryError("(1300012) dispatch qty")):
                 self.service.post_to_sap(summary.id)
         summary.refresh_from_db()
-        self.assertEqual(summary.status, BillSummaryStatus.GENERATED)
+        self.assertEqual(summary.status, BillSummaryStatus.APPROVED)
         self.assertEqual(summary.sap_status, BillSummarySapStatus.FAILED)
         self.assertIn("1300012", summary.sap_error)
 
     def test_posting_can_be_retried_after_a_failure(self):
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice",
                               side_effect=BillSummaryError("boom")):
                 self.service.post_to_sap(summary.id)
@@ -395,7 +433,7 @@ class SapPostingTests(BillSummaryTestBase):
         It used to refuse outright, which left the invoice claiming a dispatch
         that had been withdrawn."""
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             self.service.cancel(summary.id, "wrong bill")
             with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.post_to_sap(summary.id)
@@ -405,7 +443,7 @@ class SapPostingTests(BillSummaryTestBase):
 class PickAndCancelTests(BillSummaryTestBase):
     def test_marking_picked_records_who_and_when(self):
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
         picker = User.objects.create_user(
             email="p@example.com", full_name="Picker", employee_code="E2", password="x"
         )
@@ -416,7 +454,7 @@ class PickAndCancelTests(BillSummaryTestBase):
 
     def test_cannot_mark_picked_twice(self):
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
         self.service.mark_picked(summary.id)
         with self.assertRaises(BillSummaryError):
             self.service.mark_picked(summary.id)
@@ -425,7 +463,7 @@ class PickAndCancelTests(BillSummaryTestBase):
         """Leaving a dispatch date on an invoice nobody is dispatching is worse
         than never having written it."""
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])):
                 self.service.post_to_sap(summary.id)
             summary.refresh_from_db()
@@ -446,7 +484,7 @@ class PickAndCancelTests(BillSummaryTestBase):
     def test_a_failed_clearing_still_leaves_the_sheet_cancelled(self):
         """The floor must be able to withdraw a sheet even when SAP is down."""
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])):
                 self.service.post_to_sap(summary.id)
             self.service.cancel(summary.id, "load pulled")
@@ -460,7 +498,7 @@ class PickAndCancelTests(BillSummaryTestBase):
 
     def test_cancelling_a_sheet_never_posted_does_not_call_sap(self):
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice", return_value=([], [])) as patched:
                 self.service.cancel(summary.id, "wrong bill")
         patched.assert_not_called()
@@ -577,8 +615,10 @@ class StampPayloadTests(BillSummaryTestBase):
     """
 
     def summary_for(self, **overrides):
+        """An APPROVED sheet: the stamp is built out of the dispatch date, which
+        only exists once the warehouse has given one."""
         with self.stub():
-            summary = self.generate(**overrides)
+            summary = self.approved(**overrides)
         return summary
 
     def test_the_companys_own_spelling_is_used(self):
@@ -669,7 +709,7 @@ class StampPayloadTests(BillSummaryTestBase):
 
     def test_what_would_not_fit_is_recorded_on_the_sheet(self):
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice",
                               return_value=([], ["driver mobile Arnav Transport"])):
                 self.service.post_to_sap(summary.id)
@@ -680,7 +720,7 @@ class StampPayloadTests(BillSummaryTestBase):
 
     def test_what_sap_kept_is_recorded_on_the_sheet(self):
         with self.stub():
-            summary = self.generate()
+            summary = self.approved()
             with patch.object(BillSummaryService, "_patch_invoice",
                               return_value=(["bilty number 1822"], [])):
                 self.service.post_to_sap(summary.id)
@@ -823,9 +863,11 @@ class SapSourcedSummaryTests(BillSummaryTestBase):
         self.assertEqual(row["sap_invoice_doc_num"], DOC_NUM)
         self.assertEqual(row["bilty_no"], "NCR-4494")
         self.assertEqual(row["dispatch_date"], DISPATCH_DATE.isoformat())
-        # It is live and SAP holds it, which is what an app sheet that posted
-        # cleanly says — so the badges read the same.
-        self.assertEqual(row["status"], BillSummaryStatus.GENERATED)
+        # It is live and SAP holds it, which is what an APPROVED app sheet that
+        # posted cleanly says — so the badges read the same. It never went
+        # through this app's warehouse step because it never went through this
+        # app at all; the dispatch date shown is the one typed into SAP.
+        self.assertEqual(row["status"], BillSummaryStatus.APPROVED)
         self.assertEqual(row["sap_status"], BillSummarySapStatus.POSTED)
 
     def test_the_apps_own_sheets_say_where_they_came_from(self):
@@ -908,7 +950,7 @@ class SapSummaryAdoptionTests(BillSummaryTestBase):
         self.assertEqual(summary.dispatch_date, DISPATCH_DATE)
         self.assertEqual(summary.bilty_no, "NCR-4494")
         self.assertEqual(summary.vehicle_no, "HR67D6673")
-        self.assertEqual(summary.entry_no, f"BS-{DISPATCH_DATE:%Y%m%d}-001")
+        self.assertEqual(summary.entry_no, f"BS-{timezone.localdate():%Y%m%d}-001")
         self.assertEqual(summary.lines.count(), 1)
 
     def test_sap_is_not_written_to_again(self):
@@ -919,6 +961,15 @@ class SapSummaryAdoptionTests(BillSummaryTestBase):
 
     def test_it_is_recorded_as_already_posted(self):
         self.assertEqual(self.adopt().sap_status, BillSummarySapStatus.POSTED)
+
+    def test_it_is_recorded_as_approved_with_nobody_credited(self):
+        """SAP already holds the dispatch date, which is the only thing approval
+        decides — so the sheet is approved. Nobody here approved it, though, and
+        the record should not claim somebody did."""
+        summary = self.adopt()
+        self.assertEqual(summary.status, BillSummaryStatus.APPROVED)
+        self.assertIsNone(summary.approved_by)
+        self.assertIsNotNone(summary.approved_at)
 
     def test_nobody_is_credited_with_issuing_it(self):
         summary = self.adopt()
@@ -1022,3 +1073,433 @@ class StampedBillQueryTests(SimpleTestCase):
         )
         self.assertEqual(reader.captured, [])
 
+
+
+class ApprovalTests(BillSummaryTestBase):
+    """The warehouse's half of the flow.
+
+    What matters here is the boundary: a sheet dispatch has sent across has
+    touched SAP not at all, and the approval is the one act that writes to it.
+    Everything else follows from that — sending back costs nothing, the bilty is
+    demanded at approval rather than before it, and the dispatch date cannot be
+    got onto a bill any other way.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.warehouse = User.objects.create_user(
+            email="whs@example.com", full_name="Warehouse", employee_code="E9",
+            password="x",
+        )
+        self.warehouse_service = BillSummaryService("JIVO_OIL", self.warehouse)
+
+    def test_approving_sets_the_date_and_records_who_gave_it(self):
+        with self.stub():
+            summary = self.generate()
+            approved, refused = self.approve(summary, service=self.warehouse_service)
+        self.assertEqual(refused, [])
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(summary.status, BillSummaryStatus.APPROVED)
+        self.assertEqual(summary.dispatch_date, DISPATCH_DATE)
+        self.assertEqual(summary.approved_by, self.warehouse)
+        self.assertIsNotNone(summary.approved_at)
+
+    def test_the_dispatch_date_reaches_sap_only_on_approval(self):
+        """Approval is the write. Before it there is nothing to say; after it the
+        stamp carries the date the warehouse gave, not one dispatch typed."""
+        with self.stub():
+            summary = self.generate()
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+                # Refused outright rather than recorded as a SAP failure: SAP
+                # never refused anything, and a sheet parked in the "not in SAP"
+                # view is a sheet somebody will go chasing for no reason.
+                with self.assertRaises(BillSummaryError) as ctx:
+                    self.service.post_to_sap(summary.id)
+        patched.assert_not_called()
+        self.assertIn("not been approved", str(ctx.exception))
+        summary.refresh_from_db()
+        self.assertEqual(summary.sap_status, BillSummarySapStatus.NOT_POSTED)
+        self.assertEqual(summary.sap_error, "")
+
+        with self.stub():
+            self.approve(summary)
+            with patch.object(
+                BillSummaryService, "_patch_invoice", return_value=([], [])
+            ) as patched:
+                self.service.post_to_sap(summary.id)
+        sent = patched.call_args[0][0]
+        self.assertEqual(sent.dispatch_date, DISPATCH_DATE)
+
+    def test_a_sheet_with_no_bilty_cannot_be_approved(self):
+        """SAP will not take a dispatch date without one, and this is the request
+        that carries the dispatch date."""
+        with self.stub():
+            summary = self.generate(bilty_no="")
+            approved, refused = self.approve(summary)
+        self.assertEqual(approved, [])
+        self.assertIn("no bilty number", refused[0]["reason"])
+        self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
+
+    def test_a_dispatch_date_before_the_bill_date_is_refused(self):
+        """SAP rule 1300014 — caught at the decision rather than at posting."""
+        with self.stub():
+            summary = self.generate()
+            approved, refused = self.approve(summary, dispatch_date=date(2026, 8, 20))
+        self.assertEqual(approved, [])
+        self.assertIn("before the bill", refused[0]["reason"])
+        self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
+
+    def test_a_whole_truck_takes_one_date(self):
+        with self.stub():
+            first = self.generate()
+            second = self.generate(sap_invoice_doc_entry=DOC_ENTRY + 1)
+            approved, refused = self.service.approve(
+                [first.id, second.id], DISPATCH_DATE
+            )
+        self.assertEqual(refused, [])
+        self.assertEqual(len(approved), 2)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.dispatch_date, DISPATCH_DATE)
+        self.assertEqual(second.dispatch_date, DISPATCH_DATE)
+
+    def test_one_bad_bill_does_not_un_approve_the_rest_of_the_truck(self):
+        """Eight bills are eight invoices. The one that cannot go is worth
+        naming, not worth making the warehouse decide the other seven again."""
+        with self.stub():
+            good = self.generate()
+            bad = self.generate(sap_invoice_doc_entry=DOC_ENTRY + 1, bilty_no="")
+            approved, refused = self.service.approve([good.id, bad.id], DISPATCH_DATE)
+        good.refresh_from_db()
+        bad.refresh_from_db()
+        self.assertEqual([s.id for s in approved], [good.id])
+        self.assertEqual(good.status, BillSummaryStatus.APPROVED)
+        self.assertEqual(bad.status, BillSummaryStatus.PENDING_APPROVAL)
+        self.assertEqual(refused[0]["entry_no"], bad.entry_no)
+
+    def test_a_sheet_cannot_be_approved_twice(self):
+        with self.stub():
+            summary = self.approved()
+            _approved, refused = self.approve(summary, dispatch_date=date(2026, 9, 9))
+        self.assertIn("not waiting for approval", refused[0]["reason"])
+        self.assertEqual(summary.dispatch_date, DISPATCH_DATE)
+
+    def test_approving_needs_a_date(self):
+        with self.stub():
+            summary = self.generate()
+        with self.assertRaises(BillSummaryError):
+            self.service.approve([summary.id], None)
+
+
+class SendingBackTests(BillSummaryTestBase):
+    def test_sending_back_records_the_reason_and_who_sent_it(self):
+        with self.stub():
+            summary = self.generate()
+        self.service.reject(summary.id, "bilty is for the wrong truck")
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.REJECTED)
+        self.assertEqual(summary.reject_reason, "bilty is for the wrong truck")
+        self.assertEqual(summary.rejected_by, self.user)
+
+    def test_sending_back_needs_a_reason(self):
+        with self.stub():
+            summary = self.generate()
+        with self.assertRaises(BillSummaryError):
+            self.service.reject(summary.id, "   ")
+
+    def test_sending_back_writes_nothing_to_sap(self):
+        """There is nothing to undo: an unapproved sheet was never stamped."""
+        with self.stub():
+            summary = self.generate()
+            with patch.object(BillSummaryService, "_patch_invoice") as patched:
+                self.service.reject(summary.id, "wrong vehicle")
+        patched.assert_not_called()
+
+    def test_an_approved_sheet_cannot_be_sent_back(self):
+        """SAP has been told by then. Withdrawing it is a cancellation, which
+        takes the stamp back off the invoice; sending back does not."""
+        with self.stub():
+            summary = self.approved()
+        with self.assertRaises(BillSummaryError):
+            self.service.reject(summary.id, "changed my mind")
+
+    def test_a_sheet_sent_back_can_be_fixed_and_re_sent(self):
+        with self.stub():
+            summary = self.generate(bilty_no="")
+            self.service.reject(summary.id, "no bilty")
+            self.service.resubmit(summary.id, {"bilty_no": "NCR-771"})
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
+        self.assertEqual(summary.bilty_no, "NCR-771")
+        # Kept, not cleared: the desk fixing it next time wants to know what was
+        # wrong last time.
+        self.assertEqual(summary.reject_reason, "no bilty")
+
+    def test_re_sending_moves_the_sheet_up_the_queue(self):
+        with self.stub():
+            summary = self.generate()
+            first_sent = summary.submitted_at
+            self.service.reject(summary.id, "wrong vehicle")
+            self.service.resubmit(summary.id, {"vehicle_no": "PB10AB1234"})
+        summary.refresh_from_db()
+        self.assertGreater(summary.submitted_at, first_sent)
+
+    def test_a_short_dispatch_can_be_restated_on_the_way_back(self):
+        """Usually what the sending-back was about. The boxes are re-split too:
+        leaving them showing the old quantity's packing would send the picker for
+        the wrong number of cartons."""
+        with self.stub([sap_line(qty="24", pcs_per_box="12")]):
+            summary = self.generate()
+            self.service.reject(summary.id, "only 12 on the truck")
+            self.service.resubmit(
+                summary.id, {"lines": [{"sap_line_num": 0, "dispatch_qty": "12"}]}
+            )
+        row = summary.active_lines.first()
+        self.assertEqual(row.dispatch_qty, Decimal("12"))
+        self.assertEqual(row.boxes, Decimal("1"))
+        self.assertTrue(row.is_short)
+
+    def test_a_restated_quantity_still_cannot_exceed_the_bill(self):
+        with self.stub([sap_line(qty="10")]):
+            summary = self.generate()
+            with self.assertRaises(BillSummaryError) as ctx:
+                self.service.resubmit(
+                    summary.id, {"lines": [{"sap_line_num": 0, "dispatch_qty": "11"}]}
+                )
+        self.assertIn("only for", str(ctx.exception))
+
+    def test_an_approved_sheet_can_no_longer_be_changed(self):
+        with self.stub():
+            summary = self.approved()
+        with self.assertRaises(BillSummaryError):
+            self.service.resubmit(summary.id, {"bilty_no": "NCR-999"})
+
+
+class PrintingTests(BillSummaryTestBase):
+    def test_printing_an_approved_sheet_records_who_and_when(self):
+        with self.stub():
+            summary = self.approved()
+        self.service.mark_printed(summary.id)
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.PRINTED)
+        self.assertEqual(summary.printed_by, self.user)
+
+    def test_a_sheet_still_with_the_warehouse_cannot_be_printed(self):
+        """The dispatch date is the reason the paper exists, and it is not on
+        the sheet yet."""
+        with self.stub():
+            summary = self.generate()
+        with self.assertRaises(BillSummaryError) as ctx:
+            self.service.mark_printed(summary.id)
+        self.assertIn("only an approved sheet", str(ctx.exception))
+
+    def test_a_reprint_does_not_move_the_record(self):
+        """What the record answers is when the signed copy went downstairs, and
+        that was the first time."""
+        with self.stub():
+            summary = self.approved()
+        self.service.mark_printed(summary.id)
+        summary.refresh_from_db()
+        first = summary.printed_at
+        self.service.mark_printed(summary.id)
+        summary.refresh_from_db()
+        self.assertEqual(summary.printed_at, first)
+
+    def test_a_printed_sheet_is_picked_like_any_other(self):
+        with self.stub():
+            summary = self.approved()
+        self.service.mark_printed(summary.id)
+        self.service.mark_picked(summary.id)
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.PICKED)
+
+    def test_a_pick_is_not_blocked_on_somebody_upstairs_pressing_print(self):
+        """The godown has the signed paper in its hand; the print flag is the
+        dispatch desk's housekeeping, not the godown's permission."""
+        with self.stub():
+            summary = self.approved()
+        self.service.mark_picked(summary.id)
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.PICKED)
+
+
+class WholeTruckSubmissionTests(BillSummaryTestBase):
+    """What the popup behind vehicle linking posts."""
+
+    def plan_for(self, doc_entry, **kwargs):
+        return self.make_plan(
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            customer_name="Goel Brothers",
+            **kwargs,
+        )
+
+    def test_a_dry_run_counts_without_writing_anything(self):
+        """The popup has to answer 'how many?' before it can ask, and the user
+        may well say no."""
+        self.plan_for(DOC_ENTRY)
+        self.plan_for(DOC_ENTRY + 1)
+        with self.stub():
+            result = self.service.submit_bills(
+                [DOC_ENTRY, DOC_ENTRY + 1], dry_run=True
+            )
+        self.assertEqual(len(result["eligible"]), 2)
+        self.assertEqual(result["created"], [])
+        self.assertEqual(BillSummary.objects.count(), 0)
+
+    def test_submitting_raises_one_sheet_per_bill(self):
+        self.plan_for(DOC_ENTRY)
+        self.plan_for(DOC_ENTRY + 1)
+        with self.stub():
+            result = self.service.submit_bills([DOC_ENTRY, DOC_ENTRY + 1])
+        self.assertEqual(len(result["created"]), 2)
+        self.assertEqual(
+            {s.status for s in result["created"]},
+            {BillSummaryStatus.PENDING_APPROVAL},
+        )
+        self.assertEqual(
+            sorted(s.entry_no for s in result["created"]),
+            sorted(BillSummary.objects.values_list("entry_no", flat=True)),
+        )
+
+    def test_the_transport_details_come_off_the_plan(self):
+        from driver_management.models import Driver
+        from vehicle_management.models import Transporter, Vehicle
+
+        self.plan_for(
+            DOC_ENTRY,
+            bilty_no="NCR-4494",
+            vehicle=Vehicle.objects.create(vehicle_number="PB10AB1234"),
+            transporter=Transporter.objects.create(name="Pick & Ship"),
+            driver=Driver.objects.create(
+                name="Sonu", mobile_no="9876543210", license_no="DL-9"
+            ),
+        )
+        with self.stub():
+            result = self.service.submit_bills([DOC_ENTRY])
+        summary = result["created"][0]
+        self.assertEqual(summary.vehicle_no, "PB10AB1234")
+        self.assertEqual(summary.transporter_name, "Pick & Ship")
+        self.assertEqual(summary.driver_name, "Sonu")
+        self.assertEqual(summary.bilty_no, "NCR-4494")
+
+    def test_a_bill_that_already_has_a_sheet_is_skipped_by_name(self):
+        self.plan_for(DOC_ENTRY)
+        with self.stub():
+            first = self.generate()
+            result = self.service.submit_bills([DOC_ENTRY])
+        self.assertEqual(result["created"], [])
+        self.assertIn(first.entry_no, result["skipped"][0]["reason"])
+
+    def test_a_bill_with_no_plan_in_this_company_is_skipped(self):
+        with self.stub():
+            result = self.service.submit_bills([DOC_ENTRY])
+        self.assertEqual(result["created"], [])
+        self.assertIn("No dispatch plan", result["skipped"][0]["reason"])
+
+    def test_one_bill_failing_does_not_take_the_truck_down(self):
+        """A truck half of whose sheets exist is far easier to finish than one
+        whose submission was refused outright."""
+        self.plan_for(DOC_ENTRY)
+        self.plan_for(DOC_ENTRY + 1)
+        real_lines = BillSummaryService._raise_sheet
+
+        def raise_for_one(service, doc_entry, data):
+            if doc_entry == DOC_ENTRY:
+                raise BillSummaryError("That bill has no lines to fetch.")
+            return real_lines(service, doc_entry, data)
+
+        with self.stub():
+            with patch.object(BillSummaryService, "_raise_sheet", raise_for_one):
+                result = self.service.submit_bills([DOC_ENTRY, DOC_ENTRY + 1])
+        self.assertEqual(len(result["created"]), 1)
+        self.assertEqual(result["created"][0].sap_invoice_doc_entry, DOC_ENTRY + 1)
+        self.assertEqual(result["skipped"][0]["doc_entry"], DOC_ENTRY)
+
+    def test_the_same_bill_twice_in_one_truck_raises_one_sheet(self):
+        self.plan_for(DOC_ENTRY)
+        with self.stub():
+            result = self.service.submit_bills([DOC_ENTRY, DOC_ENTRY])
+        self.assertEqual(len(result["created"]), 1)
+
+    def test_an_empty_truck_is_refused(self):
+        with self.assertRaises(BillSummaryError):
+            self.service.submit_bills([])
+
+
+class DeskPermissionTests(TestCase):
+    """Who may do what, given that the point of the step is two desks.
+
+    Checked against the permission classes rather than over HTTP, which is how
+    the rest of this module is tested — and the claim being made is about the
+    permissions themselves, not about routing.
+    """
+
+    def user_with(self, *codenames):
+        from django.contrib.auth.models import Permission
+
+        user = User.objects.create_user(
+            email=f"{'-'.join(codenames) or 'none'}@example.com",
+            full_name="Desk",
+            employee_code=f"E{abs(hash(codenames)) % 10000}",
+            password="x",
+        )
+        for codename in codenames:
+            user.user_permissions.add(
+                Permission.objects.get(
+                    content_type__app_label="dispatch_plans", codename=codename
+                )
+            )
+        # Permissions are cached on first check.
+        return User.objects.get(pk=user.pk)
+
+    def allows(self, permission_class, user):
+        return permission_class().has_permission(
+            SimpleNamespace(user=user), None
+        )
+
+    def test_raising_does_not_carry_approving(self):
+        """The whole point: the desk that fills the sheet in is not the desk
+        that dates it. A permission that implied the other would put the flow
+        straight back where it started."""
+        from dispatch_plans.permissions import (
+            CanApproveBillSummary,
+            CanCreateBillSummary,
+        )
+
+        dispatch = self.user_with("can_create_bill_summary")
+        self.assertTrue(self.allows(CanCreateBillSummary, dispatch))
+        self.assertFalse(self.allows(CanApproveBillSummary, dispatch))
+
+    def test_approving_does_not_carry_raising(self):
+        from dispatch_plans.permissions import (
+            CanApproveBillSummary,
+            CanCreateBillSummary,
+        )
+
+        warehouse = self.user_with("can_approve_bill_summary")
+        self.assertTrue(self.allows(CanApproveBillSummary, warehouse))
+        self.assertFalse(self.allows(CanCreateBillSummary, warehouse))
+
+    def test_the_warehouse_can_see_the_queue_it_is_meant_to_work(self):
+        from dispatch_plans.permissions import CanViewBillSummary
+
+        warehouse = self.user_with("can_approve_bill_summary")
+        self.assertTrue(self.allows(CanViewBillSummary, warehouse))
+
+    def test_either_desk_can_retry_a_refused_sap_posting(self):
+        """It decides nothing — it only makes SAP agree with what is already
+        recorded here — and the desk that approved is often the one looking at
+        the failure."""
+        from dispatch_plans.permissions import CanReconcileBillSummaryWithSap
+
+        for codename in ("can_create_bill_summary", "can_approve_bill_summary"):
+            self.assertTrue(
+                self.allows(CanReconcileBillSummaryWithSap, self.user_with(codename)),
+                codename,
+            )
+        self.assertFalse(
+            self.allows(
+                CanReconcileBillSummaryWithSap, self.user_with("can_pick_bill_summary")
+            )
+        )

@@ -305,12 +305,32 @@ def customer_name(entry: SalesDispatchGateOut, live_document: Dict[str, Any] | N
 
 
 def bilty_for_customer(entry: SalesDispatchGateOut, customer_code: str) -> tuple[str, Any]:
-    """The bilty (LR) number + date for a customer, from that customer's tagged bilty.
+    """The bilty (LR) number + date for a customer, off that customer's plan.
 
-    Bilties are per consignee now; fall back to the docking header when a legacy/untagged
-    bilty is all that's present.
+    A bilty is issued per consignee and is captured when the vehicle is linked,
+    so the dispatch plan behind this customer's bill is where it lives. What the
+    gatepass prints has to be that same number — the driver is carrying the LR
+    it names.
+
+    Falls back to the docking's own per-customer bilty attachment and then to
+    its header, for a load raised before the capture moved and never linked.
     """
     wanted = (customer_code or "").strip()
+
+    for document in entry.active_documents:
+        if not document.dispatch_plan_id:
+            continue
+        if wanted and (document.customer_code or "").strip() != wanted:
+            continue
+        plan = document.dispatch_plan
+        if (plan.bilty_no or "").strip() or plan.bilty_date:
+            return plan.bilty_no or "NA", plan.bilty_date
+
+    # A single-bill docking, whose own plan is the whole load.
+    plan = entry.dispatch_plan
+    if plan is not None and ((plan.bilty_no or "").strip() or plan.bilty_date):
+        return plan.bilty_no or "NA", plan.bilty_date
+
     match = None
     fallback = None
     for attachment in entry.attachments.all():

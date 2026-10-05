@@ -12,6 +12,10 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from company.permissions import HasCompanyContext
+from dispatch_plans.freight_approval_service import (
+    gate_refusal as freight_gate_refusal,
+    truck_plans as truck_freight_plans,
+)
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from dispatch_plans.permissions import (
     CanAddBillInsideVehicle,
@@ -537,6 +541,16 @@ class EmptyVehicleGateInListCreateView(APIView):
                     refusal_payload(vehicle, data["gate_in_date"], company_ids),
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+        # A truck linked at a freight over its benchmark waits here until Admin
+        # clears it -- the same place, and the same shape of refusal, as a late
+        # one. Dispatch raised it at Vehicle Linking; the gate only reads it.
+        if data["reason"] == "DISPATCH":
+            freight_refusal = freight_gate_refusal(
+                vehicle, truck_freight_plans(vehicle, user_company_ids(request))
+            )
+            if freight_refusal is not None:
+                return Response(freight_refusal, status=status.HTTP_400_BAD_REQUEST)
 
         if data["reason"] == "BST":
             linked_gate_in = find_active_empty_vehicle_bst_link(

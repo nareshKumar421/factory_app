@@ -57,6 +57,7 @@ from .permissions import (
     CanViewTransporterAPInvoice,
 )
 from .serializers import (
+    CustomerBiltySerializer,
     DispatchBillDetailSerializer,
     DispatchBillFilterSerializer,
     DispatchPlanBiltyAttachmentStateSerializer,
@@ -651,6 +652,54 @@ class DispatchPlanUpdateAPI(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(DispatchPlanSerializer(plan).data)
+
+
+class DispatchPlanCustomerBiltyAPI(APIView):
+    """Record one consignee's bilty against that consignee's bills on a truck.
+
+    Posted by the vehicle-linking screen, once per customer, straight after the
+    link itself. It is not part of the link payload because that payload is
+    shared across every bill on the vehicle, and a bilty is issued per consignee
+    — sharing it would put one customer's LR number on another customer's bill.
+
+    Gated by the linking permission rather than the planning one: this is a step
+    of linking a vehicle, and the desks that do the two are not the same.
+    """
+
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    permission_classes = [
+        IsAuthenticated,
+        HasCompanyContext,
+        CanEditDispatchPlansOrLinkDispatchVehicle,
+    ]
+
+    def post(self, request):
+        serializer = CustomerBiltySerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid bilty details.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        service = DispatchPlansService(company_code=request.company.company.code)
+        data = serializer.validated_data
+        try:
+            plans = service.record_customer_bilty(
+                doc_entries=data["doc_entries"],
+                bilty_no=data["bilty_no"],
+                bilty_date=data.get("bilty_date"),
+                attachment=data.get("bilty_attachment"),
+                user=request.user,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                "updated": len(plans),
+                "bilty_no": data["bilty_no"],
+                "doc_entries": [plan.sap_invoice_doc_entry for plan in plans],
+            }
+        )
 
 
 class DispatchPlanBulkDateAPI(APIView):

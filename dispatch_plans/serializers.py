@@ -603,6 +603,23 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
     remarks = serializers.CharField(required=False, allow_blank=True)
 
 
+class CustomerBiltySerializer(serializers.Serializer):
+    """One consignee's bilty, against that consignee's bills on a truck.
+
+    The file is optional on a re-save: a correction to the number or the date
+    should not make somebody re-upload the LR they already sent.
+    """
+
+    doc_entries = CommaSeparatedIntegerListField(
+        child=serializers.IntegerField(min_value=1), allow_empty=False
+    )
+    bilty_no = serializers.CharField(max_length=50)
+    bilty_date = serializers.DateField(
+        required=False, allow_null=True, input_formats=["%Y-%m-%d"]
+    )
+    bilty_attachment = serializers.FileField(required=False, allow_null=True)
+
+
 class DispatchBillSerializer(serializers.Serializer):
     doc_entry = serializers.IntegerField()
     doc_num = serializers.CharField()

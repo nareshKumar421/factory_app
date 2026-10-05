@@ -77,6 +77,17 @@ class NotificationType(models.TextChoices):
     SERVICE_GRPO_FAILED = "SERVICE_GRPO_FAILED", "Service GRPO Posting Failed"
     BOM_REQUEST_CREATED = "BOM_REQUEST_CREATED", "BOM Request Submitted to Warehouse"
     BOM_REQUEST_REVIEWED = "BOM_REQUEST_REVIEWED", "BOM Request Reviewed"
+    # The picking sheet dispatch raises and the warehouse dates. One goes to the
+    # warehouse when a truck's sheets are sent across, one back to dispatch when
+    # the warehouse has decided.
+    BILL_SUMMARY_SUBMITTED = (
+        "BILL_SUMMARY_SUBMITTED",
+        "Bill Summary Sent to Warehouse",
+    )
+    BILL_SUMMARY_DECIDED = (
+        "BILL_SUMMARY_DECIDED",
+        "Bill Summary Approved or Sent Back",
+    )
     FG_RECEIPT_POSTED = "FG_RECEIPT_POSTED", "Finished Goods Receipt Posted"
     FG_RECEIPT_FAILED = "FG_RECEIPT_FAILED", "Finished Goods Receipt Failed"
     PRODUCTION_RUN_SAP_POSTED = "PRODUCTION_RUN_SAP_POSTED", "Production Run Posted to SAP"
@@ -95,6 +106,16 @@ class NotificationType(models.TextChoices):
     LATE_DISPATCH_GATE_IN_REVIEWED = (
         "LATE_DISPATCH_GATE_IN_REVIEWED",
         "Late Dispatch Gate-In Reviewed",
+    )
+    # A truck linked at a freight over its benchmark: one to the approvers, one
+    # back to dispatch with the answer.
+    DISPATCH_FREIGHT_APPROVAL_REQUESTED = (
+        "DISPATCH_FREIGHT_APPROVAL_REQUESTED",
+        "Dispatch Freight Over Benchmark",
+    )
+    DISPATCH_FREIGHT_APPROVAL_REVIEWED = (
+        "DISPATCH_FREIGHT_APPROVAL_REVIEWED",
+        "Dispatch Freight Approval Reviewed",
     )
     WORK_PERMIT_SUBMITTED = "WORK_PERMIT_SUBMITTED", "Work Permit Submitted for Approval"
     WORK_PERMIT_APPROVED = "WORK_PERMIT_APPROVED", "Work Permit Approved"

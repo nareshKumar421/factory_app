@@ -135,10 +135,29 @@ def split_line(
             0, Decimal("0"), pieces_per_box(sal_factor2, item_name, sal_factor3)
         )
 
-    per_box = pieces_per_box(sal_factor2, item_name, sal_factor3)
+    return split_with_pieces_per_box(
+        qty, pieces_per_box(sal_factor2, item_name, sal_factor3)
+    )
+
+
+def split_with_pieces_per_box(quantity: Any, per_box: Any) -> LinePacking:
+    """The same split, from a divisor already worked out.
+
+    For callers holding a stored ``pieces_per_box`` rather than SAP's factors —
+    the bill summary snapshots the divisor onto its lines when the sheet is
+    raised (master data edits ``SalFactor2``, and a sheet must keep footing up
+    the same afterwards), so restating a quantity on one has to re-split against
+    that snapshot rather than ask SAP again. ``None`` or zero means the item is
+    not transacted in boxes.
+    """
+    qty = to_decimal(quantity)
+    per_box = to_decimal(per_box) if per_box not in (None, "") else None
+    if per_box is not None and per_box <= 0:
+        per_box = None
+    if qty <= 0:
+        return LinePacking(0, Decimal("0"), per_box)
     if per_box is None:
         return LinePacking(0, qty, None)
-
     if per_box == 1:
         # One billed unit per box (CSD, or SalFactor3 > 1): a fractional unit
         # still needs its own box.

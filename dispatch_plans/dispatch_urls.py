@@ -1,12 +1,17 @@
 from django.urls import path
 
 from .views_bill_summary import (
+    BillSummaryApproveAPI,
+    BillSummaryBulkSubmitAPI,
     BillSummaryCancelAPI,
     BillSummaryDetailAPI,
     BillSummaryInvoicePrintAPI,
     BillSummaryListCreateAPI,
     BillSummaryPickAPI,
+    BillSummaryPrintedAPI,
     BillSummaryLookupAPI,
+    BillSummaryRejectAPI,
+    BillSummaryResubmitAPI,
     BillSummarySapAdoptAPI,
     BillSummarySapDetailAPI,
     BillSummarySapListAPI,
@@ -14,6 +19,20 @@ from .views_bill_summary import (
 )
 
 from .views_freight_rate import FreightRateAPI
+from .views_freight_approval import (
+    DispatchFreightApprovalListAPI,
+    DispatchFreightApproveAPI,
+    DispatchFreightRejectAPI,
+    TruckFreightAPI,
+    TruckFreightBoardAPI,
+)
+from .views_freight_benchmark import (
+    FreightBenchmarkTableAPI,
+    FreightDestinationCreateAPI,
+    FreightDestinationDetailAPI,
+    FreightSlabCreateAPI,
+    FreightSlabDetailAPI,
+)
 from .views_transporter_account import TransporterAccountAPI
 
 from .views import (
@@ -40,6 +59,60 @@ urlpatterns = [
         "freight-rate/",
         FreightRateAPI.as_view(),
         name="dispatch-freight-rate",
+    ),
+    # What a truckload should cost to each destination, by vehicle size: the
+    # benchmark a vehicle's actual freight is held against.
+    path(
+        "freight-benchmarks/",
+        FreightBenchmarkTableAPI.as_view(),
+        name="dispatch-freight-benchmarks",
+    ),
+    path(
+        "freight-benchmarks/destinations/",
+        FreightDestinationCreateAPI.as_view(),
+        name="dispatch-freight-destination-create",
+    ),
+    path(
+        "freight-benchmarks/destinations/<int:pk>/",
+        FreightDestinationDetailAPI.as_view(),
+        name="dispatch-freight-destination-detail",
+    ),
+    path(
+        "freight-benchmarks/slabs/",
+        FreightSlabCreateAPI.as_view(),
+        name="dispatch-freight-slab-create",
+    ),
+    path(
+        "freight-benchmarks/slabs/<int:pk>/",
+        FreightSlabDetailAPI.as_view(),
+        name="dispatch-freight-slab-detail",
+    ),
+    # Trucks linked at a freight over their benchmark, and the decision on them.
+    # The request is raised by entering the truck's freight at Vehicle Linking.
+    path(
+        "freight-approvals/",
+        DispatchFreightApprovalListAPI.as_view(),
+        name="dispatch-freight-approvals",
+    ),
+    path(
+        "freight-approvals/truck/",
+        TruckFreightAPI.as_view(),
+        name="dispatch-freight-approval-truck",
+    ),
+    path(
+        "freight-approvals/trucks/",
+        TruckFreightBoardAPI.as_view(),
+        name="dispatch-freight-approval-trucks",
+    ),
+    path(
+        "freight-approvals/<int:pk>/approve/",
+        DispatchFreightApproveAPI.as_view(),
+        name="dispatch-freight-approval-approve",
+    ),
+    path(
+        "freight-approvals/<int:pk>/reject/",
+        DispatchFreightRejectAPI.as_view(),
+        name="dispatch-freight-approval-reject",
     ),
     path(
         "transporter-account/",
@@ -130,6 +203,18 @@ urlpatterns = [
         BillSummaryListCreateAPI.as_view(),
         name="bill-summary-list-create",
     ),
+    # A whole truck at once, and the warehouse's decision over a whole truck at
+    # once. Both before the <int:pk> route so neither word is read as a sheet id.
+    path(
+        "bill-summaries/bulk/",
+        BillSummaryBulkSubmitAPI.as_view(),
+        name="bill-summary-bulk-submit",
+    ),
+    path(
+        "bill-summaries/approve/",
+        BillSummaryApproveAPI.as_view(),
+        name="bill-summary-approve",
+    ),
     # Dispatches stamped straight into SAP. Before the <int:pk> route, so
     # "sap" is never read as a sheet id.
     path(
@@ -159,6 +244,21 @@ urlpatterns = [
         "bill-summaries/<int:pk>/",
         BillSummaryDetailAPI.as_view(),
         name="bill-summary-detail",
+    ),
+    path(
+        "bill-summaries/<int:pk>/reject/",
+        BillSummaryRejectAPI.as_view(),
+        name="bill-summary-reject",
+    ),
+    path(
+        "bill-summaries/<int:pk>/resubmit/",
+        BillSummaryResubmitAPI.as_view(),
+        name="bill-summary-resubmit",
+    ),
+    path(
+        "bill-summaries/<int:pk>/printed/",
+        BillSummaryPrintedAPI.as_view(),
+        name="bill-summary-printed",
     ),
     path(
         "bill-summaries/<int:pk>/pick/",

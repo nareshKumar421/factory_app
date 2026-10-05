@@ -35,6 +35,10 @@ from gate_core.services.arrival_gatepass import (
     locked_companies,
     reprint_arrival_gatepass,
 )
+from dispatch_plans.freight_approval_service import (
+    gate_refusal as freight_gate_refusal,
+    truck_plans as truck_freight_plans,
+)
 from gate_core.services.late_dispatch_gate_in import (
     consume_approval,
     is_late_dispatch_gate_in,
@@ -168,6 +172,14 @@ class VehicleArrivalListCreateView(APIView):
                     refusal_payload(vehicle, data["gate_in_date"], company_ids),
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+        # Freight over its benchmark and not yet cleared: refused at this door
+        # too, for the same reason the late check is.
+        freight_refusal = freight_gate_refusal(
+            vehicle, truck_freight_plans(vehicle, company_ids)
+        )
+        if freight_refusal is not None:
+            return Response(freight_refusal, status=status.HTTP_400_BAD_REQUEST)
 
         arrival = create_vehicle_arrival(
             vehicle=vehicle,

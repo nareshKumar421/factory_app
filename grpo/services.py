@@ -2708,6 +2708,12 @@ class GRPOService:
     # transporter's consignment note and only exists once the truck has gone, so
     # a BOOKED plan without one is not broken -- it is waiting. That distinction
     # is the whole point of reporting a stage rather than an error.
+    #
+    # Both come off the plan, and the plan is where vehicle linking now writes
+    # them: the bilty is asked for per consignee when the truck is assigned to
+    # its bills. Nothing here had to change for that -- this queue has always
+    # read the plan -- but it is why a row that used to sit AWAITING_BILTY for
+    # days now usually arrives READY.
     STAGE_READY = "READY"
     STAGE_AWAITING_BILTY = "AWAITING_BILTY"
 

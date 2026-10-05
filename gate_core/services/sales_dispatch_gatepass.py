@@ -746,49 +746,82 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     if not entry.active_items:
         missing.append("document_items")
 
-    # One bilty (LR) is required per distinct customer on the docking, each carrying its
-    # own file + number + date. A customer is keyed by customer_code (falling back to
-    # customer_name). Each BILTY is tagged with the customer it covers; a blank tag is a
-    # legacy/whole-truck bilty whose number/date live on the docking header.
+    # One bilty (LR) is required per distinct customer on the docking, each
+    # carrying its own file + number + date. A customer is keyed by
+    # customer_code (falling back to customer_name).
+    #
+    # It is read off the DISPATCH PLAN, because that is where it is captured
+    # now: the bilty is asked for when the vehicle is linked, which is when the
+    # dispatch desk has the LR in hand, rather than later at the gate. The gate
+    # still refuses without it — that has not changed — it just no longer owns
+    # the collecting.
+    #
+    # Dockings raised before the move are covered by the same read: the old
+    # attachment upload mirrored the number, date and file onto the plan as it
+    # went, so their plans carry it too. Only a document with no plan at all
+    # falls back to the attachment, and that is a bill no vehicle linking ever
+    # touched.
     def _customer_key(code, name):
         return (code or "").strip() or (name or "").strip()
 
-    def _bilty_complete(attachment):
+    def _plan_bilty_complete(plan):
+        return bool(
+            plan
+            and (plan.bilty_no or "").strip()
+            and plan.bilty_date is not None
+            and plan.bilty_attachment
+        )
+
+    def _attachment_bilty_complete(attachment):
         return (
             bool(attachment.file)
             and bool((attachment.bilty_no or "").strip())
             and attachment.bilty_date is not None
         )
 
-    required_customers = []
-    seen_customers = set()
-    for document in entry.active_documents:
-        key = _customer_key(document.customer_code, document.customer_name)
-        if key and key not in seen_customers:
-            seen_customers.add(key)
-            required_customers.append(key)
-
     bilty_attachments = [
         a for a in attachments if a.attachment_type == SalesDispatchAttachmentType.BILTY
     ]
-    covered_customers = {
+    attachment_covered = {
         _customer_key(a.customer_code, a.customer_name)
         for a in bilty_attachments
-        if _bilty_complete(a)
+        if _attachment_bilty_complete(a)
     }
-    covered_customers.discard("")
+    attachment_covered.discard("")
 
-    if len(required_customers) <= 1:
-        # Single (or unknown) customer: one complete bilty satisfies. Back-compat: a
-        # legacy untagged bilty file plus header number/date also counts.
+    # Per customer: every one of its bills has to carry the bilty, so a bill
+    # added to the truck afterwards cannot ride in on its neighbour's LR.
+    documents_by_customer: Dict[str, List] = {}
+    for document in entry.active_documents:
+        key = _customer_key(document.customer_code, document.customer_name)
+        if key:
+            documents_by_customer.setdefault(key, []).append(document)
+
+    def _customer_has_bilty(key, documents) -> bool:
+        planned = [d for d in documents if d.dispatch_plan_id]
+        if planned:
+            return all(_plan_bilty_complete(d.dispatch_plan) for d in planned)
+        # No plan behind any of this customer's bills: nothing was ever linked,
+        # so the attachment is all there is to go on.
+        return key in attachment_covered
+
+    if not documents_by_customer:
+        # A docking with no per-bill documents — its own plan is the whole load.
         legacy_ok = (
             bool(bilty_attachments)
             and bool((entry.bilty_no or "").strip())
             and entry.bilty_date is not None
         )
-        has_bilty_attachment = any(_bilty_complete(a) for a in bilty_attachments) or legacy_ok
+        has_bilty_attachment = (
+            _plan_bilty_complete(entry.dispatch_plan)
+            or any(_attachment_bilty_complete(a) for a in bilty_attachments)
+            or legacy_ok
+        )
     else:
-        has_bilty_attachment = all(c in covered_customers for c in required_customers)
+        has_bilty_attachment = all(
+            _customer_has_bilty(key, documents)
+            for key, documents in documents_by_customer.items()
+        )
     if not has_bilty_attachment:
         missing.append("bilty_attachment")
 

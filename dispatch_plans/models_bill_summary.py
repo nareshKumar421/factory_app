@@ -1,4 +1,4 @@
-"""The bill summary a warehouse manager hands to the floor.
+"""The bill summary the dispatch desk raises and the warehouse approves.
 
 **One summary per bill.** The operator is sent to fetch the goods for a named
 A/R invoice, so the sheet is that invoice: its customer, its lines, and the
@@ -6,11 +6,22 @@ transport details that go with it. An earlier draft of this module grouped a
 whole day's dispatch by warehouse; that is how SAP's saved query happens to be
 written, but it is not how the work is handed out.
 
-The flow it replaces is manual: the details are typed onto the invoice in SAP,
-then a query is printed. Here the user searches the bill number, the app fills in
-everything the dispatch module already knows, the user supplies whatever is
-missing — in practice the bilty, which is raised once the truck is loaded and so
-is not yet known — and the summary is posted to SAP.
+**Two desks, and the paper goes down last.** Dispatch fills the sheet in and
+sends it to the warehouse. The warehouse sets the dispatch date and approves —
+that is the whole of its job, and it is the moment the invoice is stamped in
+SAP. Dispatch then prints the approved sheet, signs it, and walks the physical
+copy down to the godown, which picks against it. A sheet the warehouse will not
+take is sent back with a reason for dispatch to fix and re-send.
+
+Most sheets are never typed one at a time. Linking a vehicle to its bills is the
+moment the dispatch desk knows the load, so that is where the sheets are raised:
+one button submits the whole truck.
+
+The flow all this replaces is manual: the details are typed onto the invoice in
+SAP, then a query is printed. Here the app fills in everything the dispatch
+module already knows, the user supplies whatever is missing — in practice the
+bilty, which is raised once the truck is loaded — and the approved summary is
+posted to SAP.
 
 SAP has a UDF literally labelled "Gate Pass No." (`U_TransporterInvoice`) that
 has never once been filled, so there is no number to reconcile against; ours is
@@ -37,9 +48,29 @@ SAP_SOURCE = "SAP"
 
 
 class BillSummaryStatus(models.TextChoices):
-    GENERATED = "GENERATED", "Generated"
+    """The sheet's progress across two desks and down to the godown.
+
+    Dispatch fills the sheet in and sends it over; the warehouse sets the
+    dispatch date and approves; dispatch prints the approved sheet, signs it and
+    walks the paper down to the godown, which confirms the pick. The dispatch
+    date is the warehouse's to give, which is why the sheet does not carry one
+    before ``APPROVED`` - and why nothing is written to SAP before then either.
+    """
+
+    PENDING_APPROVAL = "PENDING_APPROVAL", "With the warehouse"
+    REJECTED = "REJECTED", "Sent back"
+    APPROVED = "APPROVED", "Approved"
+    PRINTED = "PRINTED", "Printed"
     PICKED = "PICKED", "Picked"
     CANCELLED = "CANCELLED", "Cancelled"
+
+
+#: Still the dispatch desk's to change: the warehouse has either not looked yet
+#: or has handed it back. Both are editable and re-submittable.
+BILL_SUMMARY_EDITABLE = (
+    BillSummaryStatus.PENDING_APPROVAL,
+    BillSummaryStatus.REJECTED,
+)
 
 
 class BillSummarySapStatus(models.TextChoices):
@@ -84,7 +115,12 @@ class BillSummary(models.Model):
 
     # What gets written onto the SAP invoice. Prefilled from the dispatch plan
     # where the app already knows it.
-    dispatch_date = models.DateField(db_index=True)
+    #
+    # The dispatch date is the ONE field the dispatch desk does not fill: the
+    # warehouse gives it when it approves, and it is null until then. Everything
+    # downstream has to cope with that - a sheet with the warehouse is a real
+    # sheet that simply has no date yet.
+    dispatch_date = models.DateField(null=True, blank=True, db_index=True)
     bilty_no = models.CharField(max_length=50, blank=True, default="")
     bilty_date = models.DateField(null=True, blank=True)
     transporter_name = models.CharField(max_length=150, blank=True, default="")
@@ -95,7 +131,7 @@ class BillSummary(models.Model):
     status = models.CharField(
         max_length=20,
         choices=BillSummaryStatus.choices,
-        default=BillSummaryStatus.GENERATED,
+        default=BillSummaryStatus.PENDING_APPROVAL,
         db_index=True,
     )
     sap_status = models.CharField(
@@ -113,6 +149,10 @@ class BillSummary(models.Model):
 
     remarks = models.TextField(blank=True, default="")
     cancel_reason = models.TextField(blank=True, default="")
+    # Why the warehouse handed it back. Kept after a re-submission rather than
+    # cleared: the dispatch desk is reading it while it fixes the sheet, and
+    # "what was wrong last time" is the question asked when it comes back again.
+    reject_reason = models.TextField(blank=True, default="")
 
     issued_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -128,7 +168,40 @@ class BillSummary(models.Model):
         blank=True,
         related_name="bill_summaries_picked",
     )
+    # Who gave the dispatch date. Separate from `issued_by` on purpose: the whole
+    # point of the step is that the desk that fills the sheet is not the desk
+    # that dates it.
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bill_summaries_approved",
+    )
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bill_summaries_rejected",
+    )
+    printed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bill_summaries_printed",
+    )
     issued_at = models.DateTimeField(default=timezone.now)
+    # When it was last sent to the warehouse. Moves on every re-submission, which
+    # is what the approval queue sorts on - a sheet sent back and fixed this
+    # morning should not sit where it was raised last week.
+    submitted_at = models.DateTimeField(default=timezone.now, db_index=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    # The first print, not the last. A reprint is a reprint; the question the
+    # record answers is when the signed copy went down to the godown.
+    printed_at = models.DateTimeField(null=True, blank=True)
     picked_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -139,7 +212,11 @@ class BillSummary(models.Model):
         db_table = "dispatch_bill_summary"
         verbose_name = "bill summary"
         verbose_name_plural = "bill summaries"
-        ordering = ["-dispatch_date", "-id"]
+        # Nulls first, said out loud rather than left to the database: a sheet
+        # waiting on the warehouse has no dispatch date, it is the one somebody
+        # opening this screen has to act on, and which end of the list it lands
+        # on otherwise depends on which database is answering.
+        ordering = [models.F("dispatch_date").desc(nulls_first=True), "-id"]
         indexes = [
             models.Index(fields=["company", "dispatch_date"]),
             models.Index(fields=["company", "status"]),
@@ -147,7 +224,9 @@ class BillSummary(models.Model):
         ]
         constraints = [
             # One live sheet per bill. A cancelled one does not block a re-issue,
-            # which is the whole reason cancelling exists.
+            # which is the whole reason cancelling exists — but a rejected one
+            # does: it is the same sheet, in the dispatch desk's hands to correct
+            # and send back, not a dead one to be raised around.
             models.UniqueConstraint(
                 fields=["company", "sap_invoice_doc_entry"],
                 condition=models.Q(is_active=True) & ~models.Q(status="CANCELLED"),
@@ -157,6 +236,10 @@ class BillSummary(models.Model):
         permissions = [
             ("can_view_bill_summary", "Can view bill summaries"),
             ("can_create_bill_summary", "Can generate a bill summary"),
+            (
+                "can_approve_bill_summary",
+                "Can set the dispatch date and approve a bill summary",
+            ),
             ("can_pick_bill_summary", "Can confirm a bill summary as picked"),
             ("can_cancel_bill_summary", "Can cancel a bill summary"),
         ]
@@ -165,13 +248,18 @@ class BillSummary(models.Model):
         return f"{self.entry_no} (bill {self.sap_invoice_doc_num})"
 
     @classmethod
-    def generate_entry_no(cls, dispatch_date) -> str:
-        """`BS-YYYYMMDD-NNN`, sequential within the dispatch date.
+    def generate_entry_no(cls, raised_on=None) -> str:
+        """`BS-YYYYMMDD-NNN`, sequential within the day the sheet was raised.
 
-        Dated by the DISPATCH date, not today: that is the number the floor will
-        be talking about.
+        It used to be dated by the DISPATCH date, on the reasoning that this is
+        the number the floor would be talking about. That no longer works: the
+        dispatch date is the warehouse's to give at approval, and a sheet needs
+        its number the moment it is raised so the dispatch desk can refer to it
+        while it is still waiting. Numbering by the day it was raised also keeps
+        a number from moving when a sheet is sent back and approved for a
+        different date.
         """
-        stamp = dispatch_date.strftime("%Y%m%d")
+        stamp = (raised_on or timezone.localdate()).strftime("%Y%m%d")
         prefix = f"BS-{stamp}-"
         last = (
             cls.objects.filter(entry_no__startswith=prefix)
@@ -185,6 +273,11 @@ class BillSummary(models.Model):
     @property
     def active_lines(self):
         return self.lines.filter(is_active=True)
+
+    @property
+    def is_editable(self) -> bool:
+        """Still the dispatch desk's to change and re-send."""
+        return self.status in BILL_SUMMARY_EDITABLE
 
     def totals(self) -> dict:
         lines = list(self.active_lines)

@@ -68,16 +68,10 @@ def apply_truck_photo_to_docking(entry, attachment, *, latitude, longitude, user
 def attach_truck_photo_to_docking(entry, *, file, latitude, longitude, notes, user):
     """Create + attach one truck photo to a single docking and lock its load.
 
-    Create the attachment, sync bilty side effects, then apply the shared
-    ``TRUCK_PHOTO`` mirror/transition. The caller owns the load-lock and status
-    guards. Returns the created ``SalesDispatchAttachment``.
+    Create the attachment, then apply the shared ``TRUCK_PHOTO``
+    mirror/transition. The caller owns the load-lock and status guards. Returns
+    the created ``SalesDispatchAttachment``.
     """
-    # Imported lazily: the view module imports services, so a top-level import here
-    # would be circular.
-    from gate_core.views_sales_dispatch import (
-        sync_sales_dispatch_bilty_attachment_to_plans,
-    )
-
     attachment = SalesDispatchAttachment.objects.create(
         sales_dispatch=entry,
         attachment_type=SalesDispatchAttachmentType.TRUCK_PHOTO,
@@ -88,7 +82,6 @@ def attach_truck_photo_to_docking(entry, *, file, latitude, longitude, notes, us
         notes=notes or "",
         uploaded_by=user,
     )
-    sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, user)
     apply_truck_photo_to_docking(entry, attachment, latitude=latitude, longitude=longitude, user=user)
     return attachment
 

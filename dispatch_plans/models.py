@@ -13,6 +13,16 @@ from .models_bill_summary import (  # noqa: F401
     BillSummarySapStatus,
     BillSummaryStatus,
 )
+from .models_freight_benchmark import (  # noqa: F401
+    FreightBenchmark,
+    FreightDestination,
+    FreightRateBasis,
+    FreightSlab,
+)
+from .models_freight_approval import (  # noqa: F401
+    DispatchFreightApproval,
+    FreightApprovalStatus,
+)
 
 
 class DispatchPlanStatus(models.TextChoices):
@@ -121,6 +131,15 @@ class DispatchPlan(BaseModel):
         max_digits=18, decimal_places=3, null=True, blank=True
     )
     remarks = models.TextField(blank=True, default="")
+    # The truck's freight against its benchmark, as of the latest link. Shared by
+    # every bill linked together; see `models_freight_approval`.
+    freight_approval = models.ForeignKey(
+        DispatchFreightApproval,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="plans",
+    )
 
     # Transport details are read through the vehicle / transporter / driver FKs
     # rather than stored (they were a duplicate, editable-override snapshot that was

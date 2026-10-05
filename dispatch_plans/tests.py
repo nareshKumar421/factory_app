@@ -1758,3 +1758,189 @@ class CanPrintInvoiceTests(SimpleTestCase):
         # document — the widening stops at the Plan page's own view permission.
         self.assertFalse(self._allowed(self._user_with("dispatch_plans.can_select_dispatch_bills")))
         self.assertFalse(self._allowed(self._user_with()))
+
+
+class CustomerBiltyAtLinkingTests(TestCase):
+    """The bilty, captured per consignee when the vehicle is linked.
+
+    A bilty (LR) is issued per consignee, not per truck. The rest of the linking
+    payload is shared across every bill on the vehicle, so the bilty cannot ride
+    along with it — a two-customer truck would end up with one customer's LR
+    number printed on the other's gatepass. That is the whole reason this is its
+    own write.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.user = User.objects.create_user(
+            email="linker@example.com",
+            password="testpass123",
+            full_name="Linker",
+            employee_code="LINK001",
+        )
+        self.service = DispatchPlansService(company_code=self.company.code)
+
+    def plan(self, doc_entry, **kwargs):
+        return DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=doc_entry,
+            sap_invoice_doc_num=str(doc_entry),
+            booking_status="BOOKED",
+            created_by=self.user,
+            updated_by=self.user,
+            **kwargs,
+        )
+
+    def upload(self, name="bilty.pdf"):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        return SimpleUploadedFile(name, b"lr-scan", content_type="application/pdf")
+
+    def test_one_customers_bilty_lands_on_every_bill_of_that_customer(self):
+        first, second = self.plan(7001), self.plan(7002)
+
+        self.service.record_customer_bilty(
+            doc_entries=[7001, 7002],
+            bilty_no="NCR-4494",
+            bilty_date=date(2026, 9, 20),
+            attachment=self.upload(),
+            user=self.user,
+        )
+
+        for plan in (first, second):
+            plan.refresh_from_db()
+            self.assertEqual(plan.bilty_no, "NCR-4494")
+            self.assertEqual(plan.bilty_date, date(2026, 9, 20))
+            self.assertTrue(plan.bilty_attachment)
+            self.assertEqual(plan.bilty_attachment_name, "bilty.pdf")
+
+    def test_one_file_across_several_bills_is_stored_whole_on_each(self):
+        """Each plan's FileField saves its own copy off one upload handle. Left
+        unrewound, the second bill stores an empty file — and an empty bilty is
+        what SAP is sent on the service GRPO."""
+        self.plan(7011)
+        self.plan(7012)
+
+        self.service.record_customer_bilty(
+            doc_entries=[7011, 7012],
+            bilty_no="NCR-1",
+            bilty_date=date(2026, 9, 20),
+            attachment=self.upload(),
+            user=self.user,
+        )
+
+        for doc_entry in (7011, 7012):
+            plan = DispatchPlan.objects.get(
+                company=self.company, sap_invoice_doc_entry=doc_entry
+            )
+            plan.bilty_attachment.open("rb")
+            try:
+                self.assertEqual(plan.bilty_attachment.read(), b"lr-scan")
+            finally:
+                plan.bilty_attachment.close()
+
+    def test_two_customers_on_one_truck_keep_their_own_numbers(self):
+        goel, sharma = self.plan(7021), self.plan(7022)
+
+        self.service.record_customer_bilty(
+            doc_entries=[7021], bilty_no="NCR-A", bilty_date=None,
+            attachment=self.upload("a.pdf"), user=self.user,
+        )
+        self.service.record_customer_bilty(
+            doc_entries=[7022], bilty_no="NCR-B", bilty_date=None,
+            attachment=self.upload("b.pdf"), user=self.user,
+        )
+
+        goel.refresh_from_db()
+        sharma.refresh_from_db()
+        self.assertEqual(goel.bilty_no, "NCR-A")
+        self.assertEqual(sharma.bilty_no, "NCR-B")
+
+    def test_the_number_can_be_corrected_without_re_uploading_the_file(self):
+        plan = self.plan(7031)
+        self.service.record_customer_bilty(
+            doc_entries=[7031], bilty_no="NCR-TYPO", bilty_date=None,
+            attachment=self.upload(), user=self.user,
+        )
+        plan.refresh_from_db()
+        stored = plan.bilty_attachment.name
+
+        self.service.record_customer_bilty(
+            doc_entries=[7031], bilty_no="NCR-4494", bilty_date=date(2026, 9, 21),
+            attachment=None, user=self.user,
+        )
+
+        plan.refresh_from_db()
+        self.assertEqual(plan.bilty_no, "NCR-4494")
+        self.assertEqual(plan.bilty_date, date(2026, 9, 21))
+        self.assertEqual(plan.bilty_attachment.name, stored)
+
+    def test_the_file_change_is_recorded_in_the_attachment_trail(self):
+        """The bilty PDF is what SAP receives on the service GRPO, so a swap has
+        to stay reconstructable — the same trail the Service GRPO screen's own
+        replace and delete write to."""
+        from .models import DispatchPlanAttachmentAudit
+
+        self.plan(7041)
+        self.service.record_customer_bilty(
+            doc_entries=[7041], bilty_no="NCR-1", bilty_date=None,
+            attachment=self.upload("first.pdf"), user=self.user,
+        )
+        added = DispatchPlanAttachmentAudit.objects.get()
+        self.assertEqual(added.action, "ADDED")
+        self.assertEqual(added.source, "VEHICLE_LINKING")
+        self.assertEqual(added.new_filename, "first.pdf")
+        self.assertEqual(added.performed_by, self.user)
+
+        self.service.record_customer_bilty(
+            doc_entries=[7041], bilty_no="NCR-1", bilty_date=None,
+            attachment=self.upload("corrected.pdf"), user=self.user,
+        )
+        replaced = DispatchPlanAttachmentAudit.objects.order_by("-id").first()
+        self.assertEqual(replaced.action, "REPLACED")
+        self.assertEqual(replaced.old_filename, "first.pdf")
+        self.assertEqual(replaced.new_filename, "corrected.pdf")
+
+    def test_a_correction_with_no_new_file_writes_no_audit_row(self):
+        from .models import DispatchPlanAttachmentAudit
+
+        self.plan(7051)
+        self.service.record_customer_bilty(
+            doc_entries=[7051], bilty_no="NCR-1", bilty_date=None,
+            attachment=self.upload(), user=self.user,
+        )
+        self.service.record_customer_bilty(
+            doc_entries=[7051], bilty_no="NCR-2", bilty_date=None,
+            attachment=None, user=self.user,
+        )
+        self.assertEqual(DispatchPlanAttachmentAudit.objects.count(), 1)
+
+    def test_a_bill_with_no_plan_is_refused_rather_than_silently_skipped(self):
+        """The link is written first, so a bill with no plan means the link did
+        not land. A bilty recorded against a bill that is on no truck is a number
+        nobody can trace back."""
+        self.plan(7061)
+        with self.assertRaises(ValueError) as caught:
+            self.service.record_customer_bilty(
+                doc_entries=[7061, 7062], bilty_no="NCR-1", bilty_date=None,
+                attachment=self.upload(), user=self.user,
+            )
+        self.assertIn("7062", str(caught.exception))
+        # Nothing was written for the bill that did exist either.
+        plan = DispatchPlan.objects.get(sap_invoice_doc_entry=7061)
+        self.assertEqual(plan.bilty_no, "")
+
+    def test_a_blank_number_is_refused(self):
+        self.plan(7071)
+        with self.assertRaises(ValueError):
+            self.service.record_customer_bilty(
+                doc_entries=[7071], bilty_no="   ", bilty_date=None,
+                attachment=self.upload(), user=self.user,
+            )
+
+    def test_no_bills_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.service.record_customer_bilty(
+                doc_entries=[], bilty_no="NCR-1", bilty_date=None,
+                attachment=None, user=self.user,
+            )

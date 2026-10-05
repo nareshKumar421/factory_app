@@ -74,6 +74,67 @@ service GRPOs** (each GRPO is the freight for one bilty). Statuses:
 base-document references (`base_entry`/`base_line`) used to build the SAP A/P
 service-invoice payload.
 
+### Freight benchmarks — `models_freight_benchmark.py`
+What a truckload **should** cost from the plant to a destination, by vehicle size:
+the benchmark the vehicle-linking freight approval (next step, not built yet)
+holds a truck's actual freight against. The company's own rates, not a
+transporter's quote. Global, not company-scoped: Oil, Mart and Beverages load at
+the same docks.
+- `FreightSlab` — a band of vehicle capacity, **open at the bottom, closed at the
+  top**: "10 MT" is `above_kg=5000 < capacity ≤ up_to_kg=10000`. The workbook has
+  two families: 5/10/15/18/24 MT, and Delhi NCR's kg bands (up to 2,000 …
+  8,001–10,000 kg).
+- `FreightDestination` — state (or `DELHI NCR`), district, name, PIN, km.
+  Unique on `(state, name)`.
+- `FreightBenchmark` — one rate per destination per slab; `PER_TRIP` (flat) or
+  `PER_KG` (Delhi NCR's 5,001–8,000 kg band, e.g. ₹1.20/kg).
+- **Invariant:** a destination may not hold rates on two slabs whose bands
+  overlap, so a vehicle falls in exactly one of its slabs. Checked on both
+  writers in `freight_benchmark_service.py`: saving a destination's rates, and
+  moving a slab's band under destinations that rate its neighbours.
+- **Seeding / refresh:** `manage.py import_freight_benchmarks "<UPDATED TRANSPORT
+  FARE.xlsx>" [--dry-run]` reads only the benchmark columns
+  (`freight_benchmark_import.py` explains how transporter columns and blocks are
+  told apart). The workbook replaces each listed destination's rates; places it
+  does not list are left alone and reported; an existing slab keeps its band.
+  Loaded on dev 2026-09-29: 115 destinations, 239 rates, 11 slabs, 7 places
+  with no benchmark yet.
+
+### Freight approval — `models_freight_approval.py`
+A truck's freight held against its benchmark. At Vehicle Linking the desk picks
+the **destination** (from the benchmark list), the **slab** (suggested from
+`Vehicle.capacity_ton` — the destination's rated slab whose band holds it — and
+editable) and enters the **actual freight**. The page links a truck one company
+at a time, so the freight goes up once per truck afterwards
+(`POST /api/v1/dispatch/freight-approvals/truck/` → `record_truck_freight`),
+which:
+- covers the bills the desk names — the linking sheet sends the bills it is
+  adding (`extend`: plus whatever the truck's freight already covers), the truck
+  card sends the bills it shows — each checked to be BOOKED on this truck and not
+  yet gated in. Never the truck's every booking: `booked_plans_for_vehicle` can
+  hold bills booked onto the truck months ago and never dispatched (on dev,
+  DL01LAC9967 carried seven from May–Sep), and freighting those put ₹8,688 of a
+  ₹9,200 freight on one of them. Bills dropped from a freight come off it with
+  their share cleared, and a truck has one live freight;
+- works the benchmark out (`PER_KG` × the bills' invoice weight, capacity only
+  when they carry none), snapshots rate/capacity/bills onto a
+  `DispatchFreightApproval`, and sets it `WITHIN_BENCHMARK` or `PENDING`;
+- splits the freight over those plans (`split_freight`) on ONE basis for all of
+  them — litres if every bill has litres, else weight, else value, else equally —
+  into `freight`/`total_freight`, via `update()` so no BOOKED notification fires;
+  each plan points at the row (`DispatchPlan.freight_approval`). Not the batch-link
+  allocator: it picks a basis per bill, so a bill with no litres is weighed in
+  rupees against the others' litres.
+
+Re-entering the same vehicle/destination/slab/price keeps the row (bills added
+since are folded in); anything else **supersedes** it. The gate
+(`EmptyVehicleGateInListCreateView` and `VehicleArrivalListCreateView`) refuses a
+DISPATCH gate-in while the truck's row is `PENDING`/`REJECTED`
+(`code: FREIGHT_APPROVAL_REQUIRED`); plans with no row — linked before this
+existed — pass. Admin > Freight Approvals (`/admin/freight-approvals`) decides;
+refusal needs a note. Notifications go to holders of
+`can_approve_freight_approvals` and back to the requester.
+
 ### Cross-app entities this module reads/writes
 - **`EmptyVehicleGateIn` / `EmptyVehicleGateInCover`** (`gate_core`) — the empty-truck arrival; a *cover* is a snapshot of one BOOKED bill taken at gate-in time.
 - **`VehicleArrival`** (`gate_core`) — one **physical truck trip** grouping the per-company gate-ins + dockings (a cross-company truck is ONE arrival, many per-company entities).
@@ -225,6 +286,11 @@ Defined on `DispatchPlan.Meta.permissions` and `TransporterAPInvoicePosting.Meta
 | `can_view_open_bilties` | Open bilties list | `CanViewOpenBiltiesOrPostTransporterAPInvoice` |
 | `can_post_bilty_service_grpo` | Bilty service GRPO queue/preview/post/history/detail (OR'd with `grpo.*`) | `CanViewBiltyServiceGRPO*` |
 | `can_view_transporter_ap_invoice` / `can_post_transporter_ap_invoice` | View / post transporter A/P invoices | `CanViewTransporterAPInvoice`, `CanPostTransporterAPInvoice` |
+| `can_view_freight_benchmarks` | Read the Freight Benchmarks table (manage and `can_link_dispatch_vehicle` also read it — linking picks destinations from it) | `CanViewFreightBenchmarks` |
+| `can_manage_freight_benchmarks` | Add/edit/delete destinations, rates and slabs — kept narrow, since whoever moves a benchmark moves what counts as over it | `CanManageFreightBenchmarks` |
+| `can_view_freight_approvals` / `can_approve_freight_approvals` | Admin > Freight Approvals queue / approve-refuse. Entering a truck's freight rides on `can_link_dispatch_vehicle` | `views_freight_approval.py` |
+
+The two freight-benchmark rights live on `FreightDestination.Meta` (`default_permissions = ()`); `manage.py setup_freight_benchmark_groups` creates **Freight Benchmark Viewer**, **Freight Benchmark Manager** and **Freight Approver** with no members. Their endpoints need no `Company-Code`.
 
 Docking actions use `gate_core.can_*_sales_dispatch_out` (view/create/edit/print/commit/reject/cancel/dispatch/reprint/reports/manage-lock). All views also require `IsAuthenticated` + `HasCompanyContext`. The whole module is gated cross-company by `Company-Code` header membership.
 
@@ -240,6 +306,8 @@ Docking actions use `gate_core.can_*_sales_dispatch_out` (view/create/edit/print
 - `dispatch_plans/hana_reader.py` — `HanaDispatchBillReader` (SAP A/R invoice reads).
 - `dispatch_plans/dashboard_service.py` / `dashboard_views.py` — read-only fulfilment dashboard (Dispatched vs Billed vs Backlog; bill-wise drill-down).
 - `dispatch_plans/serializers.py`, `permissions.py`, `signals.py`, `notifications.py`.
+- `dispatch_plans/models_freight_approval.py`, `freight_approval_service.py`, `views_freight_approval.py` — the freight approval (`/api/v1/dispatch/freight-approvals/…`); the gate check is imported by `gate_core/views.py` and `gate_core/views_arrival.py`.
+- `dispatch_plans/models_freight_benchmark.py`, `freight_benchmark_service.py`, `freight_benchmark_import.py`, `serializers_freight_benchmark.py`, `views_freight_benchmark.py` — the benchmark table (`/api/v1/dispatch/freight-benchmarks/…`); commands `import_freight_benchmarks`, `setup_freight_benchmark_groups`.
 - `dispatch_plans/urls.py` (`/api/v1/dispatch-plans/`) + `dispatch_plans/dispatch_urls.py` (`/api/v1/dispatch/`); mounted in `config/urls.py`.
 - `barcode/services/dispatch_service.py`, `barcode/models.py` (`DispatchSession…`), `barcode/views.py`, `barcode/urls.py` (`/api/v1/barcode/dispatch/…`) — standalone barcode-dispatch subsystem.
 - `gate_core/models/sales_dispatch.py`, `gate_core/services/empty_vehicle_dispatch.py`, `gate_core/services/sales_dispatch_docking.py`, `gate_core/views_sales_dispatch.py` — docking / gate-in / arrival (downstream boundary).
@@ -247,6 +315,8 @@ Docking actions use `gate_core.can_*_sales_dispatch_out` (view/create/edit/print
 
 ### Frontend (key files — see the companion doc)
 - `src/modules/dispatch/module.config.tsx`, `api/dispatch.api.ts`, `api/dispatch.queries.ts`, `pages/*`.
+- Freight Benchmarks (`/dispatch/freight-benchmarks`): `pages/FreightBenchmarksPage.tsx`, `components/freight-benchmarks/*`, `api/freightBenchmark.api.ts`.
+- Freight approval: `components/freight-approval/*` (fields in the linking sheet, the truck card's badge and Freight dialog), `api/freightApproval.api.ts`; Admin page `src/modules/admin/pages/FreightApprovalsPage.tsx` + `FreightApprovalsBadge`.
 - Cross-module screens: `src/modules/dashboards/dispatch-plans/…`, `src/modules/vehicle-management/pages/{DispatchVehicleLinkingPage,InsideVehicleManagerPage}.tsx`, `src/modules/gate/pages/customerSalesFlow/…`, `src/modules/warehouse/grpo/…`.
 
 ---

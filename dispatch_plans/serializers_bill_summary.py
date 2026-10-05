@@ -47,6 +47,10 @@ class BillSummaryListSerializer(serializers.ModelSerializer):
     company_code = serializers.CharField(source="company.code", read_only=True)
     issued_by_name = serializers.SerializerMethodField()
     picked_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+    rejected_by_name = serializers.SerializerMethodField()
+    printed_by_name = serializers.SerializerMethodField()
+    is_editable = serializers.BooleanField(read_only=True)
     totals = serializers.SerializerMethodField()
     source = serializers.SerializerMethodField()
     key = serializers.SerializerMethodField()
@@ -85,10 +89,19 @@ class BillSummaryListSerializer(serializers.ModelSerializer):
             "sap_posted_at",
             "issued_by_name",
             "picked_by_name",
+            "approved_by_name",
+            "rejected_by_name",
+            "printed_by_name",
             "issued_at",
+            "submitted_at",
+            "approved_at",
+            "rejected_at",
+            "printed_at",
             "picked_at",
+            "is_editable",
             "remarks",
             "cancel_reason",
+            "reject_reason",
             "totals",
         ]
 
@@ -103,6 +116,15 @@ class BillSummaryListSerializer(serializers.ModelSerializer):
 
     def get_picked_by_name(self, obj) -> str:
         return _person(obj.picked_by)
+
+    def get_approved_by_name(self, obj) -> str:
+        return _person(obj.approved_by)
+
+    def get_rejected_by_name(self, obj) -> str:
+        return _person(obj.rejected_by)
+
+    def get_printed_by_name(self, obj) -> str:
+        return _person(obj.printed_by)
 
     def get_totals(self, obj) -> dict:
         return obj.totals()
@@ -123,14 +145,18 @@ class BillSummaryGenerateLineSerializer(serializers.Serializer):
 class BillSummaryGenerateSerializer(serializers.Serializer):
     """The form: what the app found, with the user's corrections and additions.
 
-    `bilty_no` is required here rather than optional-with-a-later-nag because SAP
-    will not take the posting without it — see `bill_summary_service`.
+    No `dispatch_date`: that is the warehouse's to give at approval, and a field
+    the dispatch desk could fill would be a field somebody fills.
+
+    `bilty_no` is optional here and required at approval. SAP will not take the
+    posting without one, but the posting does not happen until the warehouse
+    approves, and the truck's LR is often not raised while its load is still
+    being put together — see `bill_summary_service`.
     """
 
     sap_invoice_doc_entry = serializers.IntegerField()
     sap_invoice_doc_num = serializers.CharField(max_length=30, required=False, allow_blank=True)
-    dispatch_date = serializers.DateField()
-    bilty_no = serializers.CharField(max_length=50)
+    bilty_no = serializers.CharField(max_length=50, required=False, allow_blank=True)
     bilty_date = serializers.DateField(required=False, allow_null=True)
     transporter_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
     vehicle_no = serializers.CharField(max_length=30, required=False, allow_blank=True)
@@ -140,6 +166,56 @@ class BillSummaryGenerateSerializer(serializers.Serializer):
     # Only the lines being dispatched short need sending; the rest default to the
     # full billed quantity.
     lines = BillSummaryGenerateLineSerializer(many=True, required=False)
+
+
+class BillSummaryResubmitSerializer(serializers.Serializer):
+    """Corrections to a sheet the warehouse has not approved, on its way back.
+
+    Every field is optional and only what is sent is changed: the screen that
+    posts this is usually fixing the one thing the warehouse asked about, and a
+    serializer that demanded the whole form back would have the frontend
+    re-sending values nobody looked at.
+    """
+
+    bilty_no = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    bilty_date = serializers.DateField(required=False, allow_null=True)
+    transporter_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    vehicle_no = serializers.CharField(max_length=30, required=False, allow_blank=True)
+    driver_name = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    driver_mobile = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+    lines = BillSummaryGenerateLineSerializer(many=True, required=False)
+
+
+class BillSummaryApproveSerializer(serializers.Serializer):
+    """One dispatch date across however many sheets are being approved together.
+
+    `ids` is a list even for a single sheet, so the one-at-a-time button and the
+    whole-truck button post the same request and there is only one path to get
+    an approval wrong in.
+    """
+
+    ids = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False, max_length=200
+    )
+    dispatch_date = serializers.DateField()
+
+
+class BillSummaryRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=500)
+
+
+class BillSummaryBulkSubmitSerializer(serializers.Serializer):
+    """The bills of one truck, as the vehicle-linking screen has just linked them.
+
+    `dry_run` is what the popup asks with: it wants the count before it offers,
+    and the user may well say no.
+    """
+
+    doc_entries = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=False, max_length=200
+    )
+    dry_run = serializers.BooleanField(required=False, default=False)
 
 
 class BillSummaryCancelSerializer(serializers.Serializer):

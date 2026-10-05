@@ -7,6 +7,7 @@ from .views import (
     DispatchBillSelectionAPI,
     DispatchPipelineView,
     DispatchPlanBulkDateAPI,
+    DispatchPlanCustomerBiltyAPI,
     DispatchPlanRemoveAPI,
     DispatchPlanUpdateAPI,
     DispatchScheduleItemsAPI,
@@ -49,6 +50,14 @@ urlpatterns = [
         "bills/plan/bulk-dispatch-date/",
         DispatchPlanBulkDateAPI.as_view(),
         name="dispatch-plan-bulk-date",
+    ),
+    # One consignee's bilty over that consignee's bills on a truck. Written by
+    # the vehicle-linking screen right after the link; not part of the link
+    # payload, which is shared across every bill on the vehicle.
+    path(
+        "bills/plan/bilty/",
+        DispatchPlanCustomerBiltyAPI.as_view(),
+        name="dispatch-plan-customer-bilty",
     ),
     path(
         "bills/<int:doc_entry>/plan/remove/",

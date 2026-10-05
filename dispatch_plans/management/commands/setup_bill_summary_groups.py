@@ -1,9 +1,11 @@
 """Create/update the Bill Summary permission groups.
 
-Issuing and picking are separate roles on purpose. The manager issues the sheet;
-the floor confirms what actually came off it. One person holding both can record
-a pick nobody performed, which is the thing the paper trail existed to prevent —
-so anyone who genuinely needs both gets both, deliberately and visibly.
+Raising, approving and picking are separate roles on purpose, because they are
+three desks. Dispatch raises the sheet; the warehouse gives it a dispatch date,
+which is the moment SAP is written to; the floor confirms what actually came off
+it. One person holding all three can date and pick a dispatch nobody checked,
+which is the thing the paper trail existed to prevent — so anyone who genuinely
+needs more than one gets them deliberately and visibly.
 
     python manage.py setup_bill_summary_groups
     python manage.py setup_bill_summary_groups --list
@@ -16,11 +18,19 @@ from django.contrib.auth.models import Group, Permission
 from django.core.management.base import BaseCommand
 
 BILL_SUMMARY_GROUPS = {
-    # Plans the day and hands the sheet to the floor.
+    # The dispatch desk: fills the sheet in, sends it to the warehouse, and
+    # prints the approved one to sign and walk downstairs.
     "Bill Summary Issuer": [
         "dispatch_plans.can_view_bill_summary",
         "dispatch_plans.can_create_bill_summary",
         "dispatch_plans.can_cancel_bill_summary",
+    ],
+    # The warehouse desk: gives the dispatch date, or hands the sheet back. It
+    # deliberately cannot raise one — that is the other desk's job, and a single
+    # person doing both is the flow this step exists to replace.
+    "Bill Summary Approver": [
+        "dispatch_plans.can_view_bill_summary",
+        "dispatch_plans.can_approve_bill_summary",
     ],
     # The floor: records what was actually picked, which is also what gets
     # written back to SAP as the dispatched quantity.
@@ -35,7 +45,7 @@ BILL_SUMMARY_GROUPS = {
 
 
 class Command(BaseCommand):
-    help = "Create/update the bill-summary groups (Issuer, Picker, Viewer)."
+    help = "Create/update the bill-summary groups (Issuer, Approver, Picker, Viewer)."
 
     def add_arguments(self, parser):
         parser.add_argument(

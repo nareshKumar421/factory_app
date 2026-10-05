@@ -973,6 +973,104 @@ class DispatchPlansService:
             if plan.sap_invoice_doc_entry == primary_sap_invoice_doc_entry
         )
 
+    # ------------------------------------------------------------------
+    # the bilty, per customer, at linking time
+    # ------------------------------------------------------------------
+
+    @transaction.atomic
+    def record_customer_bilty(
+        self,
+        *,
+        doc_entries: Sequence[int],
+        bilty_no: str,
+        bilty_date,
+        attachment=None,
+        user,
+    ) -> List[DispatchPlan]:
+        """Put one customer's bilty onto that customer's bills on a truck.
+
+        A bilty (LR) is issued per consignee, not per truck, so it cannot ride
+        along with the rest of the linking payload — that is shared across every
+        bill on the vehicle, and a two-customer truck would end up with one
+        customer's LR number on the other's bill. It is written here instead,
+        once per customer, against exactly the bills that customer has on the
+        load.
+
+        This is where the bilty is captured now. It used to arrive later, as a
+        file attached to the docking at the gate; the dispatch desk has the LR in
+        hand when it assigns the truck, and everything downstream — the gatepass
+        gate, the Service GRPO queue — already reads it off the plan.
+
+        Separate from ``update_plan`` rather than folded into it because the two
+        answer different questions: that one says what truck the bills are on,
+        this one says what consignment note covers them.
+        """
+        doc_entries = list(dict.fromkeys(int(entry) for entry in doc_entries))
+        if not doc_entries:
+            raise ValueError("No bills to record a bilty against.")
+
+        bilty_no = (bilty_no or "").strip()
+        if not bilty_no:
+            raise ValueError("A bilty number is required.")
+
+        plans = list(
+            DispatchPlan.objects.filter(
+                company=self.company, sap_invoice_doc_entry__in=doc_entries
+            )
+        )
+        found = {plan.sap_invoice_doc_entry for plan in plans}
+        missing = [entry for entry in doc_entries if entry not in found]
+        if missing:
+            # The link is written first, so by the time this runs every bill has
+            # a plan. One that does not means the link did not land, and
+            # recording a bilty against a bill that is on no truck would be a
+            # number nobody can trace back.
+            raise ValueError(
+                f"These bills are not on a dispatch plan yet: {missing}. "
+                "Link the vehicle first."
+            )
+
+        for plan in plans:
+            update_fields = ["bilty_no", "bilty_date", "updated_by", "updated_at"]
+            plan.bilty_no = bilty_no
+            plan.bilty_date = bilty_date
+            old_file = plan.bilty_attachment.name if plan.bilty_attachment else ""
+            old_filename = plan.bilty_attachment_name or old_file
+
+            if attachment is not None:
+                # One uploaded file across several bills: each plan's FileField
+                # saves its own copy, so the handle has to go back to the start
+                # before every write or the second bill stores an empty file.
+                if hasattr(attachment, "seek"):
+                    attachment.seek(0)
+                plan.bilty_attachment = attachment
+                plan.bilty_attachment_name = getattr(attachment, "name", "") or ""
+                update_fields += ["bilty_attachment", "bilty_attachment_name"]
+
+            plan.updated_by = user
+            plan.save(update_fields=list(dict.fromkeys(update_fields)))
+
+            if attachment is not None and plan.bilty_attachment.name != old_file:
+                record_bilty_attachment_audit(
+                    plan,
+                    action=(
+                        DispatchPlanAttachmentAuditAction.REPLACED
+                        if old_file
+                        else DispatchPlanAttachmentAuditAction.ADDED
+                    ),
+                    source=DispatchPlanAttachmentAuditSource.VEHICLE_LINKING,
+                    user=user,
+                    old_file=old_file,
+                    old_filename=old_filename,
+                    new_file=plan.bilty_attachment.name,
+                    new_filename=plan.bilty_attachment_name,
+                )
+
+        logger.info(
+            "Bilty %s recorded on %s bill(s) at vehicle linking", bilty_no, len(plans)
+        )
+        return plans
+
     def _update_single_plan(
         self,
         sap_invoice_doc_entry: int,

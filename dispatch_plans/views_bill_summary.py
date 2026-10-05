@@ -1,14 +1,20 @@
-"""API for the bill summary — the picking sheet handed to the warehouse floor.
+"""API for the bill summary — raised by dispatch, dated by the warehouse.
 
 SAP failures are reported as 502 rather than 400, so the frontend can tell "SAP
 said no" from "you asked for something impossible". That distinction matters more
-here than usual: a refused SAP stamp does not undo a pick, and the screen has to
-say so rather than implying the whole action failed.
+here than usual: a refused SAP stamp does not undo an approval or a pick, and the
+screen has to say so rather than implying the whole action failed.
+
+The batch endpoints — submitting a truck, approving a truck — answer 200 with
+what went through AND what did not, rather than failing the request over one bad
+bill. Eight bills are eight invoices; the one SAP would not take is worth naming,
+not worth making somebody re-do the other seven for.
 """
 
 import logging
 from datetime import date
 
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -24,17 +30,23 @@ from sap_client.exceptions import (
 from .bill_summary_service import BillSummaryError, BillSummaryService
 from .models_bill_summary import BillSummary
 from .permissions import (
+    CanApproveBillSummary,
     CanCancelBillSummary,
     CanCreateBillSummary,
     CanPickBillSummary,
     CanPrintInvoice,
+    CanReconcileBillSummaryWithSap,
     CanViewBillSummary,
 )
 from .serializers_bill_summary import (
+    BillSummaryApproveSerializer,
+    BillSummaryBulkSubmitSerializer,
     BillSummaryCancelSerializer,
     BillSummaryDetailSerializer,
     BillSummaryGenerateSerializer,
     BillSummaryListSerializer,
+    BillSummaryRejectSerializer,
+    BillSummaryResubmitSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,19 +94,31 @@ class BillSummaryListCreateAPI(APIView):
             BillSummary.objects.filter(
                 company__code=request.company.company.code, is_active=True
             )
-            .select_related("company", "issued_by", "picked_by")
+            .select_related(
+                "company", "issued_by", "picked_by",
+                "approved_by", "rejected_by", "printed_by",
+            )
             .prefetch_related("lines")
         )
         for field in ("status", "sap_status", "sap_invoice_doc_num"):
             value = request.query_params.get(field)
             if value:
                 rows = rows.filter(**{field: value})
+        # A sheet still with the warehouse has no dispatch date, so a window on
+        # the dispatch date alone would hide exactly the sheets somebody opening
+        # this screen is looking for. Those fall back to when they were sent.
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
         if date_from:
-            rows = rows.filter(dispatch_date__gte=date_from)
+            rows = rows.filter(
+                Q(dispatch_date__gte=date_from)
+                | Q(dispatch_date__isnull=True, submitted_at__date__gte=date_from)
+            )
         if date_to:
-            rows = rows.filter(dispatch_date__lte=date_to)
+            rows = rows.filter(
+                Q(dispatch_date__lte=date_to)
+                | Q(dispatch_date__isnull=True, submitted_at__date__lte=date_to)
+            )
         return Response(BillSummaryListSerializer(rows, many=True).data)
 
     def post(self, request):
@@ -114,6 +138,113 @@ class BillSummaryListCreateAPI(APIView):
         return Response(
             BillSummaryDetailSerializer(summary).data, status=status.HTTP_201_CREATED
         )
+
+
+class BillSummaryBulkSubmitAPI(APIView):
+    """Raise a sheet for each of a truck's bills and send the lot to the warehouse.
+
+    What the popup behind vehicle linking posts. With `dry_run` it answers "how
+    many would this be?" without writing anything, which is the question the
+    popup has to answer before it can ask its own.
+
+    One company per call: each bill's plan lives in its own company, and the
+    linking screen already links company by company for the same reason.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBillSummary]
+
+    def post(self, request):
+        serializer = BillSummaryBulkSubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            result = _service(request).submit_bills(
+                data["doc_entries"], dry_run=data["dry_run"]
+            )
+        except BillSummaryError as exc:
+            return _bad(exc)
+        except (SAPConnectionError, SAPDataError, SAPValidationError) as exc:
+            return _sap_down(exc)
+        return Response(
+            {
+                "dry_run": result["dry_run"],
+                "eligible": result["eligible"],
+                "skipped": result["skipped"],
+                "created": BillSummaryListSerializer(
+                    result["created"], many=True
+                ).data,
+            },
+            status=status.HTTP_200_OK if result["dry_run"] else status.HTTP_201_CREATED,
+        )
+
+
+class BillSummaryApproveAPI(APIView):
+    """The warehouse's decision: one dispatch date over one or many sheets.
+
+    This is the call that writes to SAP. A sheet SAP then refuses stays approved
+    with the refusal recorded on it — the warehouse's decision stands, and the
+    posting is retried from the sheet.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveBillSummary]
+
+    def post(self, request):
+        serializer = BillSummaryApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            approved, refused = _service(request).approve(
+                data["ids"], data["dispatch_date"]
+            )
+        except BillSummaryError as exc:
+            return _bad(exc)
+        return Response({
+            "approved": BillSummaryListSerializer(approved, many=True).data,
+            "refused": refused,
+        })
+
+
+class BillSummaryRejectAPI(APIView):
+    """Send a sheet back to the dispatch desk with what is wrong with it."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanApproveBillSummary]
+
+    def post(self, request, pk):
+        serializer = BillSummaryRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            summary = _service(request).reject(pk, serializer.validated_data["reason"])
+        except BillSummaryError as exc:
+            return _bad(exc)
+        return Response(BillSummaryDetailSerializer(summary).data)
+
+
+class BillSummaryResubmitAPI(APIView):
+    """Correct a sheet the warehouse has not approved and send it again."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBillSummary]
+
+    def post(self, request, pk):
+        serializer = BillSummaryResubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            summary = _service(request).resubmit(pk, serializer.validated_data)
+        except BillSummaryError as exc:
+            return _bad(exc)
+        return Response(BillSummaryDetailSerializer(summary).data)
+
+
+class BillSummaryPrintedAPI(APIView):
+    """The approved sheet has been printed for signing and walking downstairs."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBillSummary]
+
+    def post(self, request, pk):
+        try:
+            summary = _service(request).mark_printed(pk)
+        except BillSummaryError as exc:
+            return _bad(exc)
+        return Response(BillSummaryDetailSerializer(summary).data)
 
 
 class BillSummarySapListAPI(APIView):
@@ -198,7 +329,10 @@ class BillSummaryDetailAPI(APIView):
             BillSummary.objects.filter(
                 pk=pk, company__code=request.company.company.code, is_active=True
             )
-            .select_related("company", "issued_by", "picked_by")
+            .select_related(
+                "company", "issued_by", "picked_by",
+                "approved_by", "rejected_by", "printed_by",
+            )
             .first()
         )
         if summary is None:
@@ -249,9 +383,15 @@ class BillSummaryPickAPI(APIView):
 
 
 class BillSummaryStampAPI(APIView):
-    """Retry the SAP posting for a sheet whose posting failed."""
+    """Retry the SAP posting for a sheet whose posting failed.
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateBillSummary]
+    Open to the warehouse as well as dispatch: approving is what sent the
+    posting, so the desk that approved is often the one looking at the refusal.
+    """
+
+    permission_classes = [
+        IsAuthenticated, HasCompanyContext, CanReconcileBillSummaryWithSap,
+    ]
 
     def post(self, request, pk):
         try:
