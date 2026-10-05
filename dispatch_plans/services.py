@@ -996,10 +996,13 @@ class DispatchPlansService:
         once per customer, against exactly the bills that customer has on the
         load.
 
-        This is where the bilty is captured now. It used to arrive later, as a
-        file attached to the docking at the gate; the dispatch desk has the LR in
-        hand when it assigns the truck, and everything downstream — the gatepass
-        gate, the Service GRPO queue — already reads it off the plan.
+        This is where the bilty NUMBER and DATE are captured: the dispatch desk
+        has them when it assigns the truck, and they are read-only on the docking
+        afterwards. The scanned file still comes from the docking, uploaded after
+        the load is scanned, and is copied onto these same plans there -- so
+        everything downstream (the gatepass gate, the Service GRPO queue) reads
+        all three off the plan. ``attachment`` is kept for a caller that has the
+        file in hand; Vehicle Linking does not send one.
 
         Separate from ``update_plan`` rather than folded into it because the two
         answer different questions: that one says what truck the bills are on,
@@ -1012,6 +1015,8 @@ class DispatchPlansService:
         bilty_no = (bilty_no or "").strip()
         if not bilty_no:
             raise ValueError("A bilty number is required.")
+        if not bilty_date:
+            raise ValueError("A bilty date is required.")
 
         plans = list(
             DispatchPlan.objects.filter(

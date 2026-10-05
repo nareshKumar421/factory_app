@@ -750,17 +750,14 @@ def get_gatepass_readiness(entry: SalesDispatchGateOut) -> Dict:
     # carrying its own file + number + date. A customer is keyed by
     # customer_code (falling back to customer_name).
     #
-    # It is read off the DISPATCH PLAN, because that is where it is captured
-    # now: the bilty is asked for when the vehicle is linked, which is when the
-    # dispatch desk has the LR in hand, rather than later at the gate. The gate
-    # still refuses without it — that has not changed — it just no longer owns
-    # the collecting.
+    # It is read off the DISPATCH PLAN, which is where all three end up: the
+    # number and date are entered at Vehicle Linking, and the file is uploaded
+    # on the docking after scanning, which copies it onto that customer's plans.
     #
-    # Dockings raised before the move are covered by the same read: the old
-    # attachment upload mirrored the number, date and file onto the plan as it
-    # went, so their plans carry it too. Only a document with no plan at all
-    # falls back to the attachment, and that is a bill no vehicle linking ever
-    # touched.
+    # Older dockings are covered by the same read: their attachment upload
+    # mirrored the number, date and file onto the plan as it went. Only a
+    # document with no plan at all falls back to the attachment, and that is a
+    # bill no vehicle linking ever touched.
     def _customer_key(code, name):
         return (code or "").strip() or (name or "").strip()
 

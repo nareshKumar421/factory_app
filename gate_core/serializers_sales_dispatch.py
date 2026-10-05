@@ -118,6 +118,13 @@ class SalesDispatchGateOutItemSerializer(serializers.ModelSerializer):
 
 class SalesDispatchGateOutDocumentSerializer(serializers.ModelSerializer):
     items = SalesDispatchGateOutItemSerializer(many=True, read_only=True, source="active_items")
+    # The bilty as the bill's plan holds it. The number and date come from
+    # Vehicle Linking and are read-only on the docking; the file comes from the
+    # docking's own upload. The attachments page shows the first and asks for
+    # the second off these.
+    plan_bilty_no = serializers.SerializerMethodField()
+    plan_bilty_date = serializers.SerializerMethodField()
+    plan_bilty_attachment_name = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesDispatchGateOutDocument
@@ -151,10 +158,27 @@ class SalesDispatchGateOutDocumentSerializer(serializers.ModelSerializer):
             "total_loose",
             "total_weight",
             "items",
+            "plan_bilty_no",
+            "plan_bilty_date",
+            "plan_bilty_attachment_name",
             "created_at",
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_plan_bilty_no(self, obj):
+        plan = obj.dispatch_plan
+        return (plan.bilty_no or "") if plan else ""
+
+    def get_plan_bilty_date(self, obj):
+        plan = obj.dispatch_plan
+        return plan.bilty_date.isoformat() if plan and plan.bilty_date else None
+
+    def get_plan_bilty_attachment_name(self, obj):
+        plan = obj.dispatch_plan
+        if not plan or not plan.bilty_attachment:
+            return ""
+        return plan.bilty_attachment_name or plan.bilty_attachment.name
 
 
 class SalesDispatchAttachmentSerializer(serializers.ModelSerializer):
@@ -659,6 +683,9 @@ class SalesDispatchGateOutDocumentListSerializer(SalesDispatchGateOutDocumentSer
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields.pop("items", None)
+        # One plan read per document; the table never shows the bilty.
+        for name in ("plan_bilty_no", "plan_bilty_date", "plan_bilty_attachment_name"):
+            self.fields.pop(name, None)
 
 
 class SalesDispatchGateOutListSerializer(SalesDispatchGateOutSerializer):
@@ -837,8 +864,9 @@ class SalesDispatchAttachmentUploadSerializer(serializers.Serializer):
         default=SalesDispatchAttachmentType.OTHER,
     )
     file = serializers.FileField()
-    # BILTY (LR) is issued per consignee: tag the file with the customer it covers and
-    # that LR's own number + date.
+    # BILTY (LR) is issued per consignee: tag the file with the customer it covers. The
+    # number + date are only read when that customer's plans have none -- they are
+    # entered at Vehicle Linking and read-only on the docking.
     customer_code = serializers.CharField(required=False, allow_blank=True, default="")
     customer_name = serializers.CharField(required=False, allow_blank=True, default="")
     bilty_no = serializers.CharField(required=False, allow_blank=True, default="")

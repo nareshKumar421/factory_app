@@ -1,9 +1,9 @@
 """The gatepass reads its bilty off the dispatch plan, not off the docking.
 
-A bilty (LR) is issued per consignee and is captured when the vehicle is linked
-— the dispatch desk has it in hand at that point, rather than the gate collecting
-it later. The gate still refuses to let a load out without one; it just no longer
-owns the collecting.
+A bilty (LR) is issued per consignee. Its number and date are entered when the
+vehicle is linked and are read-only on the docking; its file is uploaded on the
+docking after scanning, which copies it onto that customer's plans. The gate
+refuses to let a load out until the plan holds all three.
 
 What these pin is the boundary: every customer on the docking needs its own
 complete bilty on its own plan, the printed gatepass carries that customer's
@@ -14,8 +14,10 @@ bilty only ever lived on a docking attachment — is not suddenly blocked.
 from datetime import date
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
+from rest_framework.test import APIClient
 
 from company.models import Company, UserCompany, UserRole
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
@@ -33,7 +35,7 @@ from gate_core.services.sales_dispatch_gatepass_pdf import bilty_for_customer
 from vehicle_management.models import Transporter, Vehicle
 
 
-class BiltyReadFromThePlanTests(TestCase):
+class _DockingFixture:
     def setUp(self):
         self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL_B")
         role = UserRole.objects.create(name="Dock")
@@ -101,6 +103,8 @@ class BiltyReadFromThePlanTests(TestCase):
         ).get(id=self.entry.id)
         return get_gatepass_readiness(entry)
 
+
+class BiltyReadFromThePlanTests(_DockingFixture, TestCase):
     # ----- the gate -------------------------------------------------------
 
     def test_a_complete_plan_bilty_satisfies_the_gate(self):
@@ -205,3 +209,113 @@ class BiltyReadFromThePlanTests(TestCase):
             "documents__dispatch_plan", "attachments"
         ).get(id=self.entry.id)
         self.assertEqual(bilty_for_customer(entry, "C1")[0], "NCR-NEW")
+
+
+class BiltyFileUploadedAtTheDockingTests(_DockingFixture, TestCase):
+    """The docking takes the bilty's file; Vehicle Linking owns its number."""
+
+    def setUp(self):
+        super().setUp()
+        self.user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="gate_core",
+                codename="can_upload_sales_dispatch_photo",
+            )
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def _upload(self, customer_code, customer_name, **fields):
+        return self.client.post(
+            f"/api/v1/gate-core/sales-dispatch/{self.entry.id}/attachments/",
+            {
+                "attachment_type": SalesDispatchAttachmentType.BILTY,
+                "file": SimpleUploadedFile("lr.pdf", b"scan", content_type="application/pdf"),
+                "customer_code": customer_code,
+                "customer_name": customer_name,
+                **fields,
+            },
+            format="multipart",
+            HTTP_COMPANY_CODE=self.company.code,
+        )
+
+    def test_the_file_lands_on_the_plan_and_the_linked_number_stands(self):
+        plan = self._plan(90001, bilty_no="NCR-4494", bilty_date=date(2026, 9, 20))
+        self._document("90001", customer_code="C1", customer_name="Goel", plan=plan)
+
+        # A number typed here is ignored: the one entered at linking stands.
+        response = self._upload("C1", "Goel", bilty_no="TYPED-HERE")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        plan.refresh_from_db()
+        self.assertEqual(plan.bilty_no, "NCR-4494")
+        self.assertTrue(plan.bilty_attachment)
+        self.assertEqual(response.data["bilty_no"], "NCR-4494")
+        self.assertNotIn("bilty_attachment", self._readiness()["missing"])
+
+    def test_a_truck_linked_before_the_number_was_asked_takes_it_here(self):
+        plan = self._plan(90001)
+        self._document("90001", customer_code="C1", customer_name="Goel", plan=plan)
+
+        response = self._upload("C1", "Goel", bilty_no="OLD-77", bilty_date="2026-10-04")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        plan.refresh_from_db()
+        self.assertEqual(plan.bilty_no, "OLD-77")
+        self.assertEqual(plan.bilty_date, date(2026, 10, 4))
+        self.assertTrue(plan.bilty_attachment)
+        self.assertNotIn("bilty_attachment", self._readiness()["missing"])
+
+    def test_with_no_number_anywhere_the_upload_is_refused(self):
+        plan = self._plan(90001)
+        self._document("90001", customer_code="C1", customer_name="Goel", plan=plan)
+
+        response = self._upload("C1", "Goel")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("bilty number and date", response.data["detail"])
+        plan.refresh_from_db()
+        self.assertFalse(plan.bilty_attachment)
+        self.assertFalse(SalesDispatchAttachment.objects.exists())
+
+    def test_one_customers_file_stays_off_the_other_customers_plans(self):
+        goel = self._plan(90001, bilty_no="NCR-A", bilty_date=date(2026, 9, 20))
+        sharma = self._plan(90002, bilty_no="NCR-B", bilty_date=date(2026, 9, 20))
+        self._document("90001", customer_code="C1", customer_name="Goel", plan=goel)
+        self._document("90002", customer_code="C2", customer_name="Sharma", plan=sharma)
+
+        self.assertEqual(self._upload("C1", "Goel").status_code, 201)
+
+        goel.refresh_from_db()
+        sharma.refresh_from_db()
+        self.assertTrue(goel.bilty_attachment)
+        self.assertFalse(sharma.bilty_attachment)
+        self.assertIn("bilty_attachment", self._readiness()["missing"])
+
+    def test_a_customer_with_no_plan_never_borrows_a_neighbours(self):
+        """An unlinked bill's bilty stays on the docking; it must not land on
+        the plan of another customer riding the same truck."""
+        goel = self._plan(90001, bilty_no="NCR-A", bilty_date=date(2026, 9, 20))
+        self._document("90001", customer_code="C1", customer_name="Goel", plan=goel)
+        self._document("90002", customer_code="C2", customer_name="Sharma", plan=None)
+
+        response = self._upload("C2", "Sharma", bilty_no="LOOSE-1", bilty_date="2026-10-04")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        goel.refresh_from_db()
+        self.assertFalse(goel.bilty_attachment)
+        self.assertEqual(goel.bilty_no, "NCR-A")
+
+    def test_a_second_upload_replaces_the_customers_first(self):
+        plan = self._plan(90001, bilty_no="NCR-4494", bilty_date=date(2026, 9, 20))
+        self._document("90001", customer_code="C1", customer_name="Goel", plan=plan)
+
+        self._upload("C1", "Goel")
+        self._upload("C1", "Goel")
+
+        self.assertEqual(
+            SalesDispatchAttachment.objects.filter(
+                attachment_type=SalesDispatchAttachmentType.BILTY
+            ).count(),
+            1,
+        )

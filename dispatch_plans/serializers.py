@@ -606,8 +606,9 @@ class DispatchPlanUpdateSerializer(serializers.Serializer):
 class CustomerBiltySerializer(serializers.Serializer):
     """One consignee's bilty, against that consignee's bills on a truck.
 
-    The file is optional on a re-save: a correction to the number or the date
-    should not make somebody re-upload the LR they already sent.
+    Vehicle Linking sends the number and date; the scanned file is uploaded at
+    the docking once the load is scanned. The date is required by the service
+    rather than here, so its refusal reads like the number's.
     """
 
     doc_entries = CommaSeparatedIntegerListField(

@@ -1843,11 +1843,11 @@ class CustomerBiltyAtLinkingTests(TestCase):
         goel, sharma = self.plan(7021), self.plan(7022)
 
         self.service.record_customer_bilty(
-            doc_entries=[7021], bilty_no="NCR-A", bilty_date=None,
+            doc_entries=[7021], bilty_no="NCR-A", bilty_date=date(2026, 9, 20),
             attachment=self.upload("a.pdf"), user=self.user,
         )
         self.service.record_customer_bilty(
-            doc_entries=[7022], bilty_no="NCR-B", bilty_date=None,
+            doc_entries=[7022], bilty_no="NCR-B", bilty_date=date(2026, 9, 20),
             attachment=self.upload("b.pdf"), user=self.user,
         )
 
@@ -1859,7 +1859,7 @@ class CustomerBiltyAtLinkingTests(TestCase):
     def test_the_number_can_be_corrected_without_re_uploading_the_file(self):
         plan = self.plan(7031)
         self.service.record_customer_bilty(
-            doc_entries=[7031], bilty_no="NCR-TYPO", bilty_date=None,
+            doc_entries=[7031], bilty_no="NCR-TYPO", bilty_date=date(2026, 9, 20),
             attachment=self.upload(), user=self.user,
         )
         plan.refresh_from_db()
@@ -1883,7 +1883,7 @@ class CustomerBiltyAtLinkingTests(TestCase):
 
         self.plan(7041)
         self.service.record_customer_bilty(
-            doc_entries=[7041], bilty_no="NCR-1", bilty_date=None,
+            doc_entries=[7041], bilty_no="NCR-1", bilty_date=date(2026, 9, 20),
             attachment=self.upload("first.pdf"), user=self.user,
         )
         added = DispatchPlanAttachmentAudit.objects.get()
@@ -1893,7 +1893,7 @@ class CustomerBiltyAtLinkingTests(TestCase):
         self.assertEqual(added.performed_by, self.user)
 
         self.service.record_customer_bilty(
-            doc_entries=[7041], bilty_no="NCR-1", bilty_date=None,
+            doc_entries=[7041], bilty_no="NCR-1", bilty_date=date(2026, 9, 20),
             attachment=self.upload("corrected.pdf"), user=self.user,
         )
         replaced = DispatchPlanAttachmentAudit.objects.order_by("-id").first()
@@ -1906,11 +1906,11 @@ class CustomerBiltyAtLinkingTests(TestCase):
 
         self.plan(7051)
         self.service.record_customer_bilty(
-            doc_entries=[7051], bilty_no="NCR-1", bilty_date=None,
+            doc_entries=[7051], bilty_no="NCR-1", bilty_date=date(2026, 9, 20),
             attachment=self.upload(), user=self.user,
         )
         self.service.record_customer_bilty(
-            doc_entries=[7051], bilty_no="NCR-2", bilty_date=None,
+            doc_entries=[7051], bilty_no="NCR-2", bilty_date=date(2026, 9, 20),
             attachment=None, user=self.user,
         )
         self.assertEqual(DispatchPlanAttachmentAudit.objects.count(), 1)
@@ -1922,7 +1922,7 @@ class CustomerBiltyAtLinkingTests(TestCase):
         self.plan(7061)
         with self.assertRaises(ValueError) as caught:
             self.service.record_customer_bilty(
-                doc_entries=[7061, 7062], bilty_no="NCR-1", bilty_date=None,
+                doc_entries=[7061, 7062], bilty_no="NCR-1", bilty_date=date(2026, 9, 20),
                 attachment=self.upload(), user=self.user,
             )
         self.assertIn("7062", str(caught.exception))
@@ -1934,13 +1934,24 @@ class CustomerBiltyAtLinkingTests(TestCase):
         self.plan(7071)
         with self.assertRaises(ValueError):
             self.service.record_customer_bilty(
-                doc_entries=[7071], bilty_no="   ", bilty_date=None,
+                doc_entries=[7071], bilty_no="   ", bilty_date=date(2026, 9, 20),
                 attachment=self.upload(), user=self.user,
             )
+
+    def test_a_missing_date_is_refused(self):
+        """Vehicle Linking asks for the number AND the date: the docking shows
+        both read-only and only takes the file."""
+        self.plan(7081)
+        with self.assertRaises(ValueError) as caught:
+            self.service.record_customer_bilty(
+                doc_entries=[7081], bilty_no="NCR-1", bilty_date=None,
+                attachment=None, user=self.user,
+            )
+        self.assertIn("date", str(caught.exception))
 
     def test_no_bills_is_refused(self):
         with self.assertRaises(ValueError):
             self.service.record_customer_bilty(
-                doc_entries=[], bilty_no="NCR-1", bilty_date=None,
+                doc_entries=[], bilty_no="NCR-1", bilty_date=date(2026, 9, 20),
                 attachment=None, user=self.user,
             )

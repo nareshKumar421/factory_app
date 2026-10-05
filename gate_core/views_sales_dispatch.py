@@ -753,6 +753,110 @@ def positive_decimal(value):
     return decimal_value if decimal_value > 0 else None
 
 
+def bilty_customer_plans(entry, customer_code):
+    """The plans one customer's bilty belongs on, within this docking.
+
+    A bilty (LR) is issued per consignee, so a customer-tagged file goes only to
+    that customer's plans. The customer->plan link lives on the docking's
+    DOCUMENTS (document.dispatch_plan + document.customer_code); the plan's own
+    customer_code is not reliably populated. A blank tag is a whole-truck bilty
+    and goes to every plan on the docking. A tag with no plan behind it goes to
+    none -- never to a neighbour's plans, whose file it is not.
+    """
+    plans = get_sales_dispatch_dispatch_plans(entry)
+    customer_code = (customer_code or "").strip()
+    if not customer_code:
+        return plans
+    wanted = {
+        document.dispatch_plan_id
+        for document in entry.documents.all()
+        if document.is_active
+        and document.dispatch_plan_id
+        and (document.customer_code or "").strip() == customer_code
+    }
+    return [plan for plan in plans if plan.id in wanted]
+
+
+def sync_sales_dispatch_bilty_attachment_to_plans(entry, attachment, plans, user):
+    """Put a docking's bilty file on the plans of the customer it covers.
+
+    The file is the docking's: the LR is scanned there, after loading. The
+    number and date are the dispatch desk's, entered at Vehicle Linking and
+    read-only here, so a plan that already holds them keeps them. Only a plan
+    with none -- a truck linked before Vehicle Linking asked for the number --
+    takes them from the upload.
+    """
+    # Local import: dispatch_plans imports gate_core models at module load.
+    from dispatch_plans.services import record_bilty_attachment_audit
+
+    for plan in plans:
+        old_file = plan.bilty_attachment.name if plan.bilty_attachment else ""
+        old_filename = plan.bilty_attachment_name or old_file
+        plan.bilty_attachment = attachment.file
+        plan.bilty_attachment_name = attachment.original_filename or attachment.file.name
+        update_fields = ["bilty_attachment", "bilty_attachment_name", "updated_by", "updated_at"]
+        if not (plan.bilty_no or "").strip() and (attachment.bilty_no or "").strip():
+            plan.bilty_no = attachment.bilty_no
+            update_fields.append("bilty_no")
+        if plan.bilty_date is None and attachment.bilty_date:
+            plan.bilty_date = attachment.bilty_date
+            update_fields.append("bilty_date")
+        plan.updated_by = user
+        plan.save(update_fields=update_fields)
+        # The Service GRPO screen answers "who put THIS file here?" from the
+        # same trail its own replace/delete writes to, so a docking upload
+        # records itself too.
+        if plan.bilty_attachment.name != old_file:
+            record_bilty_attachment_audit(
+                plan,
+                action="REPLACED" if old_file else "ADDED",
+                source="VEHICLE_LINKING",
+                user=user,
+                old_file=old_file,
+                old_filename=old_filename,
+                new_file=plan.bilty_attachment.name,
+                new_filename=plan.bilty_attachment_name,
+            )
+
+
+def sync_sales_dispatch_header_bilty(entry, user):
+    """Keep the docking's header bilty_no/date pointing at a real per-customer bilty.
+
+    Per-customer bilties own the number + date; the header field is retained only
+    for single-value consumers (the scan report, the SAP-less fallback gatepass).
+    Prefer the primary customer's bilty, else the most recent one that carries a number.
+    """
+    bilties = list(
+        SalesDispatchAttachment.objects.filter(
+            sales_dispatch=entry,
+            attachment_type=SalesDispatchAttachmentType.BILTY,
+        ).order_by("-uploaded_at", "-id")
+    )
+    header_customer = (entry.customer_code or "").strip()
+    primary = next(
+        (
+            a
+            for a in bilties
+            if (a.bilty_no or "").strip()
+            and (a.customer_code or "").strip() == header_customer
+        ),
+        None,
+    )
+    chosen = primary or next((a for a in bilties if (a.bilty_no or "").strip()), None)
+    if chosen is None:
+        return
+    changed = False
+    if (entry.bilty_no or "") != (chosen.bilty_no or ""):
+        entry.bilty_no = chosen.bilty_no or ""
+        changed = True
+    if entry.bilty_date != chosen.bilty_date:
+        entry.bilty_date = chosen.bilty_date
+        changed = True
+    if changed:
+        entry.updated_by = user
+        entry.save(update_fields=["bilty_no", "bilty_date", "updated_by", "updated_at"])
+
+
 def print_request_context(request):
     return {
         "ip_address": request.META.get("REMOTE_ADDR") or None,
@@ -2304,30 +2408,56 @@ class SalesDispatchAttachmentListCreateView(APIView):
                 )
 
         attachment_type = data["attachment_type"]
-
-        # The bilty is no longer collected here. It is asked for when the vehicle
-        # is linked — the dispatch desk has the LR in hand at that point, and the
-        # gatepass and the Service GRPO both read it off the dispatch plan. The
-        # old rows stay readable; only new uploads are refused, and they are
-        # refused rather than quietly written somewhere else so that whoever is
-        # still doing it here learns where it moved to.
-        if attachment_type == SalesDispatchAttachmentType.BILTY:
-            return Response(
-                {
-                    "detail": (
-                        "The bilty is captured when the vehicle is linked, not on "
-                        "the docking. Add it on the Vehicle Linking screen and it "
-                        "will appear on the gatepass."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         customer_code = data.get("customer_code", "") or ""
         customer_name = data.get("customer_name", "") or ""
         bilty_no = (data.get("bilty_no", "") or "").strip()
         bilty_date = data.get("bilty_date")
         existing = None
+
+        # The bilty's FILE is uploaded here, per consignee, once the load is
+        # scanned. Its number and date are entered at Vehicle Linking and are
+        # read-only here: whatever the customer's plans already hold wins over
+        # the request. A plan without them -- a truck linked before Vehicle
+        # Linking asked -- needs them from this upload instead.
+        bilty_plans = []
+        if attachment_type == SalesDispatchAttachmentType.BILTY:
+            bilty_plans = bilty_customer_plans(entry, customer_code)
+            linked = next(
+                (plan for plan in bilty_plans if (plan.bilty_no or "").strip()), None
+            )
+            if linked is not None:
+                bilty_no = linked.bilty_no.strip()
+                bilty_date = linked.bilty_date or bilty_date
+            needs_no = not bilty_no and (
+                not bilty_plans
+                or any(not (plan.bilty_no or "").strip() for plan in bilty_plans)
+            )
+            needs_date = bilty_date is None and (
+                not bilty_plans or any(plan.bilty_date is None for plan in bilty_plans)
+            )
+            if needs_no or needs_date:
+                who = customer_name or customer_code or "this customer"
+                return Response(
+                    {
+                        "detail": (
+                            f"Enter the bilty number and date for {who} with the file: "
+                            "its bills were linked before Vehicle Linking asked for them."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # One bilty per customer: re-uploading a customer's bilty replaces that
+            # customer's existing one (matched on the customer tag) instead of
+            # stacking duplicates.
+            existing = (
+                SalesDispatchAttachment.objects.filter(
+                    sales_dispatch=entry,
+                    attachment_type=SalesDispatchAttachmentType.BILTY,
+                    customer_code=customer_code,
+                )
+                .order_by("-uploaded_at", "-id")
+                .first()
+            )
 
         if existing is not None:
             existing.customer_name = customer_name or existing.customer_name
@@ -2354,6 +2484,12 @@ class SalesDispatchAttachmentListCreateView(APIView):
                 notes=data.get("notes", ""),
                 uploaded_by=request.user,
             )
+        if attachment_type == SalesDispatchAttachmentType.BILTY:
+            sync_sales_dispatch_bilty_attachment_to_plans(
+                entry, attachment, bilty_plans, request.user
+            )
+            sync_sales_dispatch_header_bilty(entry, request.user)
+
         if data["attachment_type"] == SalesDispatchAttachmentType.TRUCK_PHOTO:
             from gate_core.services.arrival_scan import apply_truck_photo_to_docking
 
@@ -2372,12 +2508,12 @@ class SalesDispatchAttachmentListCreateView(APIView):
 
 
 class SalesDispatchAttachmentDetailView(APIView):
-    """Kept only to say where the bilty went.
+    """Kept only to say where the bilty number went.
 
-    Its one job was editing a bilty attachment's number and date in place. The
-    bilty is collected at vehicle linking now, so there is nothing here to edit
-    — and a client still pointed at this route should be told that rather than
-    get a 404 it will read as a bug.
+    Its one job was editing a bilty attachment's number and date in place. Those
+    are entered at Vehicle Linking now and are read-only on the docking, which
+    keeps only the file -- and a client still pointed at this route should be
+    told that rather than get a 404 it will read as a bug.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
@@ -2389,8 +2525,9 @@ class SalesDispatchAttachmentDetailView(APIView):
         return Response(
             {
                 "detail": (
-                    "The bilty is captured when the vehicle is linked, not on the "
-                    "docking. Change it on the Vehicle Linking screen."
+                    "The bilty number and date are entered when the vehicle is "
+                    "linked, not on the docking. Change them on the Vehicle Linking "
+                    "screen."
                 )
             },
             status=status.HTTP_400_BAD_REQUEST,
