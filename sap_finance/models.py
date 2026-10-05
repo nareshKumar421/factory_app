@@ -56,6 +56,10 @@ class SapBudgetChange(BaseModel):
             ),
             ("can_view_sap_budgets", "Can view SAP budgets"),
             ("can_manage_sap_budgets", "Can create, edit and delete SAP budgets"),
+            (
+                "can_view_sap_outstanding",
+                "Can view SAP outstanding: party balances, open A/P and A/R, open GRPOs, customer aging",
+            ),
         ]
 
     def __str__(self):

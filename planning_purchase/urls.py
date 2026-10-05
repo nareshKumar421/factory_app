@@ -16,6 +16,7 @@ from .views import (
     VendorListAPI,
     WarehouseListAPI,
 )
+from .views_exim import MonthlyPlanDetailAPI, MonthlyPlanListAPI, OpenPurchaseOrdersAPI
 
 app_name = "planning_purchase"
 
@@ -76,4 +77,8 @@ urlpatterns = [
         PurchaseOrderPostAPI.as_view(),
         name="pp-purchase-order-post",
     ),
+    # SAP's open purchase orders and the monthly plan workbook, from EXIM.
+    path("open-pos/", OpenPurchaseOrdersAPI.as_view(), name="pp-open-pos"),
+    path("monthly-plans/", MonthlyPlanListAPI.as_view(), name="pp-monthly-plans"),
+    path("monthly-plans/<str:pk>/", MonthlyPlanDetailAPI.as_view(), name="pp-monthly-plan"),
 ]

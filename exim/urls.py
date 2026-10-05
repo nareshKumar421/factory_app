@@ -4,6 +4,7 @@ from django.urls import path
 
 from .views_contract import ContractDetailAPI, ContractListAPI, ContractTermsAPI
 from .views_customs_rates import CustomsRatesAPI
+from .views_inventory import WarehouseInventoryAPI
 from .views_price import PriceDayAPI, PriceRangeAPI, PriceSheetAPI, RateDayAPI, RateRangeAPI, RateSheetAPI
 from .views_lot import (
     ContractHistoryAPI,
@@ -85,4 +86,5 @@ urlpatterns = [
     path("pack-rates/", RateDayAPI.as_view(), name="exim-pack-rates"),
     path("pack-rates/range/", RateRangeAPI.as_view(), name="exim-pack-rate-range"),
     path("pack-rates/sheet/", RateSheetAPI.as_view(), name="exim-pack-rate-sheet"),
+    path("warehouse-inventory/", WarehouseInventoryAPI.as_view(), name="exim-warehouse-inventory"),
 ]

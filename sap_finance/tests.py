@@ -26,7 +26,9 @@ from .management.commands.setup_sap_finance_groups import SAP_FINANCE_GROUPS
 from .models import SapBudgetChange
 
 BASE = "/api/v1/sap-finance/"
-ALL_PERMISSIONS = ["can_view_sap_ledgers", "can_view_sap_budgets", "can_manage_sap_budgets"]
+ALL_PERMISSIONS = [
+    "can_view_sap_ledgers", "can_view_sap_budgets", "can_manage_sap_budgets", "can_view_sap_outstanding",
+]
 
 BUDGET_BODY = {
     "budget": "BUD-ADMIN",

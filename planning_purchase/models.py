@@ -26,6 +26,8 @@ class PlanningPurchasePermission(models.Model):
             ("can_create_purchase_order", "Can create purchase orders from a plan"),
             ("can_approve_purchase_order", "Can approve purchase orders"),
             ("can_post_purchase_order_to_sap", "Can post purchase orders to SAP"),
+            ("can_view_open_pos", "Can view SAP's open purchase orders"),
+            ("can_upload_monthly_plan", "Can upload and remove the monthly plan workbook"),
         ]
 
 
@@ -206,3 +208,6 @@ class PurchaseOrderLine(models.Model):
     @property
     def line_value(self):
         return self.quantity * self.unit_price
+
+
+from .models_monthly_plan import MonthlyPlanRow, MonthlyPlanUpload  # noqa: E402,F401

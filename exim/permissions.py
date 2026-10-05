@@ -104,6 +104,9 @@ class Rights:
     RATE_FETCH = "exim.fetch_jivo_rates"
     RATE_ADD = "exim.add_jivorates"
 
+    #: Warehouse Inventory: EXIM's right for its SAP stock screen.
+    INVENTORY_VIEW = "exim.sync_inventory"
+
 
 def any_of(*rights):
     """A permission class passing a user who holds at least one of ``rights``."""

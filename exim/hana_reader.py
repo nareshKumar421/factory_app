@@ -180,6 +180,52 @@ def oil_grpo_lines(company_code: str, po_doc_entries) -> list:
     return found
 
 
+#: An oil's category for the stock screens: SAP's sub-group, with EXIM's
+#: overrides (its imported olive and sunflower, and gift packs as blended).
+_OIL_CATEGORY = """CASE WHEN I."ItemCode" IN ('RM0000012', 'RM0000013', 'RM0000014') THEN 'OLIVE IMPORTED'
+     WHEN I."ItemCode" = 'RM0000019' THEN 'SUNFLOWER IMPORTED'
+     WHEN I."ItemName" LIKE 'GIFT%' THEN 'BLENDED'
+     ELSE I."U_Sub_Group" END"""
+
+_WAREHOUSE_LITRES = """
+SELECT W."WhsCode", WH."WhsName", W."ItemCode", I."ItemName", """ + _OIL_CATEGORY + """ AS "Category",
+       W."OnHand", I."InvntryUom", W."OnHand" * I."SalPackUn" AS "Litres"
+  FROM "{schema}"."OITW" W
+  JOIN "{schema}"."OITM" I ON I."ItemCode" = W."ItemCode"
+  LEFT JOIN "{schema}"."OWHS" WH ON WH."WhsCode" = W."WhsCode"
+ WHERE I."U_IsLitre" = 'Y' AND (I."ItemCode" LIKE 'RM%' OR I."ItemCode" LIKE 'FG%') AND W."OnHand" <> 0
+"""
+
+
+def warehouse_litres(company_code: str) -> list:
+    """Every oil item kept in litres (RM and FG) with stock in a warehouse:
+    its on-hand and its litres (on-hand x litres a pack). Ghee is left out, as
+    EXIM's Warehouse Inventory left it. EXIM summed the whole stock ledger
+    (OINM) with every item's balance made positive; SAP's on-hand per
+    warehouse (OITW) is the same figure without the scan, and a negative
+    balance is kept negative so it shows. Raises SAP errors."""
+    out = []
+    for whs, whs_name, code, name, category, on_hand, unit, litres in _read(
+        company_code, _WAREHOUSE_LITRES, [], "warehouse stock"
+    ):
+        category = (category or "").strip() or "UNCLASSIFIED"
+        if category.upper() == "GHEE":
+            continue
+        out.append({
+            "warehouse": (whs or "").strip(),
+            "warehouse_name": (whs_name or "").strip(),
+            "item_code": (code or "").strip(),
+            "item_name": (name or "").strip(),
+            "kind": "FG" if (code or "").startswith("FG") else "RM",
+            "category": category,
+            "on_hand": Decimal(str(on_hand or 0)),
+            #: SAP's inventory unit for the item, what ``on_hand`` counts.
+            "unit": (unit or "").strip(),
+            "litres": Decimal(str(litres or 0)),
+        })
+    return out
+
+
 def finished_litres(company_code: str) -> dict:
     """{warehouse: litres} for ``FINISHED_WAREHOUSES``. Raises SAPConnectionError
     or SAPDataError; the caller decides what the page shows then."""

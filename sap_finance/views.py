@@ -21,9 +21,9 @@ from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 
-from . import services
+from . import outstanding, services
 from .models import SapBudgetChange
-from .permissions import CanManageSapBudgets, CanViewSapBudgets, CanViewSapLedgers
+from .permissions import CanManageSapBudgets, CanViewOutstanding, CanViewSapBudgets, CanViewSapLedgers
 from .serializers import (
     BudgetWriteSerializer,
     JournalEntryFilterSerializer,
@@ -189,3 +189,90 @@ class BudgetChangeListAPI(_SapFinanceView):
             except ValueError:
                 return Response({"detail": "doc_entry must be a number."}, status=status.HTTP_400_BAD_REQUEST)
         return Response(SapBudgetChangeSerializer(rows[:200], many=True).data)
+
+
+# ---------------------------------------------------------------------------
+# Outstanding (from EXIM): party balances, open bills, open GRPOs, aging
+# ---------------------------------------------------------------------------
+
+
+def _flag(params, name) -> bool:
+    return params.get(name) in ("1", "true", "yes")
+
+
+def _int(params, name, default) -> int:
+    try:
+        return int(params.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+class PartyOutstandingAPI(_SapFinanceView):
+    """GET ?side=vendor|customer [&oil_suppliers=1] [&refresh=1] — every party
+    SAP holds a balance against, with its last bill and last payment."""
+
+    def get_permissions(self):
+        side = "customer" if self.request.query_params.get("side") == "customer" else "vendor"
+        return [IsAuthenticated(), HasCompanyContext(), CanViewOutstanding(f"{side}_outstanding")()]
+
+    def get(self, request):
+        params = request.query_params
+        side = "customer" if params.get("side") == "customer" else "vendor"
+        return Response(outstanding.party_outstanding(
+            self.company, side, oil_suppliers=_flag(params, "oil_suppliers") and side == "vendor",
+            refresh=_flag(params, "refresh"),
+        ))
+
+
+class OpenBillsAPI(_SapFinanceView):
+    """GET ?side=vendor|customer — open A/P or A/R invoices: totals by overdue
+    bucket and party, and a page of bills. Filters: q, card_code, group, bucket,
+    oil_suppliers (vendors); sort (due_date, doc_date, due, overdue_days,
+    party) with desc=1; page, page_size (≤ 200); refresh=1."""
+
+    def get_permissions(self):
+        report = "open_ar" if self.request.query_params.get("side") == "customer" else "open_ap"
+        return [IsAuthenticated(), HasCompanyContext(), CanViewOutstanding(report)()]
+
+    def get(self, request):
+        params = request.query_params
+        side = "customer" if params.get("side") == "customer" else "vendor"
+        return Response(outstanding.open_bills(
+            self.company, side,
+            q=params.get("q", "").strip(), card_code=params.get("card_code", "").strip(),
+            group=params.get("group", "").strip(), bucket=params.get("bucket", "").strip(),
+            oil_suppliers=_flag(params, "oil_suppliers") and side == "vendor",
+            sort=params.get("sort", "due_date"), descending=_flag(params, "desc"),
+            page=_int(params, "page", 1), page_size=_int(params, "page_size", 50),
+            refresh=_flag(params, "refresh"),
+        ))
+
+
+class OpenGrpoAPI(_SapFinanceView):
+    """GET [?raw_material=1] [&refresh=1] — goods received and not yet billed."""
+
+    def get_permissions(self):
+        return [IsAuthenticated(), HasCompanyContext(), CanViewOutstanding("open_grpos")()]
+
+    def get(self, request):
+        params = request.query_params
+        return Response(outstanding.open_grpos(
+            self.company, raw_material_only=_flag(params, "raw_material"), refresh=_flag(params, "refresh"),
+        ))
+
+
+class CustomerAgingAPI(_SapFinanceView):
+    """GET [?basis=due|bill] [&q &group &sales_employee] [&card_code=<one
+    customer's documents>] [&refresh=1] — what each customer owes, by age."""
+
+    def get_permissions(self):
+        return [IsAuthenticated(), HasCompanyContext(), CanViewOutstanding("customer_aging")()]
+
+    def get(self, request):
+        params = request.query_params
+        return Response(outstanding.customer_aging(
+            self.company, basis="bill" if params.get("basis") == "bill" else "due",
+            q=params.get("q", "").strip(), group=params.get("group", "").strip(),
+            sales_employee=params.get("sales_employee", "").strip(),
+            card_code=params.get("card_code", "").strip(), refresh=_flag(params, "refresh"),
+        ))

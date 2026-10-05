@@ -5,9 +5,13 @@ from .views import (
     BudgetDetailAPI,
     BudgetListCreateAPI,
     ChartOfAccountsAPI,
+    CustomerAgingAPI,
     GeneralLedgerAPI,
     JournalEntryListAPI,
     LedgerAccountSearchAPI,
+    OpenBillsAPI,
+    OpenGrpoAPI,
+    PartyOutstandingAPI,
 )
 
 urlpatterns = [
@@ -18,4 +22,8 @@ urlpatterns = [
     path("budgets/", BudgetListCreateAPI.as_view(), name="sap-finance-budgets"),
     path("budgets/<int:doc_entry>/", BudgetDetailAPI.as_view(), name="sap-finance-budget-detail"),
     path("budget-changes/", BudgetChangeListAPI.as_view(), name="sap-finance-budget-changes"),
+    path("outstanding/parties/", PartyOutstandingAPI.as_view(), name="sap-finance-party-outstanding"),
+    path("outstanding/bills/", OpenBillsAPI.as_view(), name="sap-finance-open-bills"),
+    path("outstanding/grpos/", OpenGrpoAPI.as_view(), name="sap-finance-open-grpos"),
+    path("outstanding/aging/", CustomerAgingAPI.as_view(), name="sap-finance-customer-aging"),
 ]
