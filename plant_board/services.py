@@ -2267,10 +2267,8 @@ class PlantBoardService:
 
         BOTH NUMBERS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS. ``entry_no`` is
         what the warehouse screen shows and what the floor calls "the BST";
-        ``sap_doc_num`` is what Accounts will ask for, and on an INVOICE
-        transfer the invoice number is the one that settles the sale. A row
-        names whichever of the latter two it has and stays quiet about the
-        other rather than printing an empty column.
+        ``sap_doc_num`` is what Accounts will ask for: the stock transfer, or on
+        an INVOICE transfer the invoice that settles the sale.
 
         Weighed off the same memoised item master as the route fold above, so
         this costs one grouped query and no extra SAP trip. Tonnage is null —
@@ -2282,7 +2280,6 @@ class PlantBoardService:
                 "transfer_id",
                 "transfer__entry_no",
                 "transfer__sap_doc_num",
-                "transfer__invoice_no",
                 "transfer__sap_to_warehouse",
                 "transfer__source_type",
                 "transfer__status",
@@ -2306,7 +2303,6 @@ class PlantBoardService:
                 shipment = out[key] = {
                     "entry_no": row["transfer__entry_no"] or "",
                     "sap_doc_num": row["transfer__sap_doc_num"] or "",
-                    "invoice_no": row["transfer__invoice_no"] or "",
                     "route": route,
                     "route_name": SHIFTING_ROUTE_NAMES.get(route, route),
                     "warehouse": row["transfer__sap_to_warehouse"] or "",

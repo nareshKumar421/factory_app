@@ -81,10 +81,6 @@ class BSTTransfer(models.Model):
     sap_from_warehouse = models.CharField(max_length=50, blank=True, default="")
     sap_to_warehouse = models.CharField(max_length=50, blank=True, default="")
     sap_reference = models.CharField(max_length=100, blank=True, default="")
-    invoice_no = models.CharField(
-        max_length=100, blank=True, default="",
-        help_text="Invoice / document number the warehouse user typed to look up the BST.",
-    )
 
     # What SAP document this entry is sourced from, and therefore how it settles:
     #   STOCK_TRANSFER — intra-company move; on receipt boxes only change
@@ -268,10 +264,6 @@ class BSTTransferDoc(models.Model):
     sap_doc_num = models.CharField(max_length=50, blank=True, default="")
     sap_doc_date = models.DateField(null=True, blank=True)
     sap_reference = models.CharField(max_length=100, blank=True, default="")
-    invoice_no = models.CharField(
-        max_length=100, blank=True, default="",
-        help_text="Invoice / document number the warehouse user typed to look up this document.",
-    )
 
     class Meta:
         ordering = ["id"]

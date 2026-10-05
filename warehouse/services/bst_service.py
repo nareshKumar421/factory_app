@@ -11,6 +11,7 @@ import re
 from decimal import Decimal
 
 from django.db import transaction
+from django.contrib.postgres.expressions import ArraySubquery
 from django.db.models import Count, F, IntegerField, OuterRef, Q, Subquery
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -76,6 +77,17 @@ def _child_count(model):
             output_field=IntegerField(),
         ),
         0,
+    )
+
+
+def _doc_nums():
+    """Every attached SAP document's number, in document order, as one array per
+    transfer — a correlated subquery for the same reason as `_child_count`."""
+    return ArraySubquery(
+        BSTTransferDoc.objects
+        .filter(transfer=OuterRef("pk"))
+        .order_by("id")
+        .values("sap_doc_num"),
     )
 
 
@@ -628,6 +640,7 @@ class BSTService:
                 scanned_box_count=_child_count(BSTBoxScan),
                 item_count=_child_count(BSTTransferItem),
                 doc_count=_child_count(BSTTransferDoc),
+                doc_nums=_doc_nums(),
             )
             .order_by("-created_at")
         )
@@ -770,8 +783,6 @@ class BSTService:
             sap_from_warehouse=head_from_warehouse,
             sap_to_warehouse=primary.get("to_warehouse") or "",
             sap_reference=primary.get("reference") or "",
-            invoice_no=data.get("invoice_no")
-            or (str(primary.get("doc_num") or "") if is_invoice else ""),
             vehicle=data.get("vehicle"),
             driver=data.get("driver"),
             requires_gate=data.get("requires_gate", False),
@@ -788,7 +799,6 @@ class BSTService:
                 sap_doc_num=str(sap.get("doc_num") or ""),
                 sap_doc_date=sap.get("doc_date"),
                 sap_reference=sap.get("reference") or "",
-                invoice_no=str(sap.get("doc_num") or "") if is_invoice else "",
             )
             for line in sap.get("lines", []):
                 items.append(
@@ -814,7 +824,7 @@ class BSTService:
         transfer = self._lock(transfer)
         # Two edit windows: the rest of the header closes once scanning is done,
         # the vehicle + driver stay open until gate-out (see vehicle_editable).
-        header_fields = [f for f in ("invoice_no", "requires_gate", "remarks") if f in data]
+        header_fields = [f for f in ("requires_gate", "remarks") if f in data]
         vehicle_fields = [f for f in ("vehicle", "driver") if f in data]
 
         if header_fields and transfer.status not in EDITABLE_STATUSES:
@@ -1530,6 +1540,7 @@ class BSTService:
                 scanned_box_count=_child_count(BSTBoxScan),
                 item_count=_child_count(BSTTransferItem),
                 doc_count=_child_count(BSTTransferDoc),
+                doc_nums=_doc_nums(),
             )
             .order_by("-dispatched_at", "-created_at")
         )
@@ -2083,7 +2094,8 @@ class BSTService:
                       # Annotated even though the gate screens don't show it:
                       # the list serializer reads doc_count on every row and
                       # falls back to a per-row COUNT(*) when it's missing.
-                      doc_count=_child_count(BSTTransferDoc))
+                      doc_count=_child_count(BSTTransferDoc),
+                      doc_nums=_doc_nums())
             # Oldest load first: `dispatched_at` is still null all through this
             # queue (the gate sets it), so the finish-of-loading stamp is what
             # actually orders the waiting vehicles.
@@ -2112,7 +2124,8 @@ class BSTService:
                       # Annotated even though the gate screens don't show it:
                       # the list serializer reads doc_count on every row and
                       # falls back to a per-row COUNT(*) when it's missing.
-                      doc_count=_child_count(BSTTransferDoc))
+                      doc_count=_child_count(BSTTransferDoc),
+                      doc_nums=_doc_nums())
             .order_by(F("gated_out_at").desc(nulls_first=True))
         )
 
@@ -2127,7 +2140,8 @@ class BSTService:
                       # Annotated even though the gate screens don't show it:
                       # the list serializer reads doc_count on every row and
                       # falls back to a per-row COUNT(*) when it's missing.
-                      doc_count=_child_count(BSTTransferDoc))
+                      doc_count=_child_count(BSTTransferDoc),
+                      doc_nums=_doc_nums())
             .order_by("gated_out_at")
         )
 

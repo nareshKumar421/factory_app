@@ -97,7 +97,7 @@ class BSTTransferDocSerializer(serializers.ModelSerializer):
         model = BSTTransferDoc
         fields = [
             "id", "sap_doc_entry", "sap_doc_num", "sap_doc_date",
-            "sap_reference", "invoice_no", "item_count", "expected_box_count",
+            "sap_reference", "item_count", "expected_box_count",
         ]
 
     def get_item_count(self, obj) -> int:
@@ -159,6 +159,9 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
     scanned_box_count = serializers.SerializerMethodField()
     item_count = serializers.SerializerMethodField()
     doc_count = serializers.SerializerMethodField()
+    # Every attached SAP document's number, so the list can be searched by any of
+    # them — the head's `sap_doc_num` names only the first.
+    doc_nums = serializers.SerializerMethodField()
 
     class Meta:
         model = BSTTransfer
@@ -170,7 +173,7 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
             "customer_code", "customer_name",
             "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
-            "invoice_no", "vehicle", "vehicle_number", "driver", "driver_name",
+            "doc_nums", "vehicle", "vehicle_number", "driver", "driver_name",
             "requires_gate",
             "scanned_box_count", "item_count", "doc_count",
             "scan_approved_at", "loaded_at", "dispatched_at", "received_at", "created_at",
@@ -193,6 +196,12 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
         if annotated is not None:
             return annotated
         return obj.docs.count()
+
+    def get_doc_nums(self, obj) -> list[str]:
+        annotated = getattr(obj, "doc_nums", None)
+        if annotated is not None:
+            return [n for n in annotated if n]
+        return [d.sap_doc_num for d in obj.docs.all() if d.sap_doc_num]
 
 
 class BSTTransferDetailSerializer(BSTTransferListSerializer):
@@ -308,7 +317,6 @@ class BSTTransferCreateSerializer(serializers.Serializer):
     driver = serializers.PrimaryKeyRelatedField(
         queryset=Driver.objects.all(), required=False, allow_null=True,
     )
-    invoice_no = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
     requires_gate = serializers.BooleanField(required=False, default=False)
     remarks = serializers.CharField(required=False, allow_blank=True, default="")
 
@@ -327,7 +335,6 @@ class BSTTransferCreateSerializer(serializers.Serializer):
 class BSTTransferUpdateSerializer(serializers.Serializer):
     vehicle = serializers.PrimaryKeyRelatedField(queryset=Vehicle.objects.all(), required=False)
     driver = serializers.PrimaryKeyRelatedField(queryset=Driver.objects.all(), required=False)
-    invoice_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
     requires_gate = serializers.BooleanField(required=False)
     remarks = serializers.CharField(required=False, allow_blank=True)
 

@@ -245,7 +245,6 @@ class BSTSenderFlowTests(TestCase):
             "sap_doc_entries": [555],
             "vehicle": self.vehicle if requires_gate else None,
             "driver": self.driver if requires_gate else None,
-            "invoice_no": "INV-9",
             "requires_gate": requires_gate,
             "remarks": "",
         }
@@ -281,7 +280,7 @@ class BSTSenderFlowTests(TestCase):
         mapping = {555: doc1, 556: doc2}
         data = {
             "sap_doc_entries": [555, 556], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
@@ -290,6 +289,11 @@ class BSTSenderFlowTests(TestCase):
         self.assertEqual(transfer.items.count(), 2)
         # The head mirrors the first (primary) document.
         self.assertEqual(transfer.sap_doc_num, "1001")
+        # The list row names every document, so the board can be searched by the
+        # second one too.
+        from .serializers_bst import BSTTransferListSerializer
+        row = BSTTransferListSerializer(self.svc.list_queryset().get(pk=transfer.pk)).data
+        self.assertEqual(row["doc_nums"], ["1001", "1002"])
 
     def test_create_rejects_sap_document_already_used_by_another_bst(self):
         # A SAP document backs at most one live BST — reusing it on a second BST
@@ -297,7 +301,7 @@ class BSTSenderFlowTests(TestCase):
         self._create_transfer()  # uses doc 555
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -321,7 +325,7 @@ class BSTSenderFlowTests(TestCase):
         mapping = {555: doc1, 557: doc2}
         data = {
             "sap_doc_entries": [555, 557], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
@@ -345,7 +349,7 @@ class BSTSenderFlowTests(TestCase):
         mapping = {555: doc1, 558: doc2}
         data = {
             "sap_doc_entries": [555, 558], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
@@ -375,7 +379,7 @@ class BSTSenderFlowTests(TestCase):
         mapping = {555: doc1, 556: doc2}
         data = {
             "sap_doc_entries": [555, 556], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.side_effect = lambda de: mapping[de]
@@ -427,7 +431,7 @@ class BSTSenderFlowTests(TestCase):
         small["lines"] = [dict(FAKE_SAP_TRANSFER["lines"][0], box_count=1)]
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "INV-9", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = small
@@ -453,7 +457,7 @@ class BSTSenderFlowTests(TestCase):
         # BST, so t2 can't reuse t1's).
         data = {
             "sap_doc_entries": [556], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = {
@@ -481,7 +485,7 @@ class BSTSenderFlowTests(TestCase):
         doc = {**FAKE_SAP_TRANSFER, "line_count": len(lines), "lines": lines}
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = doc
@@ -712,7 +716,7 @@ class BSTScanCompletenessTests(TestCase):
         }
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "INV-9", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = doc
@@ -993,7 +997,7 @@ class BSTReceiverFlowTests(TestCase):
     def _dispatched_transfer(self, barcodes):
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "INV-1", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1099,7 +1103,7 @@ class BSTReceiverFlowTests(TestCase):
         # (rather than hard-failing the whole scan).
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "INV-1", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1126,7 +1130,7 @@ class BSTReceiverFlowTests(TestCase):
         # destination can only act once the sender has scanned something.
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1140,7 +1144,7 @@ class BSTReceiverFlowTests(TestCase):
         """Create a live internal transfer and scan boxes WITHOUT approving."""
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "INV-L", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1226,7 +1230,7 @@ class BSTAcceptedBoxOnwardFlowTests(TestCase):
         sender is still working it, as a real BST is for 3-4 days."""
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "INV-L", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1247,7 +1251,7 @@ class BSTAcceptedBoxOnwardFlowTests(TestCase):
         }
         data = {
             "sap_doc_entries": [556], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = doc
@@ -1290,7 +1294,7 @@ class BSTAcceptedBoxOnwardFlowTests(TestCase):
         }
         data = {
             "sap_doc_entries": [557], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = doc
@@ -1372,7 +1376,7 @@ class BSTGateFlowTests(TestCase):
     def _gated_dispatched(self):
         data = {
             "sap_doc_entries": [555], "vehicle": self.vehicle, "driver": self.driver,
-            "invoice_no": "INV-G", "requires_gate": True, "remarks": "",
+            "requires_gate": True, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1477,7 +1481,7 @@ class BSTGateFlowTests(TestCase):
         # A non-gated transfer never reaches AWAITING_GATE_OUT.
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1525,7 +1529,7 @@ class BSTInvoiceFlowTests(TestCase):
             status=BSTTransferStatus.SCANNING, created_by=self.sender,
         )
         doc = BSTTransferDoc.objects.create(
-            transfer=transfer, sap_doc_entry=900, sap_doc_num="INV-900", invoice_no="INV-900",
+            transfer=transfer, sap_doc_entry=900, sap_doc_num="INV-900",
         )
         # Expected quantity matches the boxes scanned (1 pc each) so the sender's
         # completeness gate passes — these tests exercise the receive/ownership flow,
@@ -1797,7 +1801,7 @@ class BSTInvoiceFlowTests(TestCase):
         data = {
             "document_type": "INVOICE", "sap_doc_entries": [900],
             "destination_company": destination, "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         assign_test_warehouses(self.sender, source)
         with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
@@ -1808,7 +1812,7 @@ class BSTInvoiceFlowTests(TestCase):
         self.assertEqual(transfer.customer_code, "BETA")
         self.assertEqual(transfer.customer_name, "Beta Co")
         self.assertEqual(transfer.sap_from_warehouse, "WH-A")
-        self.assertEqual(transfer.invoice_no, "INV-900")
+        self.assertEqual(transfer.sap_doc_num, "INV-900")
         self.assertEqual(transfer.items.get(item_code="ITM1").expected_boxes, 10)
 
     def _invoice_transfer(self, *, doc_entry, item_name, quantity, sal_factor2, suffix):
@@ -1829,7 +1833,7 @@ class BSTInvoiceFlowTests(TestCase):
         data = {
             "document_type": "INVOICE", "sap_doc_entries": [doc_entry],
             "destination_company": destination, "vehicle": None, "driver": None,
-            "invoice_no": "", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         assign_test_warehouses(self.sender, source)
         with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
@@ -1883,7 +1887,7 @@ class BSTScanRejectionLoggingTests(TestCase):
     def _create_transfer(self):
         data = {
             "sap_doc_entries": [555], "vehicle": None, "driver": None,
-            "invoice_no": "INV-9", "requires_gate": False, "remarks": "",
+            "requires_gate": False, "remarks": "",
         }
         with patch("warehouse.services.bst_service.SAPClient") as sap:
             sap.return_value.get_stock_transfer.return_value = dict(FAKE_SAP_TRANSFER)
@@ -1990,7 +1994,7 @@ class BSTLoadedAtTests(TestCase):
             "sap_doc_entries": [doc_entry],
             "vehicle": self.vehicle if requires_gate else None,
             "driver": self.driver if requires_gate else None,
-            "invoice_no": "INV-L", "requires_gate": requires_gate, "remarks": "",
+            "requires_gate": requires_gate, "remarks": "",
         }
         doc = dict(FAKE_SAP_TRANSFER, doc_entry=doc_entry, doc_num=str(1000 + doc_entry))
         with patch("warehouse.services.bst_service.SAPClient") as sap:
