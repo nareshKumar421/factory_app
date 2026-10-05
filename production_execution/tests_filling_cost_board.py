@@ -142,6 +142,21 @@ class FillingCostBoardTests(APITestCase):
         self.assertEqual([h['head'] for h in day['sheet_heads']],
                          ['Fixed Manpower', 'Electricity'])
 
+    def test_a_day_kept_only_line_by_line_adds_its_lines_up(self):
+        other = ProductionLine.objects.create(company=self.company, name='Krones')
+        self._sheet('2026-09-29', 'DAY', '100', [('Lab', '100')], line=self.line)
+        self._sheet('2026-09-29', 'DAY', '50', [('Lab', '50'), ('Misc', '25')], line=other)
+        self._sheet('2026-09-29', 'NIGHT', '50', [('Lab', '25')], line=other)
+        # The line's whole-day sheet loses to its shift sheets, as on the floor.
+        self._sheet('2026-09-29', '', '999', [('Lab', '99999')], line=other)
+
+        day = self._board(day='2026-09-29')['day']
+        self.assertEqual(day['cases'], '200.00')
+        self.assertEqual(day['total'], '200.00')
+        self.assertEqual(day['kept_by'], 'shift')
+        self.assertEqual([(s['shift'], s['total']) for s in day['shifts']],
+                         [('DAY', '175.00'), ('NIGHT', '25.00')])
+
     def test_a_day_nobody_entered_has_no_detail(self):
         self.assertIsNone(self._board(day='2026-09-20')['day'])
 

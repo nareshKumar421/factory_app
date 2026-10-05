@@ -4,10 +4,12 @@ Read from the sheets as they were saved, not worked out again: the board
 shows what the factory signed off, and a sheet corrected by hand shows
 corrected.
 
-**Which sheets make a day.** Only the floor-wide sheets (no line). A day kept
-by shift is its Day and Night sheets added up; a day with no shift sheet is
-its whole-day sheet. Both at once would count the day twice, so the shift
-sheets win.
+**Which sheets make a day.** The floor-wide sheets (no line). A day kept by
+shift is its Day and Night sheets added up; a day with no shift sheet is its
+whole-day sheet. Both at once would count the day twice, so the shift sheets
+win. A day saved only line by line, with no floor-wide sheet, is its lines
+added up — each line by the same shift-wins rule — rather than a blank day;
+once a floor-wide sheet exists the lines' sheets are not counted beside it.
 
 **Bottles.** A sheet counts cases, and the rate a bottle is what the factory
 compares SKUs by. The bottles come from the day's production runs: the
@@ -52,17 +54,27 @@ def month_bounds(month):
     return first, first.replace(day=calendar.monthrange(first.year, first.month)[1])
 
 
+def _shift_wins(sheets):
+    return [s for s in sheets if s.shift] or [s for s in sheets if not s.shift]
+
+
 def _sheets(company, first, last):
     """``{day: [sheets that make it]}`` — see the module docstring."""
-    by_day = {}
+    floor, lines = {}, {}
     for sheet in (FillingCostSheet.objects
-                  .filter(company=company, line__isnull=True, date__range=(first, last))
-                  .prefetch_related('entries').order_by('date', 'shift')):
-        by_day.setdefault(sheet.date, []).append(sheet)
-    return {
-        day: [s for s in sheets if s.shift] or [s for s in sheets if not s.shift]
-        for day, sheets in by_day.items()
-    }
+                  .filter(company=company, date__range=(first, last))
+                  .prefetch_related('entries').order_by('date', 'shift', 'line_id')):
+        if sheet.line_id is None:
+            floor.setdefault(sheet.date, []).append(sheet)
+        else:
+            lines.setdefault(sheet.date, {}).setdefault(sheet.line_id, []).append(sheet)
+    by_day = {day: _shift_wins(sheets) for day, sheets in floor.items()}
+    for day, per_line in lines.items():
+        if day not in by_day:
+            by_day[day] = sorted(
+                (s for sheets in per_line.values() for s in _shift_wins(sheets)),
+                key=lambda s: (s.shift, s.line_id))
+    return by_day
 
 
 class _Tally:
@@ -173,19 +185,24 @@ def board(company, month, day):
     if day_sheets:
         ratio, skus = _made(company, day)
         tally = _Tally()
-        shifts = []
+        by_shift = OrderedDict()
         for sheet in day_sheets:
             tally.add_sheet(sheet, ratio)
             if sheet.shift:
-                own_ratio, own_skus = _made(company, day, sheet.shift)
-                own = _Tally()
+                # Several lines' sheets for one shift read as that shift.
+                by_shift.setdefault(sheet.shift, []).append(sheet)
+        shifts = []
+        for shift, sheets in by_shift.items():
+            own_ratio, own_skus = _made(company, day, shift)
+            own = _Tally()
+            for sheet in sheets:
                 own.add_sheet(sheet, own_ratio or ratio)
-                shifts.append({'shift': sheet.shift,
-                               'label': FillingCostShift(sheet.shift).label,
-                               **own.figures(),
-                               # In the sheet's own order, as the factory writes it.
-                               'heads': own.head_rows(ordered=True),
-                               'skus': own_skus})
+            shifts.append({'shift': shift,
+                           'label': FillingCostShift(shift).label,
+                           **own.figures(),
+                           # In the sheet's own order, as the factory writes it.
+                           'heads': own.head_rows(ordered=True),
+                           'skus': own_skus})
         day_block = {
             'date': day.isoformat(),
             'kept_by': 'shift' if shifts else 'day',
