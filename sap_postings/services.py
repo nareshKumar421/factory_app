@@ -40,6 +40,7 @@ HANDLERS = {
     "goods_return.receive": "goods_return.sap_posting.ReceiveHandler",
     "grpo.material": "grpo.sap_posting.MaterialGRPOHandler",
     "short_dispatch.post": "short_dispatch.sap_posting.ShortDispatchHandler",
+    "bill_summary.stamp": "dispatch_plans.sap_posting.BillSummaryStampHandler",
 }
 
 #: kind -> what a person calls that kind of posting, for the log's filter.
@@ -47,6 +48,7 @@ KIND_LABELS = {
     "goods_return.receive": "Goods return (A/R Return)",
     "grpo.material": "Material GRPO",
     "short_dispatch.post": "Short dispatch (A/R Return)",
+    "bill_summary.stamp": "Bill summary (invoice dispatch stamp)",
 }
 
 
@@ -119,6 +121,41 @@ def post_now(*, kind, company, source_id, title, link="", params=None, user=None
         user=user,
     )
     return posting, attempt(posting, by_worker=False)
+
+
+def queue(*, kind, company, source_id, title, link="", params=None, user=None, reason=""):
+    """Record the posting as waiting for SAP, without trying it now.
+
+    For a caller that already knows SAP is not answering -- an earlier try in
+    the same request got nothing -- and should not make the person wait out the
+    same timeout again. The worker sends it as for any wait. A posting already
+    being sent is left alone.
+    """
+    with transaction.atomic(durable=True):
+        live = (
+            SapPosting.objects.select_for_update()
+            .filter(kind=kind, source_id=source_id, status__in=ACTIVE_STATUSES)
+            .first()
+        )
+        if live is None:
+            return SapPosting.objects.create(
+                company=company,
+                kind=kind,
+                source_id=source_id,
+                title=title[:255],
+                link=link[:255],
+                params=params or {},
+                status=SapPostingStatus.QUEUED,
+                last_error=reason[:5000],
+                next_attempt_at=timezone.now() + _backoff(1),
+                created_by=user,
+            )
+        if live.status == SapPostingStatus.QUEUED:
+            live.params = params or {}
+            live.title = title[:255]
+            live.link = link[:255]
+            live.save(update_fields=["params", "title", "link", "updated_at"])
+        return live
 
 
 def _open(*, kind, company, source_id, title, link, params, user):

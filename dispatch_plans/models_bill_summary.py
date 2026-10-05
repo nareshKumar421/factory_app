@@ -84,6 +84,8 @@ class BillSummarySapStatus(models.TextChoices):
     NOT_POSTED = "NOT_POSTED", "Not posted to SAP"
     POSTED = "POSTED", "Posted to SAP"
     FAILED = "FAILED", "SAP refused"
+    # SAP did not answer; the SAP posting queue stamps it once SAP is back.
+    WAITING = "WAITING", "Waiting for SAP"
 
 
 class BillSummary(models.Model):

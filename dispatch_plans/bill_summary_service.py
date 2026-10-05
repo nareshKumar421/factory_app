@@ -46,6 +46,15 @@ down with it. What SAP already holds is therefore read first and left alone.
 
 SAP also refuses a dispatch date earlier than the invoice date (`1300014`), so
 that is checked here rather than being discovered at the end.
+
+**SAP not answering never holds up the warehouse.** The stamp goes through the
+SAP posting queue (``sap_posting``, kind ``bill_summary.stamp``): tried at once
+when SAP answers, so the approver sees the result; otherwise the sheet is
+"Waiting for SAP" and the worker stamps it once SAP is back. Resending is safe
+-- what SAP already holds is read back and kept, so a second PATCH writes the
+same values. And once SAP has not answered for one sheet of an approval, the
+rest of that approval are queued without trying, rather than each waiting out
+the same timeout.
 """
 
 import logging
@@ -61,7 +70,7 @@ from company.models import Company
 from gate_core.services.box_packing import split_line, split_with_pieces_per_box
 from sap_client.client import SAPClient
 from sap_client.context import CompanyContext
-from sap_client.exceptions import SAPConnectionError, SAPDataError
+from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPUnavailable
 
 from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan
@@ -94,6 +103,10 @@ def _dec(value, field: str) -> Decimal:
 
 
 class BillSummaryService:
+    #: Raised from a sheet whose stamp SAP did not answer, for the rest of the
+    #: request: see the module docstring.
+    _sap_not_answering = False
+
     def __init__(self, company_code: str, user=None):
         self.company_code = company_code
         self.user = user
@@ -478,7 +491,9 @@ class BillSummaryService:
             invoice_date=self._as_date(header.get("doc_date")),
             bill_amount=header.get("doc_total") or 0,
             branch_name=header.get("branch_name") or "",
-            branch_gstin=self._branch_gstin(header.get("branch_id")),
+            branch_gstin=self._branch_gstin(
+                header.get("branch_id"), header.get("branch_name") or ""
+            ),
             company_legal_name=self._company_legal_name(),
             warehouse_codes=header.get("warehouses") or "",
             dispatch_date=dispatch_date,
@@ -605,7 +620,9 @@ class BillSummaryService:
             invoice_date=self._as_date(header.get("doc_date")),
             bill_amount=header.get("doc_total") or 0,
             branch_name=header.get("branch_name") or "",
-            branch_gstin=self._branch_gstin(header.get("branch_id")),
+            branch_gstin=self._branch_gstin(
+                header.get("branch_id"), header.get("branch_name") or ""
+            ),
             company_legal_name=self._company_legal_name(),
             warehouse_codes=", ".join(
                 sorted({line["warehouse_code"] for line in lines if line["warehouse_code"]})
@@ -825,20 +842,39 @@ class BillSummaryService:
         }
 
     def _company_legal_name(self) -> str:
-        """Best effort — a missing name must not stop the sheet being produced."""
+        """Best effort — a missing name must not stop the sheet being produced.
+
+        SAP not answering falls back to the name on this company's last sheet:
+        it does not change, and a sheet printed during an outage should still
+        carry it.
+        """
         try:
             return self.reader.company_legal_name()
         except Exception:  # noqa: BLE001
             logger.warning("Could not read the company name for %s", self.company_code)
-            return ""
+            return self._last_sheet_value("company_legal_name")
 
-    def _branch_gstin(self, branch_id) -> str:
-        """Best effort — a missing GST must not stop the sheet being produced."""
+    def _branch_gstin(self, branch_id, branch_name: str = "") -> str:
+        """Best effort — a missing GST must not stop the sheet being produced.
+
+        Falls back, like the legal name, to the last sheet of the same branch.
+        """
         try:
             return self.reader.branch_gstin(branch_id)
         except Exception:  # noqa: BLE001
             logger.warning("Could not read the branch GST for %s", branch_id)
-            return ""
+            if not branch_name:
+                return ""
+            return self._last_sheet_value("branch_gstin", branch_name=branch_name)
+
+    def _last_sheet_value(self, field: str, **match) -> str:
+        return (
+            BillSummary.objects.filter(company=self.company, **match)
+            .exclude(**{field: ""})
+            .order_by("-id")
+            .values_list(field, flat=True)
+            .first()
+        ) or ""
 
     @staticmethod
     def _as_date(value):
@@ -891,26 +927,94 @@ class BillSummaryService:
                 "date to put on the bill."
             )
 
-        kept, dropped = [], []
+        from sap_postings import services as sap_postings
+
+        from . import sap_posting
+
+        # Tried now, logged, and -- if SAP does not answer -- left waiting for the
+        # worker; the handler records the outcome on the sheet.
         try:
-            kept, dropped = self._patch_invoice(summary, clear=clearing)
-        except (SAPConnectionError, SAPDataError, BillSummaryError) as exc:
-            summary.sap_status = BillSummarySapStatus.FAILED
-            summary.sap_error = str(exc)[:4000]
-        except Exception as exc:  # noqa: BLE001 - recorded, never swallowed
-            logger.exception("Unexpected SAP failure posting %s", summary.entry_no)
-            summary.sap_status = BillSummarySapStatus.FAILED
-            summary.sap_error = str(exc)[:4000]
-        else:
-            # Cleared is NOT_POSTED, not POSTED: the invoice no longer carries a
-            # dispatch, and saying otherwise would hide it from the "not in SAP"
-            # view that exists to catch exactly this.
-            summary.sap_status = (
-                BillSummarySapStatus.NOT_POSTED if clearing
-                else BillSummarySapStatus.POSTED
+            sap_postings.post_now(
+                kind=sap_posting.KIND,
+                company=summary.company,
+                source_id=summary.pk,
+                title=sap_posting.title_for(summary),
+                link=sap_posting.link_for(summary),
+                user=self.user,
             )
-            summary.sap_error = ""
-            summary.sap_posted_at = None if clearing else timezone.now()
+        except sap_postings.PostingInProgress as exc:
+            raise BillSummaryError(str(exc))
+        summary.refresh_from_db()
+        return summary
+
+    def _send_stamp(self, summary_id: int) -> None:
+        """Stamp (or clear) SAP for a sheet just approved or cancelled.
+
+        Once SAP has not answered for one sheet in this request, the rest are
+        queued without trying: each would only wait out the same timeout, and the
+        approver would be left looking at a spinner over SAP's outage.
+        """
+        if self._sap_not_answering:
+            self._queue_stamp(summary_id)
+            return
+        try:
+            summary = self.post_to_sap(summary_id)
+        except BillSummaryError as exc:
+            logger.warning("Bill summary %s not sent to SAP: %s", summary_id, exc)
+            return
+        if summary.sap_status == BillSummarySapStatus.WAITING:
+            self._sap_not_answering = True
+
+    def _queue_stamp(self, summary_id: int) -> None:
+        from sap_postings import services as sap_postings
+
+        from . import sap_posting
+
+        summary = BillSummary.objects.select_related("company").get(pk=summary_id)
+        reason = (
+            "SAP did not answer for an earlier bill in the same approval, so this "
+            "one waits for SAP without being tried."
+        )
+        sap_postings.queue(
+            kind=sap_posting.KIND,
+            company=summary.company,
+            source_id=summary.pk,
+            title=sap_posting.title_for(summary),
+            link=sap_posting.link_for(summary),
+            user=self.user,
+            reason=reason,
+        )
+        self.record_waiting(summary, reason)
+
+    # -- what the posting handler records on the sheet --------------------------
+
+    @staticmethod
+    def record_posted(summary: BillSummary, *, clearing: bool, kept, dropped) -> None:
+        # Cleared is NOT_POSTED, not POSTED: the invoice no longer carries a
+        # dispatch, and saying otherwise would hide it from the "not in SAP"
+        # view that exists to catch exactly this.
+        summary.sap_status = (
+            BillSummarySapStatus.NOT_POSTED if clearing
+            else BillSummarySapStatus.POSTED
+        )
+        summary.sap_error = ""
+        summary.sap_posted_at = None if clearing else timezone.now()
+        BillSummaryService._save_sap(summary, kept, dropped)
+
+    @staticmethod
+    def record_waiting(summary: BillSummary, message: str) -> None:
+        summary.sap_status = BillSummarySapStatus.WAITING
+        summary.sap_error = message[:4000]
+        BillSummaryService._save_sap(summary, [], [])
+
+    @staticmethod
+    def record_refused(summary: BillSummary, message: str) -> None:
+        summary.sap_status = BillSummarySapStatus.FAILED
+        summary.sap_error = message[:4000]
+        BillSummaryService._save_sap(summary, [], [])
+
+    @staticmethod
+    def _save_sap(summary: BillSummary, kept, dropped) -> None:
         # Said on the sheet rather than only in the log: either way the driver is
         # carrying a document that disagrees with the invoice, and the difference
         # should be visible to whoever holds both.
@@ -934,7 +1038,6 @@ class BillSummaryService:
                 "sap_status", "sap_error", "sap_posted_at", "sap_note", "updated_at",
             ]
         )
-        return summary
 
     def _patch_invoice(self, summary: BillSummary, *, clear: bool = False) -> tuple:
         """The write itself. See the module docstring for why it looks like this.
@@ -949,19 +1052,26 @@ class BillSummaryService:
         here too — the notification rule fires on a date with no quantity, so
         both are cleared in the same request. Tested against SAP; it accepts it.
         """
+        from sap_client import health
+
+        # Known down and probed moments ago: wait for SAP instead of timing out.
+        health.guard_service_layer()
         sl = CompanyContext(self.company_code).service_layer
 
         session = requests.Session()
         session.verify = False
-        login = session.post(
-            f"{sl['base_url']}/b1s/v2/Login",
-            json={
-                "CompanyDB": sl["company_db"],
-                "UserName": sl["username"],
-                "Password": sl["password"],
-            },
-            timeout=30,
-        )
+        try:
+            login = session.post(
+                f"{sl['base_url']}/b1s/v2/Login",
+                json={
+                    "CompanyDB": sl["company_db"],
+                    "UserName": sl["username"],
+                    "Password": sl["password"],
+                },
+                timeout=(10, 30),
+            )
+        except requests.RequestException as exc:
+            raise SAPUnavailable(f"SAP Service Layer did not answer the login: {exc}") from exc
         if login.status_code != 200:
             raise SAPConnectionError(f"SAP login failed ({login.status_code}).")
 
@@ -975,13 +1085,7 @@ class BillSummaryService:
             }
             # The bilty is deliberately left alone: it is the transporter's
             # number for a real consignment note, not ours to erase.
-            response = session.patch(
-                f"{sl['base_url']}/b1s/v2/Invoices({summary.sap_invoice_doc_entry})",
-                json=payload,
-                timeout=180,
-            )
-            if response.status_code not in (200, 204):
-                raise SAPDataError(self._sap_message(response))
+            self._send_patch(session, sl, summary, payload)
             return [], []
 
         payload, kept, dropped = self._stamp_payload(
@@ -991,14 +1095,27 @@ class BillSummaryService:
             self.reader.dispatch_stamp_sizes(),
         )
 
-        response = session.patch(
-            f"{sl['base_url']}/b1s/v2/Invoices({summary.sap_invoice_doc_entry})",
-            json=payload,
-            timeout=180,
-        )
+        self._send_patch(session, sl, summary, payload)
+        return kept, dropped
+
+    def _send_patch(self, session, sl, summary: BillSummary, payload: dict) -> None:
+        """The PATCH, with SAP not answering told apart from SAP refusing.
+
+        A timeout may have reached SAP; that is still a wait, because a resend
+        writes the same values (what SAP already holds is read and kept).
+        """
+        try:
+            response = session.patch(
+                f"{sl['base_url']}/b1s/v2/Invoices({summary.sap_invoice_doc_entry})",
+                json=payload,
+                timeout=(10, 180),
+            )
+        except requests.RequestException as exc:
+            raise SAPUnavailable(f"SAP Service Layer did not answer: {exc}") from exc
+        if response.status_code in (502, 503, 504):
+            raise SAPUnavailable(f"SAP Service Layer is not available ({response.status_code}).")
         if response.status_code not in (200, 204):
             raise SAPDataError(self._sap_message(response))
-        return kept, dropped
 
     # The dispatch identity is write-once in SAP. `SBO_SP_TRANSACTIONNOTIFICATION`
     # compares an updated A/R invoice against its own previous version and refuses
@@ -1192,6 +1309,9 @@ class BillSummaryService:
             transaction.on_commit(
                 lambda: notify_bill_summary_decided(approved, approved=True)
             )
+        # As SAP left them: each was stamped (or queued) as it was approved.
+        for summary in approved:
+            summary.refresh_from_db()
         return approved, refused
 
     @transaction.atomic
@@ -1224,7 +1344,7 @@ class BillSummaryService:
         # Outside the approval's own correctness: the warehouse has made its
         # decision, and SAP refusing the stamp is a thing to retry rather than a
         # reason to make the warehouse decide again.
-        transaction.on_commit(lambda: self.post_to_sap(summary.id))
+        transaction.on_commit(lambda: self._send_stamp(summary.id))
         logger.info(
             "Bill summary %s approved for %s", summary.entry_no, dispatch_date
         )
@@ -1420,5 +1540,5 @@ class BillSummaryService:
         # failure is recorded for retry, rather than the floor being unable to
         # withdraw a sheet because SAP was unreachable.
         if was_posted:
-            transaction.on_commit(lambda: self.post_to_sap(summary.id))
+            transaction.on_commit(lambda: self._send_stamp(summary.id))
         return summary
