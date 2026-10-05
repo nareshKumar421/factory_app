@@ -93,6 +93,7 @@ class GoodsReturnListSerializer(serializers.ModelSerializer):
             "customer_code",
             "customer_name",
             "customer_ref_no",
+            "comes_on_vehicle",
             "vehicle_no",
             "driver_name",
             "company_code",
@@ -166,6 +167,7 @@ class GoodsReturnDetailSerializer(serializers.ModelSerializer):
             "customer_code",
             "customer_name",
             "customer_ref_no",
+            "comes_on_vehicle",
             "vehicle",
             "vehicle_no",
             "driver",
@@ -216,6 +218,9 @@ class GoodsReturnCreateSerializer(serializers.Serializer):
     # return straight into the gate's arrival queue, so the vehicle and driver
     # have to be known by then. Both are enforced in the service (so the message
     # is the human one); the expected arrival date stays optional.
+    # A return that does not come on a vehicle needs none of the three: it skips
+    # the gate and is saved as already arrived.
+    comes_on_vehicle = serializers.BooleanField(required=False, default=True)
     vehicle_id = serializers.IntegerField(required=False, allow_null=True)
     driver_id = serializers.IntegerField(required=False, allow_null=True)
     expected_arrival_at = serializers.DateField(required=False, allow_null=True)
@@ -276,8 +281,10 @@ class GoodsReturnVehicleSerializer(serializers.Serializer):
     """Corrects the truck on a return that is already in the gate's queue (the
     vehicle is captured at creation, not here). A key left out is not touched;
     the vehicle and driver cannot be cleared back to nothing, because the gate is
-    already waiting on them -- ``expected_arrival_at: null`` still clears."""
+    already waiting on them -- ``expected_arrival_at: null`` still clears.
+    ``comes_on_vehicle`` moves the return on or off the gate's queue."""
 
+    comes_on_vehicle = serializers.BooleanField(required=False)
     vehicle_id = serializers.IntegerField(required=False, allow_null=True)
     driver_id = serializers.IntegerField(required=False, allow_null=True)
     expected_arrival_at = serializers.DateField(required=False, allow_null=True)

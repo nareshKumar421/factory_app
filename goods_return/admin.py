@@ -26,6 +26,6 @@ class GoodsReturnAttachmentInline(admin.TabularInline):
 @admin.register(GoodsReturn)
 class GoodsReturnAdmin(admin.ModelAdmin):
     list_display = ("entry_no", "company", "basis", "status", "customer_name", "created_at")
-    list_filter = ("company", "basis", "status")
+    list_filter = ("company", "basis", "status", "comes_on_vehicle")
     search_fields = ("entry_no", "customer_code", "customer_name", "customer_ref_no")
     inlines = [GoodsReturnInvoiceRefInline, GoodsReturnItemInline, GoodsReturnAttachmentInline]

@@ -254,6 +254,147 @@ class GoodsReturnFlowTests(TestCase):
             self.service.submit(gr.id, self.user, self.allowed)
 
 
+class NoVehicleReturnTests(TestCase):
+    """A return carried in by hand or dropped off by courier never meets the
+    gate: it is saved as already arrived and goes straight on to receipt."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="OIL")
+        self.user = get_user_model().objects.create(
+            email="clerk@example.com", full_name="Return Clerk"
+        )
+        self.vehicle = Vehicle.objects.create(vehicle_number="PB01AB1234")
+        self.driver = Driver.objects.create(
+            name="Ranjit", mobile_no="9990001111", license_no="DL-1"
+        )
+        self.service = GoodsReturnService(self.company)
+        self.allowed = [self.company.id]
+
+    def create(self, **overrides):
+        data = {
+            "basis": "DEBIT_NOTE",
+            "customer_name": "Sharma Traders",
+            "customer_code": "CUST001",
+            "comes_on_vehicle": False,
+        }
+        data.update(overrides)
+        return self.service.create_return(data, self.user)
+
+    def test_it_is_saved_as_arrived_with_no_truck(self):
+        gr = self.create()
+        self.assertFalse(gr.comes_on_vehicle)
+        self.assertEqual(gr.status, GoodsReturnStatus.ARRIVED)
+        self.assertIsNone(gr.vehicle_id)
+        self.assertIsNone(gr.driver_id)
+        self.assertIsNone(gr.vehicle_entry_id)
+
+    def test_a_truck_sent_along_with_it_is_ignored(self):
+        gr = self.create(
+            vehicle_id=self.vehicle.id,
+            driver_id=self.driver.id,
+            expected_arrival_at=timezone.localdate(),
+        )
+        self.assertIsNone(gr.vehicle_id)
+        self.assertIsNone(gr.driver_id)
+        self.assertIsNone(gr.expected_arrival_at)
+
+    def test_the_gate_never_sees_it(self):
+        gr = self.create()
+        self.assertNotIn(gr, list(list_expected_returns(self.allowed)))
+        with self.assertRaises(ValueError):
+            mark_return_in(
+                gr.id,
+                self.user,
+                {"vehicle_id": self.vehicle.id, "driver_id": self.driver.id},
+                self.allowed,
+            )
+        gr.refresh_from_db()
+        self.assertIsNone(gr.vehicle_entry_id)
+
+    def test_it_can_be_received_without_a_gate_entry(self):
+        gr = self.create()
+        self.service.save_items(
+            gr.id, [{"item_code": "FG1", "return_quantity": 2}], self.user, self.allowed
+        )
+        # Past the status check: what is left to ask for is the warehouse.
+        with self.assertRaisesMessage(ValueError, "Select the goods-return warehouse"):
+            self.service.assert_receivable(gr.id, "", self.allowed)
+
+    def test_coming_on_approval_still_holds_the_receipt(self):
+        gr = self.create(requires_approval=True)
+        self.service.save_items(
+            gr.id, [{"item_code": "FG1", "return_quantity": 2}], self.user, self.allowed
+        )
+        with self.assertRaisesMessage(ValueError, "awaiting admin approval"):
+            self.service.assert_receivable(gr.id, "GR-WH", self.allowed)
+
+    def test_submit_keeps_it_arrived(self):
+        gr = self.create()
+        self.service.save_items(
+            gr.id, [{"item_code": "FG1", "return_quantity": 2}], self.user, self.allowed
+        )
+        self.service.upload_attachment(
+            gr.id, _a_file(), "DEBIT_NOTE", "", self.user, self.allowed
+        )
+        gr = self.service.submit(gr.id, self.user, self.allowed)
+        self.assertEqual(gr.status, GoodsReturnStatus.ARRIVED)
+
+    def test_it_can_be_cancelled_until_it_is_received(self):
+        gr = self.service.cancel(self.create().id, self.user, self.allowed)
+        self.assertEqual(gr.status, GoodsReturnStatus.CANCELLED)
+
+    def test_a_truck_the_gate_let_in_still_cannot_be_cancelled(self):
+        gr = self.create(
+            comes_on_vehicle=True, vehicle_id=self.vehicle.id, driver_id=self.driver.id
+        )
+        mark_return_in(gr.id, self.user, {}, self.allowed)
+        with self.assertRaises(ValueError):
+            self.service.cancel(gr.id, self.user, self.allowed)
+
+    def test_switching_it_off_takes_the_return_off_the_gates_queue(self):
+        gr = self.create(
+            comes_on_vehicle=True, vehicle_id=self.vehicle.id, driver_id=self.driver.id
+        )
+        gr = self.service.set_vehicle(
+            gr.id, {"comes_on_vehicle": False}, self.user, self.allowed
+        )
+        self.assertEqual(gr.status, GoodsReturnStatus.ARRIVED)
+        self.assertIsNone(gr.vehicle_id)
+        self.assertIsNone(gr.driver_id)
+        self.assertNotIn(gr, list(list_expected_returns(self.allowed)))
+
+    def test_switching_it_on_needs_a_truck_and_puts_it_in_the_queue(self):
+        gr = self.create()
+        with self.assertRaises(ValueError):
+            self.service.set_vehicle(
+                gr.id, {"comes_on_vehicle": True}, self.user, self.allowed
+            )
+        gr.refresh_from_db()
+        self.assertFalse(gr.comes_on_vehicle)
+        self.assertEqual(gr.status, GoodsReturnStatus.ARRIVED)
+
+        gr = self.service.set_vehicle(
+            gr.id,
+            {
+                "comes_on_vehicle": True,
+                "vehicle_id": self.vehicle.id,
+                "driver_id": self.driver.id,
+            },
+            self.user,
+            self.allowed,
+        )
+        self.assertEqual(gr.status, GoodsReturnStatus.AWAITING_ARRIVAL)
+        self.assertEqual(gr.vehicle_id, self.vehicle.id)
+        self.assertIn(gr, list(list_expected_returns(self.allowed)))
+
+    def test_a_return_that_omits_the_answer_comes_on_a_vehicle(self):
+        from .serializers import GoodsReturnCreateSerializer
+
+        serializer = GoodsReturnCreateSerializer(data={"basis": "DEBIT_NOTE"})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertTrue(serializer.validated_data["comes_on_vehicle"])
+
+
 class GateHistoryTests(TestCase):
     """The queue drops a return the moment it is marked in; the history tab is
     where the gate goes to see what it let in earlier."""

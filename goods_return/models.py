@@ -9,6 +9,9 @@ have to wait for the paperwork to finish. A different user marks it in at the ga
 The vehicle/driver columns stay nullable for the returns booked before that was
 so, and the gate can still supply the truck at mark-in for those.
 
+A return that does not come on a vehicle (``comes_on_vehicle=False``) never meets
+the gate: it is saved straight as ARRIVED and goes on to items and receipt.
+
 No-redundancy design: every shared entity is referenced, never copied --
 ``company``/``vehicle``/``driver`` are FKs to their masters, the gate-in event and
 the truck's inside/outside state live on the shared ``driver_management.VehicleEntry``
@@ -120,9 +123,18 @@ class GoodsReturn(BaseModel):
     # it blank and uses the invoice numbers instead.
     customer_ref_no = models.CharField(max_length=100, blank=True)
 
+    # Not every return comes back on a truck -- some are carried in by hand or
+    # dropped off by courier. Those have nothing for the gate to mark in, so they
+    # skip the gate altogether: no vehicle, no driver, and born ARRIVED, which is
+    # where receipt picks a return up. True for every return booked before the
+    # choice existed. `db_default` as well: a server still running the code
+    # before this column inserts returns without naming it.
+    comes_on_vehicle = models.BooleanField(default=True, db_default=True)
+
     # Reference-only FKs to the shared masters (never copied). Required from
-    # creation onwards; nullable only for the returns booked before the vehicle
-    # moved to the first page.
+    # creation onwards on a return that comes on a vehicle; nullable for the ones
+    # that do not, and for the returns booked before the vehicle moved to the
+    # first page.
     vehicle = models.ForeignKey(
         "vehicle_management.Vehicle",
         on_delete=models.PROTECT,

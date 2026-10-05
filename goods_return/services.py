@@ -231,27 +231,39 @@ class GoodsReturnService:
         already on its way while the items are still being keyed in, and the gate
         cannot mark in what it cannot see. The rest of the booking (items, review)
         carries on against a return that is already in the gate's queue.
+
+        A return that does not come on a vehicle skips the gate instead: it has no
+        truck to mark in, so it is born ARRIVED -- where the gate would have left
+        it -- and goes straight on to items and receipt.
         """
         if self.company is None:
             raise ValueError("A company context is required to create a return.")
 
         basis = data["basis"]
         requires_approval = bool(data.get("requires_approval"))
-        if not data.get("vehicle_id") or not data.get("driver_id"):
-            raise ValueError("Pick the vehicle and driver bringing the goods back.")
-        vehicle = self._resolve_vehicle(data["vehicle_id"])
-        driver = self._resolve_driver(data["driver_id"])
+        comes_on_vehicle = data.get("comes_on_vehicle", True)
+        vehicle = driver = None
+        if comes_on_vehicle:
+            if not data.get("vehicle_id") or not data.get("driver_id"):
+                raise ValueError("Pick the vehicle and driver bringing the goods back.")
+            vehicle = self._resolve_vehicle(data["vehicle_id"])
+            driver = self._resolve_driver(data["driver_id"])
         gr = GoodsReturn(
             company=self.company,
             entry_no=GoodsReturn.generate_entry_no(),
             basis=basis,
-            status=GoodsReturnStatus.AWAITING_ARRIVAL,
+            status=(
+                GoodsReturnStatus.AWAITING_ARRIVAL
+                if comes_on_vehicle
+                else GoodsReturnStatus.ARRIVED
+            ),
             customer_code=(data.get("customer_code") or "").strip(),
             customer_name=(data.get("customer_name") or "").strip(),
             customer_ref_no=(data.get("customer_ref_no") or "").strip(),
+            comes_on_vehicle=comes_on_vehicle,
             vehicle=vehicle,
             driver=driver,
-            expected_arrival_at=data.get("expected_arrival_at"),
+            expected_arrival_at=data.get("expected_arrival_at") if comes_on_vehicle else None,
             remarks=(data.get("remarks") or "").strip(),
             requires_approval=requires_approval,
             approval_status=(
@@ -463,6 +475,11 @@ class GoodsReturnService:
         only ever changes them -- it cannot blank them, because the gate is
         already waiting on this arrival. A key left out is not touched;
         ``expected_arrival_at: null`` still clears the date.
+
+        ``comes_on_vehicle`` corrects the other answer on that page, until the
+        gate has marked a truck in. Turning it off takes the return off the
+        gate's queue and drops the truck; turning it on puts the return back in
+        the queue, and then needs the truck the gate is to look for.
         """
         gr = self._get_scoped(pk, allowed_company_ids)
         self._assert_editable(gr)
@@ -470,6 +487,34 @@ class GoodsReturnService:
             raise ValueError("The vehicle is already marked in at the gate.")
 
         update_fields = []
+
+        switched_on = False
+        if "comes_on_vehicle" in data and data["comes_on_vehicle"] != gr.comes_on_vehicle:
+            gr.comes_on_vehicle = data["comes_on_vehicle"]
+            switched_on = gr.comes_on_vehicle
+            gr.status = (
+                GoodsReturnStatus.AWAITING_ARRIVAL
+                if gr.comes_on_vehicle
+                else GoodsReturnStatus.ARRIVED
+            )
+            update_fields += ["comes_on_vehicle", "status"]
+
+        if not gr.comes_on_vehicle:
+            gr.vehicle = None
+            gr.driver = None
+            gr.expected_arrival_at = None
+            gr.updated_by = user
+            gr.save(
+                update_fields=[
+                    *update_fields,
+                    "vehicle",
+                    "driver",
+                    "expected_arrival_at",
+                    "updated_by",
+                    "updated_at",
+                ]
+            )
+            return gr
 
         if "vehicle_id" in data:
             if data["vehicle_id"] is None:
@@ -486,6 +531,9 @@ class GoodsReturnService:
         if "expected_arrival_at" in data:
             gr.expected_arrival_at = data["expected_arrival_at"]
             update_fields.append("expected_arrival_at")
+
+        if switched_on and (not gr.vehicle_id or not gr.driver_id):
+            raise ValueError("Pick the vehicle and driver bringing the goods back.")
 
         gr.updated_by = user
         gr.save(update_fields=[*update_fields, "updated_by", "updated_at"])
@@ -1439,8 +1487,11 @@ class GoodsReturnService:
 
     def cancel(self, pk, user, allowed_company_ids) -> GoodsReturn:
         gr = self._get_scoped(pk, allowed_company_ids)
-        if gr.status in (
-            GoodsReturnStatus.ARRIVED,
+        # A return with no vehicle is ARRIVED from the moment it is saved, without
+        # anything having come through the gate, so it can still be cancelled
+        # until it is received.
+        gated_in = gr.status == GoodsReturnStatus.ARRIVED and gr.comes_on_vehicle
+        if gated_in or gr.status in (
             GoodsReturnStatus.RECEIVED,
             GoodsReturnStatus.SAP_QUEUED,
             GoodsReturnStatus.PARTIALLY_POSTED,
