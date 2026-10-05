@@ -1491,6 +1491,13 @@ class PlantBoardService:
         produced_qty_floor = sum(row["pieces"] for row in floor_days.values())
         daily = self._daily_pieces(floor_days, window_from, window_to)
         active_days = [row for row in daily if row["qty"] > 0]
+        # The SKUs behind the unplanned tonnage, so the drill can name them
+        # rather than leave a reader with a single figure to argue with.
+        unplanned = self._unplanned_items(
+            window_from,
+            window_to,
+            {line.get("item_code") for line in lines if line.get("item_code")},
+        )
 
         floor = self._floor_stock()
 
@@ -1538,6 +1545,9 @@ class PlantBoardService:
                 if _tons(planned_litres) > 0
                 else None
             ),
+            "unplanned_items": unplanned,
+            "unplanned_item_count": len(unplanned),
+            "unplanned_qty": round(sum(row["pieces"] for row in unplanned), 2),
             "unweighed_lines": unweighed_lines,
             # The average the business defined: output over the days that
             # actually produced, so a Sunday does not drag it down and it reads
@@ -1705,6 +1715,39 @@ class PlantBoardService:
             held["pieces"] += _f(row.get("Pieces"))
             held["litres"] += _f(row.get("Litres"))
         return by_day
+
+    def _unplanned_items(
+        self, window_from: date, window_to: date, plan_codes: set
+    ) -> List[Dict[str, Any]]:
+        """What the floor made this month that the plan never listed, by SKU.
+
+        The same receipts the tile's output figure is built from, read by item
+        and set against the plan's own codes. A SKU on the plan is left out even
+        when it was planned at zero: it was the plan's to speak for. Heaviest
+        first, then by pieces for the SKUs SAP holds no litre volume for, so the
+        list opens on the tonnes that make up the tile's "Unplanned" figure.
+        """
+        out: List[Dict[str, Any]] = []
+        for row in self.reader.floor_production_by_item(window_from, window_to) or []:
+            code = row.get("ItemCode")
+            if not code or code in plan_codes:
+                continue
+            last = _as_date(row.get("LastDay"))
+            litres = _f(row.get("Litres"))
+            out.append(
+                {
+                    "item_code": code,
+                    "item_name": row.get("ItemName") or "",
+                    "pieces": round(_f(row.get("Pieces")), 2),
+                    "tons": _tons(litres),
+                    # A SKU with no litre volume is in the pieces and in no ton.
+                    "weighed": litres > 0,
+                    "days": int(row.get("Days") or 0),
+                    "last_day": last.isoformat() if last else None,
+                }
+            )
+        out.sort(key=lambda row: (-row["tons"], -row["pieces"], row["item_code"]))
+        return out
 
     def _daily_pieces(
         self, by_day: Dict[date, Dict[str, float]], window_from: date, window_to: date

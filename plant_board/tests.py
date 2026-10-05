@@ -83,6 +83,10 @@ class FakeReader:
         """
         return getattr(self, "floor_rows", [])
 
+    def floor_production_by_item(self, date_from, date_to):
+        """The same receipts by SKU. Empty by default, for the same reason."""
+        return getattr(self, "floor_item_rows", [])
+
 
 class FakeStock:
     def __init__(self, occupancy=None, levels=None):
@@ -1887,6 +1891,31 @@ class ProductionSeriesTests(TestCase):
         )
         self.assertEqual(band["attainment_pct"], 90.0)
         self.assertEqual(band["attainment_planned_pct"], 40.0)
+
+    def test_the_unplanned_skus_are_named_heaviest_first(self):
+        """The drill lists what the plan never saw, and nothing it did."""
+        board = service(
+            plans=self.FakePlans(
+                [{"item_code": "FG1", "planned_qty": 1000, "planned_litres": 1000}]
+            ),
+            reader=self.FakeFloor(),
+            plan_reader=object(),
+        )
+        board.reader.floor_item_rows = [
+            {"ItemCode": "FG1", "ItemName": "Planned", "Pieces": 400, "Litres": 400},
+            {"ItemCode": "CP1", "ItemName": "Cold press", "Pieces": 100, "Litres": 500,
+             "Days": 2, "LastDay": date(2026, 9, 4)},
+            {"ItemCode": "NOL", "ItemName": "No litre", "Pieces": 70, "Litres": 0},
+            {"ItemCode": "RB1", "ItemName": "Rice bran", "Pieces": 900, "Litres": 900},
+        ]
+        band = board._production(self.PLAN)
+        rows = band["unplanned_items"]
+        self.assertEqual([row["item_code"] for row in rows], ["RB1", "CP1", "NOL"])
+        self.assertEqual(rows[1]["tons"], 0.5)
+        self.assertEqual(rows[1]["last_day"], "2026-09-04")
+        self.assertFalse(rows[2]["weighed"])
+        self.assertEqual(band["unplanned_item_count"], 3)
+        self.assertEqual(band["unplanned_qty"], 1070)
 
     def test_a_plan_actual_above_the_floor_is_never_a_negative_surplus(self):
         """A receipt posted to another warehouse is a question, not a surplus."""
