@@ -71,6 +71,7 @@ from gate_core.services.box_packing import split_line, split_with_pieces_per_box
 from sap_client.client import SAPClient
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPUnavailable
+from warehouse.services import warehouse_scope
 
 from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan
@@ -102,6 +103,15 @@ def _dec(value, field: str) -> Decimal:
         raise BillSummaryError(f"{field} is not a number: {value!r}")
 
 
+def _godowns(summary: BillSummary) -> frozenset:
+    """The godowns a sheet comes out of, upper-cased as `UserWarehouse` keeps them."""
+    return frozenset(
+        code.strip().upper()
+        for code in (summary.warehouse_codes or "").split(",")
+        if code.strip()
+    )
+
+
 class BillSummaryService:
     #: Raised from a sheet whose stamp SAP did not answer, for the rest of the
     #: request: see the module docstring.
@@ -111,6 +121,7 @@ class BillSummaryService:
         self.company_code = company_code
         self.user = user
         self._reader = None
+        self._managed = None
 
     @property
     def company(self) -> Company:
@@ -1276,6 +1287,45 @@ class BillSummaryService:
     # the warehouse's decision
     # ------------------------------------------------------------------
 
+    def manages(self, summary: BillSummary) -> bool:
+        """Is this sheet the user's to decide — is a godown on it one they manage?
+
+        Any godown on the sheet, not every one: a bill spanning two godowns is
+        still one truck and one dispatch date, and demanding a manager of both
+        would leave it on nobody's screen. A sheet with no godown on it goes to
+        every godown manager rather than to none, for the same reason — but
+        never to a user who manages nothing (see `warehouse_scope`).
+        """
+        if warehouse_scope.is_unrestricted(self.user):
+            return True
+        if self._managed is None:
+            self._managed = warehouse_scope.managed_warehouses(
+                self.user, self.company_code
+            )
+        if not self._managed:
+            return False
+        godowns = _godowns(summary)
+        return not godowns or bool(godowns & self._managed)
+
+    def managed_only(self, summaries) -> list:
+        """The sheets out of the godowns this user manages."""
+        return [summary for summary in summaries if self.manages(summary)]
+
+    def _check_manages(self, summary: BillSummary, action: str) -> None:
+        if self.manages(summary):
+            return
+        if not self._managed:
+            raise BillSummaryError(
+                f"Cannot {action} {summary.entry_no}: you are not set as the "
+                "manager of any godown in this company. An administrator assigns "
+                "this on Admin → Warehouse Managers."
+            )
+        raise BillSummaryError(
+            f"Cannot {action} {summary.entry_no}: it goes out of "
+            f"{', '.join(sorted(_godowns(summary)))}, and you manage "
+            f"{', '.join(sorted(self._managed))}."
+        )
+
     def approve(self, summary_ids: list, dispatch_date) -> list:
         """Set the dispatch date on each sheet and stamp SAP.
 
@@ -1322,6 +1372,7 @@ class BillSummaryService:
                 f"{summary.entry_no} is not waiting for approval "
                 f"({summary.get_status_display().lower()})."
             )
+        self._check_manages(summary, "approve")
         # Demanded here rather than when the sheet was raised: this is the
         # request SAP refuses without one, and until now there was nothing to
         # refuse. See the module docstring for what SAP does instead.
@@ -1365,6 +1416,7 @@ class BillSummaryService:
                 f"{summary.entry_no} is not waiting for approval "
                 f"({summary.get_status_display().lower()})."
             )
+        self._check_manages(summary, "send back")
         summary.status = BillSummaryStatus.REJECTED
         summary.reject_reason = reason.strip()
         summary.rejected_by = self.user

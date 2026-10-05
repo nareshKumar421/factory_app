@@ -57,19 +57,52 @@ BILL_SUMMARY_URL = "/warehouse/bill-summaries"
 
 
 def notify_bill_summary_submitted(summaries):
-    """Dispatch has sent sheets across; tell the warehouse they are waiting.
+    """Dispatch has sent sheets across; tell the godowns' managers they are waiting.
 
-    One notification for the batch, not one per bill. A truck is submitted in a
-    single action and approved in a single action, so eight pushes would be eight
-    ways of saying the same thing to the same person.
+    Only the warehouse users who manage a godown on the sheets, and each of them
+    about their own sheets only — the same rule as the approvals screen
+    (`BillSummaryService.manages`), so nobody is told about a sheet that screen
+    will not show them. One notification per person for the batch, not one per
+    bill: a truck is submitted in a single action and approved in a single
+    action, so eight pushes would be eight ways of saying the same thing.
 
     Called from inside an ``on_commit`` callback, so it sends straight away
     rather than deferring again — by the time it runs the sheets are committed.
     """
+    # Imported here: the service imports this module.
+    from .bill_summary_service import BillSummaryService
+
     summaries = [summary for summary in summaries if summary]
     if not summaries:
         return
 
+    company = summaries[0].company
+    for user in _warehouse_desk(company):
+        theirs = BillSummaryService(company.code, user).managed_only(summaries)
+        if theirs:
+            _send_submitted(user, theirs)
+
+
+def _warehouse_desk(company):
+    """Active members of the warehouse group with access to this company."""
+    from django.contrib.auth import get_user_model
+
+    from company.models import UserCompany
+
+    return (
+        get_user_model()
+        .objects.filter(
+            groups__name=WAREHOUSE_GROUP,
+            is_active=True,
+            id__in=UserCompany.objects.filter(
+                company=company, is_active=True
+            ).values("user_id"),
+        )
+        .distinct()
+    )
+
+
+def _send_submitted(user, summaries):
     first = summaries[0]
     vehicles = sorted({(s.vehicle_no or "").strip() for s in summaries} - {""})
     truck = f" on {', '.join(vehicles)}" if vehicles else ""
@@ -79,8 +112,8 @@ def notify_bill_summary_submitted(summaries):
         f"{'is' if count == 1 else 'are'} waiting for a dispatch date."
     )
 
-    NotificationService.send_notification_by_auth_group(
-        group_name=WAREHOUSE_GROUP,
+    NotificationService.send_notification_to_user(
+        user=user,
         title="Bill Summary Awaiting Approval",
         body=body,
         notification_type=NotificationType.BILL_SUMMARY_SUBMITTED,

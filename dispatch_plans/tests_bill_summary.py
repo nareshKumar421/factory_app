@@ -10,11 +10,13 @@ from types import SimpleNamespace
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.contrib.auth.models import Permission
 from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from accounts.models import User
-from company.models import Company
+from company.models import Company, UserCompany, UserRole
 from dispatch_plans.bill_summary_service import BillSummaryError, BillSummaryService
 from dispatch_plans.hana_reader import HanaDispatchBillReader
 from dispatch_plans.models import DispatchPlan
@@ -26,6 +28,7 @@ from dispatch_plans.models_bill_summary import (
     BillSummaryStatus,
 )
 from dispatch_plans.serializers_bill_summary import BillSummaryListSerializer
+from warehouse.models_manager import UserWarehouse
 
 DOC_ENTRY = 5101
 DOC_NUM = "626080596"
@@ -140,6 +143,11 @@ class BillSummaryTestBase(TestCase):
         self.company = Company.objects.create(code="JIVO_OIL", name="Jivo Oil")
         self.user = User.objects.create_user(
             email="mgr@example.com", full_name="Manager", employee_code="E1", password="x"
+        )
+        # The godown `sap_line` bills come out of: approving and sending back
+        # are for that godown's managers only (see GodownScopeTests).
+        UserWarehouse.objects.create(
+            user=self.user, company=self.company, warehouse_code="GP-FG"
         )
         self.service = BillSummaryService("JIVO_OIL", self.user)
 
@@ -1091,6 +1099,9 @@ class ApprovalTests(BillSummaryTestBase):
             email="whs@example.com", full_name="Warehouse", employee_code="E9",
             password="x",
         )
+        UserWarehouse.objects.create(
+            user=self.warehouse, company=self.company, warehouse_code="GP-FG"
+        )
         self.warehouse_service = BillSummaryService("JIVO_OIL", self.warehouse)
 
     def test_approving_sets_the_date_and_records_who_gave_it(self):
@@ -1273,6 +1284,158 @@ class SendingBackTests(BillSummaryTestBase):
             summary = self.approved()
         with self.assertRaises(BillSummaryError):
             self.service.resubmit(summary.id, {"bilty_no": "NCR-999"})
+
+
+class GodownScopeTests(BillSummaryTestBase):
+    """A sheet is for the managers of the godown it goes out of.
+
+    Not for every warehouse user in the company: the approvals screen lists only
+    a user's own godowns, and approving or sending back anyone else's is refused
+    the same way. `self.user` manages GP-FG (see the base); `self.bhakharpur`
+    manages BH-FG only.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.bhakharpur = self.desk_user("bh@example.com", "BH-FG")
+
+    def desk_user(self, email, *godowns, **extra):
+        user = User.objects.create_user(
+            email=email, full_name=email.split("@")[0].title(),
+            employee_code=email.split("@")[0].upper(), password="x", **extra,
+        )
+        UserCompany.objects.create(
+            user=user, company=self.company,
+            role=UserRole.objects.get_or_create(name="Warehouse")[0],
+            is_default=True,
+        )
+        user.user_permissions.add(
+            Permission.objects.get(codename="can_approve_bill_summary")
+        )
+        for godown in godowns:
+            UserWarehouse.objects.create(
+                user=user, company=self.company, warehouse_code=godown
+            )
+        return User.objects.get(pk=user.pk)
+
+    def sheet(self, godowns, doc_entry=DOC_ENTRY):
+        """A sheet with the warehouse, going out of `godowns` as SAP names them."""
+        with self.stub():
+            summary = self.generate(sap_invoice_doc_entry=doc_entry)
+        BillSummary.objects.filter(pk=summary.pk).update(warehouse_codes=godowns)
+        summary.refresh_from_db()
+        return summary
+
+    def service_for(self, user):
+        return BillSummaryService("JIVO_OIL", user)
+
+    def test_another_godowns_sheet_cannot_be_approved(self):
+        summary = self.sheet("GP-FG")
+        with self.stub():
+            approved, refused = self.approve(
+                summary, service=self.service_for(self.bhakharpur)
+            )
+        self.assertEqual(approved, [])
+        self.assertIn("goes out of GP-FG", refused[0]["reason"])
+        self.assertIn("you manage BH-FG", refused[0]["reason"])
+        self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
+
+    def test_another_godowns_sheet_cannot_be_sent_back(self):
+        summary = self.sheet("GP-FG")
+        with self.assertRaises(BillSummaryError) as ctx:
+            self.service_for(self.bhakharpur).reject(summary.id, "wrong truck")
+        self.assertIn("goes out of GP-FG", str(ctx.exception))
+        summary.refresh_from_db()
+        self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
+
+    def test_a_user_who_manages_no_godown_decides_nothing(self):
+        """Not even a sheet with no godown on it: missing SAP data must not
+        become a way round the assignment."""
+        nobody = self.desk_user("nobody@example.com")
+        for godowns, doc_entry in (("GP-FG", DOC_ENTRY), ("", DOC_ENTRY + 1)):
+            summary = self.sheet(godowns, doc_entry)
+            with self.stub():
+                approved, refused = self.approve(
+                    summary, service=self.service_for(nobody)
+                )
+            self.assertEqual(approved, [])
+            self.assertIn("not set as the manager of any godown", refused[0]["reason"])
+
+    def test_either_godown_of_a_split_bill_can_approve_it(self):
+        """One truck, one dispatch date: asking for a manager of both godowns
+        would leave the sheet on nobody's screen."""
+        summary = self.sheet("bh-fg , GP-FG")
+        with self.stub():
+            approved, refused = self.approve(
+                summary, service=self.service_for(self.bhakharpur)
+            )
+        self.assertEqual(refused, [])
+        self.assertEqual(summary.status, BillSummaryStatus.APPROVED)
+
+    def test_a_sheet_with_no_godown_goes_to_every_godown_manager(self):
+        summary = self.sheet("")
+        self.assertTrue(self.service_for(self.bhakharpur).manages(summary))
+        self.assertTrue(self.service.manages(summary))
+
+    def test_a_superuser_decides_any_sheet(self):
+        admin = self.desk_user("admin@example.com", is_superuser=True)
+        summary = self.sheet("GP-FG")
+        with self.stub():
+            _approved, refused = self.approve(summary, service=self.service_for(admin))
+        self.assertEqual(refused, [])
+        self.assertEqual(summary.status, BillSummaryStatus.APPROVED)
+
+    def test_the_approvals_screen_lists_only_the_users_godowns(self):
+        gp = self.sheet("GP-FG", DOC_ENTRY)
+        bh = self.sheet("BH-FG", DOC_ENTRY + 1)
+        unnamed = self.sheet("", DOC_ENTRY + 2)
+        client = APIClient()
+        client.force_authenticate(self.bhakharpur)
+
+        def listed(**params):
+            response = client.get(
+                "/api/v1/dispatch/bill-summaries/",
+                {"status": "PENDING_APPROVAL", **params},
+                HTTP_COMPANY_CODE=self.company.code,
+            )
+            self.assertEqual(response.status_code, 200, response.content)
+            return {row["id"] for row in response.json()}
+
+        self.assertEqual(listed(managed="1"), {bh.id, unnamed.id})
+        # The register itself is unchanged: it is what dispatch reads too.
+        self.assertEqual(listed(), {gp.id, bh.id, unnamed.id})
+
+    def test_only_the_godowns_managers_are_told_a_sheet_is_waiting(self):
+        """Each about their own sheets: the count on the push is what the
+        approvals screen will show them."""
+        from django.contrib.auth.models import Group
+
+        from dispatch_plans.notifications import notify_bill_summary_submitted
+        from notifications.models import Notification, NotificationType
+
+        desk = Group.objects.get_or_create(name="warehouse")[0]
+        gurgaon = self.desk_user("gp@example.com", "GP-FG")
+        nobody = self.desk_user("nobody@example.com")
+        # Manages the godown but is not on the warehouse desk.
+        self.desk_user("outsider@example.com", "GP-FG")
+        for user in (gurgaon, self.bhakharpur, nobody):
+            user.groups.add(desk)
+
+        notify_bill_summary_submitted([
+            self.sheet("GP-FG", DOC_ENTRY),
+            self.sheet("GP-FG", DOC_ENTRY + 1),
+            self.sheet("BH-FG", DOC_ENTRY + 2),
+        ])
+
+        told = {
+            n.recipient_id: n.body
+            for n in Notification.objects.filter(
+                notification_type=NotificationType.BILL_SUMMARY_SUBMITTED
+            )
+        }
+        self.assertEqual(set(told), {gurgaon.id, self.bhakharpur.id})
+        self.assertTrue(told[gurgaon.id].startswith("2 bill summaries"))
+        self.assertTrue(told[self.bhakharpur.id].startswith("1 bill summary "))
 
 
 class PrintingTests(BillSummaryTestBase):
