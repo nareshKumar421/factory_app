@@ -142,6 +142,11 @@ urlpatterns = [
         "api/v1/dashboards/accounts-board/",
         include("accounts_board.urls"),
     ),
+    # The Amounts board -- the plants' stock in rupees and the debtors.
+    path(
+        "api/v1/dashboards/amounts-board/",
+        include("amounts_board.urls"),
+    ),
     # The Operations Report -- production, wastage, labour and electricity by
     # day, for the page that adds them up into a cost per litre.
     path(

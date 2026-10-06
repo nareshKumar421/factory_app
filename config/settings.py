@@ -270,6 +270,11 @@ INSTALLED_APPS = [
     # call anywhere in it -- and like the other boards owns no data, so no
     # migration and no permission row of its own on a live database.
     'accounts_board.apps.AccountsBoardConfig',
+    # The Amounts board. The two plants' RM / PM / FG stock in rupees, godown by
+    # godown, and what customers owe each company. Reads SAP across all three
+    # schemas; owns the per-plant stock owners and its own view right, so it
+    # does ship a migration.
+    'amounts_board.apps.AmountsBoardConfig',
     # The Operations Report. A company's production, wastage, labour and
     # electricity a day at a time, for the page that works out what each litre
     # cost. Reads the runs, the waste register, the labour gate and Daily

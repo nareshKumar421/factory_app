@@ -154,6 +154,12 @@ PAGE_GROUPS: dict[str, list[str]] = {
         "dispatch_plans.can_view_dispatch_plans",
         "factory_expense.can_view_factory_expense",
     ],
+    # /dashboards/amounts — the two plants' stock in rupees and what customers
+    # owe. Unlike the control boards it HAS a right of its own (amounts_board
+    # migration 0001): no stock or warehouse right ever disclosed debtors, so
+    # none of them may open it. Setting the RM / PM / FG owners is the action
+    # group "Amounts Owners" below.
+    "Amounts": ["amounts_board.can_view_amounts_board"],
     # /dashboards/plant-board — the whole plant on one wall in the order
     # material moves: bought, stored, made, shifted. Also covers
     # /dashboards/plant-board/settings, which is gated on these same rights
@@ -358,6 +364,11 @@ ACTION_GROUPS: dict[str, list[str]] = {
     "SAP Reports Admin": [
         "sap_reports.can_view_sap_reports",
         "sap_reports.can_manage_sap_reports",
+    ],
+    # /dashboards/amounts/owners — who the RM / PM / FG tiles name.
+    "Amounts Owners": [
+        "amounts_board.can_view_amounts_board",
+        "amounts_board.can_manage_stock_owners",
     ],
 }
 
