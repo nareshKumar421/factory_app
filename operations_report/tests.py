@@ -11,6 +11,8 @@ What these pin down, each because it would go wrong silently:
   valued at that run's own price;
 - labour counts the gate's intake, never the HOD's allocation of the same
   people, and is priced from the Cost Master -- or left uncosted, not zero;
+- salary is the Cost Master's monthly bill spread over its month's days, every
+  day alike, and a day with no rate in force is a gap, not a nil payroll;
 - a day nobody read the meters is a gap, not zero units;
 - a reader holding only one of the two rights gets that half of the report.
 """
@@ -29,7 +31,7 @@ from rest_framework.test import APIClient
 from accounts.models import Department as PlantDepartment
 from company.models import Company, UserCompany, UserRole
 from cost_master.models import CostRate, CostType
-from factory_expense.constants import LABOUR_COST_TYPE_CODE
+from factory_expense.constants import LABOUR_COST_TYPE_CODE, SALARY_COST_TYPE_CODE
 from goods_return.models import GoodsReturn, GoodsReturnItem
 from labour_gate.models import LabourGateEntry
 from person_gatein.models import Contractor
@@ -221,6 +223,57 @@ class LabourTests(ReportTestCase):
         self.assertEqual(self.day(report)["labour"][0]["heads"], 40)
 
 
+class SalaryTests(ReportTestCase):
+    def salary(self, amount, *, department=None, effective_from=date(2026, 9, 1)):
+        cost_type, _ = CostType.objects.get_or_create(
+            code=SALARY_COST_TYPE_CODE,
+            defaults={"name": "Factory — Salary", "default_basis": "PER_MONTH"},
+        )
+        return CostRate.objects.create(
+            cost_type=cost_type, scope="DEPARTMENT" if department else "FACTORY",
+            department=department, basis="PER_MONTH", rate=Decimal(amount),
+            effective_from=effective_from,
+        )
+
+    def test_each_day_carries_its_months_bill_over_the_months_days(self):
+        refinery = PlantDepartment.objects.create(name="Refinery")
+        self.salary("300000", department=self.packing)
+        self.salary("600000", department=refinery)
+
+        # The 30th of September and the 1st of October: 30 days, then 31.
+        report = self.report(date(2026, 9, 30), date(2026, 10, 1))
+
+        self.assertEqual(
+            self.day(report, date(2026, 9, 30))["salary"],
+            [
+                {"department": "Refinery", "monthly": 600000.0, "cost": 20000.0},
+                {"department": "Packing", "monthly": 300000.0, "cost": 10000.0},
+            ],
+        )
+        self.assertEqual(
+            [row["cost"] for row in self.day(report, date(2026, 10, 1))["salary"]],
+            [19354.8387, 9677.4194],
+        )
+
+    def test_a_day_before_any_rate_is_a_gap_not_a_nil_payroll(self):
+        self.salary("300000", effective_from=DAY + timedelta(days=1))
+
+        report = self.report(DAY, DAY + timedelta(days=1))
+
+        self.assertIsNone(self.day(report)["salary"])
+        self.assertEqual(
+            self.day(report, DAY + timedelta(days=1))["salary"],
+            [{"department": "All departments", "monthly": 300000.0, "cost": 10000.0}],
+        )
+        self.assertFalse(any("factory-salary" in w for w in report["meta"]["warnings"]))
+
+    def test_no_rate_anywhere_in_the_span_is_said(self):
+        report = self.report()
+
+        self.assertIsNone(self.day(report)["salary"])
+        self.assertTrue(any("'factory-salary'" in w for w in report["meta"]["warnings"]))
+
+
 class PowerTests(ReportTestCase):
     def test_meters_by_day_and_an_unread_day_is_a_gap(self):
         result = {
@@ -327,7 +380,9 @@ class AccessTests(ReportTestCase):
         response = self.get(user, **{"from": "2026-09-14", "to": "2026-09-14"})
 
         self.assertEqual(response.status_code, 200, response.content[:300])
-        self.assertEqual(sorted(response.data["meta"]["withheld"]), ["labour", "power", "returns"])
+        self.assertEqual(
+            sorted(response.data["meta"]["withheld"]), ["labour", "power", "returns", "salary"]
+        )
 
     def test_neither_right_is_refused(self):
         response = self.get(self.user_with(), **{"from": "2026-09-14", "to": "2026-09-14"})

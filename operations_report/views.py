@@ -5,8 +5,8 @@ operations_report/views.py
 
 Read-only. JWT, a company context header, and either the factory expense or
 the production cost right -- or the board feed that mirrors one of them. The
-report shows the factory's wage and power bill beside what each litre cost,
-which is exactly what those two rights already disclose; it mints no right of
+report shows the factory's wage, salary and power bill beside what each litre
+cost, which is exactly what those two rights already disclose; it mints no right of
 its own, so nothing has to be created on the live database before it opens.
 
 Per section the service withholds what the reader may not see, so a reader

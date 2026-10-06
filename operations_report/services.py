@@ -1,7 +1,7 @@
 """
 operations_report/services.py
 
-A company's production, wastage, labour and electricity, one record a day.
+A company's production, wastage, labour, salary and electricity, one record a day.
 
 The Operations Report's page reads a period (a day or a month), the period it
 is compared with and the run of days around it, so it asks for ONE span that
@@ -27,6 +27,11 @@ WHERE EACH FIGURE COMES FROM
   barrier), per contractor and shift, priced at the Cost Master labour rate the
   Factory Expense board uses. The gate records heads only: there are no hours
   and no overtime anywhere to report.
+- **Salary** -- the staff on the payroll, as the Factory Expense board and the
+  Admin board cost them: the ``factory-salary`` PER_MONTH rates from the Cost
+  Master, department by department, each day carrying its month's bill over the
+  month's days. A salary is earned on a Sunday too, so every day accrues one,
+  production or not. A day with no rate in force is a gap (``None``), not nil.
 - **Electricity** -- Daily Electricity++, the company's share of each meter's
   own units (reading less sub-meters), which is what every board now reads.
 - **Goods Return (GR)** -- customer returns, counted the way the Customer
@@ -42,6 +47,7 @@ different fact from a section nobody could read.
 
 from __future__ import annotations
 
+import calendar
 import logging
 from collections import defaultdict
 from datetime import date, timedelta
@@ -52,9 +58,9 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 
 from control_boards.sections import SectionBuilder
-from factory_expense.constants import LABOUR_COST_TYPE_CODE
+from factory_expense.constants import LABOUR_COST_TYPE_CODE, SALARY_COST_TYPE_CODE
 from factory_expense.models import FactoryExpenseSettings
-from factory_expense.rates import load_rates, resolve
+from factory_expense.rates import load_rates, monthly_amounts_by_department, resolve
 from factory_expense.services import _price_labour
 from labour_gate.models import LabourGateEntry, LabourShift
 from production_execution.models import (
@@ -160,6 +166,7 @@ class OperationsReportService(SectionBuilder):
             "wastage", self._wastage, needs_sap=False, feed="production_cost"
         )
         labour = self.section("labour", self._labour, needs_sap=False, feed="factory_expense")
+        salary = self.section("salary", self._salary, needs_sap=False, feed="factory_expense")
         power = self.section("power", self._power, needs_sap=False, feed="factory_expense")
         returns = self.section(
             "returns", self._returns, needs_sap=False, feed="goods_return"
@@ -183,6 +190,7 @@ class OperationsReportService(SectionBuilder):
                     "lines": day_of(lines, day),
                     "wastage": day_of(wastage, day),
                     "labour": day_of(labour, day),
+                    "salary": day_of(salary, day),
                     "power": day_of(power, day),
                     "returns": day_of(returns, day),
                 }
@@ -397,6 +405,45 @@ class OperationsReportService(SectionBuilder):
             self.warn(
                 f"No contract labour was booked through the labour gate under "
                 f"{self.company.name} in this span, so labour reads as nil."
+            )
+        return out
+
+    # ----------------------------------------------------------------- salary
+
+    def _salary(self) -> Dict[date, Optional[List[Dict]]]:
+        code = (
+            FactoryExpenseSettings.objects.filter(company=self.company)
+            .values_list("salary_cost_type_code", flat=True)
+            .first()
+            or SALARY_COST_TYPE_CODE
+        )
+        rates = load_rates(code, self.company, self.date_to)
+
+        out: Dict[date, Optional[List[Dict]]] = {}
+        for day in self.days:
+            departments = monthly_amounts_by_department(rates, day)
+            if not departments:
+                # No rate in force: the payroll is not known that day, which is
+                # not the same as nobody being paid. The page counts these.
+                out[day] = None
+                continue
+            days_in_month = calendar.monthrange(day.year, day.month)[1]
+            out[day] = [
+                {
+                    "department": name,
+                    "monthly": _num(amount),
+                    # Four places, not two: thirty days of a share rounded
+                    # to the paisa do not add back up to the month's bill.
+                    "cost": _num(amount / days_in_month, 4),
+                }
+                for _, name, amount, _ in sorted(departments, key=lambda row: -row[2])
+            ]
+
+        if all(rows is None for rows in out.values()):
+            self.warn(
+                f"No '{code}' rate is in force for {self.company.name} in this span, so "
+                "salary is not known -- set one in Admin › Cost Master, effective from "
+                "the start of the period you are looking at."
             )
         return out
 
