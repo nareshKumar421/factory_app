@@ -185,12 +185,23 @@ SQL (a re-seed refreshes it and re-infers prompts), while display names,
 descriptions and customised parameter labels survive every re-seed. The SQL tab
 shows the authored SQL exactly as it runs.
 
-The one local report today is **Inventory Audit Report** — a corrected rebuild
-of the Crystal original: opening balance per item/godown as on the From date,
-every stock movement in the period (doc-type-prefixed document numbers), and
-the box/loose split of finished-goods stock computed with `FLOOR`/`MOD` from
-stock **as on the To date**. Item and Warehouse are real optional prompts,
-which the Crystal report only faked client-side.
+There are two local reports today:
+
+- **Inventory Audit Report** — a corrected rebuild of the Crystal original:
+  opening balance per item/godown as on the From date, every stock movement in
+  the period, and the box/loose split of finished-goods stock computed with
+  `FLOOR`/`MOD` from stock **as on the To date**. Item and Warehouse are real
+  optional prompts, which the Crystal report only faked client-side. Its rows
+  carry no document label, so an opening-balance row reads like stock still
+  on hand.
+- **Godown Stock** — what is on hand: one row per item/godown, summed from
+  `OINM` up to an optional **As on date** (blank: every posting, i.e.
+  `OITW."OnHand"`), with the audit sheet's Ltr and box/loose rules. Written
+  after a warehouse user read the audit sheet's opening row as today's stock.
+
+A local report can name a prompt's caption (`LocalReport.labels`) where the
+inference would guess wrong — Godown Stock's `DocDate <= '[%0]'` infers "To
+date". It is applied like an inferred label, so a customised one wins.
 
 ## Company scoping
 

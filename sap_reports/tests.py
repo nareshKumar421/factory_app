@@ -1767,8 +1767,8 @@ class TestLocalReports(SapReportsSyncTestCase):
     def test_seeding_registers_the_inventory_audit_report_with_typed_filters(self):
         summary = self.seed()
 
-        self.assertEqual(summary["created"], ["Inventory Audit Report"])
-        report = SapReport.objects.get(company=self.company, is_local=True)
+        self.assertEqual(summary["created"], ["Inventory Audit Report", "Godown Stock"])
+        report = SapReport.objects.get(company=self.company, sap_name="Inventory Audit Report")
         self.assertEqual(report.slug, "inventory-audit-report")
         self.assertEqual(report.sap_category_name, "Factory App")
         self.assertTrue(report.is_runnable, report.not_runnable_reason)
@@ -1783,18 +1783,45 @@ class TestLocalReports(SapReportsSyncTestCase):
             ],
         )
 
+    def test_seeding_registers_godown_stock_with_an_optional_as_on_date(self):
+        self.seed()
+
+        report = SapReport.objects.get(company=self.company, sap_name="Godown Stock")
+        self.assertEqual(report.slug, "godown-stock")
+        self.assertTrue(report.is_runnable, report.not_runnable_reason)
+        self.assertEqual(
+            [(p.position, p.label, p.kind, p.is_required) for p in report.parameters.all()],
+            [
+                (0, "As on date", ParameterKind.DATE, False),
+                (1, "Item", ParameterKind.ITEM, False),
+                (2, "Warehouse", ParameterKind.WAREHOUSE, False),
+            ],
+        )
+
+    def test_a_reseed_keeps_a_customised_label_over_the_reports_own(self):
+        self.seed()
+        report = SapReport.objects.get(sap_name="Godown Stock")
+        report.parameters.filter(position=0).update(label="Stock date", is_customised=True)
+        SapReport.objects.filter(pk=report.pk).update(sql_hash="stale")
+
+        self.seed()
+
+        self.assertEqual(report.parameters.get(position=0).label, "Stock date")
+
     def test_seeding_twice_changes_nothing(self):
         self.seed()
         summary = self.seed()
 
         self.assertEqual(summary["created"], [])
-        self.assertEqual(summary["unchanged"], ["Inventory Audit Report"])
-        self.assertEqual(SapReport.objects.count(), 1)
-        self.assertEqual(SapReport.objects.get().parameters.count(), 4)
+        self.assertEqual(summary["unchanged"], ["Inventory Audit Report", "Godown Stock"])
+        self.assertEqual(SapReport.objects.count(), 2)
+        self.assertEqual(
+            SapReport.objects.get(sap_name="Inventory Audit Report").parameters.count(), 4
+        )
 
     def test_a_reseed_after_an_sql_change_keeps_customised_filters(self):
         self.seed()
-        report = SapReport.objects.get()
+        report = SapReport.objects.get(sap_name="Inventory Audit Report")
         parameter = report.parameters.get(position=3)
         parameter.label = "Godown"
         parameter.is_customised = True
@@ -1804,7 +1831,7 @@ class TestLocalReports(SapReportsSyncTestCase):
         summary = self.seed()
 
         self.assertEqual(summary["updated"], ["Inventory Audit Report"])
-        self.assertEqual(SapReport.objects.get().parameters.get(position=3).label, "Godown")
+        self.assertEqual(report.parameters.get(position=3).label, "Godown")
 
     def test_the_default_sync_never_flags_a_local_report_as_missing(self):
         self.seed()
@@ -1812,14 +1839,17 @@ class TestLocalReports(SapReportsSyncTestCase):
         summary = self.sync([saved_query()])
 
         self.assertEqual(summary["missing_in_sap"], [])
-        self.assertFalse(SapReport.objects.get(is_local=True).is_missing_in_sap)
+        self.assertFalse(SapReport.objects.filter(is_local=True, is_missing_in_sap=True).exists())
 
     def test_a_slug_already_taken_by_a_synced_report_is_suffixed(self):
         self.sync([saved_query(name="Inventory Audit Report")])
 
         self.seed()
 
-        self.assertEqual(SapReport.objects.get(is_local=True).slug, "inventory-audit-report-2")
+        self.assertEqual(
+            SapReport.objects.get(is_local=True, sap_name="Inventory Audit Report").slug,
+            "inventory-audit-report-2",
+        )
 
 class TestReferenceResolution(TestCase):
     """A report's document numbers resolved back to this app's own records.

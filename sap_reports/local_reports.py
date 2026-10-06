@@ -18,7 +18,7 @@ parameter labels belong to the people running the app and survive every
 re-seed.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from django.db import transaction
@@ -161,6 +161,52 @@ ORDER BY R."Godown", R."ItemCode", R."DocDate", R."DocTime"
 """
 
 
+# ---------------------------------------------------------------------------
+# Godown Stock
+# ---------------------------------------------------------------------------
+#
+# Stock on hand per godown and item: one row each, summed from OINM up to the
+# As on date, or over every posting when the date is left blank -- which is
+# OITW."OnHand", the stock right now.
+#
+# The audit sheet above answers "what moved", and people were reading its
+# opening-balance row as current stock: an item billed out during the day
+# still showed its morning quantity on one row, with the bill as a separate
+# minus row underneath. This report answers "what is there" directly.
+#
+# Ltr, Box and Loose Qty follow the audit sheet's rules, so the two reports
+# agree: Godown Stock as on a date is the audit sheet's opening balance plus
+# its documents for that date. Quantity is rounded to three places, not cast
+# to two: a HANA cast truncates, and film, tape and loose oil are stocked in
+# kg and metres to the gram.
+GODOWN_STOCK_SQL = """\
+SELECT
+    N."Warehouse" AS "Godown",
+    N."ItemCode",
+    I."ItemName",
+    I."U_Sub_Group" AS "Variety",
+    I."SalPackMsr" AS "UOM",
+    CAST(ROUND(SUM(N."InQty" - N."OutQty"), 3) AS DECIMAL(19,3)) AS "Quantity",
+    CAST(ROUND(SUM((N."InQty" - N."OutQty") * CASE WHEN UPPER(IFNULL(I."U_IsLitre", 'N')) = 'Y'
+              THEN IFNULL(I."SalPackUn", 0)
+                   / CASE WHEN IFNULL(I."NumInSale", 0) > 0 THEN I."NumInSale" ELSE 1 END
+              ELSE 0 END), 2) AS DECIMAL(19,2)) AS "Ltr",
+    CASE WHEN I."ItmsGrpCod" = 102 AND IFNULL(I."SalFactor2", 0) > 0
+         THEN CAST(FLOOR(SUM(N."InQty" - N."OutQty") / I."SalFactor2") AS INTEGER) ELSE 0 END AS "Box",
+    CASE WHEN I."ItmsGrpCod" = 102 AND IFNULL(I."SalFactor2", 0) > 0
+         THEN CAST(MOD(SUM(N."InQty" - N."OutQty"), I."SalFactor2") AS INTEGER) ELSE 0 END AS "Loose Qty"
+FROM OINM N
+INNER JOIN OITM I ON I."ItemCode" = N."ItemCode"
+WHERE (N."DocDate" <= '[%0]' OR '[%0]' = '')
+  AND (N."ItemCode" = '[%1]' OR '[%1]' = '')
+  AND (N."Warehouse" = '[%2]' OR '[%2]' = '')
+GROUP BY N."Warehouse", N."ItemCode", I."ItemName", I."U_Sub_Group", I."SalPackMsr",
+         I."ItmsGrpCod", I."SalFactor2"
+HAVING SUM(N."InQty" - N."OutQty") <> 0
+ORDER BY N."Warehouse", N."ItemCode"
+"""
+
+
 @dataclass(frozen=True)
 class LocalReport:
     """One app-authored report, ready to be seeded into the catalogue."""
@@ -171,6 +217,9 @@ class LocalReport:
     description: str
     sql_text: str
     row_limit: Optional[int] = None
+    # Prompt captions the inference can't guess, by position. Applied like an
+    # inferred label: a parameter a person customised keeps theirs.
+    labels: Dict[int, str] = field(default_factory=dict)
 
 
 LOCAL_REPORTS = [
@@ -188,6 +237,18 @@ LOCAL_REPORTS = [
             "today's stock."
         ),
         sql_text=INVENTORY_AUDIT_SQL,
+    ),
+    LocalReport(
+        internal_key=LOCAL_INTERNAL_KEY_BASE - 2,
+        slug="godown-stock",
+        sap_name="Godown Stock",
+        description=(
+            "Stock on hand per godown and item, in pieces, litres and the box / "
+            "loose split for finished goods. Leave As on date blank for the "
+            "stock right now, or pick a date for the closing stock that day."
+        ),
+        sql_text=GODOWN_STOCK_SQL,
+        labels={0: "As on date"},
     ),
 ]
 
@@ -245,6 +306,11 @@ def _seed_one(company, definition: LocalReport) -> Tuple[SapReport, str]:
 
     if sql_changed:
         sync_report_parameters(report)
+        for parameter in report.parameters.filter(
+            position__in=list(definition.labels), is_customised=False
+        ):
+            parameter.label = definition.labels[parameter.position]
+            parameter.save(update_fields=["label"])
 
     if is_new:
         return report, "created"
