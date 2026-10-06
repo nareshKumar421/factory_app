@@ -122,11 +122,12 @@ class AmountsReader:
         """
         return self._rows(query, codes)
 
-    def oldest_debt(self, group_card_codes: Sequence[str], floor: float) -> Optional[Dict[str, Any]]:
-        """The longest-standing debt among outside customers owing ``floor`` or more.
+    def debtor_list(self, group_card_codes: Sequence[str]) -> List[Dict[str, Any]]:
+        """Every outside customer in debit, with how long their debt has stood.
 
-        FIFO, as the module docstring explains. Ties on the date go to the
-        bigger balance, the one a reader would chase first.
+        ``Since`` is FIFO, as the module docstring explains: the oldest of the
+        debits still needed to make up the balance once payments have cleared
+        the oldest bills first. Largest balance first.
         """
         codes = list(group_card_codes)
         query = f"""
@@ -134,7 +135,7 @@ class AmountsReader:
                 SELECT "CardCode", "CardName", "Balance"
                 FROM "{self.schema}"."OCRD"
                 WHERE "CardType" = 'C'
-                  AND "Balance" >= ?
+                  AND "Balance" > 0
                   AND "CardCode" NOT IN ({_placeholders(codes)})
             ),
             "DEB" AS (
@@ -157,17 +158,58 @@ class AmountsReader:
                 WHERE D."Cum" - D."Debit" < B."Balance"
                 GROUP BY D."CardCode"
             )
-            SELECT TOP 1
-                S."CardCode" AS "CardCode",
+            SELECT
+                B."CardCode" AS "CardCode",
                 IFNULL(B."CardName", '') AS "CardName",
                 B."Balance" AS "Balance",
                 S."Since" AS "Since"
-            FROM "SINCE" S
-            JOIN "BAL" B ON B."CardCode" = S."CardCode"
-            ORDER BY S."Since" ASC, B."Balance" DESC
+            FROM "BAL" B
+            LEFT JOIN "SINCE" S ON S."CardCode" = B."CardCode"
+            ORDER BY B."Balance" DESC, B."CardCode"
         """
-        rows = self._rows(query, [floor, *codes])
+        return self._rows(query, codes)
+
+    def customer(self, card_code: str) -> Optional[Dict[str, Any]]:
+        """One customer's name and ledger balance, or None if no such customer."""
+        query = f"""
+            SELECT "CardCode", IFNULL("CardName", '') AS "CardName", "Balance"
+            FROM "{self.schema}"."OCRD"
+            WHERE "CardCode" = ?
+              AND "CardType" = 'C'
+        """
+        rows = self._rows(query, [card_code])
         return rows[0] if rows else None
+
+    def unpaid_debits(self, card_code: str, balance: float) -> List[Dict[str, Any]]:
+        """The debits a customer's balance is still made of, oldest first.
+
+        Walking their debits newest-first, every one needed to make up
+        ``balance`` -- the same FIFO the "since" date comes from, so the oldest
+        row here IS that date. ``Cum`` lets the caller work out how much of the
+        oldest one is still unpaid.
+        """
+        query = f"""
+            SELECT * FROM (
+                SELECT
+                    J."TransId" AS "TransId",
+                    J."Line_ID" AS "LineId",
+                    J."RefDate" AS "RefDate",
+                    J."DueDate" AS "DueDate",
+                    J."TransType" AS "TransType",
+                    IFNULL(J."BaseRef", '') AS "BaseRef",
+                    IFNULL(J."LineMemo", '') AS "LineMemo",
+                    J."Debit" AS "Debit",
+                    SUM(J."Debit") OVER (
+                        ORDER BY J."RefDate" DESC, J."TransId" DESC, J."Line_ID" DESC
+                    ) AS "Cum"
+                FROM "{self.schema}"."JDT1" J
+                WHERE J."ShortName" = ?
+                  AND J."Debit" > 0
+            )
+            WHERE "Cum" - "Debit" < ?
+            ORDER BY "RefDate", "TransId", "LineId"
+        """
+        return self._rows(query, [card_code, balance])
 
     # ------------------------------------------------------------------
     # Execution

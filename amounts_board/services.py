@@ -34,6 +34,8 @@ from admin_board.constants import INTERCOMPANY_CARD_CODES
 from control_boards.sections import SectionBuilder
 from non_moving_rm.services import NonMovingRMService
 from sap_client.context import CompanyContext
+from sap_client.exceptions import SAPConnectionError, SAPDataError
+from sap_client.hana.finance_reader import TRANS_TYPE_LABELS
 from warehouse.models_manager import UserWarehouse
 
 from .constants import (
@@ -64,6 +66,32 @@ def _iso(value) -> Optional[str]:
     if isinstance(value, date):
         return value.isoformat()
     return str(value)[:10]
+
+
+#: Debtor tile key -> (label, company code), and company code -> label.
+DEBTOR_BY_KEY = {key: (label, code) for key, label, code in DEBTOR_COMPANIES}
+DEBTOR_LABEL = {code: label for _key, label, code in DEBTOR_COMPANIES}
+#: The Total tile's drill key: every debtor company at once.
+ALL_DEBTORS = "TOTAL"
+
+
+def oldest_of(rows: List[Dict[str, Any]], floor: float) -> Optional[Dict[str, Any]]:
+    """The longest-standing debt among customers owing ``floor`` or more.
+
+    Ties on the date go to the bigger balance, the one a reader would chase
+    first. The floor keeps rounding residues -- Rs 7 left on a settled account
+    -- from setting the date.
+    """
+    eligible = [r for r in rows if r.get("since") and r["balance"] >= floor]
+    if not eligible:
+        return None
+    best = min(eligible, key=lambda r: (r["since"], -r["balance"]))
+    return {
+        "date": best["since"],
+        "card_code": best["card_code"],
+        "card_name": best["card_name"],
+        "balance": best["balance"],
+    }
 
 
 def owner_payload(owner: Optional[StockOwner]) -> Optional[Dict[str, Any]]:
@@ -289,19 +317,98 @@ class AmountsBoardService(SectionBuilder):
         outside = by_kind.get("C") or {}
         group = by_kind.get("G") or {}
 
-        oldest_row = reader.oldest_debt(group_codes, OLDEST_DEBT_FLOOR)
-        oldest = None
-        if oldest_row is not None:
-            oldest = {
-                "date": _iso(oldest_row["Since"]),
-                "card_code": oldest_row["CardCode"],
-                "card_name": oldest_row["CardName"],
-                "balance": _money(oldest_row["Balance"]),
-            }
-
         return {
             "amount": _money(outside.get("Amount")),
             "customers": int(outside.get("Customers") or 0),
             "group_amount": _money(group.get("Amount")),
-            "oldest": oldest,
+            "oldest": oldest_of(self.debtor_customers(company_code), OLDEST_DEBT_FLOOR),
+        }
+
+    def debtor_customers(self, company_code: str) -> List[Dict[str, Any]]:
+        """One company's outside customers in debit, largest balance first."""
+        rows = self._reader(company_code).debtor_list(
+            INTERCOMPANY_CARD_CODES.get(company_code, [])
+        )
+        return [
+            {
+                "company_code": company_code,
+                "company_label": DEBTOR_LABEL.get(company_code, company_code),
+                "card_code": row["CardCode"],
+                "card_name": row["CardName"],
+                "balance": _money(row["Balance"]),
+                "since": _iso(row["Since"]),
+            }
+            for row in rows
+        ]
+
+    def debtor_drill(self, key: str) -> Dict[str, Any]:
+        """The customers behind one debtor tile -- or, for the Total, all three.
+
+        A single company that cannot be read is an error, as any drill is. The
+        Total names a company it could not read in ``missing`` and lists the
+        rest, the same way its tile does.
+        """
+        if key == ALL_DEBTORS:
+            scope = [(label, code) for _key, label, code in DEBTOR_COMPANIES]
+        else:
+            scope = [DEBTOR_BY_KEY[key]]
+
+        customers: List[Dict[str, Any]] = []
+        missing: List[str] = []
+        for label, code in scope:
+            try:
+                customers.extend(self.debtor_customers(code))
+            except (SAPConnectionError, SAPDataError):
+                if key != ALL_DEBTORS:
+                    raise
+                missing.append(label)
+
+        customers.sort(key=lambda r: (-r["balance"], r["company_code"], r["card_code"]))
+        return {
+            "key": key,
+            "amount": _money(sum(r["balance"] for r in customers)),
+            "customers": customers,
+            "missing": missing,
+        }
+
+    def debtor_bills(self, company_code: str, card_code: str) -> Optional[Dict[str, Any]]:
+        """What one customer's balance is made of: their unpaid bills, oldest first.
+
+        ``unpaid`` is the part of each still owed. Only the oldest row can be
+        part-paid -- payments clear the oldest bills first -- so every other
+        row's unpaid part is its whole amount. None if there is no such customer.
+        """
+        reader = self._reader(company_code)
+        customer = reader.customer(card_code)
+        if customer is None:
+            return None
+
+        balance = float(customer["Balance"] or 0)
+        rows = reader.unpaid_debits(card_code, balance) if balance > 0 else []
+        bills = []
+        for row in rows:
+            debit = float(row["Debit"] or 0)
+            before = float(row["Cum"] or 0) - debit
+            trans_type = str(row["TransType"])
+            bills.append(
+                {
+                    "trans_id": int(row["TransId"]),
+                    "line_id": int(row["LineId"]),
+                    "date": _iso(row["RefDate"]),
+                    "due_date": _iso(row["DueDate"]),
+                    "type": TRANS_TYPE_LABELS.get(trans_type, trans_type),
+                    "reference": row["BaseRef"],
+                    "memo": row["LineMemo"],
+                    "amount": _money(debit),
+                    "unpaid": _money(min(debit, balance - before)),
+                }
+            )
+
+        return {
+            "company_code": company_code,
+            "company_label": DEBTOR_LABEL.get(company_code, company_code),
+            "card_code": customer["CardCode"],
+            "card_name": customer["CardName"],
+            "balance": _money(balance),
+            "bills": bills,
         }

@@ -9,6 +9,13 @@ amounts_board/views.py
 ``GET /api/v1/dashboards/amounts-board/godown-items/?company=&category=&warehouse=``
     The stock inside one godown, for one category: the drill's last level.
 
+``GET /api/v1/dashboards/amounts-board/debtors/?debtor=JWPL|MART|BEVERAGES|TOTAL``
+    The customers behind one debtor tile, largest balance first; TOTAL is all
+    three companies, naming in ``missing`` any it could not read.
+
+``GET /api/v1/dashboards/amounts-board/debtor-bills/?company=&customer=``
+    One customer's unpaid bills, oldest first: the debtor drill's last level.
+
 ``GET / PUT /api/v1/dashboards/amounts-board/owners/``
     The RM / PM / FG owner of each plant, and who may be picked. PUT takes
     ``{"company", "category", "user"}``; ``"user": null`` clears the owner.
@@ -31,14 +38,26 @@ from company.models import Company
 from company.permissions import HasCompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
-from .constants import CATEGORIES, PLANT_COMPANIES, PLANT_LABELS
+from .constants import CATEGORIES, DEBTOR_COMPANIES, PLANT_COMPANIES, PLANT_LABELS
 from .models import StockOwner
 from .permissions import CanManageStockOwners, CanViewAmountsBoard
-from .services import AmountsBoardService, owner_payload, owners_by_company
+from .services import ALL_DEBTORS, AmountsBoardService, owner_payload, owners_by_company
 
 logger = logging.getLogger(__name__)
 
 CATEGORY_KEYS = [c.value for c in CATEGORIES]
+DEBTOR_KEYS = [key for key, _label, _code in DEBTOR_COMPANIES] + [ALL_DEBTORS]
+DEBTOR_CODES = [code for _key, _label, code in DEBTOR_COMPANIES]
+
+
+def _sap_failure(exc):
+    """503 when SAP did not answer, 502 when it refused the read."""
+    code = (
+        status.HTTP_503_SERVICE_UNAVAILABLE
+        if isinstance(exc, SAPConnectionError)
+        else status.HTTP_502_BAD_GATEWAY
+    )
+    return Response({"detail": str(exc)}, status=code)
 
 
 class AmountsBoardAPI(APIView):
@@ -81,10 +100,52 @@ class AmountsGodownItemsAPI(APIView):
 
         try:
             payload = AmountsBoardService(user=request.user).godown_items(company, category, warehouse)
-        except SAPConnectionError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        except SAPDataError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        except (SAPConnectionError, SAPDataError) as exc:
+            return _sap_failure(exc)
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class AmountsDebtorsAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewAmountsBoard]
+
+    def get(self, request):
+        key = (request.query_params.get("debtor") or "").strip().upper()
+        if key not in DEBTOR_KEYS:
+            return Response(
+                {"detail": f"`debtor` must be one of {', '.join(DEBTOR_KEYS)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            payload = AmountsBoardService(user=request.user).debtor_drill(key)
+        except (SAPConnectionError, SAPDataError) as exc:
+            return _sap_failure(exc)
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class AmountsDebtorBillsAPI(APIView):
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewAmountsBoard]
+
+    def get(self, request):
+        company = (request.query_params.get("company") or "").strip().upper()
+        customer = (request.query_params.get("customer") or "").strip().upper()
+        if company not in DEBTOR_CODES:
+            return Response(
+                {"detail": f"`company` must be one of {', '.join(DEBTOR_CODES)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not customer:
+            return Response(
+                {"detail": "`customer` is required."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        try:
+            payload = AmountsBoardService(user=request.user).debtor_bills(company, customer)
+        except (SAPConnectionError, SAPDataError) as exc:
+            return _sap_failure(exc)
+        if payload is None:
+            return Response(
+                {"detail": f"{customer} is not a customer of {company}."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         return Response(payload, status=status.HTTP_200_OK)
 
 
