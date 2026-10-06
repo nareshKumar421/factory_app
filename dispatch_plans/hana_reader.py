@@ -342,6 +342,36 @@ class HanaDispatchBillReader:
         """
         return {int(row[0]) for row in self._execute(query, [created_from]) if row[0] is not None}
 
+    def credited_before_dispatch(self, doc_entries: Sequence[int]) -> Set[int]:
+        """Of these bills, the ones a live credit note is based on that SAP has
+        not stamped as dispatched.
+
+        The same credit test as the list's ``exclude_credited``. The stamp is
+        what keeps a return in: a bill that went out and came back was still
+        dispatched. Guarded on the column, as everywhere -- without it nothing
+        is stamped, so every credited bill counts.
+        """
+        entries = [int(entry) for entry in dict.fromkeys(doc_entries or [])]
+        if not entries:
+            return set()
+        schema = self.connection.schema
+        unstamped = (
+            ' AND H."U_Dipatch_Date" IS NULL'
+            if "U_Dipatch_Date" in self._table_columns("OINV")
+            else ""
+        )
+        placeholders = ", ".join("?" for _ in entries)
+        query = f"""
+            SELECT DISTINCT CN."BaseEntry"
+            FROM "{schema}"."RIN1" CN
+            JOIN "{schema}"."ORIN" CH ON CH."DocEntry" = CN."DocEntry"
+            JOIN "{schema}"."OINV" H ON H."DocEntry" = CN."BaseEntry"
+            WHERE CN."BaseType" = 13
+              AND IFNULL(CH."CANCELED", 'N') = 'N'
+              AND CN."BaseEntry" IN ({placeholders}){unstamped}
+        """
+        return {int(row[0]) for row in self._execute(query, entries) if row[0] is not None}
+
     def list_stamped_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Invoices already carrying a dispatch stamp, with no app sheet involved.
 

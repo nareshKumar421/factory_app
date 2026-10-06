@@ -1955,3 +1955,40 @@ class CustomerBiltyAtLinkingTests(TestCase):
                 doc_entries=[], bilty_no="NCR-1", bilty_date=date(2026, 9, 20),
                 attachment=None, user=self.user,
             )
+
+
+class CreditedBeforeDispatchQueryTests(SimpleTestCase):
+    """Which bills the sheet drops for a credit note: the list's credit test,
+    less any bill SAP has stamped as dispatched."""
+
+    def _reader(self, header_columns):
+        reader = HanaDispatchBillReader.__new__(HanaDispatchBillReader)
+        reader.connection = MagicMock(schema="JIVO_OIL_HANADB")
+        reader._table_columns = MagicMock(return_value=set(header_columns))
+        reader._execute = MagicMock(return_value=[(5,), (9,)])
+        return reader
+
+    def test_it_asks_about_exactly_these_bills_and_skips_stamped_ones(self):
+        reader = self._reader({"DocEntry", "U_Dipatch_Date"})
+
+        self.assertEqual(reader.credited_before_dispatch([5, 9, 5, 11]), {5, 9})
+
+        query, params = reader._execute.call_args.args
+        self.assertEqual(params, [5, 9, 11])
+        self.assertIn('CN."BaseType" = 13', query)
+        self.assertIn("IFNULL(CH.\"CANCELED\", 'N') = 'N'", query)
+        self.assertIn('H."U_Dipatch_Date" IS NULL', query)
+
+    def test_without_the_stamp_column_every_credited_bill_counts(self):
+        reader = self._reader({"DocEntry"})
+
+        reader.credited_before_dispatch([5])
+
+        query, _ = reader._execute.call_args.args
+        self.assertNotIn("U_Dipatch_Date", query)
+
+    def test_no_bills_costs_sap_nothing(self):
+        reader = self._reader({"DocEntry"})
+
+        self.assertEqual(reader.credited_before_dispatch([]), set())
+        reader._execute.assert_not_called()

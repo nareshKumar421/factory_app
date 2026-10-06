@@ -87,9 +87,13 @@ class DispatchSheetAPITests(TestCase):
         mock.side_effect = SAPConnectionError("HANA is asleep")
         return patch("dispatch_plans.views_sheet.DispatchPlansService", mock)
 
-    def _sap(self, enrichment):
+    def _sap(self, enrichment, credited=()):
         service = MagicMock()
         service.get_sheet_enrichment.return_value = enrichment
+        # As SAP does: an answer only about the bills it was asked about.
+        service.get_credited_before_dispatch.side_effect = lambda entries: {
+            entry for entry in entries if entry in set(credited)
+        }
         return patch(
             "dispatch_plans.views_sheet.DispatchPlansService",
             MagicMock(return_value=service),
@@ -267,6 +271,59 @@ class DispatchSheetAPITests(TestCase):
 
         entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
         self.assertEqual(entries, [8])
+
+    # -- a bill credited out before it left ----------------------------------
+
+    def test_a_plan_credited_out_in_sap_is_not_a_line(self):
+        """A credit note against a bill still waiting means it is not going."""
+        self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
+        self._plan(2, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
+
+        with self._sap({}, credited={1}):
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
+        self.assertEqual(entries, [2])
+        self.assertEqual(response.json()["meta"]["counts_by_company"], {"JIVO_OIL": 1})
+
+    def test_a_chosen_bill_credited_out_in_sap_is_not_a_line(self):
+        self._selected(7)
+        self._selected(8)
+
+        with self._sap(
+            {7: {"doc_num": "626030007"}, 8: {"doc_num": "626030008"}}, credited={7}
+        ):
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        entries = [row["sap_invoice_doc_entry"] for row in response.json()["data"]]
+        self.assertEqual(entries, [8])
+
+    def test_a_bill_that_left_stays_a_line_whatever_was_credited_after(self):
+        """A credit note after dispatch is a return: the truck still went, so
+        SAP is not even asked about it."""
+        self._plan(1, booking_status=DispatchPlanStatus.DISPATCHED)
+        self._plan(2, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
+
+        with self._sap({}, credited={1}) as service_class:
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        entries = sorted(row["sap_invoice_doc_entry"] for row in response.json()["data"])
+        self.assertEqual(entries, [1, 2])
+        asked = service_class.return_value.get_credited_before_dispatch.call_args.args[0]
+        self.assertEqual(asked, [2])
+
+    def test_sap_down_for_the_credit_check_hides_nothing(self):
+        self._plan(1, dispatch_date=None, booking_status=DispatchPlanStatus.PENDING)
+
+        with self._sap({}) as service_class:
+            service_class.return_value.get_credited_before_dispatch.side_effect = (
+                SAPConnectionError("HANA is asleep")
+            )
+            response = self._get(date_from="2026-04-01", date_to="2026-04-30")
+
+        body = response.json()
+        self.assertEqual([row["sap_invoice_doc_entry"] for row in body["data"]], [1])
+        self.assertFalse(body["meta"]["sap_available"])
 
     # -- the row --------------------------------------------------------------
 

@@ -20,6 +20,9 @@ plan would have spoken.
 Neither has a dispatch date to be windowed on, so both ride along in every
 window, exactly as the Plan page rides its own unscheduled bills along.
 
+A bill SAP has credited out before it left closes its line again: it will not
+be dispatched. One that left stays, whatever was credited after.
+
 The read spans every company the caller belongs to, and each row says which
 it came from: the desk keeps ONE book for the group and turns to Oil,
 Beverages or Mart within it, so a read of one company alone would be a
@@ -147,11 +150,30 @@ class DispatchSheetAPI(APIView):
         # invoice alone -- below, after the plans, since none of them is dated.
         unplanned = self._unplanned_bills(companies, data)
 
-        enrichment, sap_available, sap_error = self._enrich(plans, unplanned)
-
         # One reading of where each truck got to, kept: it names the stage AND
         # points at the docking whose weighbridge slip is the kanta weight.
         stages = [compute_pipeline_stage(plan) for plan in plans]
+
+        credited, credit_error = self._credited_before_dispatch(plans, stages, unplanned)
+        if credited:
+            kept = [
+                (plan, stage)
+                for plan, stage in zip(plans, stages)
+                if (plan.company_id, plan.sap_invoice_doc_entry) not in credited
+            ]
+            plans = [plan for plan, _ in kept]
+            stages = [stage for _, stage in kept]
+            unplanned = [
+                (company, doc_entry)
+                for company, doc_entry in unplanned
+                if (company.id, doc_entry) not in credited
+            ]
+
+        enrichment, sap_available, sap_error = self._enrich(plans, unplanned)
+        if credit_error:
+            sap_available = False
+            sap_error = sap_error or credit_error
+
         weighments = self._weighbridge(stages)
 
         rows = []
@@ -423,6 +445,44 @@ class DispatchSheetAPI(APIView):
             "eway_bill": "",
             "freight_from_sap": False,
         }
+
+    @staticmethod
+    def _credited_before_dispatch(
+        plans: List[DispatchPlan], stages, unplanned: Iterable[tuple]
+    ) -> tuple:
+        """Bills SAP credited out before they left, as {(company, entry)}.
+
+        A credit note against a bill still waiting means it will not be
+        dispatched, so it is no line of the register. A bill that has gone is
+        never asked about: a credit note after dispatch is a return, and the
+        truck still left.
+
+        SAP being down hides nothing -- every line stays, and the error is
+        handed back for the sheet's "SAP did not answer" flag.
+        """
+        by_company: Dict[int, List[int]] = {}
+        codes: Dict[int, str] = {}
+        for plan, (stage, _, _) in zip(plans, stages):
+            if stage == "DISPATCHED" or plan.booking_status == DispatchPlanStatus.DISPATCHED:
+                continue
+            by_company.setdefault(plan.company_id, []).append(plan.sap_invoice_doc_entry)
+            codes[plan.company_id] = plan.company.code
+        for company, doc_entry in unplanned:
+            by_company.setdefault(company.id, []).append(doc_entry)
+            codes[company.id] = company.code
+
+        credited = set()
+        error = ""
+        for company_id, doc_entries in by_company.items():
+            try:
+                service = DispatchPlansService(company_code=codes[company_id])
+                credited.update(
+                    (company_id, doc_entry)
+                    for doc_entry in service.get_credited_before_dispatch(doc_entries)
+                )
+            except (SAPConnectionError, SAPDataError) as exc:
+                error = str(exc)
+        return credited, error
 
     @staticmethod
     def _enrich(plans: List[DispatchPlan], unplanned: Iterable[tuple] = ()):

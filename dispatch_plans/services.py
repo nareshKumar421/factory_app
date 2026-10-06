@@ -861,6 +861,21 @@ class DispatchPlansService:
             cache.set_many(fresh, SHEET_INVOICE_CACHE_TTL_SECONDS)
         return enrichment
 
+    def get_credited_before_dispatch(self, doc_entries: Sequence[int]) -> Set[int]:
+        """The bills among these that SAP credited out before they left.
+
+        Asked fresh on every load, never cached with the invoice's figures: a
+        credit note is raised days after the bill, and a remembered "not
+        credited" would keep the line on the sheet for as long as it lasted.
+        """
+        doc_entries = [int(d) for d in dict.fromkeys(doc_entries or [])]
+        credited: Set[int] = set()
+        for start in range(0, len(doc_entries), self.SHEET_ENRICHMENT_CHUNK):
+            credited |= self.reader.credited_before_dispatch(
+                doc_entries[start : start + self.SHEET_ENRICHMENT_CHUNK]
+            )
+        return credited
+
     def get_schedule_line_items(self, doc_entry: int) -> List[Dict[str, Any]]:
         """Full SAP line items for one scheduled invoice (loaded on demand)."""
         return self.reader.list_bill_lines(int(doc_entry))
