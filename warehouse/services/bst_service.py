@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from django.db import transaction
 from django.contrib.postgres.expressions import ArraySubquery
-from django.db.models import Count, F, IntegerField, OuterRef, Q, Subquery
+from django.db.models import Count, Exists, F, IntegerField, OuterRef, Q, Subquery
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -444,6 +444,30 @@ INCOMING_VIEW_STATUSES = RECEIVABLE_STATUSES + (
     BSTTransferStatus.RECEIVED,
     BSTTransferStatus.CLOSED,
 )
+
+# Dock handover: a cross-company (INVOICE) BST that leaves on a truck can still
+# hand some of its pallets to the destination company right at the dock, before
+# the truck goes — stock the destination needs at once (Mart dispatching from
+# BH-PF the same afternoon) while the rest of the bill rides out through the
+# gate. Open from the first scan until the gate marks the vehicle out; after
+# that, everything is received the normal way.
+DOCK_HANDOVER_STATUSES = (
+    BSTTransferStatus.SCANNING,
+    BSTTransferStatus.AWAITING_GATE_OUT,
+)
+
+
+def dock_handover_open(transfer) -> bool:
+    """True while the destination may take pallets off this BST at the dock.
+
+    Served to the frontend as `dock_handover_open` so the receive page and
+    `hand_over_at_dock` can't disagree."""
+    return (
+        transfer.requires_gate
+        and transfer.source_type == BSTSourceType.INVOICE
+        and transfer.gated_out_at is None
+        and transfer.status in DOCK_HANDOVER_STATUSES
+    )
 
 # Statuses shown on the gate-out board: transfers still awaiting gate-out plus
 # those already gated out. The board doubles as history so the gate can see
@@ -1531,10 +1555,20 @@ class BSTService:
     # Receiver side (current company == destination)
     # ==================================================================
 
-    def _incoming_base(self, statuses):
+    def _incoming_base(self, statuses, *, at_dock: bool = False):
+        listed = Q(status__in=statuses)
+        if at_dock:
+            # Gated invoices still at the dock, once they carry a box — see
+            # `dock_handover_open`. Mirrors that rule in SQL.
+            listed |= Q(
+                requires_gate=True,
+                source_type=BSTSourceType.INVOICE,
+                gated_out_at__isnull=True,
+                status__in=DOCK_HANDOVER_STATUSES,
+            ) & Exists(BSTBoxScan.objects.filter(transfer=OuterRef("pk")))
         return (
             BSTTransfer.objects
-            .filter(self._receivable_scope(), status__in=statuses)
+            .filter(self._receivable_scope(), listed)
             .select_related("company", "destination_company", "vehicle", "driver")
             .annotate(
                 scanned_box_count=_child_count(BSTBoxScan),
@@ -1554,8 +1588,10 @@ class BSTService:
     def incoming_view_queryset(self):
         """Incoming board listing: the receivable set PLUS already-finalized
         (RECEIVED/CLOSED) receipts, so finalized transfers stay visible as
-        history instead of disappearing off the dashboard."""
-        return self._incoming_base(INCOMING_VIEW_STATUSES)
+        history instead of disappearing off the dashboard — and the gated
+        invoices still loading at the dock, so the destination can take a pallet
+        it needs at once (`hand_over_at_dock`)."""
+        return self._incoming_base(INCOMING_VIEW_STATUSES, at_dock=True)
 
     def get_incoming_transfer(self, transfer_id: int) -> BSTTransfer:
         try:
@@ -1582,8 +1618,11 @@ class BSTService:
     def _ensure_receivable(self, transfer: BSTTransfer) -> None:
         if transfer.status not in RECEIVABLE_STATUSES:
             raise BSTError("This BST is not open for receiving.")
-        # Both receive paths (scan and finalize) come through here, so this is
-        # the single place the destination is checked.
+        self._assert_receiver_scope(transfer)
+
+    def _assert_receiver_scope(self, transfer: BSTTransfer) -> None:
+        # Every receive path (scan, finalize, dock handover) comes through here,
+        # so this is the single place the destination is checked.
         #
         # `blank_ok` is load-bearing, not laziness: an INVOICE BST has no
         # destination warehouse at all — it settles to a destination *company*
@@ -1597,6 +1636,71 @@ class BSTService:
             [transfer.sap_to_warehouse],
             blank_ok=True,
         )
+
+    def _match_receive_scans(self, transfer: BSTTransfer, barcode_raw: str):
+        """Resolve a receive-side scan (box or pallet) to this transfer's own box scans.
+
+        Returns ``(is_pallet, pallet_code, existing, matched)``: ``existing`` maps
+        each candidate barcode to its scan row, ``matched`` lists the barcodes that
+        are on this transfer. Shared by the normal receive and the dock handover.
+        """
+        # Resolve within the company (BST is intra-company).
+        lookup = ScanService(transfer.company.code).lookup_barcode(barcode_raw)
+        entity_type = lookup.get("entity_type")
+        entity_id = lookup.get("entity_id")
+
+        is_pallet = False
+        resolved_pallet_code = ""
+        if entity_type == "PALLET" and entity_id:
+            is_pallet = True
+            pallet = Pallet.objects.filter(id=entity_id).first()
+            resolved_pallet_code = pallet.pallet_id if pallet else barcode_raw
+            barcodes = list(
+                (pallet.boxes.values_list("box_barcode", flat=True)) if pallet else []
+            )
+            if not barcodes:
+                raise BSTError("Pallet has no boxes.")
+        elif entity_type == "BOX" and entity_id:
+            box = Box.objects.filter(id=entity_id).first()
+            barcodes = [box.box_barcode] if box else []
+        else:
+            # A pallet that already changed hands (e.g. accepted → moved to the
+            # destination company) no longer resolves via the source-scoped
+            # ScanService, so re-scanning it to reject/accept the rest would miss.
+            # Fall back to this transfer's own scans: if the raw value is a
+            # pallet_code recorded on the transfer, receive every box under it.
+            pallet_boxes = list(
+                transfer.box_scans.filter(pallet_code=barcode_raw)
+                .values_list("box_barcode", flat=True)
+            )
+            if pallet_boxes:
+                is_pallet = True
+                resolved_pallet_code = barcode_raw
+                barcodes = pallet_boxes
+            else:
+                # A sender-scanned box barcode still matches by raw value even if
+                # the box already changed hands.
+                barcodes = [barcode_raw]
+
+        existing = {
+            s.box_barcode: s
+            for s in transfer.box_scans.filter(box_barcode__in=barcodes)
+        }
+        # Receiving is restricted to the boxes the sender dispatched on this
+        # transfer. A pallet is just a container — receive the boxes on it that
+        # belong to this transfer and ignore the rest; but an explicitly scanned
+        # box (or raw barcode) that wasn't dispatched here is an error.
+        matched = [c for c in barcodes if c in existing]
+        if is_pallet:
+            if not matched:
+                raise BSTError("None of this pallet's boxes were dispatched on this transfer.")
+        else:
+            missing = [c for c in barcodes if c not in existing]
+            if missing:
+                raise BSTError(
+                    f"{', '.join(missing)} was not dispatched on this transfer."
+                )
+        return is_pallet, resolved_pallet_code, existing, matched
 
     def receive_scan(
         self,
@@ -1638,63 +1742,10 @@ class BSTService:
         if not barcode_raw:
             raise BSTError("Barcode is required.")
 
-        # Resolve within the company (BST is intra-company).
-        lookup = ScanService(transfer.company.code).lookup_barcode(barcode_raw)
-        entity_type = lookup.get("entity_type")
-        entity_id = lookup.get("entity_id")
-
-        is_pallet = False
-        resolved_pallet_code = ""
-        if entity_type == "PALLET" and entity_id:
-            is_pallet = True
-            pallet = Pallet.objects.filter(id=entity_id).first()
-            resolved_pallet_code = pallet.pallet_id if pallet else barcode_raw
-            barcodes = list(
-                (pallet.boxes.values_list("box_barcode", flat=True)) if pallet else []
-            )
-            if not barcodes:
-                raise BSTError("Pallet has no boxes.")
-        elif entity_type == "BOX" and entity_id:
-            box = Box.objects.filter(id=entity_id).first()
-            barcodes = [box.box_barcode] if box else []
-        else:
-            # A pallet that already changed hands (e.g. accepted → moved to the
-            # destination company) no longer resolves via the source-scoped
-            # ScanService, so re-scanning it to reject/accept the rest would miss.
-            # Fall back to this transfer's own scans: if the raw value is a
-            # pallet_code recorded on the transfer, receive every box under it.
-            pallet_boxes = list(
-                transfer.box_scans.filter(pallet_code=barcode_raw)
-                .values_list("box_barcode", flat=True)
-            )
-            if pallet_boxes:
-                is_pallet = True
-                resolved_pallet_code = barcode_raw
-                barcodes = pallet_boxes
-            else:
-                # A sender-scanned box barcode still matches by raw value even if
-                # the box already changed hands.
-                barcodes = [barcode_raw]
-
+        is_pallet, resolved_pallet_code, existing, matched = self._match_receive_scans(
+            transfer, barcode_raw,
+        )
         now = timezone.now()
-        existing = {
-            s.box_barcode: s
-            for s in transfer.box_scans.filter(box_barcode__in=barcodes)
-        }
-        # Receiving is restricted to the boxes the sender dispatched on this
-        # transfer. A pallet is just a container — receive the boxes on it that
-        # belong to this transfer and ignore the rest; but an explicitly scanned
-        # box (or raw barcode) that wasn't dispatched here is an error.
-        matched = [c for c in barcodes if c in existing]
-        if is_pallet:
-            if not matched:
-                raise BSTError("None of this pallet's boxes were dispatched on this transfer.")
-        else:
-            missing = [c for c in barcodes if c not in existing]
-            if missing:
-                raise BSTError(
-                    f"{', '.join(missing)} was not dispatched on this transfer."
-                )
         # Rejecting a previously-accepted box is only possible while it hasn't
         # travelled on: an accepted box is free to be scanned onto a NEW BST
         # (see `_box_locked_elsewhere`), and once it is, pulling it back here
@@ -1764,6 +1815,117 @@ class BSTService:
             "updated_count": len(updated),
             "unexpected": [],
         }
+
+    # ==================================================================
+    # Dock handover (gated INVOICE transfers, before the truck leaves)
+    # ==================================================================
+
+    def hand_over_at_dock(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
+        """The destination takes a scanned pallet/box off a gated invoice BST at
+        the dock, before the truck leaves (see `dock_handover_open`).
+
+        It is an ordinary accept — the scan goes ACCEPTED and the boxes and their
+        pallet are handed to the destination company at once — except that the
+        transfer's status is left alone: the rest of the load still waits for the
+        gate, and is received the normal way when the truck arrives."""
+        try:
+            return self._dock_handover_atomic(transfer, barcode_raw, undo=False)
+        except BSTError as exc:
+            self._log_scan_rejection(transfer, barcode_raw, exc, scan_type=ScanType.RECEIVE)
+            raise
+
+    def undo_dock_handover(self, transfer: BSTTransfer, barcode_raw: str) -> dict:
+        """Put a pallet/box handed over at the dock back on the truck: the scan
+        returns to PENDING and the stock to the source company. Refused once the
+        destination has moved it on (loaded, dispatched, or onto another BST)."""
+        try:
+            return self._dock_handover_atomic(transfer, barcode_raw, undo=True)
+        except BSTError as exc:
+            self._log_scan_rejection(transfer, barcode_raw, exc, scan_type=ScanType.RECEIVE)
+            raise
+
+    @transaction.atomic
+    def _dock_handover_atomic(self, transfer: BSTTransfer, barcode_raw: str, *, undo: bool) -> dict:
+        transfer = self._lock(transfer, as_receiver=True)
+        if not (transfer.requires_gate and transfer.source_type == BSTSourceType.INVOICE):
+            raise BSTError(
+                "Only an invoice BST that leaves on a truck is handed over at the dock — "
+                "receive this one the normal way.",
+                code="DOCK_NOT_APPLICABLE",
+            )
+        if not dock_handover_open(transfer):
+            raise BSTError(
+                "The truck has already left the gate — receive these boxes the normal way "
+                "when it arrives.",
+                code="DOCK_CLOSED",
+            )
+        self._assert_receiver_scope(transfer)
+        barcode_raw = str(barcode_raw or "").strip()
+        if not barcode_raw:
+            raise BSTError("Barcode is required.")
+
+        is_pallet, pallet_code, existing, matched = self._match_receive_scans(transfer, barcode_raw)
+        pallet_codes = [pallet_code] if is_pallet and pallet_code else None
+        want = BSTReceiveStatus.ACCEPTED if undo else BSTReceiveStatus.PENDING
+        scans = [existing[c] for c in matched if existing[c].receive_status == want]
+        boxes = list(
+            Box.objects.select_related("company")
+            .filter(id__in=[s.box_id for s in scans if s.box_id])
+        )
+
+        if undo:
+            self._ensure_dock_boxes_unmoved(transfer, scans, boxes)
+            BSTBoxScan.objects.filter(id__in=[s.id for s in scans]).update(
+                receive_status=BSTReceiveStatus.PENDING,
+                received_by=None, received_at=None, reject_reason="",
+            )
+            if boxes:
+                self._return_to_source(transfer, boxes, pallet_codes=pallet_codes)
+        else:
+            BSTBoxScan.objects.filter(id__in=[s.id for s in scans]).update(
+                receive_status=BSTReceiveStatus.ACCEPTED,
+                received_by=self.user, received_at=timezone.now(), reject_reason="",
+            )
+            if boxes:
+                self._hand_to_destination(transfer, boxes, pallet_codes=pallet_codes)
+
+        # Touch the transfer so the sender's screen (which polls) sees the change,
+        # but never its status: the truck and the gate still own the rest.
+        transfer.save(update_fields=["updated_at"])
+        return {
+            "action": "undo" if undo else "handover",
+            "updated_count": len(scans),
+            "unchanged_count": len(matched) - len(scans),
+        }
+
+    def _ensure_dock_boxes_unmoved(self, transfer: BSTTransfer, scans, boxes) -> None:
+        """Refuse to undo a handover the destination has already acted on.
+
+        Handing the stock back to the source is only honest while it sits exactly
+        where the sender scanned it: same warehouse, still on the shelf, owned by
+        the destination, and on no other live BST. Once the destination has loaded
+        or dispatched it, pulling it back here would fight that movement."""
+        scanned_at = {s.box_id: s.warehouse_code for s in scans}
+        moved = [
+            b.box_barcode for b in boxes
+            if b.company_id != transfer.destination_company_id
+            or b.status not in (BoxStatus.ACTIVE, BoxStatus.PARTIAL)
+            or b.dispatched_at is not None
+            or (scanned_at.get(b.id) and b.current_warehouse != scanned_at[b.id])
+        ]
+        moved += list(
+            BSTBoxScan.objects
+            .filter(box_id__in=[b.id for b in boxes], transfer__status__in=IN_FLIGHT_STATUSES)
+            .exclude(transfer_id=transfer.id)
+            .values_list("box_barcode", flat=True)
+        )
+        if moved:
+            name = transfer.destination_company.name if transfer.destination_company else "the destination"
+            raise BSTError(
+                f"{_join_barcodes(sorted(set(moved)))} already moved on in {name} "
+                "(loaded, dispatched or moved) — the handover can no longer be undone.",
+                code="MOVED_ON",
+            )
 
     def _apply_accepted_moves(self, transfer: BSTTransfer) -> None:
         """Settle the accepted boxes. How they settle depends on `source_type`:

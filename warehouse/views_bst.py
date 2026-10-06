@@ -16,6 +16,7 @@ from .serializers_bst import (
     BSTBoxScanBulkDeleteSerializer,
     BSTBoxScanCreateSerializer,
     BSTBoxScanSerializer,
+    BSTDockHandoverSerializer,
     BSTLoadedAtSerializer,
     BSTManualItemEntrySaveSerializer,
     BSTPartialTransferApprovalSerializer,
@@ -460,6 +461,28 @@ class BSTReceiveScanView(APIView):
                 transfer, data["barcode_raw"],
                 decision=data["decision"], reject_reason=data.get("reject_reason", ""),
             )
+        except BSTError as exc:
+            return _bst_error(exc)
+        return Response(result)
+
+
+class BSTDockHandoverView(APIView):
+    """POST /bst/<id>/dock-handover/ — the destination takes a scanned pallet/box
+    off a gated invoice BST at the dock, before the truck leaves (`undo: true`
+    puts it back on the truck)."""
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request, transfer_id):
+        serializer = BSTDockHandoverSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        svc = _service(request)
+        data = serializer.validated_data
+        try:
+            transfer = svc.get_incoming_transfer(transfer_id)
+            if data["undo"]:
+                result = svc.undo_dock_handover(transfer, data["barcode_raw"])
+            else:
+                result = svc.hand_over_at_dock(transfer, data["barcode_raw"])
         except BSTError as exc:
             return _bst_error(exc)
         return Response(result)

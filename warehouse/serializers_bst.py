@@ -16,6 +16,7 @@ from .models_bst import (
     BSTTransferItem,
 )
 from .services.bst_service import (
+    dock_handover_open,
     partial_transfer_state,
     scan_status_payload,
     vehicle_editable,
@@ -162,6 +163,9 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
     # Every attached SAP document's number, so the list can be searched by any of
     # them — the head's `sap_doc_num` names only the first.
     doc_nums = serializers.SerializerMethodField()
+    # A gated invoice still at the dock: the destination can take pallets off it
+    # now (`hand_over_at_dock`); the rest waits for the truck.
+    dock_handover_open = serializers.SerializerMethodField()
 
     class Meta:
         model = BSTTransfer
@@ -174,7 +178,7 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
             "sap_doc_entry", "sap_doc_num", "sap_doc_date",
             "sap_from_warehouse", "sap_to_warehouse", "sap_reference",
             "doc_nums", "vehicle", "vehicle_number", "driver", "driver_name",
-            "requires_gate",
+            "requires_gate", "dock_handover_open",
             "scanned_box_count", "item_count", "doc_count",
             "scan_approved_at", "loaded_at", "dispatched_at", "received_at", "created_at",
         ]
@@ -202,6 +206,9 @@ class BSTTransferListSerializer(serializers.ModelSerializer):
         if annotated is not None:
             return [n for n in annotated if n]
         return [d.sap_doc_num for d in obj.docs.all() if d.sap_doc_num]
+
+    def get_dock_handover_open(self, obj) -> bool:
+        return dock_handover_open(obj)
 
 
 class BSTTransferDetailSerializer(BSTTransferListSerializer):
@@ -379,6 +386,12 @@ class BSTReceiveScanSerializer(serializers.Serializer):
         choices=["ACCEPTED", "REJECTED"], required=False, default="ACCEPTED",
     )
     reject_reason = serializers.CharField(allow_blank=True, required=False, default="")
+
+
+class BSTDockHandoverSerializer(serializers.Serializer):
+    barcode_raw = serializers.CharField(max_length=100)
+    # True puts a handed-over pallet/box back on the truck.
+    undo = serializers.BooleanField(required=False, default=False)
 
 
 # ---------------------------------------------------------------------------
