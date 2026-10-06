@@ -27,7 +27,10 @@ from dispatch_plans.models_bill_summary import (
     BillSummarySapStatus,
     BillSummaryStatus,
 )
-from dispatch_plans.serializers_bill_summary import BillSummaryListSerializer
+from dispatch_plans.serializers_bill_summary import (
+    BillSummaryDetailSerializer,
+    BillSummaryListSerializer,
+)
 from warehouse.models_manager import UserWarehouse
 
 DOC_ENTRY = 5101
@@ -1285,6 +1288,101 @@ class SendingBackTests(BillSummaryTestBase):
         with self.assertRaises(BillSummaryError):
             self.service.resubmit(summary.id, {"bilty_no": "NCR-999"})
 
+    def sent_back_for_its_bilty(self, **plan):
+        """A sheet raised off a plan with no bilty, and handed back for it."""
+        self.make_plan(**{"bilty_no": "", **plan})
+        with self.stub():
+            summary = self.generate(bilty_no="")
+        self.service.reject(summary.id, "BILTY NOT SHOWING")
+        return summary
+
+    def test_a_re_sent_bilty_and_its_date_reach_the_sheet(self):
+        summary = self.sent_back_for_its_bilty()
+        self.service.resubmit(
+            summary.id,
+            {
+                "bilty_no": "2124",
+                "bilty_date": date(2026, 10, 6),
+                "transporter_name": "Bhargave Road Carrier",
+            },
+        )
+        summary.refresh_from_db()
+        self.assertEqual(summary.bilty_no, "2124")
+        self.assertEqual(summary.bilty_date, date(2026, 10, 6))
+        self.assertEqual(summary.transporter_name, "Bhargave Road Carrier")
+
+    def test_a_re_sent_bilty_goes_onto_a_plan_that_had_none(self):
+        """Otherwise the docking asks for the same LR again, and the gatepass and
+        the Service GRPO go out without the one SAP was told."""
+        summary = self.sent_back_for_its_bilty()
+        self.service.resubmit(
+            summary.id, {"bilty_no": "2124", "bilty_date": date(2026, 10, 6)}
+        )
+        plan = DispatchPlan.objects.get(sap_invoice_doc_entry=DOC_ENTRY)
+        self.assertEqual(plan.bilty_no, "2124")
+        self.assertEqual(plan.bilty_date, date(2026, 10, 6))
+        self.assertEqual(plan.updated_by, self.user)
+
+    def test_a_plan_s_own_bilty_is_never_overwritten_from_a_sheet(self):
+        """The plan's LR may already be downstream. The sheet is the copy."""
+        self.make_plan(bilty_no="BLT-900", bilty_date=date(2026, 10, 5))
+        with self.stub():
+            summary = self.generate()
+        self.service.reject(summary.id, "wrong bilty")
+        self.service.resubmit(
+            summary.id, {"bilty_no": "OTHER-1", "bilty_date": date(2026, 10, 6)}
+        )
+        plan = DispatchPlan.objects.get(sap_invoice_doc_entry=DOC_ENTRY)
+        self.assertEqual(plan.bilty_no, "BLT-900")
+        self.assertEqual(plan.bilty_date, date(2026, 10, 5))
+
+    def test_a_bilty_typed_on_a_new_sheet_goes_onto_a_plan_that_had_none(self):
+        """BS-20261006-024: raised by bill number with bilty 2126 typed in, for a
+        plan the bill had gone onto the truck without."""
+        self.make_plan(bilty_no="")
+        with self.stub():
+            self.generate(bilty_no="2126", bilty_date=date(2026, 10, 6))
+        plan = DispatchPlan.objects.get(sap_invoice_doc_entry=DOC_ENTRY)
+        self.assertEqual(plan.bilty_no, "2126")
+        self.assertEqual(plan.bilty_date, date(2026, 10, 6))
+
+    def test_a_plan_with_the_number_but_no_date_gets_the_date(self):
+        self.make_plan(bilty_no="BLT-900", bilty_date=None)
+        with self.stub():
+            summary = self.generate()
+        self.service.reject(summary.id, "no bilty date")
+        self.service.resubmit(
+            summary.id, {"bilty_no": "BLT-900", "bilty_date": date(2026, 10, 6)}
+        )
+        plan = DispatchPlan.objects.get(sap_invoice_doc_entry=DOC_ENTRY)
+        self.assertEqual(plan.bilty_date, date(2026, 10, 6))
+
+    def test_the_sheet_shows_what_its_plan_holds_now(self):
+        """The re-send form fills its blanks from the plan as it is now, not
+        from the copy the sheet took when it was raised, before the bilty."""
+        from vehicle_management.models import Transporter, Vehicle
+
+        summary = self.sent_back_for_its_bilty()
+        DispatchPlan.objects.filter(sap_invoice_doc_entry=DOC_ENTRY).update(
+            bilty_no="2124",
+            bilty_date=date(2026, 10, 6),
+            vehicle=Vehicle.objects.create(
+                vehicle_number="DL01LAN0395",
+                transporter=Transporter.objects.create(name="Bhargave Road Carrier"),
+            ),
+        )
+        held = BillSummaryDetailSerializer(summary).data["plan_transport"]
+        self.assertEqual(held["bilty_no"], "2124")
+        self.assertEqual(held["bilty_date"], date(2026, 10, 6))
+        self.assertEqual(held["vehicle_no"], "DL01LAN0395")
+        # Planning named no transporter, so it is the truck's own.
+        self.assertEqual(held["transporter_name"], "Bhargave Road Carrier")
+
+    def test_a_sheet_with_no_plan_shows_none(self):
+        with self.stub():
+            summary = self.generate()
+        self.assertIsNone(BillSummaryDetailSerializer(summary).data["plan_transport"])
+
 
 class GodownScopeTests(BillSummaryTestBase):
     """A sheet is for the managers of the godown it goes out of.
@@ -1545,6 +1643,22 @@ class WholeTruckSubmissionTests(BillSummaryTestBase):
         self.assertEqual(summary.transporter_name, "Pick & Ship")
         self.assertEqual(summary.driver_name, "Sonu")
         self.assertEqual(summary.bilty_no, "NCR-4494")
+
+    def test_with_no_transporter_planned_the_sheet_takes_the_truck_s(self):
+        """The rule linking applies. A bill put on a truck at the gate used to
+        skip it, and its sheet went over with the transporter blank."""
+        from vehicle_management.models import Transporter, Vehicle
+
+        self.plan_for(
+            DOC_ENTRY,
+            vehicle=Vehicle.objects.create(
+                vehicle_number="DL01LAN0395",
+                transporter=Transporter.objects.create(name="Bhargave Road Carrier"),
+            ),
+        )
+        with self.stub():
+            result = self.service.submit_bills([DOC_ENTRY])
+        self.assertEqual(result["created"][0].transporter_name, "Bhargave Road Carrier")
 
     def test_a_bill_that_already_has_a_sheet_is_skipped_by_name(self):
         self.plan_for(DOC_ENTRY)

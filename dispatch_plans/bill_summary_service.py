@@ -112,6 +112,21 @@ def _godowns(summary: BillSummary) -> frozenset:
     )
 
 
+def _transporter_name(plan, vehicle) -> str:
+    """The plan's transporter, else the one its truck is registered to.
+
+    That is the rule linking applies when planning names no transporter
+    (``DispatchPlansService._apply_master_data``). A bill added to a truck at the
+    gate used to skip it, and its sheet then went over with the transporter
+    blank, so the sheet falls back the same way rather than trusting every path
+    to have written the plan.
+    """
+    transporter = getattr(plan, "transporter", None) or getattr(
+        vehicle, "transporter", None
+    )
+    return getattr(transporter, "name", "") or ""
+
+
 class BillSummaryService:
     #: Raised from a sheet whose stamp SAP did not answer, for the rest of the
     #: request: see the module docstring.
@@ -164,8 +179,9 @@ class BillSummaryService:
                 company=self.company, sap_invoice_doc_entry=doc_entry
             )
             .select_related(
-                "vehicle", "transporter", "driver",
-                "linked_vehicle_entry__vehicle", "linked_vehicle_entry__driver",
+                "vehicle__transporter", "transporter", "driver",
+                "linked_vehicle_entry__vehicle__transporter",
+                "linked_vehicle_entry__driver",
             )
             .first()
         )
@@ -245,7 +261,6 @@ class BillSummaryService:
             }
 
         entry = getattr(plan, "linked_vehicle_entry", None)
-        transporter = getattr(plan, "transporter", None)
         # Fall through to the gate entry for anything planning left blank.
         vehicle = getattr(plan, "vehicle", None) or getattr(entry, "vehicle", None)
         driver = getattr(plan, "driver", None) or getattr(entry, "driver", None)
@@ -254,7 +269,7 @@ class BillSummaryService:
             "dispatch_date": None,
             "bilty_no": (plan.bilty_no or "").strip() or sap_bilty,
             "bilty_date": plan.bilty_date,
-            "transporter_name": getattr(transporter, "name", "") or "",
+            "transporter_name": _transporter_name(plan, vehicle),
             "vehicle_no": getattr(vehicle, "vehicle_number", "") or "",
             "driver_name": getattr(driver, "name", "") or "",
             "driver_mobile": getattr(driver, "mobile_no", "") or "",
@@ -581,6 +596,10 @@ class BillSummaryService:
             )
 
         summary = self._raise_sheet(doc_entry, data)
+        # A bilty typed here, for a bill whose plan has none, belongs on the plan
+        # too. That is how 626100143 went out on 2026-10-06: bilty 2126 typed
+        # onto a sheet raised by bill number, and a plan left with no bilty.
+        self._give_plan_the_bilty(summary)
         transaction.on_commit(lambda: notify_bill_summary_submitted([summary]))
         logger.info(
             "Bill summary %s raised for bill %s and sent to the warehouse",
@@ -763,8 +782,9 @@ class BillSummaryService:
             for plan in DispatchPlan.objects.filter(
                 company=self.company, sap_invoice_doc_entry__in=wanted
             ).select_related(
-                "vehicle", "transporter", "driver",
-                "linked_vehicle_entry__vehicle", "linked_vehicle_entry__driver",
+                "vehicle__transporter", "transporter", "driver",
+                "linked_vehicle_entry__vehicle__transporter",
+                "linked_vehicle_entry__driver",
             )
         }
         taken = {
@@ -837,6 +857,7 @@ class BillSummaryService:
         The driver is read through the gate entry as well as the plan: planning
         books a vehicle and a transporter but hardly ever a driver, because the
         driver is only known when the truck turns up and the gate records it.
+        The transporter falls back to the truck's own (``_transporter_name``).
         """
         entry = getattr(plan, "linked_vehicle_entry", None)
         vehicle = plan.vehicle or getattr(entry, "vehicle", None)
@@ -845,7 +866,7 @@ class BillSummaryService:
             "sap_invoice_doc_num": plan.sap_invoice_doc_num or "",
             "bilty_no": (plan.bilty_no or "").strip(),
             "bilty_date": plan.bilty_date,
-            "transporter_name": getattr(plan.transporter, "name", "") or "",
+            "transporter_name": _transporter_name(plan, vehicle),
             "vehicle_no": getattr(vehicle, "vehicle_number", "") or "",
             "driver_name": getattr(driver, "name", "") or "",
             "driver_mobile": getattr(driver, "mobile_no", "") or "",
@@ -1463,8 +1484,51 @@ class BillSummaryService:
         summary.status = BillSummaryStatus.PENDING_APPROVAL
         summary.submitted_at = timezone.now()
         summary.save()
+        self._give_plan_the_bilty(summary)
         transaction.on_commit(lambda: notify_bill_summary_submitted([summary]))
         return summary
+
+    def _give_plan_the_bilty(self, summary: BillSummary) -> None:
+        """Copy a sheet's typed bilty onto its dispatch plan, if the plan has none.
+
+        A sheet raised off a truck is a copy of its plan. So a sheet sent back
+        for its bilty usually means the plan never had one: the bill went on the
+        truck without the linking form. The desk then types the bilty on the
+        sheet, either re-sending it or raising a new one by bill number. The
+        docking, the gatepass and the Service GRPO all read the LR off the plan,
+        and leaving it only on the sheet would have the desk type it a second
+        time at the docking.
+
+        A plan that already carries a bilty number keeps it. That number may
+        already have gone downstream, and the sheet is only the copy.
+        """
+        bilty_no = (summary.bilty_no or "").strip()
+        if not bilty_no:
+            return
+        plan = (
+            DispatchPlan.objects.select_for_update()
+            .filter(
+                company=self.company,
+                sap_invoice_doc_entry=summary.sap_invoice_doc_entry,
+            )
+            .first()
+        )
+        if plan is None:
+            return
+        held = (plan.bilty_no or "").strip()
+        if held and held != bilty_no:
+            return
+        # The same LR already on the plan: only a missing date is worth adding.
+        if held and (plan.bilty_date or not summary.bilty_date):
+            return
+        plan.bilty_no = bilty_no
+        plan.bilty_date = summary.bilty_date or plan.bilty_date
+        plan.updated_by = self.user
+        plan.save(update_fields=["bilty_no", "bilty_date", "updated_by", "updated_at"])
+        logger.info(
+            "Bilty %s given to dispatch plan %s from re-sent %s",
+            bilty_no, plan.pk, summary.entry_no,
+        )
 
     def _restate_lines(self, summary: BillSummary, rows: list) -> None:
         """Change what is being dispatched on lines the sheet already holds.

@@ -3161,6 +3161,17 @@ class InsideDispatchVehiclesView(APIView):
                         "removable": commit_reason is None and cover.consumed_at is None,
                         "not_removable_reason": commit_reason,
                         "duplicate_on": duplicate_on,
+                        # Whose bill it is and what LR covers it, so a bill added
+                        # to the truck for the same consignee can be offered the
+                        # same bilty rather than having it typed again.
+                        "customer_code": plan.customer_code if plan else "",
+                        "customer_name": plan.customer_name if plan else "",
+                        "bilty_no": plan.bilty_no if plan else "",
+                        "bilty_date": (
+                            plan.bilty_date.isoformat()
+                            if plan and plan.bilty_date
+                            else None
+                        ),
                     }
                 )
             result.append(
@@ -3185,6 +3196,74 @@ class InsideDispatchVehiclesView(APIView):
         return Response(result)
 
 
+def _bilty_for_added_bill(request, plan):
+    """The consignee's bilty for a bill being put on a truck that is already inside.
+
+    Linking will not take a truck without each consignee's bilty number and
+    date, and a bill added after the gate-in is no different. The gatepass and
+    the bill summary both read the LR off the plan, so a bill added without one
+    becomes a sheet the warehouse sends straight back. A plan booked through the
+    linking form already holds its bilty and keeps it, unless another is sent.
+
+    Number and date come together from one place, the request or the plan.
+    Mixing a typed number with an old plan's date would be a bilty that never
+    existed.
+    """
+    sent_no = str(request.data.get("bilty_no") or "").strip()
+    if sent_no:
+        raw_date = str(request.data.get("bilty_date") or "").strip()
+        try:
+            bilty_date = parse_date(raw_date) if raw_date else None
+        except ValueError:
+            bilty_date = None
+        if raw_date and bilty_date is None:
+            raise ValueError("The bilty date is not a date.")
+        bilty_no = sent_no
+    else:
+        bilty_no, bilty_date = (plan.bilty_no or "").strip(), plan.bilty_date
+
+    if not bilty_no:
+        raise ValueError("A bilty number is required.")
+    if not bilty_date:
+        raise ValueError("A bilty date is required.")
+    limit = DispatchPlan._meta.get_field("bilty_no").max_length
+    if len(bilty_no) > limit:
+        raise ValueError(f"A bilty number can be at most {limit} characters.")
+    return bilty_no, bilty_date
+
+
+def _put_plan_on_inside_truck(plan, *, vehicle, driver_id, bilty_no, bilty_date, user):
+    """Point a bill at a truck that is already inside, ready for it to be attached.
+
+    This writes what linking would have written: the vehicle and driver from the
+    gate, the consignee's bilty, and, when planning named no transporter, the
+    one the truck is registered to. That last part is the rule linking applies
+    (``DispatchPlansService._apply_master_data``). Before it was here, a bill
+    added to an inside truck carried no transporter, and neither did its bill
+    summary.
+    """
+    plan.vehicle_id = vehicle.id
+    plan.driver_id = driver_id
+    plan.bilty_no = bilty_no
+    plan.bilty_date = bilty_date
+    update_fields = [
+        "vehicle",
+        "driver",
+        "bilty_no",
+        "bilty_date",
+        "booking_status",
+        "updated_by",
+        "updated_at",
+    ]
+    if not plan.transporter_id and vehicle.transporter_id:
+        plan.transporter_id = vehicle.transporter_id
+        update_fields.append("transporter")
+    if plan.booking_status != DispatchPlanStatus.BOOKED:
+        plan.booking_status = DispatchPlanStatus.BOOKED
+    plan.updated_by = user
+    plan.save(update_fields=update_fields)
+
+
 class InsideVehicleAddBillView(APIView):
     """Add one dispatch bill to a vehicle that is already inside.
 
@@ -3193,7 +3272,8 @@ class InsideVehicleAddBillView(APIView):
     (``_assert_bill_not_added_to_inside_vehicle``); this endpoint is the
     deliberate way to add a late bill (e.g. a 4th bill decided after the first
     three were scanned) to the truck's current load, reusing the same cover +
-    photo-lock rules the old auto-flow used.
+    photo-lock rules the old auto-flow used. It asks for the consignee's bilty
+    the way linking does (``_bilty_for_added_bill``).
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanAddBillInsideVehicle]
@@ -3264,6 +3344,10 @@ class InsideVehicleAddBillView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        try:
+            bilty_no, bilty_date = _bilty_for_added_bill(request, plan)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         attached = False
         with transaction.atomic():
@@ -3271,19 +3355,13 @@ class InsideVehicleAddBillView(APIView):
             # gate-in's load (cover + link). attach_bill_to_inside_vehicle
             # enforces the photo-lock cutoff -- no adding once the truck photo is
             # on. Roll back the transport re-point if attaching is refused.
-            plan.vehicle_id = gate_in.vehicle_id
-            plan.driver_id = gate_in.vehicle_entry.driver_id
-            if plan.booking_status != DispatchPlanStatus.BOOKED:
-                plan.booking_status = DispatchPlanStatus.BOOKED
-            plan.updated_by = request.user
-            plan.save(
-                update_fields=[
-                    "vehicle",
-                    "driver",
-                    "booking_status",
-                    "updated_by",
-                    "updated_at",
-                ]
+            _put_plan_on_inside_truck(
+                plan,
+                vehicle=gate_in.vehicle,
+                driver_id=gate_in.vehicle_entry.driver_id,
+                bilty_no=bilty_no,
+                bilty_date=bilty_date,
+                user=request.user,
             )
             attached = attach_bill_to_inside_vehicle(plan, request.user)
             if not attached:
@@ -3321,7 +3399,7 @@ class InsideVehicleAddBillToTruckView(APIView):
     truck that is already inside -- it points the bill at the truck and lets
     ``attach_bill_to_inside_vehicle`` create the company's gate-in chain under the
     truck's open arrival (one truck, one trip, many companies), the same mechanism
-    Move uses. Same cover + photo-lock rules apply.
+    Move uses. Same cover + photo-lock rules apply, and the same bilty rule.
     """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanAddBillInsideVehicle]
@@ -3408,24 +3486,22 @@ class InsideVehicleAddBillToTruckView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        try:
+            bilty_no, bilty_date = _bilty_for_added_bill(request, plan)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         attached = False
         with transaction.atomic():
             # Point the bill at this truck, then let attach create/join the
             # company's chain under the open arrival. Roll back on refusal.
-            plan.vehicle_id = target.vehicle_id
-            plan.driver_id = target.vehicle_entry.driver_id
-            if plan.booking_status != DispatchPlanStatus.BOOKED:
-                plan.booking_status = DispatchPlanStatus.BOOKED
-            plan.updated_by = request.user
-            plan.save(
-                update_fields=[
-                    "vehicle",
-                    "driver",
-                    "booking_status",
-                    "updated_by",
-                    "updated_at",
-                ]
+            _put_plan_on_inside_truck(
+                plan,
+                vehicle=target.vehicle,
+                driver_id=target.vehicle_entry.driver_id,
+                bilty_no=bilty_no,
+                bilty_date=bilty_date,
+                user=request.user,
             )
             attached = attach_bill_to_inside_vehicle(plan, request.user)
             if not attached:

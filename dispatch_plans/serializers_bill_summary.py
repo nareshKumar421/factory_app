@@ -2,6 +2,8 @@
 
 from rest_framework import serializers
 
+from .bill_summary_service import BillSummaryService
+from .models import DispatchPlan
 from .models_bill_summary import APP_SOURCE, BillSummary, BillSummaryLine
 
 
@@ -132,9 +134,41 @@ class BillSummaryListSerializer(serializers.ModelSerializer):
 
 class BillSummaryDetailSerializer(BillSummaryListSerializer):
     lines = BillSummaryLineSerializer(source="active_lines", many=True, read_only=True)
+    plan_transport = serializers.SerializerMethodField()
 
     class Meta(BillSummaryListSerializer.Meta):
-        fields = BillSummaryListSerializer.Meta.fields + ["lines"]
+        fields = BillSummaryListSerializer.Meta.fields + ["lines", "plan_transport"]
+
+    def get_plan_transport(self, obj) -> dict | None:
+        """What the bill's dispatch plan holds now, for the re-send form.
+
+        The sheet copied the plan when it was raised. A sheet sent back for its
+        bilty was usually raised before the plan had one, so the form fills its
+        blanks from here instead of from a copy that was empty from the start.
+        Null when the bill has no dispatch plan.
+        """
+        plan = (
+            DispatchPlan.objects.filter(
+                company_id=obj.company_id,
+                sap_invoice_doc_entry=obj.sap_invoice_doc_entry,
+            )
+            .select_related(
+                "vehicle__transporter", "transporter", "driver",
+                "linked_vehicle_entry__vehicle__transporter",
+                "linked_vehicle_entry__driver",
+            )
+            .first()
+        )
+        if plan is None:
+            return None
+        data = BillSummaryService._plan_data(plan)
+        return {
+            field: data[field]
+            for field in (
+                "bilty_no", "bilty_date", "transporter_name",
+                "vehicle_no", "driver_name", "driver_mobile",
+            )
+        }
 
 
 class BillSummaryGenerateLineSerializer(serializers.Serializer):
