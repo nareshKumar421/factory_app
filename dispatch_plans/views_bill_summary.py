@@ -119,10 +119,6 @@ class BillSummaryListCreateAPI(APIView):
                 Q(dispatch_date__lte=date_to)
                 | Q(dispatch_date__isnull=True, submitted_at__date__lte=date_to)
             )
-        # The approvals screen: a sheet is for the managers of the godown it
-        # goes out of, not for every warehouse user in the company.
-        if request.query_params.get("managed") in ("1", "true"):
-            rows = _service(request).managed_only(rows)
         return Response(BillSummaryListSerializer(rows, many=True).data)
 
     def post(self, request):
