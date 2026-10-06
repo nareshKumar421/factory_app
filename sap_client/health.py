@@ -353,20 +353,43 @@ def _alert_recipients():
     return get_user_model().objects.filter(who, is_active=True).distinct()
 
 
+def _waiting_phrase() -> str:
+    """"GRPOs, goods returns and bill summary stamps": what the posting queue holds."""
+    try:
+        from sap_postings.services import waiting_kinds
+
+        kinds = waiting_kinds()
+    except Exception:  # noqa: BLE001 -- an alert's wording is never why it is not sent
+        kinds = []
+    if not kinds:
+        return "Postings on the SAP posting queue"
+    phrase = kinds[0] if len(kinds) == 1 else ", ".join(kinds[:-1]) + " and " + kinds[-1]
+    return phrase[0].upper() + phrase[1:]
+
+
 def _alert(component, *, recovered, state):
     """Tell the people who answer for SAP. Never the reason a probe fails."""
     label = LABELS[component]
     if recovered:
         title = f"SAP {label} is answering again"
-        body = f"It was down from {_clock(state.get('since'))}. Postings to SAP can be retried."
+        body = (
+            f"It was down from {_clock(state.get('since'))}. What waited for SAP is "
+            "being sent now; anything else can be retried."
+            if component == SERVICE_LAYER
+            else f"It was down from {_clock(state.get('since'))}. Screens read SAP live "
+            "again, and bills handed out from the copy are being checked against it."
+        )
     else:
         title = f"SAP {label} is down"
         body = (
             f"Not answering since {_clock(state.get('since'))}: {state.get('error')}. "
-            f"Postings to SAP fail until it is restarted on the SAP server."
+            f"{_waiting_phrase()} wait and post by themselves once it is back; other "
+            f"postings to SAP fail until it is restarted on the SAP server."
             if component == SERVICE_LAYER
             else f"Not answering since {_clock(state.get('since'))}: {state.get('error')}. "
-            f"SAP lists and stock figures in the app are empty until it is back."
+            f"The app works from its copy of SAP (bills and open POs from the last 15 "
+            f"minutes, items, BOMs, warehouses and vendors from last night); stock "
+            f"figures are not copied."
         )
     try:
         from notifications.services import NotificationService

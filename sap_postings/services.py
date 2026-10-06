@@ -51,6 +51,19 @@ KIND_LABELS = {
     "bill_summary.stamp": "Bill summary (invoice dispatch stamp)",
 }
 
+#: kind -> what the "SAP is down" banner calls it, in a list of what waits.
+KIND_SHORT = {
+    "grpo.material": "GRPOs",
+    "goods_return.receive": "goods returns",
+    "short_dispatch.post": "short dispatches",
+    "bill_summary.stamp": "bill summary stamps",
+}
+
+
+def waiting_kinds():
+    """What waits for SAP and posts by itself, as the banner lists it."""
+    return [KIND_SHORT.get(kind, kind_label(kind)) for kind in HANDLERS]
+
 
 def kind_label(kind):
     return KIND_LABELS.get(kind, kind)

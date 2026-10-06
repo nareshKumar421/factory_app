@@ -6,7 +6,9 @@ Runs for good under systemd (see ``sap_postings/deploy/``). Each pass:
    has the app open -- and is the one process that sends the SAP-down alerts;
 2. on SAP coming back (or being up when it starts), brings every waiting
    posting forward to now;
-3. sends what is due (``services.run_due``), oldest first.
+3. sends what is due (``services.run_due``), oldest first;
+4. every few minutes, checks that the app's copies of SAP (``sap_mirror``) are
+   still being refreshed, and alerts the same people if one has stopped.
 
 ``--exit-when-moved <symlink>``: stop when the release that symlink points at is
 no longer the one this process runs from. systemd starts it again from the new
@@ -15,12 +17,16 @@ release, so a deploy never leaves the worker sending with yesterday's code.
 ``--require-test-sap``: refuse to start unless every company database is a
 ``TEST_`` copy. For a worker on a developer's machine: its app database is full
 of test postings, and one started after ``.env`` went back to live SAP would
-send them all there.
+send them all there. Such a worker does not watch the copies either: nothing
+refreshes them on a schedule there, so it would only cry wolf.
 """
 
 import logging
 import os
 import time
+
+#: Seconds between checks that the SAP copies are still being refreshed.
+COPY_WATCH_INTERVAL = 300
 from pathlib import Path
 
 from django.conf import settings
@@ -62,6 +68,8 @@ class Command(BaseCommand):
                     f"and --require-test-sap allows only TEST_ company databases."
                 )
         running_from = Path(settings.BASE_DIR).resolve()
+        self.watch_copies = not require_test_sap
+        self.copies_checked_at = 0.0
         was_up = None
         self.stdout.write(f"SAP posting worker started from {running_from}")
         while True:
@@ -91,4 +99,12 @@ class Command(BaseCommand):
         sent = services.run_due()
         if sent:
             logger.info("Sent %s SAP posting(s)", sent)
+        if getattr(self, "watch_copies", False) and time.time() - self.copies_checked_at >= COPY_WATCH_INTERVAL:
+            self.copies_checked_at = time.time()
+            try:
+                from sap_mirror import monitor
+
+                monitor.watch(snap)
+            except Exception:  # noqa: BLE001 -- the copies are never why postings stop
+                logger.exception("Checking the SAP copies failed")
         return is_up
