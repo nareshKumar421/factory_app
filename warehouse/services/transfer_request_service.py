@@ -43,7 +43,10 @@ from ..models_transfer import (
 )
 from . import transfer_guards as guards
 from . import warehouse_scope
-from .transfer_reservations import reserved_by_open_requests
+from .transfer_reservations import (
+    batches_held_by_open_requests,
+    reserved_by_open_requests,
+)
 from .transfer_guards import TransferGuardError
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,11 @@ logger = logging.getLogger(__name__)
 
 class TransferRequestError(ValueError):
     """A request the app itself refuses — bad state, not a SAP rejection."""
+
+
+def _plain(quantity: Decimal) -> str:
+    """`Decimal('60.000')` as "60", never as "6E+1"."""
+    return format(quantity.normalize(), 'f')
 
 
 
@@ -178,6 +186,47 @@ class TransferRequestService:
             row["free_to_move"] = row["on_hand"] - own
         return rows
 
+    def item_batches(
+        self, warehouse: str, item_code: str, *, exclude_request_id: int | None = None
+    ) -> dict:
+        """Released batches of one item in the source warehouse, for the raise form.
+
+        Each carries how much of it our other open requests were raised
+        against, so two requests are not quietly pinned to the same batch.
+        That is shown, not refused — the item-level figure works the same way,
+        and posting is where a batch that has gone is actually caught.
+        """
+        warehouse = (warehouse or "").strip()
+        item_code = (item_code or "").strip()
+        if not warehouse or not item_code:
+            raise TransferRequestError("Pick the source warehouse and the item first.")
+
+        is_batch_managed = bool(self.client.batch_managed_flags([item_code]).get(item_code))
+        batches = []
+        if is_batch_managed:
+            held = batches_held_by_open_requests(
+                self.company_code, warehouse, item_code,
+                exclude_request_id=exclude_request_id,
+            )
+            batches = [
+                {
+                    "batch_number": batch["batch_number"],
+                    "quantity": batch["quantity"],
+                    "in_date": batch["in_date"],
+                    "expiry_date": batch["expiry_date"],
+                    "production_date": batch["production_date"],
+                    "held_by_requests": held.get(batch["batch_number"], Decimal("0")),
+                }
+                for batch in self._batch_reader().available_batches(item_code, warehouse)
+                if batch["status"] == "0"
+            ]
+        return {
+            "item_code": item_code,
+            "warehouse": warehouse,
+            "is_batch_managed": is_batch_managed,
+            "batches": batches,
+        }
+
     def get_request(
         self, request_id: int, *, link_bst: bool = False
     ) -> WarehouseTransferRequest:
@@ -292,6 +341,14 @@ class TransferRequestService:
             # Catch it here rather than at posting: a fractional pouch is wrong
             # the moment it is asked for, and SAP will not object later.
             guards.check_whole_units(item_code, quantity, line.get('uom', ''))
+            is_batch_managed = bool(batch_flags.get(item_code))
+            chosen = self._chosen_batches(
+                item_code,
+                line.get('from_warehouse') or request.from_warehouse,
+                quantity,
+                line.get('batches'),
+                is_batch_managed=is_batch_managed,
+            )
             WarehouseTransferRequestLine.objects.create(
                 request=request,
                 line_num=index,
@@ -301,8 +358,74 @@ class TransferRequestService:
                 from_warehouse=line.get('from_warehouse', ''),
                 to_warehouse=line.get('to_warehouse', ''),
                 requested_qty=quantity,
-                is_batch_managed=bool(batch_flags.get(item_code)),
+                is_batch_managed=is_batch_managed,
+                chosen_batches=chosen,
             )
+
+    def _chosen_batches(
+        self, item_code: str, source: str, quantity: Decimal, raw, *, is_batch_managed: bool
+    ) -> list[dict]:
+        """Check the batches picked for a line, and return them as stored.
+
+        Nothing picked is the ordinary case: posting takes the oldest. A pick
+        must add up to the line exactly and name batches the shelf holds now —
+        caught here, while the requester is still at the form, rather than by
+        whoever posts it later.
+        """
+        merged: dict[str, Decimal] = {}
+        for entry in raw or []:
+            number = str(entry.get('batch_number') or '').strip()
+            taking = Decimal(str(entry.get('quantity') or 0))
+            if not number:
+                raise TransferRequestError(f"A batch picked for {item_code} has no number.")
+            if taking > 0:
+                merged[number] = merged.get(number, Decimal('0')) + taking
+        if not merged:
+            return []
+        if not is_batch_managed:
+            raise TransferRequestError(
+                f"{item_code} is not batch-tracked in SAP, so it has no batches to pick."
+            )
+
+        total = sum(merged.values(), Decimal('0'))
+        if total != quantity:
+            raise TransferRequestError(
+                f"{item_code}: the batches picked add up to {_plain(total)}, but "
+                f"{_plain(quantity)} is asked for."
+            )
+
+        from sap_client.hana.batch_stock_reader import InsufficientBatchStock
+        try:
+            self._batch_reader().check_allocation(
+                item_code, source,
+                [{'BatchNumber': number, 'Quantity': q} for number, q in merged.items()],
+            )
+        except InsufficientBatchStock as exc:
+            # The requester's to fix, not SAP failing, so a 400 and not a 502.
+            raise TransferRequestError(str(exc)) from exc
+        return [
+            {'batch_number': number, 'quantity': _plain(q)} for number, q in merged.items()
+        ]
+
+    def _repick_batches(self, request: WarehouseTransferRequest, raw_lines: list) -> None:
+        """Save an edit that changed only which batches the lines are pinned to.
+
+        Batches never reach SAP's request, so this leaves SAP alone. The
+        request's `updated_at` still moves, so an approver deciding on the old
+        picks is refused like any other stale decision.
+        """
+        changed = False
+        for line, raw in zip(request.lines.all(), raw_lines):
+            chosen = self._chosen_batches(
+                line.item_code, line.source_warehouse, line.requested_qty,
+                raw.get('batches'), is_batch_managed=line.is_batch_managed,
+            )
+            if chosen != line.chosen_batches:
+                line.chosen_batches = chosen
+                line.save(update_fields=['chosen_batches', 'updated_at'])
+                changed = True
+        if changed:
+            request.save(update_fields=['updated_at'])
 
     # ------------------------------------------------------------------
     # 01b — edit, until it is decided
@@ -347,6 +470,8 @@ class TransferRequestService:
                 request.lines.all().delete()
                 self._add_lines(request, raw_lines)
                 self._replace_sap_request(request)
+            else:
+                self._repick_batches(request, raw_lines)
         return self.get_request(request.pk)
 
     @staticmethod
@@ -635,8 +760,12 @@ class TransferRequestService:
                 "to_warehouse": line.to_warehouse or destination,
                 "is_batch_managed": line.is_batch_managed,
                 "proposed": [],
+                # What was picked when raising, cut to what was approved.
+                "chosen": [],
                 "available": [],
                 "error": "",
+                # Unlike `error`, nothing the poster cannot fix by picking again.
+                "note": "",
             }
 
             if line.is_batch_managed:
@@ -651,14 +780,20 @@ class TransferRequestService:
                     for batch in reader.available_batches(line.item_code, source)
                     if batch["status"] == "0"
                 ]
-                try:
-                    entry["proposed"] = reader.allocate_fifo(
-                        line.item_code, source, outstanding
+                entry["chosen"] = line.chosen_split(outstanding)
+                if entry["chosen"]:
+                    entry["proposed"], entry["note"] = self._propose_chosen(
+                        line, entry["chosen"], entry["available"]
                     )
-                except (SAPDataError, SAPValidationError) as exc:
-                    # Report the shortfall in the dialog rather than failing the
-                    # whole preview — other lines may still be fine.
-                    entry["error"] = str(exc)
+                else:
+                    try:
+                        entry["proposed"] = reader.allocate_fifo(
+                            line.item_code, source, outstanding
+                        )
+                    except (SAPDataError, SAPValidationError) as exc:
+                        # Report the shortfall in the dialog rather than failing
+                        # the whole preview — other lines may still be fine.
+                        entry["error"] = str(exc)
 
             lines.append(entry)
 
@@ -671,6 +806,38 @@ class TransferRequestService:
             "lines": lines,
         }
 
+    @staticmethod
+    def _propose_chosen(line, chosen: list[dict], available: list[dict]):
+        """Start the split from the raise-time pick, as far as the shelf still allows.
+
+        A picked batch may have moved since the request was raised. Proposing
+        it anyway would show a split that adds up but cannot post, so each pick
+        is capped at what its batch holds now and the gap is said in words —
+        the poster then makes up the rest from another batch.
+        """
+        held = {batch["batch_number"]: batch["quantity"] for batch in available}
+        proposed, short = [], []
+        for pick in chosen:
+            wanted = Decimal(str(pick["Quantity"]))
+            there = held.get(pick["BatchNumber"], Decimal("0"))
+            take = min(wanted, there)
+            if take > 0:
+                proposed.append({"BatchNumber": pick["BatchNumber"], "Quantity": float(take)})
+            if take < wanted:
+                short.append(
+                    f"{pick['BatchNumber']} now holds {_plain(there)}, not {_plain(wanted)}"
+                    if there > 0 else
+                    f"{pick['BatchNumber']} is no longer in {line.source_warehouse}"
+                )
+        note = ""
+        if short:
+            note = (
+                "Picked when the request was raised, but "
+                + "; ".join(short)
+                + ". Make up the rest from another batch."
+            )
+        return proposed, note
+
     @_keeps_posting_failure
     @transaction.atomic
     def post_transfer(
@@ -681,9 +848,10 @@ class TransferRequestService:
         Intra-branch this is the whole move. Cross-branch it is leg 1, into the
         destination branch's in-transit warehouse; leg 2 waits for receipt.
 
-        `allocations` maps line_num -> a hand-picked batch split. Anything not
-        given falls back to oldest-first, so an operator can override one line
-        and leave the rest alone.
+        `allocations` maps line_num -> a hand-picked batch split. A line not
+        given one takes the batches picked when the request was raised, and
+        oldest-first when none were, so an operator can override one line and
+        leave the rest alone.
         """
         request = self.get_request(request_id)
         self._assert_can_post(request)
@@ -767,9 +935,10 @@ class TransferRequestService:
     ) -> list[dict]:
         """Turn approved quantities into SAP lines and choose their batches.
 
-        Oldest-first unless the caller supplied a split for that line, which is
-        validated against the shelf before it is sent — a typed batch can name
-        stock that has already moved, which FIFO could never do.
+        The caller's split for a line wins, then the one picked when raising,
+        then oldest-first. A chosen split is validated against the shelf before
+        it is sent — a picked batch can name stock that has since moved, which
+        FIFO could never do.
         """
         allocations = allocations or {}
         lines: list[dict] = []
@@ -789,7 +958,7 @@ class TransferRequestService:
             }
 
             if line.is_batch_managed:
-                chosen = allocations.get(line.line_num)
+                chosen = allocations.get(line.line_num) or line.chosen_split(outstanding)
                 if chosen:
                     entry['batches'] = self._batch_reader().check_allocation(
                         line.item_code, source, chosen

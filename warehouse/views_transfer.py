@@ -318,6 +318,33 @@ class TransferRequestStockView(_TransferView):
         return self.dispatch_action(action)
 
 
+class TransferRequestItemBatchesView(_TransferView):
+    """One item's released batches in the source warehouse, for the request form.
+
+    `exclude_request` is the request being edited, so its own picks are not
+    counted as held by someone else.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewTransferRequest]
+
+    def get(self, request):
+        warehouse = (request.query_params.get("warehouse") or "").strip()
+        item_code = (request.query_params.get("item_code") or "").strip()
+        try:
+            exclude = int(request.query_params.get("exclude_request") or 0) or None
+        except (TypeError, ValueError):
+            return _bad_request("exclude_request must be a request id.")
+
+        def action():
+            return Response(
+                _service(request).item_batches(
+                    warehouse, item_code, exclude_request_id=exclude
+                )
+            )
+
+        return self.dispatch_action(action)
+
+
 class TransferRequestReconcileView(_TransferView):
     """Where the app and SAP disagree — drift reported rather than discovered."""
 

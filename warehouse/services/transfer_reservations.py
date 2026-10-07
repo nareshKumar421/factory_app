@@ -53,19 +53,9 @@ SHIPPED_POSTING_STATUSES = (
 )
 
 
-def reserved_by_open_requests(
-    company_code: str, warehouse: str, item_codes=None
-) -> dict[str, Decimal]:
-    """Item code -> quantity this app's own open requests hold at `warehouse`.
-
-    Pass `item_codes` to scope the query to the picker's page of stock rather
-    than every item the warehouse has ever been asked for.
-    """
-    warehouse = (warehouse or "").strip()
-    if not warehouse:
-        return {}
-
-    lines = (
+def _open_lines(company_code: str, warehouse: str):
+    """Lines of this app's open requests that still take stock out of `warehouse`."""
+    return (
         WarehouseTransferRequestLine.objects
         .filter(
             request__company__code=company_code,
@@ -80,6 +70,28 @@ def reserved_by_open_requests(
             | Q(from_warehouse="", request__from_warehouse=warehouse)
         )
     )
+
+
+def _still_promised(requested, approved, transferred) -> Decimal:
+    # The receiving warehouse may have approved less than was asked for;
+    # once it has decided, its number is the one that holds stock.
+    promised = approved if approved > 0 else requested
+    return promised - transferred
+
+
+def reserved_by_open_requests(
+    company_code: str, warehouse: str, item_codes=None
+) -> dict[str, Decimal]:
+    """Item code -> quantity this app's own open requests hold at `warehouse`.
+
+    Pass `item_codes` to scope the query to the picker's page of stock rather
+    than every item the warehouse has ever been asked for.
+    """
+    warehouse = (warehouse or "").strip()
+    if not warehouse:
+        return {}
+
+    lines = _open_lines(company_code, warehouse)
     if item_codes is not None:
         item_codes = list(item_codes)
         if not item_codes:
@@ -90,10 +102,37 @@ def reserved_by_open_requests(
     for item_code, requested, approved, transferred in lines.values_list(
         "item_code", "requested_qty", "approved_qty", "transferred_qty"
     ):
-        # The receiving warehouse may have approved less than was asked for;
-        # once it has decided, its number is the one that holds stock.
-        promised = approved if approved > 0 else requested
-        outstanding = promised - transferred
+        outstanding = _still_promised(requested, approved, transferred)
         if outstanding > 0:
             reserved[item_code] += outstanding
     return dict(reserved)
+
+
+def batches_held_by_open_requests(
+    company_code: str, warehouse: str, item_code: str, *, exclude_request_id=None
+) -> dict[str, Decimal]:
+    """Batch number -> quantity of it our open requests were raised against.
+
+    Only requests that picked their batches count; the rest take oldest first
+    when posted and hold no batch in particular. Pass `exclude_request_id` when
+    editing a request, so its own picks are not reported back as someone
+    else's.
+    """
+    warehouse = (warehouse or "").strip()
+    if not warehouse or not item_code:
+        return {}
+
+    lines = _open_lines(company_code, warehouse).filter(item_code=item_code)
+    if exclude_request_id:
+        lines = lines.exclude(request_id=exclude_request_id)
+
+    held: dict[str, Decimal] = defaultdict(Decimal)
+    for line in lines:
+        if not line.chosen_batches:
+            continue
+        outstanding = _still_promised(
+            line.requested_qty, line.approved_qty, line.transferred_qty
+        )
+        for split in line.chosen_split(outstanding):
+            held[split["BatchNumber"]] += Decimal(str(split["Quantity"]))
+    return dict(held)

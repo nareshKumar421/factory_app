@@ -27,7 +27,7 @@ class TransferRequestLineSerializer(serializers.ModelSerializer):
             'from_warehouse', 'to_warehouse',
             'source_warehouse', 'destination_warehouse',
             'requested_qty', 'approved_qty', 'transferred_qty', 'outstanding_qty',
-            'is_batch_managed', 'batch_allocation',
+            'is_batch_managed', 'batch_allocation', 'chosen_batches',
             'status', 'notes',
         ]
 
@@ -125,6 +125,11 @@ class TransferRequestDetailSerializer(serializers.ModelSerializer):
 # Write
 # ---------------------------------------------------------------------------
 
+class TransferBatchChoiceSerializer(serializers.Serializer):
+    batch_number = serializers.CharField(max_length=40)
+    quantity = serializers.DecimalField(max_digits=15, decimal_places=3, min_value=0)
+
+
 class TransferRequestLineCreateSerializer(serializers.Serializer):
     item_code = serializers.CharField(max_length=50)
     item_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
@@ -132,6 +137,8 @@ class TransferRequestLineCreateSerializer(serializers.Serializer):
     quantity = serializers.DecimalField(max_digits=15, decimal_places=3, min_value=0)
     from_warehouse = serializers.CharField(max_length=20, required=False, allow_blank=True)
     to_warehouse = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    # Left out or empty: posting takes the oldest batches.
+    batches = TransferBatchChoiceSerializer(many=True, required=False)
 
 
 class TransferRequestCreateSerializer(serializers.Serializer):
@@ -192,11 +199,6 @@ class TransferRejectSerializer(serializers.Serializer):
         if not value.strip():
             raise serializers.ValidationError("A rejection needs a reason.")
         return value.strip()
-
-
-class TransferBatchChoiceSerializer(serializers.Serializer):
-    batch_number = serializers.CharField(max_length=40)
-    quantity = serializers.DecimalField(max_digits=15, decimal_places=3, min_value=0)
 
 
 class TransferPostLineSerializer(serializers.Serializer):

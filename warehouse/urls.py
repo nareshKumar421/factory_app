@@ -98,6 +98,7 @@ from .views_transfer import (
     TransferRequestInTransitView,
     TransferRequestReconcileView,
     TransferRequestStockView,
+    TransferRequestItemBatchesView,
     TransferRequestVerifyBatchesView,
     WarehousePrintInfoView,
 )
@@ -197,6 +198,7 @@ urlpatterns = [
     path('transfer-requests/pending/', TransferRequestPendingView.as_view(), name='transfer-request-pending'),
     path('transfer-requests/in-transit/', TransferRequestInTransitView.as_view(), name='transfer-request-in-transit'),
     path('transfer-requests/stock/', TransferRequestStockView.as_view(), name='transfer-request-stock'),
+    path('transfer-requests/batches/', TransferRequestItemBatchesView.as_view(), name='transfer-request-item-batches'),
     path('transfer-requests/reconcile/', TransferRequestReconcileView.as_view(), name='transfer-request-reconcile'),
     path('transfer-requests/<int:request_id>/', TransferRequestDetailView.as_view(), name='transfer-request-detail'),
     path('transfer-requests/<int:request_id>/approve/', TransferRequestApproveView.as_view(), name='transfer-request-approve'),

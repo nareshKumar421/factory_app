@@ -17,6 +17,8 @@ requested/approved/transferred triple per line, and the same split between a
 business status and a separate SAP-posting status.
 """
 
+from decimal import Decimal
+
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
@@ -290,6 +292,13 @@ class WarehouseTransferRequestLine(models.Model):
         help_text="The BatchNumbers split sent to SAP, kept for reconciliation "
                   "against IBT1 (a Service Layer GET returns an empty list).",
     )
+    chosen_batches = models.JSONField(
+        default=list, blank=True,
+        help_text="Batches the requester picked when raising it, as "
+                  "[{batch_number, quantity}] adding up to requested_qty. Empty "
+                  "means oldest first. Never sent to SAP's request; posting "
+                  "starts from it.",
+    )
 
     status = models.CharField(
         max_length=15, choices=TransferLineStatus.choices,
@@ -312,6 +321,26 @@ class WarehouseTransferRequestLine(models.Model):
     def outstanding_qty(self):
         """Approved but not yet moved."""
         return max(self.approved_qty - self.transferred_qty, 0)
+
+    def chosen_split(self, quantity) -> list[dict]:
+        """The batches picked when raising, cut down to `quantity`.
+
+        The approver may approve less than was asked for, so the picked split
+        can be bigger than what moves. It is cut in the order it was picked —
+        oldest batch first, as the picker lists them — so the newest pick is
+        the one that gives way. Returned as the `BatchNumbers` shape a transfer
+        line carries.
+        """
+        remaining = Decimal(str(quantity or 0))
+        split: list[dict] = []
+        for entry in self.chosen_batches or []:
+            if remaining <= 0:
+                break
+            take = min(remaining, Decimal(str(entry.get('quantity') or 0)))
+            if take > 0:
+                split.append({'BatchNumber': entry['batch_number'], 'Quantity': float(take)})
+                remaining -= take
+        return split
 
     @property
     def source_warehouse(self) -> str:
