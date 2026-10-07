@@ -332,7 +332,7 @@ class FillingCostDefaultsTests(APITestCase):
         # Electricity++ for the day, as its allocation would report it.
         patcher = mock.patch(
             'production_execution.services.filling_cost._electricity',
-            return_value=(Decimal('32787'), {'Production Floor Beverage': Decimal('32787')}))
+            return_value=(Decimal('32787'), {'Production Floor Beverage': Decimal('32787')}, {}))
         self.electricity = patcher.start()
         self.addCleanup(patcher.stop)
         # No night readings unless a test reads the meter twice.
@@ -526,9 +526,33 @@ class FillingCostDefaultsTests(APITestCase):
         self.assertTrue(any('Scrap Recovering: no rate' in w for w in data['warnings']))
 
     def test_no_meter_readings_leaves_electricity_to_be_typed(self):
-        self.electricity.return_value = (Decimal('0'), {})
+        self.electricity.return_value = (Decimal('0'), {}, {})
         data = self._open('NIGHT')
         self.assertNotIn('Electricity', self._amounts(data))
+
+    def test_the_etp_meter_is_not_filling_electricity(self):
+        # Electricity++ charges Beverages for the ETP too; the sheet leaves it out.
+        from unittest import mock
+
+        mock.patch.stopall()  # the stand-in Electricity++ above; read the real split
+        party = f'company:{self.company.code}'
+        breakdown = {
+            'by_party': {party: {'cost': Decimal('35379')}},
+            'by_meter': {party: {'Production Floor Beverage': {'cost': Decimal('32787')},
+                                 'etp ': {'cost': Decimal('2592')}}},
+        }
+        with mock.patch('maintenance.electricity.service.company_breakdown',
+                        return_value=breakdown), \
+                mock.patch('production_execution.services.filling_cost._meter_rounds',
+                           return_value={}):
+            day = self._open()
+            night = self._open('NIGHT')
+        explain = {e['head']: e['explain'] for e in day['entries']}
+        self.assertEqual(self._amounts(day)['Electricity'], '32787.00')
+        self.assertIn('less etp', explain['Electricity'].lower())
+        self.assertIn('2,592', explain['Electricity'])
+        # A shift's share is of the filling meters only.
+        self.assertLessEqual(Decimal(self._amounts(night)['Electricity']), Decimal('32787'))
 
     def test_fixed_manpower_takes_over_an_old_salary_row(self):
         heads = {e['head']: e for e in self._open('NIGHT')['entries']}

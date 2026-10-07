@@ -6,10 +6,11 @@ rather than typed:
 
 ========================  ==================================================
 Cases                     the shift's production-run cases
-Electricity               Beverages' Electricity++ cost for the day; a shift
-                          takes each meter's part by that meter's own day and
-                          night readings, or by its share of the day's cases
-                          where the meter was read only once
+Electricity               Beverages' Electricity++ cost for the day, less
+                          the ETP meter (effluent treatment, not filling); a
+                          shift takes each meter's part by that meter's own
+                          day and night readings, or by its share of the
+                          day's cases where the meter was read only once
 Fixed Manpower,           the Cost Master's monthly rate over 26 working days,
 Maintenance, Lab, Misc    by the shift's share of the day's running hours
 Batch Coding              bottles (cases x bottles per case) x rate a bottle
@@ -68,6 +69,10 @@ KG_UOMS = {'KG', 'KGS', 'KILOGRAM', 'KILOGRAMS'}
 
 #: The heads worked out from production rather than resolved as a rate.
 ELECTRICITY = 'Electricity'
+# Meters Electricity++ charges Beverages for that are not filling cost: the
+# ETP treats the plant's effluent whatever the lines fill. Matched by name,
+# ignoring case.
+NOT_FILLING_METERS = ('ETP',)
 WASTAGE = 'Wastage'
 
 
@@ -333,9 +338,11 @@ def sku_rows(made):
 
 
 def _electricity(company, day):
-    """Beverages' Electricity++ cost for ``day``: ``(total, {meter name: cost})``.
+    """Beverages' filling electricity for ``day``:
+    ``(total, {meter name: cost}, {left-out meter name: cost})``.
 
-    ``None`` when the allocation cannot be read.
+    The Electricity++ cost less the ``NOT_FILLING_METERS``. ``None`` when the
+    allocation cannot be read.
     """
     from maintenance.electricity import service
     from maintenance.electricity.sources import company_party
@@ -346,8 +353,11 @@ def _electricity(company, day):
         return None
     party = company_party(company.code)
     total = breakdown['by_party'].get(party, {}).get('cost', ZERO)
-    by_meter = {name: part['cost'] for name, part in breakdown['by_meter'].get(party, {}).items()}
-    return total, by_meter
+    not_filling = {name.casefold() for name in NOT_FILLING_METERS}
+    by_meter, left_out = {}, {}
+    for name, part in breakdown['by_meter'].get(party, {}).items():
+        (left_out if name.strip().casefold() in not_filling else by_meter)[name] = part['cost']
+    return total - sum(left_out.values(), ZERO), by_meter, left_out
 
 
 def _meter_rounds(day):
@@ -412,8 +422,11 @@ def defaults(company, day, shift='', line=None, now=None):
     if electricity is None:
         made.warnings.append("Electricity++ could not be read: enter Electricity by hand.")
     elif electricity[0] > 0:
-        total, by_meter = electricity
+        total, by_meter, left_out = electricity
         said = f"Electricity++: ₹{_figure(total)} for {company.name} on {day:%d %b}"
+        if left_out:
+            said += " (less " + ', '.join(
+                f"{name} ₹{_figure(cost)}" for name, cost in sorted(left_out.items())) + ")"
         if not shift:
             share = ONE if line is None else made.case_share
             add(ELECTRICITY, total * share, said + case_part, 'electricity')
