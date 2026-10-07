@@ -31,6 +31,7 @@ from dispatch_plans.serializers_bill_summary import (
     BillSummaryDetailSerializer,
     BillSummaryListSerializer,
 )
+from sap_client.exceptions import SAPConnectionError
 
 DOC_ENTRY = 5101
 DOC_NUM = "626080596"
@@ -105,8 +106,12 @@ def stamped_bill(**overrides):
 class _Reader:
     """Stands in for the HANA reader."""
 
-    def __init__(self, lines, bill=_DEFAULT, stamped=None, state=_DEFAULT):
+    def __init__(self, lines, bill=_DEFAULT, stamped=None, state=_DEFAULT,
+                 dispatched=None):
         self.lines = lines
+        # Bills SAP already holds a dispatch date for, as `list_bills` returns
+        # them; or an exception, for SAP not answering.
+        self.dispatched = dispatched if dispatched is not None else []
         self.stamped = stamped if stamped is not None else [stamped_bill()]
         self.state = (
             {"doc_num": DOC_NUM, "is_cancelled": False} if state is _DEFAULT else state
@@ -130,6 +135,12 @@ class _Reader:
     def list_pickable_lines(self, doc_entries):
         return list(self.lines)
 
+    def list_bills_by_doc_entries(self, doc_entries):
+        if isinstance(self.dispatched, Exception):
+            raise self.dispatched
+        wanted = {int(d) for d in doc_entries}
+        return [row for row in self.dispatched if row["doc_entry"] in wanted]
+
     def invoice_state(self, doc_entry):
         return self.state
 
@@ -148,9 +159,11 @@ class BillSummaryTestBase(TestCase):
         )
         self.service = BillSummaryService("JIVO_OIL", self.user)
 
-    def stub(self, lines=None, bill=_DEFAULT, stamped=None, state=_DEFAULT):
+    def stub(self, lines=None, bill=_DEFAULT, stamped=None, state=_DEFAULT,
+             dispatched=None):
         reader = _Reader(
-            lines if lines is not None else [sap_line()], bill, stamped, state
+            lines if lines is not None else [sap_line()], bill, stamped, state,
+            dispatched,
         )
         return patch.object(
             BillSummaryService, "reader",
@@ -302,6 +315,12 @@ class GenerateTests(BillSummaryTestBase):
         self.assertEqual(summary.warehouse_codes, "GP-FG")
         self.assertEqual(summary.status, BillSummaryStatus.PENDING_APPROVAL)
         self.assertEqual(summary.active_lines.count(), 2)
+
+    def test_a_bill_sap_already_dispatched_is_refused(self):
+        with self.stub([sap_line(dispatch_date=date(2026, 6, 22))]):
+            with self.assertRaisesMessage(BillSummaryError, "dispatched on 22-06-2026"):
+                self.generate()
+        self.assertEqual(BillSummary.objects.count(), 0)
 
     def test_raising_a_sheet_writes_nothing_to_sap(self):
         """The dispatch date is the whole of the message, and the warehouse has
@@ -1609,6 +1628,54 @@ class WholeTruckSubmissionTests(BillSummaryTestBase):
         self.assertEqual(len(result["created"]), 1)
         self.assertEqual(result["created"][0].sap_invoice_doc_entry, DOC_ENTRY + 1)
         self.assertEqual(result["skipped"][0]["doc_entry"], DOC_ENTRY)
+
+    def test_a_bill_sap_already_dispatched_is_not_offered(self):
+        """A truck left on the linking page from an old trip offered a sheet for
+        every bill on it, though SAP had stamped them all months earlier."""
+        self.plan_for(DOC_ENTRY)
+        self.plan_for(DOC_ENTRY + 1)
+        june = {
+            "doc_entry": DOC_ENTRY,
+            "sap_dispatch_date": "2026-06-22",
+            "sap_vehicle_no": "HR67C6723",
+        }
+        with self.stub(dispatched=[june]):
+            result = self.service.submit_bills(
+                [DOC_ENTRY, DOC_ENTRY + 1], dry_run=True
+            )
+        self.assertEqual([row["doc_entry"] for row in result["eligible"]], [DOC_ENTRY + 1])
+        self.assertEqual(result["skipped"][0]["doc_entry"], DOC_ENTRY)
+        self.assertEqual(
+            result["skipped"][0]["reason"],
+            "SAP already has this bill dispatched on 22-06-2026, vehicle HR67C6723; "
+            "it needs no sheet.",
+        )
+
+    def test_nor_is_a_sheet_raised_for_it(self):
+        self.plan_for(DOC_ENTRY)
+        june = {"doc_entry": DOC_ENTRY, "sap_dispatch_date": "2026-06-22"}
+        with self.stub(dispatched=[june]):
+            result = self.service.submit_bills([DOC_ENTRY])
+        self.assertEqual(result["created"], [])
+        self.assertIn("22-06-2026", result["skipped"][0]["reason"])
+        self.assertEqual(BillSummary.objects.count(), 0)
+
+    def test_sap_not_answering_the_stamp_read_still_raises_the_sheets(self):
+        """The truck's read is best effort; the sheet itself still checks."""
+        self.plan_for(DOC_ENTRY)
+        with self.stub(dispatched=SAPConnectionError("HANA is down")):
+            result = self.service.submit_bills([DOC_ENTRY])
+        self.assertEqual(len(result["created"]), 1)
+
+    def test_the_sheet_refuses_a_stamp_the_truck_s_read_missed(self):
+        self.plan_for(DOC_ENTRY)
+        with self.stub(
+            [sap_line(dispatch_date=date(2026, 6, 22))],
+            dispatched=SAPConnectionError("HANA is down"),
+        ):
+            result = self.service.submit_bills([DOC_ENTRY])
+        self.assertEqual(result["created"], [])
+        self.assertIn("22-06-2026", result["skipped"][0]["reason"])
 
     def test_the_same_bill_twice_in_one_truck_raises_one_sheet(self):
         self.plan_for(DOC_ENTRY)

@@ -622,6 +622,10 @@ class BillSummaryService:
         lines = self.reader.list_pickable_lines([doc_entry])
         if not lines:
             raise BillSummaryError("That bill has no lines to fetch.")
+        if lines[0].get("sap_dispatch_date"):
+            raise BillSummaryError(
+                self._already_dispatched(lines[0]["sap_dispatch_date"])
+            )
 
         header = bill or {}
         now = timezone.now()
@@ -748,9 +752,10 @@ class BillSummaryService:
         vehicle number onto the same truck.
 
         `dry_run` answers the popup's question — how many bills would this raise
-        a sheet for — off the app's own tables alone. Reaching into SAP for a
-        count the user has not yet agreed to is a HANA query per bill for a
-        dialog they may well dismiss.
+        a sheet for — off the app's own tables plus ONE read of SAP for the
+        whole truck: which of its bills SAP already has as dispatched. Those get
+        no sheet, and the popup has to know before it offers one; a HANA query
+        per bill would still be too much for a dialog the user may dismiss.
 
         One bill failing does not take the rest down: each is its own record and
         its own SAP invoice, and a truck half of whose sheets exist is far easier
@@ -784,6 +789,9 @@ class BillSummaryService:
                 sap_invoice_doc_entry__in=wanted,
             ).exclude(status=BillSummaryStatus.CANCELLED)
         }
+        stamped = self._sap_dispatched(
+            [d for d in wanted if d in plans and d not in taken]
+        )
 
         eligible, skipped, created = [], [], []
         for doc_entry in wanted:
@@ -802,6 +810,13 @@ class BillSummaryService:
                     "doc_entry": doc_entry,
                     "doc_num": label,
                     "reason": "No dispatch plan for this bill in this company.",
+                })
+                continue
+            if doc_entry in stamped:
+                skipped.append({
+                    "doc_entry": doc_entry,
+                    "doc_num": plan.sap_invoice_doc_num or label,
+                    "reason": stamped[doc_entry],
                 })
                 continue
             eligible.append({
@@ -838,6 +853,45 @@ class BillSummaryService:
             "skipped": skipped,
             "created": created,
         }
+
+    def _sap_dispatched(self, doc_entries: list) -> dict:
+        """Of these bills, the ones SAP already has a dispatch date for, and why
+        each gets no sheet. One read for the whole truck.
+
+        Best effort: if SAP cannot be asked, nothing is ruled out here, and
+        `_raise_sheet` still refuses each stamped bill when the sheet is raised.
+        """
+        if not doc_entries:
+            return {}
+        try:
+            bills = self.reader.list_bills_by_doc_entries(doc_entries)
+        except (SAPConnectionError, SAPDataError) as exc:
+            logger.warning(
+                "Could not read SAP's dispatch stamps for %s: %s", self.company_code, exc
+            )
+            return {}
+        return {
+            bill["doc_entry"]: self._already_dispatched(
+                bill["sap_dispatch_date"], bill.get("sap_vehicle_no") or ""
+            )
+            for bill in bills
+            if bill.get("sap_dispatch_date")
+        }
+
+    @classmethod
+    def _already_dispatched(cls, dispatch_date, vehicle_no: str = "") -> str:
+        """Why a bill SAP already holds a dispatch date for gets no sheet.
+
+        The sheet's whole errand is to collect that date for SAP, and SAP keeps
+        the first one it is given. On 2026-10-07 a truck from a June trip, never
+        marked departed, was still on the linking page; one press of its "Bill
+        summaries" button sent the warehouse eleven sheets for bills SAP had
+        stamped on 22 June.
+        """
+        when = cls._as_date(dispatch_date)
+        on = when.strftime("%d-%m-%Y") if when else str(dispatch_date)
+        truck = f", vehicle {vehicle_no.strip()}" if vehicle_no.strip() else ""
+        return f"SAP already has this bill dispatched on {on}{truck}; it needs no sheet."
 
     @staticmethod
     def _plan_data(plan) -> dict:
