@@ -427,9 +427,14 @@ def defaults(company, day, shift='', line=None, now=None):
         if left_out:
             said += " (less " + ', '.join(
                 f"{name} ₹{_figure(cost)}" for name, cost in sorted(left_out.items())) + ")"
+        # Each meter at Beverages' share — a shared meter such as the Lab at
+        # its percentage — so the figure can be checked against Electricity++.
+        meters = ', '.join(f"{name} ₹{_figure(cost)}" for name, cost in
+                           sorted(by_meter.items(), key=lambda kv: -kv[1]) if cost)
         if not shift:
             share = ONE if line is None else made.case_share
-            add(ELECTRICITY, total * share, said + case_part, 'electricity')
+            add(ELECTRICITY, total * share,
+                said + case_part + (f". Meters: {meters}" if meters else ''), 'electricity')
         else:
             amount, by_readings, by_cases = _shift_electricity(
                 by_meter or {'': total}, _meter_rounds(day), shift, made.case_share)
@@ -440,7 +445,9 @@ def defaults(company, day, shift='', line=None, now=None):
             if by_cases:
                 how.append(f"{by_cases} {'meter' if by_cases == 1 else 'meters'} by "
                            f"{_pct(made.case_share)} of the day's cases")
-            add(ELECTRICITY, amount, f"{said}: " + ', '.join(how), 'electricity')
+            add(ELECTRICITY, amount,
+                f"{said}: " + ', '.join(how) + (f". Meters: {meters}" if meters else ''),
+                'electricity')
     else:
         made.warnings.append(
             f"Electricity++ has no {company.name} units on {day:%d %b} yet: "

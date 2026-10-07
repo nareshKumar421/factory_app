@@ -551,6 +551,8 @@ class FillingCostDefaultsTests(APITestCase):
         self.assertEqual(self._amounts(day)['Electricity'], '32787.00')
         self.assertIn('less etp', explain['Electricity'].lower())
         self.assertIn('2,592', explain['Electricity'])
+        self.assertIn('Meters: Production Floor Beverage ₹32,787', explain['Electricity'])
+        self.assertNotIn('etp ₹', explain['Electricity'].split('Meters:')[1])
         # A shift's share is of the filling meters only.
         self.assertLessEqual(Decimal(self._amounts(night)['Electricity']), Decimal('32787'))
 
