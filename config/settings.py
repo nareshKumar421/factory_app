@@ -300,6 +300,10 @@ INSTALLED_APPS = [
     # bunches of vouchers sent for approval. Picks its G/L heads out of SAP's
     # chart of accounts and posts nothing back.
     'cash_book.apps.CashBookConfig',
+    # Expenses anybody in the factory spent: a comment and an amount, filed
+    # by accounts under a SAP branch and G/L account, approved by an HOD.
+    # Posts nothing to SAP.
+    'expense_claims.apps.ExpenseClaimsConfig',
     # The company's OWN vehicles -- the trucks, the cars, the Eeco, the scooty
     # -- and what they cost to run: every fuel filling and every service bill,
     # each approved before it counts. Deliberately not vehicle_management,

@@ -154,6 +154,10 @@ class NotificationType(models.TextChoices):
     RETURNABLE_OVERDUE = "RETURNABLE_OVERDUE", "Returnable Items Overdue"
     RETURNABLE_CLOSED = "RETURNABLE_CLOSED", "Returnable Gate Pass Closed"
     RETURNABLE_CANCELLED = "RETURNABLE_CANCELLED", "Returnable Gate Pass Cancelled"
+    # Expense claims: one to the HOD a claim is sent to, one back to whoever
+    # put it in once the HOD has decided.
+    EXPENSE_CLAIM_SENT = "EXPENSE_CLAIM_SENT", "Expense Sent for HOD Approval"
+    EXPENSE_CLAIM_DECIDED = "EXPENSE_CLAIM_DECIDED", "Expense Approved or Rejected"
     GENERAL_ANNOUNCEMENT = "GENERAL_ANNOUNCEMENT", "General Announcement"
 
 
