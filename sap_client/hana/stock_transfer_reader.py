@@ -196,6 +196,95 @@ class HanaStockTransferReader:
                 except Exception:
                     pass
 
+    def find_by_base(self, base_type: int, base_entry: int, comments: str) -> Optional[dict]:
+        """The live transfer with exactly these comments drawn from one base document.
+
+        This is how a post whose reply was lost is found again: SAP made the
+        document and the app never heard. The app stamps each transfer it posts
+        with its own request's number, and SAP records which document every
+        line was drawn from, so together they name one document. Its batches
+        come from ``IBT1``, since a Service Layer GET returns none.
+        """
+        conn = None
+        cursor = None
+        try:
+            conn = self.connection.connect()
+        except dbapi.Error as e:
+            logger.error("SAP HANA connection failed while finding a transfer: %s", e)
+            raise SAPConnectionError("Unable to connect to SAP HANA.") from e
+
+        try:
+            cursor = conn.cursor()
+            schema = self.connection.schema
+            cursor.execute(
+                f"""
+                SELECT T0."DocEntry", T0."DocNum", T0."DocDate", T0."CreateTS",
+                       T1."LineNum", T1."BaseLine", IFNULL(T1."ItemCode", ''), T1."Quantity"
+                FROM "{schema}"."OWTR" T0
+                JOIN "{schema}"."WTR1" T1 ON T0."DocEntry" = T1."DocEntry"
+                WHERE T1."BaseType" = ? AND T1."BaseEntry" = ?
+                  AND T0."Comments" = ? AND IFNULL(T0."CANCELED", 'N') = 'N'
+                ORDER BY T0."DocEntry", T1."LineNum"
+                """,
+                (int(base_type), int(base_entry), comments),
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return None
+            # Only one can exist: the first used the base document up, so SAP
+            # refuses a second. Should that ever fail, the earliest is the one.
+            doc_entry = int(rows[0][0])
+            rows = [row for row in rows if int(row[0]) == doc_entry]
+
+            cursor.execute(
+                f"""
+                SELECT "BaseLinNum", "BatchNum", "Quantity"
+                FROM "{schema}"."IBT1"
+                WHERE "BaseType" = 67 AND "BaseEntry" = ? AND "Direction" = 1
+                ORDER BY "BaseLinNum", "BatchNum"
+                """,
+                (doc_entry,),
+            )
+            batches: dict[int, list] = {}
+            for line_num, batch, quantity in cursor.fetchall():
+                batches.setdefault(int(line_num), []).append(
+                    {"BatchNumber": batch, "Quantity": float(quantity or 0)}
+                )
+
+            first = rows[0]
+            doc_date = first[2].date() if hasattr(first[2], "date") else first[2]
+            return {
+                "doc_entry": doc_entry,
+                "doc_num": str(first[1]),
+                "doc_date": doc_date,
+                # HHMMSS on the SAP server's clock, which runs on IST.
+                "create_ts": int(first[3] or 0),
+                "lines": [
+                    {
+                        "line_num": int(row[4]),
+                        "base_line": int(row[5]) if row[5] is not None else None,
+                        "item_code": row[6] or "",
+                        "quantity": row[7],
+                        "batches": batches.get(int(row[4]), []),
+                    }
+                    for row in rows
+                ],
+            }
+        except dbapi.Error as e:
+            logger.error("SAP HANA query for a transfer by its base failed: %s", e)
+            raise SAPDataError("Failed to look the transfer up in SAP.") from e
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     @staticmethod
     def _header_from_row(row) -> dict:
         doc_date = row[2].date() if hasattr(row[2], "date") else row[2]

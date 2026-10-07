@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import functools
 import logging
-from datetime import date
+from datetime import date, datetime, time
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from django.db import transaction
 from django.utils import timezone
@@ -23,8 +24,14 @@ from rest_framework.exceptions import PermissionDenied
 
 from company.models import Company
 from sap_client.client import SAPClient
-from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
+from sap_client.exceptions import (
+    SAPConnectionError,
+    SAPDataError,
+    SAPOutcomeUnknown,
+    SAPValidationError,
+)
 from sap_client.hana.series_reader import HanaSeriesReader
+from sap_client.hana.stock_transfer_reader import HanaStockTransferReader
 from sap_client.service_layer.itr_writer import build_transfer_request_payload
 from sap_client.service_layer.stock_transfer_writer import (
     BASE_TYPE_STOCK_TRANSFER,
@@ -50,6 +57,9 @@ from .transfer_reservations import (
 from .transfer_guards import TransferGuardError
 
 logger = logging.getLogger(__name__)
+
+# The SAP server's clock, which stamps OWTR.CreateTS.
+SAP_TIME_ZONE = ZoneInfo('Asia/Kolkata')
 
 
 class TransferRequestError(ValueError):
@@ -868,6 +878,10 @@ class TransferRequestService:
                 f"{request.sap_transfer_doc_num}."
             )
 
+        adopted = self._adopt_lost_post(request, is_second_leg=False)
+        if adopted:
+            return adopted
+
         destination = request.leg1_destination
         posting_date = timezone.localdate()
         guards.check_posting_date(posting_date)
@@ -904,7 +918,16 @@ class TransferRequestService:
             card_code=guards.card_code_for_route(request.from_warehouse, destination),
         )
 
-        created = self._post_and_record(request, payload, is_second_leg=False)
+        try:
+            created = self._post_and_record(request, payload, is_second_leg=False)
+        except (SAPValidationError, SAPOutcomeUnknown):
+            # A timeout may mean SAP committed anyway, and a post racing one
+            # whose reply is still lost is refused as "base document already
+            # closed". If a post of ours did go through, that is the answer.
+            adopted = self._adopt_after_failure(request, is_second_leg=False)
+            if adopted:
+                return adopted
+            raise
         self._persist_transfer_lines(request, lines)
         return created
 
@@ -1213,6 +1236,9 @@ class TransferRequestService:
                 f"{request.entry_no} already completed as SAP document "
                 f"{request.sap_leg2_doc_num}."
             )
+        adopted = self._adopt_lost_post(request, is_second_leg=True)
+        if adopted:
+            return adopted
 
         posting_date = timezone.localdate()
         guards.check_posting_date(posting_date)
@@ -1277,7 +1303,13 @@ class TransferRequestService:
             posting_date=posting_date,
             comments=f"App transfer request {request.entry_no} — leg 2",
         )
-        return self._post_and_record(request, payload, is_second_leg=True)
+        try:
+            return self._post_and_record(request, payload, is_second_leg=True)
+        except (SAPValidationError, SAPOutcomeUnknown):
+            adopted = self._adopt_after_failure(request, is_second_leg=True)
+            if adopted:
+                return adopted
+            raise
 
     # ------------------------------------------------------------------
     # posting mechanics
@@ -1302,9 +1334,16 @@ class TransferRequestService:
             exc.failed_transfer_request_id = request.pk
             raise
 
-        doc_entry = created.get('DocEntry')
-        doc_num = str(created.get('DocNum') or '')
+        return self._record_posted(
+            request, created.get('DocEntry'), str(created.get('DocNum') or ''),
+            is_second_leg=is_second_leg,
+        )
 
+    def _record_posted(
+        self, request: WarehouseTransferRequest, doc_entry, doc_num: str, *,
+        is_second_leg: bool, posted_at=None,
+    ) -> WarehouseTransferRequest:
+        """Point the request at the SAP transfer that moved its stock."""
         if is_second_leg:
             request.sap_leg2_doc_entry = doc_entry
             request.sap_leg2_doc_num = doc_num
@@ -1318,7 +1357,7 @@ class TransferRequestService:
                 else TransferPostingStatus.POSTED
             )
             request.posted_by = self.user
-            request.posted_at = timezone.now()
+            request.posted_at = posted_at or timezone.now()
             fields = [
                 'sap_transfer_doc_entry', 'sap_transfer_doc_num',
                 'posted_by', 'posted_at',
@@ -1332,6 +1371,83 @@ class TransferRequestService:
             "Transfer request %s posted %s as SAP %s",
             request.entry_no, "leg 2" if is_second_leg else "leg 1", doc_num,
         )
+        return request
+
+    def _adopt_after_failure(
+        self, request: WarehouseTransferRequest, *, is_second_leg: bool
+    ) -> WarehouseTransferRequest | None:
+        """`_adopt_lost_post` once a post has failed — never masking that failure.
+
+        If the lookup cannot reach SAP either, the post's own error is the one
+        the operator needs, so the lookup's is logged and dropped.
+        """
+        try:
+            return self._adopt_lost_post(request, is_second_leg=is_second_leg)
+        except (SAPConnectionError, SAPDataError) as exc:
+            logger.warning(
+                "Transfer request %s: could not check SAP for a lost post: %s",
+                request.entry_no, exc,
+            )
+            return None
+
+    def _adopt_lost_post(
+        self, request: WarehouseTransferRequest, *, is_second_leg: bool
+    ) -> WarehouseTransferRequest | None:
+        """Record a transfer SAP already made for this request, if its reply was lost.
+
+        SAP can commit a transfer and never send the answer: the Service Layer
+        hangs, the browser gives up at 30 s, a restart kills the worker still
+        waiting, and the app's half rolls back. TR-20261003-0002 sat "not
+        posted" for four days that way while its 6,900 PCS had moved, and the
+        next press of Post was refused because the first had used SAP's request
+        up. So before posting, and again when SAP refuses, look for the app's
+        own transfer — its comment and its base document name it exactly — and
+        record it instead of posting a second.
+
+        Only the app's own document is adopted. A transfer keyed against the
+        same request in the SAP client is someone else's decision about what
+        moved, and stays theirs to reconcile.
+        """
+        if is_second_leg:
+            base_type, base_entry = BASE_TYPE_STOCK_TRANSFER, request.sap_transfer_doc_entry
+            comments = f"App transfer request {request.entry_no} — leg 2"
+        else:
+            base_type, base_entry = BASE_TYPE_TRANSFER_REQUEST, request.sap_request_doc_entry
+            comments = f"App transfer request {request.entry_no}"
+        if not base_entry:
+            return None
+
+        found = HanaStockTransferReader(self.client.context).find_by_base(
+            base_type, base_entry, comments
+        )
+        if not found:
+            return None
+
+        created_at = datetime.combine(
+            found['doc_date'],
+            time(*divmod(found['create_ts'] // 100, 100), found['create_ts'] % 100),
+            tzinfo=SAP_TIME_ZONE,
+        )
+        logger.warning(
+            "Transfer request %s: SAP already holds %s %s from %s; recording it "
+            "instead of posting again",
+            request.entry_no, "leg 2" if is_second_leg else "transfer",
+            found['doc_num'], created_at,
+        )
+        request = self._record_posted(
+            request, found['doc_entry'], found['doc_num'],
+            is_second_leg=is_second_leg, posted_at=created_at,
+        )
+        if not is_second_leg:
+            self._persist_transfer_lines(request, [
+                {
+                    'line_num': line['base_line'],
+                    'quantity': line['quantity'],
+                    'batches': line['batches'],
+                }
+                for line in found['lines']
+                if line['base_line'] is not None
+            ])
         return request
 
     # ------------------------------------------------------------------
