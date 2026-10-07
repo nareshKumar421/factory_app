@@ -1,0 +1,26 @@
+# /etc/systemd/system/factory-api-log-prune.service on the 117 box.
+#
+# One run of manage.py prune_api_log, started by factory-api-log-prune.timer. It
+# runs from `current`, so a deploy needs no step: the next run uses the new
+# release.
+#
+#   sudo cp api_log/deploy/factory-api-log-prune.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now factory-api-log-prune.timer
+#   journalctl -u factory-api-log-prune
+[Unit]
+Description=factory_app API call log pruning (one run)
+After=network.target
+
+[Service]
+Type=oneshot
+User=superadmin
+Group=www-data
+WorkingDirectory=/home/superadmin/django_projects/factory_app/current
+Environment="DJANGO_SETTINGS_MODULE=config.settings"
+Environment="PYTHONPATH=/home/superadmin/django_projects/factory_app/current"
+Environment="LD_LIBRARY_PATH=/usr/sap/hdbclient"
+Environment="ODBCINI=/etc/odbc.ini"
+Environment="ODBCSYSINI=/etc"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/superadmin/django_projects/factory_app/current/.venv/bin/python manage.py prune_api_log
+Nice=10

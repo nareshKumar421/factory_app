@@ -24,3 +24,7 @@ CACHES = {
     **CACHES,  # noqa: F405
     'shared': {'BACKEND': 'django.core.cache.backends.dummy.DummyCache'},
 }
+
+# No test pays for an API log row it never asked about (or finds one in a query
+# count). api_log's own tests switch it back on.
+API_LOG_ENABLED = False

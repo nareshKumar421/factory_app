@@ -1,0 +1,12 @@
+# /etc/systemd/system/factory-api-log-prune.timer on the 117 box: prune_api_log
+# once a night, when the floor is quiet.
+[Unit]
+Description=factory_app API call log pruning, nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

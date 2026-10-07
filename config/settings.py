@@ -311,6 +311,10 @@ INSTALLED_APPS = [
     # written by `import_exim_users`. Not the `exim` DATABASE alias further
     # down, which is how EXIM itself is read.
     'exim.apps.EximConfig',
+    # Every call made to the API: who, what, when and how it went, with the
+    # bodies of writes and failures. Written by its middleware (last in
+    # MIDDLEWARE); `manage.py api_usage` says what is used most.
+    'api_log.apps.ApiLogConfig',
 ]
 
 MIDDLEWARE = [
@@ -326,7 +330,14 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Last, so it times the view alone and sees the user DRF signed in.
+    'api_log.middleware.ApiCallLogMiddleware',
 ]
+
+# The API call log (api_log). Off, nothing is recorded. Rows older than the
+# retention are deleted by `manage.py prune_api_log`, nightly on the 117 box.
+API_LOG_ENABLED = config('API_LOG_ENABLED', default=True, cast=bool)
+API_LOG_RETENTION_DAYS = config('API_LOG_RETENTION_DAYS', default=90, cast=int)
 
 ROOT_URLCONF = 'config.urls'
 
