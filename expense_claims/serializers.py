@@ -1,6 +1,5 @@
 from decimal import Decimal
 
-from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from .constants import COMPANY_LABELS
@@ -14,7 +13,7 @@ def _name(user):
 
 
 class ExpenseClaimSerializer(serializers.ModelSerializer):
-    """One claim, as the approval list reads it. Output only."""
+    """One claim, as both lists read it. Output only."""
 
     status_label = serializers.CharField(source="get_status_display")
     company_code = serializers.CharField(source="company.code")
@@ -22,7 +21,6 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
     submitted_by = serializers.IntegerField(source="created_by_id")
     submitted_by_name = serializers.SerializerMethodField()
     submitted_at = serializers.DateTimeField(source="created_at")
-    approver_name = serializers.SerializerMethodField()
     decided_by_name = serializers.SerializerMethodField()
 
     class Meta:
@@ -31,10 +29,11 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
             "id",
             "company_code",
             "company_name",
-            "budget_id",
+            "budget_code",
             "budget_name",
             "gl_account_code",
             "gl_account_name",
+            "gl_description",
             "comment",
             "amount",
             "status",
@@ -42,8 +41,6 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
             "submitted_by",
             "submitted_by_name",
             "submitted_at",
-            "approver",
-            "approver_name",
             "decided_at",
             "decided_by_name",
             "decision_note",
@@ -56,25 +53,20 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
     def get_submitted_by_name(self, obj):
         return _name(obj.created_by)
 
-    def get_approver_name(self, obj):
-        return _name(obj.approver)
-
     def get_decided_by_name(self, obj):
         return _name(obj.decided_by)
 
 
 class SubmitClaimSerializer(serializers.Serializer):
-    """The whole of the entry page."""
+    """The whole of the expense form. One of the G/L account or its description."""
 
     company = serializers.CharField(max_length=50)
-    budget_id = serializers.IntegerField(min_value=1)
-    gl_account_code = serializers.CharField(max_length=32)
+    budget_code = serializers.CharField(max_length=32)
+    gl_account_code = serializers.CharField(max_length=32, required=False, allow_blank=True, default="")
+    gl_description = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
     comment = serializers.CharField(max_length=2000)
     amount = serializers.DecimalField(
         max_digits=14, decimal_places=2, min_value=Decimal("0.01")
-    )
-    approver = serializers.PrimaryKeyRelatedField(
-        queryset=get_user_model().objects.filter(is_active=True)
     )
 
 
@@ -83,13 +75,10 @@ class DecideClaimSerializer(serializers.Serializer):
     note = serializers.CharField(max_length=2000, required=False, allow_blank=True, default="")
 
 
-class ApproverSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    name = serializers.SerializerMethodField()
-    email = serializers.EmailField()
-
-    def get_name(self, obj):
-        return _name(obj)
+class BudgetSerializer(serializers.Serializer):
+    budget_code = serializers.CharField()
+    budget_name = serializers.CharField()
+    is_default = serializers.BooleanField()
 
 
 class GLAccountSerializer(serializers.Serializer):

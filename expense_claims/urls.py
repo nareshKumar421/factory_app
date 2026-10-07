@@ -1,7 +1,6 @@
 from django.urls import path
 
 from .views import (
-    ApproverListAPI,
     BudgetListAPI,
     CompanyListAPI,
     ExpenseClaimDecideAPI,
@@ -17,5 +16,4 @@ urlpatterns = [
     path("companies/", CompanyListAPI.as_view(), name="expense-claim-companies"),
     path("budgets/", BudgetListAPI.as_view(), name="expense-claim-budgets"),
     path("gl-accounts/", GLAccountSearchAPI.as_view(), name="expense-claim-gl-accounts"),
-    path("approvers/", ApproverListAPI.as_view(), name="expense-claim-approvers"),
 ]

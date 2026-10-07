@@ -1,35 +1,43 @@
 """
-Create the expense claim group and assign its permission.
+Create the expense claim groups and assign their permissions.
 
 Usage::
 
     python manage.py setup_expense_claim_groups                    # create / update
-    python manage.py setup_expense_claim_groups --list             # show what it holds
+    python manage.py setup_expense_claim_groups --list             # show what each holds
     python manage.py setup_expense_claim_groups --assign-everyone  # + every user may submit
 
-One group, **Expense Submitter** (see :mod:`expense_claims.constants`).
+Two groups (see :mod:`expense_claims.constants`): **Expense Submitter** for
+everybody, and **Expense Approver**, which also approves and is filled from
+Admin.
 
 ``--assign-everyone`` drops every active account into **Expense Submitter**.
 It only ever adds, so running it twice is harmless. New accounts do not need
 it; they pick the group up at creation (see :mod:`expense_claims.signals`).
 
-Nobody needs a group to approve: an expense can be sent to any active user,
-and whoever it is sent to decides it.
+Who approves is NOT set here: put them in **Expense Approver** from Admin.
 """
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.core.management.base import BaseCommand
 
-from expense_claims.constants import SUBMIT_PERMISSION, SUBMITTER_GROUP
+from expense_claims.constants import (
+    APPROVE_PERMISSION,
+    APPROVER_GROUP,
+    SUBMIT_PERMISSION,
+    SUBMITTER_GROUP,
+)
 
 EXPENSE_CLAIM_GROUPS = {
     SUBMITTER_GROUP: [SUBMIT_PERMISSION],
+    # Approvers spend money too.
+    APPROVER_GROUP: [SUBMIT_PERMISSION, APPROVE_PERMISSION],
 }
 
 
 class Command(BaseCommand):
-    help = "Create the expense claim group and assign its permission."
+    help = "Create the expense claim groups and assign their permissions."
 
     def add_arguments(self, parser):
         parser.add_argument(

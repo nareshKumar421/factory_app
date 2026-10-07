@@ -1,6 +1,6 @@
 """
-Two pushes: one to the approver when a claim is sent to them, one back to the
-submitter when it is decided.
+Two pushes: one to every expense approver when a claim is waiting, one back to
+the submitter when it is decided.
 
 Best-effort, like every other module's: a push that fails is logged and
 swallowed, because the transition it describes has already committed.
@@ -11,9 +11,12 @@ import logging
 from notifications.models import NotificationType
 from notifications.services import NotificationService
 
+from .constants import APPROVE_PERMISSION
+
 logger = logging.getLogger(__name__)
 
 REFERENCE_TYPE = "expense_claim"
+APPROVE_CODENAME = APPROVE_PERMISSION.split(".", 1)[1]
 
 APPROVAL_URL = "/accounts/expense-approval"
 ENTRY_URL = "/accounts/expense-entry"
@@ -50,18 +53,28 @@ def _send(user, claim, title, body, ntype, url, actor):
         )
 
 
-def sent_to_hod(claim, *, actor):
-    _send(
-        claim.approver,
-        claim,
-        title="Expense waiting for your approval",
-        body=(
-            f"{_who(claim.created_by)}: ₹{claim.amount} -- {claim.comment[:120]}"
-        ),
-        ntype=NotificationType.EXPENSE_CLAIM_SENT,
-        url=APPROVAL_URL,
-        actor=actor,
-    )
+def waiting(claim, *, actor):
+    """Tell every expense approver that an expense is waiting for them."""
+    try:
+        NotificationService.send_notification_by_permission(
+            permission_codename=APPROVE_CODENAME,
+            title="Expense waiting for approval",
+            body=f"{_who(claim.created_by)}: \u20b9{claim.amount} -- {claim.comment[:120]}",
+            notification_type=NotificationType.EXPENSE_CLAIM_SENT,
+            click_action_url=APPROVAL_URL,
+            reference_type=REFERENCE_TYPE,
+            reference_id=claim.id,
+            # Expenses are common to every company, so is the approver list.
+            company=None,
+            created_by=actor,
+        )
+    except Exception as exc:  # a push never undoes the expense it reports
+        logger.error(
+            "[Expense claims] Could not notify approvers about claim %s: %s",
+            claim.id,
+            exc,
+            exc_info=True,
+        )
 
 
 def decided(claim, *, actor):

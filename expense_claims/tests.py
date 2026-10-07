@@ -1,9 +1,9 @@
 """
 Expense claims, end to end through the API.
 
-SAP is patched out throughout: the two readers are the only things that talk
-to HANA, so patching them keeps the suite offline without weakening what is
-tested.
+SAP is patched out throughout: ``ExpenseSapReader`` is the only thing that
+talks to HANA, so patching it keeps the suite offline without weakening what
+is tested.
 """
 
 from decimal import Decimal
@@ -18,19 +18,25 @@ from rest_framework.test import APITestCase
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
-from .constants import SUBMITTER_GROUP
+from .constants import APPROVER_GROUP, SUBMITTER_GROUP
 from .models import ExpenseClaim, ExpenseClaimStatus
 
 User = get_user_model()
 
 BASE = "/api/v1/expense-claims"
+READER = "expense_claims.services.ExpenseSapReader"
+VIEW_READER = "expense_claims.views.ExpenseSapReader"
 
-#: The HOD right is the cash book's approve right.
-CASH_APPROVER = "cash_book.can_approve_cash_entries"
 SUBMIT = "expense_claims.can_submit_expense_claim"
+APPROVE = "expense_claims.can_approve_expense_claims"
 
-BUDGET = {"branch_id": 2, "branch_name": "FACTORY"}
+BUDGET = {"budget_code": "Factory", "budget_name": "Factory"}
 ACCOUNT = {"account_code": "5630004", "account_name": "REFRESHMENT"}
+
+
+def _sap_ok(reader):
+    reader.return_value.budget.return_value = BUDGET
+    reader.return_value.expense_account.return_value = ACCOUNT
 
 
 class ExpenseClaimTestCase(APITestCase):
@@ -42,8 +48,10 @@ class ExpenseClaimTestCase(APITestCase):
         cls.role = UserRole.objects.create(name="Staff")
 
         cls.worker = cls._user("worker@example.com", [SUBMIT])
-        cls.hod = cls._user("hod@example.com", [SUBMIT, CASH_APPROVER])
-        cls.other_hod = cls._user("other.hod@example.com", [SUBMIT, CASH_APPROVER])
+        cls.approver = cls._user("approver@example.com", [SUBMIT, APPROVE])
+        cls.other_approver = cls._user(
+            "other.approver@example.com", [SUBMIT, APPROVE], companies=(cls.mart,)
+        )
         cls.outsider = cls._user("outsider@example.com", [])
 
     @classmethod
@@ -60,39 +68,47 @@ class ExpenseClaimTestCase(APITestCase):
 
     def as_user(self, user, company=None):
         self.client.force_authenticate(user=user)
-        self.client.credentials(HTTP_COMPANY_CODE=(company or self.oil).code)
+        self.client.credentials(
+            HTTP_COMPANY_CODE=(company or user.usercompany_set.first().company).code
+        )
 
     def payload(self, **changes):
         data = {
             "company": "JIVO_MART",
-            "budget_id": 2,
+            "budget_code": "Factory",
             "gl_account_code": "5630004",
+            "gl_description": "",
             "comment": "  Tea for the night shift ",
             "amount": "450",
-            "approver": self.hod.id,
         }
         data.update(changes)
         return data
 
-    @patch("expense_claims.services.GLAccountReader")
-    @patch("expense_claims.services.BranchReader")
-    def submit(self, branch_reader, gl_reader, user=None, **changes):
-        branch_reader.return_value.resolve.return_value = BUDGET
-        gl_reader.return_value.resolve.return_value = ACCOUNT
+    @patch(READER)
+    def submit(self, reader, user=None, **changes):
+        _sap_ok(reader)
         self.as_user(user or self.worker)
         with self.captureOnCommitCallbacks(execute=True):
             return self.client.post(f"{BASE}/claims/", self.payload(**changes), format="json")
 
-    def claim(self, by=None, approver=None, **fields):
+    @patch(READER)
+    def edit(self, claim, reader, user=None, **changes):
+        _sap_ok(reader)
+        self.as_user(user or self.worker)
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.put(
+                f"{BASE}/claims/{claim.id}/", self.payload(**changes), format="json"
+            )
+
+    def claim(self, by=None, **fields):
         return ExpenseClaim.objects.create(
             company=self.oil,
-            budget_id=2,
-            budget_name="FACTORY",
+            budget_code="Factory",
+            budget_name="Factory",
             gl_account_code="5630004",
             gl_account_name="REFRESHMENT",
             comment="Tea for the night shift",
             amount=Decimal("450.00"),
-            approver=approver or self.hod,
             created_by=by or self.worker,
             **fields,
         )
@@ -108,32 +124,52 @@ class ExpenseClaimTestCase(APITestCase):
 
 
 class EntryTests(ExpenseClaimTestCase):
-    def test_the_whole_expense_is_put_in_and_sent_to_the_hod(self):
-        with patch("expense_claims.notifications.sent_to_hod") as notify:
+    def test_an_expense_is_put_in_and_the_approvers_are_told(self):
+        with patch("expense_claims.notifications.waiting") as notify:
             response = self.submit()
         self.assertEqual(response.status_code, 201, response.data)
         claim = ExpenseClaim.objects.get(pk=response.data["id"])
         self.assertEqual(claim.company, self.mart)
         self.assertEqual(response.data["company_name"], "Mart")
-        self.assertEqual((claim.budget_id, claim.budget_name), (2, "FACTORY"))
+        self.assertEqual((claim.budget_code, claim.budget_name), ("Factory", "Factory"))
         self.assertEqual((claim.gl_account_code, claim.gl_account_name), ("5630004", "REFRESHMENT"))
         self.assertEqual(claim.comment, "Tea for the night shift")
         self.assertEqual(claim.amount, Decimal("450.00"))
-        self.assertEqual(claim.approver, self.hod)
         self.assertEqual(claim.status, ExpenseClaimStatus.PENDING_APPROVAL)
         self.assertEqual(claim.created_by, self.worker)
         notify.assert_called_once()
 
-    @patch("expense_claims.services.GLAccountReader")
-    @patch("expense_claims.services.BranchReader")
-    def test_budget_and_account_are_read_from_the_chosen_companys_sap(self, branch_reader, gl_reader):
-        branch_reader.return_value.resolve.return_value = BUDGET
-        gl_reader.return_value.resolve.return_value = ACCOUNT
-        # Header says Oil; the page says Beverages. The page wins.
-        self.as_user(self.worker, company=self.oil)
+    @patch(READER)
+    def test_budget_and_account_are_read_from_the_chosen_companys_sap(self, reader):
+        _sap_ok(reader)
+        self.as_user(self.worker)
         self.client.post(f"{BASE}/claims/", self.payload(company="JIVO_BEVERAGES"), format="json")
-        branch_reader.assert_called_once_with("JIVO_BEVERAGES")
-        gl_reader.assert_called_once_with("JIVO_BEVERAGES")
+        reader.assert_called_once_with("JIVO_BEVERAGES")
+        reader.return_value.budget.assert_called_once_with("Factory")
+        reader.return_value.expense_account.assert_called_once_with("5630004")
+
+    @patch(READER)
+    def test_the_gl_account_can_be_skipped_for_what_it_is_for(self, reader):
+        _sap_ok(reader)
+        self.as_user(self.worker)
+        response = self.client.post(
+            f"{BASE}/claims/",
+            self.payload(gl_account_code="", gl_description="  pump repair  "),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        claim = ExpenseClaim.objects.get(pk=response.data["id"])
+        self.assertEqual((claim.gl_account_code, claim.gl_description), ("", "pump repair"))
+        reader.return_value.expense_account.assert_not_called()
+
+    def test_one_of_the_account_or_what_it_is_for_is_needed(self):
+        response = self.submit(gl_account_code="", gl_description=" ")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("gl_account_code", response.data)
+
+    def test_a_picked_account_wins_over_a_description(self):
+        response = self.submit(gl_description="pump repair")
+        self.assertEqual(response.data["gl_description"], "")
 
     def test_only_oil_mart_or_beverages(self):
         Company.objects.create(name="Test", code="TEST_MU")
@@ -141,47 +177,23 @@ class EntryTests(ExpenseClaimTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("company", response.data)
 
-    def test_every_field_is_needed(self):
-        for field in ("company", "budget_id", "gl_account_code", "comment", "amount", "approver"):
-            data = self.payload()
-            del data[field]
-            self.as_user(self.worker)
-            response = self.client.post(f"{BASE}/claims/", data, format="json")
-            self.assertEqual(response.status_code, 400, field)
-        self.assertFalse(ExpenseClaim.objects.exists())
-
     def test_a_blank_comment_or_a_zero_amount_is_refused(self):
         self.assertEqual(self.submit(comment="   ").status_code, 400)
         self.assertEqual(self.submit(amount="0").status_code, 400)
+        self.assertFalse(ExpenseClaim.objects.exists())
 
-    def test_any_active_user_can_be_chosen(self):
-        self.assertEqual(self.submit(approver=self.outsider.id).status_code, 201)
-
-    def test_an_inactive_user_cannot_be_chosen(self):
-        gone = User.objects.create(email="gone@example.com", is_active=False)
-        response = self.submit(approver=gone.id)
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("approver", response.data)
-
-    def test_nobody_sends_their_own_expense_to_themselves(self):
-        response = self.submit(user=self.hod, approver=self.hod.id)
-        self.assertEqual(response.status_code, 400)
-
-    @patch("expense_claims.services.GLAccountReader")
-    @patch("expense_claims.services.BranchReader")
-    def test_an_account_sap_will_not_post_to_is_refused(self, branch_reader, gl_reader):
-        branch_reader.return_value.resolve.return_value = BUDGET
-        gl_reader.return_value.resolve.side_effect = SAPDataError("not postable")
+    @patch(READER)
+    def test_an_account_that_is_not_an_expense_account_is_refused(self, reader):
+        reader.return_value.budget.return_value = BUDGET
+        reader.return_value.expense_account.side_effect = SAPDataError("not an expense account")
         self.as_user(self.worker)
         response = self.client.post(f"{BASE}/claims/", self.payload(), format="json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("gl_account_code", response.data)
-        self.assertFalse(ExpenseClaim.objects.exists())
 
-    @patch("expense_claims.services.GLAccountReader")
-    @patch("expense_claims.services.BranchReader")
-    def test_sap_down_answers_503(self, branch_reader, gl_reader):
-        branch_reader.return_value.resolve.side_effect = SAPConnectionError("down")
+    @patch(READER)
+    def test_sap_down_answers_503(self, reader):
+        reader.return_value.budget.side_effect = SAPConnectionError("down")
         self.as_user(self.worker)
         response = self.client.post(f"{BASE}/claims/", self.payload(), format="json")
         self.assertEqual(response.status_code, 503)
@@ -189,104 +201,70 @@ class EntryTests(ExpenseClaimTestCase):
     def test_somebody_without_the_right_cannot_submit(self):
         self.assertEqual(self.submit(user=self.outsider).status_code, 403)
 
+    def test_anybody_sees_the_expenses_they_put_in(self):
+        mine = self.claim()
+        self.claim(by=self.approver)
+        self.as_user(self.worker)
+        response = self.client.get(f"{BASE}/claims/?by_me=1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row["id"] for row in response.data["results"]], [mine.id])
+
     def test_companies_are_oil_mart_and_beverages(self):
         Company.objects.create(name="Test", code="TEST_MU")
         self.as_user(self.worker)
         response = self.client.get(f"{BASE}/companies/")
         self.assertEqual(
-            response.data,
-            [
-                {"code": "JIVO_OIL", "name": "Oil"},
-                {"code": "JIVO_MART", "name": "Mart"},
-                {"code": "JIVO_BEVERAGES", "name": "Beverages"},
-            ],
+            [row["name"] for row in response.data], ["Oil", "Mart", "Beverages"]
         )
 
-    @patch("expense_claims.views.BranchReader")
-    def test_budgets_come_from_the_named_companys_sap_with_factory_first_choice(self, reader):
-        reader.return_value.list.return_value = [
-            {"branch_id": 1, "branch_name": "DELHI"},
-            {"branch_id": 2, "branch_name": "FACTORY"},
+    @patch(VIEW_READER)
+    def test_budgets_are_dimension_3_with_factory_the_default(self, reader):
+        reader.return_value.budgets.return_value = [
+            {"budget_code": "BackOff", "budget_name": "Back Office"},
+            {"budget_code": "Factory", "budget_name": "Factory"},
         ]
         self.as_user(self.worker)
         response = self.client.get(f"{BASE}/budgets/?company=JIVO_BEVERAGES")
         self.assertEqual(response.status_code, 200)
         reader.assert_called_once_with("JIVO_BEVERAGES")
         self.assertEqual(
-            [(row["budget_name"], row["is_default"]) for row in response.data],
-            [("DELHI", False), ("FACTORY", True)],
+            [(row["budget_code"], row["is_default"]) for row in response.data],
+            [("BackOff", False), ("Factory", True)],
         )
 
-    @patch("expense_claims.views.BranchReader")
+    @patch(VIEW_READER)
     def test_budgets_answer_503_when_sap_is_down(self, reader):
-        reader.return_value.list.side_effect = SAPConnectionError("down")
+        reader.return_value.budgets.side_effect = SAPConnectionError("down")
         self.as_user(self.worker)
         self.assertEqual(self.client.get(f"{BASE}/budgets/?company=JIVO_OIL").status_code, 503)
 
-    @patch("expense_claims.views.GLAccountReader")
-    def test_gl_accounts_are_searched_in_the_named_companys_sap(self, reader):
-        reader.return_value.search.return_value = [ACCOUNT]
+    @patch(VIEW_READER)
+    def test_gl_accounts_are_the_named_companys_expense_accounts(self, reader):
+        reader.return_value.expense_accounts.return_value = [ACCOUNT]
         self.as_user(self.worker)
         response = self.client.get(f"{BASE}/gl-accounts/?company=JIVO_MART&search=refresh")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data, [ACCOUNT])
         reader.assert_called_once_with("JIVO_MART")
-        self.assertEqual(reader.return_value.search.call_args.args[0], "refresh")
-
-    def test_approvers_are_every_active_user_but_the_caller(self):
-        User.objects.create(email="gone@example.com", is_active=False)
-        self.as_user(self.worker)
-        response = self.client.get(f"{BASE}/approvers/")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            sorted(row["email"] for row in response.data),
-            ["hod@example.com", "other.hod@example.com", "outsider@example.com"],
-        )
+        self.assertEqual(reader.return_value.expense_accounts.call_args.args[0], "refresh")
 
 
 class EditTests(ExpenseClaimTestCase):
-    @patch("expense_claims.services.GLAccountReader")
-    @patch("expense_claims.services.BranchReader")
-    def edit(self, claim, branch_reader, gl_reader, user=None, **changes):
-        branch_reader.return_value.resolve.return_value = {"branch_id": 1, "branch_name": "DELHI"}
-        gl_reader.return_value.resolve.return_value = {
-            "account_code": "5680023",
-            "account_name": "POSTAGE & COURIER",
-        }
-        self.as_user(user or self.worker)
-        with self.captureOnCommitCallbacks(execute=True):
-            return self.client.put(
-                f"{BASE}/claims/{claim.id}/",
-                self.payload(**{"budget_id": 1, "gl_account_code": "5680023", **changes}),
-                format="json",
-            )
-
-    def test_the_submitter_changes_a_waiting_expense(self):
+    def test_the_submitter_changes_a_waiting_expense_quietly(self):
         claim = self.claim()
-        with patch("expense_claims.notifications.sent_to_hod") as notify:
+        with patch("expense_claims.notifications.waiting") as notify:
             response = self.edit(claim, comment="Courier", amount="99.50")
         self.assertEqual(response.status_code, 200, response.data)
         claim.refresh_from_db()
         self.assertEqual(claim.company, self.mart)
-        self.assertEqual((claim.budget_id, claim.budget_name), (1, "DELHI"))
-        self.assertEqual(claim.gl_account_name, "POSTAGE & COURIER")
         self.assertEqual((claim.comment, claim.amount), ("Courier", Decimal("99.50")))
         self.assertEqual(claim.status, ExpenseClaimStatus.PENDING_APPROVAL)
-        # Still with the same approver: a correction is not news to them.
         notify.assert_not_called()
-
-    def test_sending_it_to_somebody_else_tells_them(self):
-        claim = self.claim()
-        with patch("expense_claims.notifications.sent_to_hod") as notify:
-            self.edit(claim, approver=self.other_hod.id)
-        claim.refresh_from_db()
-        self.assertEqual(claim.approver, self.other_hod)
-        notify.assert_called_once()
 
     def test_changing_a_rejected_expense_sends_it_again(self):
         claim = self.claim()
-        self.decide(claim, self.hod, False, "Wrong account")
-        with patch("expense_claims.notifications.sent_to_hod") as notify:
+        self.decide(claim, self.approver, False, "Wrong account")
+        with patch("expense_claims.notifications.waiting") as notify:
             self.assertEqual(self.edit(claim).status_code, 200)
         claim.refresh_from_db()
         self.assertEqual(claim.status, ExpenseClaimStatus.PENDING_APPROVAL)
@@ -296,87 +274,69 @@ class EditTests(ExpenseClaimTestCase):
 
     def test_an_approved_expense_cannot_be_changed(self):
         claim = self.claim()
-        self.decide(claim, self.hod, True)
+        self.decide(claim, self.approver, True)
         self.assertEqual(self.edit(claim).status_code, 400)
-        claim.refresh_from_db()
-        self.assertEqual(claim.comment, "Tea for the night shift")
 
     def test_only_the_submitter_can_change_it(self):
-        claim = self.claim()
-        self.assertEqual(self.edit(claim, user=self.hod, approver=self.other_hod.id).status_code, 403)
+        self.assertEqual(self.edit(self.claim(), user=self.approver).status_code, 403)
 
 
 class ApprovalTests(ExpenseClaimTestCase):
-    def test_hods_see_every_expense_or_just_their_own(self):
-        mine = self.claim()
-        theirs = self.claim(approver=self.other_hod)
-        self.as_user(self.hod)
+    def test_approvers_see_every_expense_whichever_company_is_selected(self):
+        first = self.claim()
+        second = self.claim(by=self.outsider)
+        self.as_user(self.other_approver, company=self.mart)
+        response = self.client.get(f"{BASE}/claims/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            sorted(row["id"] for row in response.data["results"]), [first.id, second.id]
+        )
+        self.assertEqual(response.data["counts"]["PENDING_APPROVAL"], 2)
 
-        every = self.client.get(f"{BASE}/claims/")
-        self.assertEqual(every.status_code, 200)
-        self.assertEqual(sorted(row["id"] for row in every.data["results"]), [mine.id, theirs.id])
+    def test_status_narrows_the_list(self):
+        waiting = self.claim()
+        self.decide(self.claim(), self.approver, True)
+        self.as_user(self.approver)
+        response = self.client.get(f"{BASE}/claims/?status=PENDING_APPROVAL")
+        self.assertEqual([row["id"] for row in response.data["results"]], [waiting.id])
 
-        for_me = self.client.get(f"{BASE}/claims/?for_me=1&status=PENDING_APPROVAL")
-        self.assertEqual([row["id"] for row in for_me.data["results"]], [mine.id])
-        self.assertEqual(for_me.data["counts"]["PENDING_APPROVAL"], 1)
-
-    def test_the_list_is_the_same_whichever_company_is_selected(self):
-        self.claim()
-        self.hod.usercompany_set.create(company=self.mart, role=self.role)
-        self.as_user(self.hod, company=self.mart)
-        self.assertEqual(len(self.client.get(f"{BASE}/claims/").data["results"]), 1)
-
-    def test_anybody_sees_what_was_sent_to_them_but_not_every_expense(self):
-        to_outsider = self.claim(approver=self.outsider)
-        self.claim()
-        self.as_user(self.outsider)
-        theirs = self.client.get(f"{BASE}/claims/?for_me=1")
-        self.assertEqual(theirs.status_code, 200)
-        self.assertEqual([row["id"] for row in theirs.data["results"]], [to_outsider.id])
+    def test_somebody_who_is_not_an_approver_cannot_see_every_expense(self):
+        self.as_user(self.worker)
         self.assertEqual(self.client.get(f"{BASE}/claims/").status_code, 403)
 
-    def test_anybody_sees_the_expenses_they_put_in(self):
-        mine = self.claim()
-        self.claim(by=self.outsider)
-        self.as_user(self.worker)
-        response = self.client.get(f"{BASE}/claims/?by_me=1")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual([row["id"] for row in response.data["results"]], [mine.id])
-
-    def test_anybody_it_was_sent_to_can_decide_it(self):
-        claim = self.claim(approver=self.outsider)
-        self.assertEqual(self.decide(claim, self.outsider, True).status_code, 200)
-
-    def test_the_hod_approves(self):
+    def test_any_approver_approves(self):
         claim = self.claim()
         with patch("expense_claims.notifications.decided") as notify:
-            response = self.decide(claim, self.hod, True)
+            response = self.decide(claim, self.other_approver, True)
         self.assertEqual(response.status_code, 200, response.data)
         claim.refresh_from_db()
         self.assertEqual(claim.status, ExpenseClaimStatus.APPROVED)
-        self.assertEqual(claim.decided_by, self.hod)
-        self.assertIsNotNone(claim.decided_at)
+        self.assertEqual(claim.decided_by, self.other_approver)
         notify.assert_called_once()
 
     def test_a_rejection_must_say_why(self):
         claim = self.claim()
-        self.assertEqual(self.decide(claim, self.hod, False).status_code, 400)
-        self.assertEqual(self.decide(claim, self.hod, False, "Bill missing").status_code, 200)
+        self.assertEqual(self.decide(claim, self.approver, False).status_code, 400)
+        self.assertEqual(self.decide(claim, self.approver, False, "Bill missing").status_code, 200)
         claim.refresh_from_db()
         self.assertEqual(claim.status, ExpenseClaimStatus.REJECTED)
         self.assertEqual(claim.decision_note, "Bill missing")
 
-    def test_another_hod_cannot_decide(self):
-        self.assertEqual(self.decide(self.claim(), self.other_hod, True).status_code, 403)
+    def test_nobody_approves_their_own_expense(self):
+        claim = self.claim(by=self.approver)
+        self.assertEqual(self.decide(claim, self.approver, True).status_code, 403)
+
+    def test_somebody_who_is_not_an_approver_cannot_decide(self):
+        self.assertEqual(self.decide(self.claim(), self.outsider, True).status_code, 403)
 
     def test_an_expense_is_decided_once(self):
         claim = self.claim()
-        self.decide(claim, self.hod, True)
-        self.assertEqual(self.decide(claim, self.hod, False, "No").status_code, 400)
+        self.decide(claim, self.approver, True)
+        self.assertEqual(self.decide(claim, self.other_approver, False, "No").status_code, 400)
 
 
 class GroupTests(ExpenseClaimTestCase):
-    def test_setup_creates_the_submitter_group_and_assigns_everyone(self):
+    def test_setup_creates_both_groups_and_assigns_everyone_to_submitter(self):
         call_command("setup_expense_claim_groups", "--assign-everyone", stdout=StringIO())
         submitters = Group.objects.get(name=SUBMITTER_GROUP)
         self.assertEqual(
@@ -384,6 +344,13 @@ class GroupTests(ExpenseClaimTestCase):
             ["can_submit_expense_claim"],
         )
         self.assertTrue(submitters.user_set.filter(pk=self.outsider.pk).exists())
+        approvers = Group.objects.get(name=APPROVER_GROUP)
+        self.assertEqual(
+            sorted(approvers.permissions.values_list("codename", flat=True)),
+            ["can_approve_expense_claims", "can_submit_expense_claim"],
+        )
+        # Approving is somebody's choice, never everybody's.
+        self.assertFalse(approvers.user_set.exists())
 
     def test_a_new_account_joins_the_submitter_group(self):
         call_command("setup_expense_claim_groups", stdout=StringIO())

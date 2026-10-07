@@ -3,18 +3,18 @@ Expense claims: money somebody in the factory spent and wants approved.
 
 Two people touch a claim:
 
-1. **The submitter** fills in all of it on one page -- which company (the
-   page's "Branch"), which SAP business place (the page's "Budget"), which
-   SAP G/L account, what it was for, how much, and who approves it -- any
-   active user.
-2. **The approver** approves or rejects it. A rejection must say why; it goes
-   back to the submitter as a notification.
+1. **The submitter** fills it in on one page -- which company (the page's
+   "Branch"), which SAP budget (dimension 3), which SAP expense G/L account
+   or, when they do not know it, what it is for in their own words, a
+   comment and the amount.
+2. **An expense approver** approves or rejects it. A rejection must say why;
+   it goes back to the submitter as a notification.
 
 The submitter can change any of it until it is approved. Changing a rejected
 expense sends it again.
 
 The budget and the account are *snapshots*: code and name both, as SAP read
-when the claim was put in. The list then reads back in full when SAP is down,
+when the claim was saved. The list then reads back in full when SAP is down,
 and a renamed account does not rewrite what was approved.
 
 Claims are common to every company: one list, whichever company the reader
@@ -43,7 +43,7 @@ class ExpenseClaimStatus(models.TextChoices):
 
 
 class ExpenseClaim(BaseModel):
-    """One expense, from the person who spent it to the person who decides it.
+    """One expense, from the person who spent it to the approver who decides it.
 
     ``created_by`` (from :class:`BaseModel`) is the submitter, and
     ``created_at`` is when they put it in.
@@ -57,15 +57,33 @@ class ExpenseClaim(BaseModel):
         "SAP the budget and the G/L account were picked from.",
     )
 
-    # --- The page's "Budget": SAP's business place (OBPL) -------------------
-    budget_id = models.PositiveIntegerField(help_text="SAP OBPL.BPLId.")
+    # --- The budget: SAP's dimension 3 ------------------------------------
+    budget_code = models.CharField(
+        max_length=32, blank=True, default="", help_text="SAP OOCR.OcrCode, dimension 3."
+    )
     budget_name = models.CharField(
-        max_length=255, help_text="SAP OBPL.BPLName as it read when the claim was put in."
+        max_length=255, help_text="SAP OOCR.OcrName as it read when the claim was saved."
     )
 
-    gl_account_code = models.CharField(max_length=32, help_text="SAP OACT.AcctCode.")
+    # --- The G/L account, or what it is for when that is not known --------
+    gl_account_code = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="SAP OACT.AcctCode, an expense account. Blank when the "
+        "submitter did not know it.",
+    )
     gl_account_name = models.CharField(
-        max_length=255, help_text="SAP OACT.AcctName as it read when the claim was put in."
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="SAP OACT.AcctName as it read when the claim was saved.",
+    )
+    gl_description = models.TextField(
+        blank=True,
+        default="",
+        help_text="Instead of a G/L account: what the expense is for, in the "
+        "submitter's words, so accounts can find the account.",
     )
 
     comment = models.TextField(
@@ -77,12 +95,6 @@ class ExpenseClaim(BaseModel):
         validators=[MinValueValidator(Decimal("0.01"))],
     )
 
-    approver = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.PROTECT,
-        related_name="expense_claims_to_approve",
-        help_text="Who it goes to. Only they can decide it.",
-    )
     status = models.CharField(
         max_length=20,
         choices=ExpenseClaimStatus.choices,
@@ -105,13 +117,15 @@ class ExpenseClaim(BaseModel):
     class Meta:
         ordering = ["-id"]
         # Nothing gates on the add/change/delete/view rows, and a view_ beside
-        # the real right in the group editor is a footgun. Approving needs no
-        # right: only to be the person the expense was sent to.
+        # the real rights in the group editor is a footgun.
         default_permissions = ()
-        permissions = [("can_submit_expense_claim", "Can put in an expense")]
+        permissions = [
+            ("can_submit_expense_claim", "Can put in an expense"),
+            ("can_approve_expense_claims", "Can approve or reject expenses"),
+        ]
         indexes = [
             models.Index(fields=["status"]),
-            models.Index(fields=["approver", "status"]),
+            models.Index(fields=["created_by"]),
         ]
 
     def __str__(self):
