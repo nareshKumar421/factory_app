@@ -130,7 +130,10 @@ class DispatchFreightApprovalSerializer(serializers.ModelSerializer):
 
 
 class BillRefSerializer(serializers.Serializer):
-    company_code = serializers.CharField()
+    # Blank means the company the request is made in: the Vehicle Linking page
+    # working inside one company sends its bills without one, and refusing them
+    # lost every freight entered there (39 of 40 on 8 Oct 2026).
+    company_code = serializers.CharField(required=False, allow_blank=True, default="")
     doc_entry = serializers.IntegerField()
 
 
@@ -258,7 +261,10 @@ class TruckFreightAPI(APIView):
             result = record_truck_freight(
                 vehicle=data["vehicle"],
                 company_ids=user_company_ids(request),
-                bills=[(bill["company_code"], bill["doc_entry"]) for bill in data["bills"]],
+                bills=[
+                    (bill["company_code"] or request.company.company.code, bill["doc_entry"])
+                    for bill in data["bills"]
+                ],
                 extend=data["extend"],
                 destination=data["destination"],
                 slab=data["slab"],

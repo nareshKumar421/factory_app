@@ -413,6 +413,32 @@ class TruckEndpointTests(FreightApprovalBase):
             truck["covered_bills"], [{"company_code": self.company.code, "doc_entry": 1}]
         )
 
+    def test_a_bill_sent_without_a_company_is_the_request_companys(self):
+        # What Vehicle Linking sends from inside one company; refusing it lost
+        # 39 of the first 40 freights entered on live.
+        self._book(1)
+        self._book(2)
+
+        response = self._client(self.dispatcher).post(
+            TRUCK_URL,
+            {
+                "vehicle_id": self.vehicle.pk,
+                "destination_id": self.khanna.pk,
+                "slab_id": self.ten.pk,
+                "actual_freight": "12000",
+                "bills": [
+                    {"company_code": "", "doc_entry": 1},
+                    {"company_code": "", "doc_entry": 2},
+                ],
+                "extend": True,
+            },
+            format="json",
+            HTTP_COMPANY_CODE=self.company.code,
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(sum(share["freight"] for share in response.json()["shares"]), 12000.0)
+
     def test_the_bills_are_required(self):
         self._book(1)
         response = self._client(self.dispatcher).post(
