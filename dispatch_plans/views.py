@@ -743,9 +743,13 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
         year, month = get_month_params(request)
         page, page_size = get_page_params(request)
         search = (request.GET.get("search") or "").strip().lower()
+        # Every month at once. Safe to list: the SAP snapshot below is still
+        # fetched for the page only, and the rest is one database read (under a
+        # second for ~720 rows on live, 8 Oct 2026).
+        all_months = (request.GET.get("all_months") or "").lower() in ("1", "true")
 
         dispatch_plans = service.get_pending_service_grpo_entries(
-            year=year, month=month
+            year=year, month=month, all_months=all_months
         )
         plans_by_id = {plan.id: plan for plan in dispatch_plans}
 

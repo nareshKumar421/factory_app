@@ -173,3 +173,10 @@ class ServiceGRPOQueueSearchTests(TestCase):
 
         missing = self._get(search=BILTY, year=2026, month=9)
         self.assertEqual(len(missing.data["results"]), 0)
+
+    def test_all_months_lists_a_bilty_from_any_month(self):
+        response = self._get(search=BILTY, year=2026, month=9, all_months=1)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertEqual(response.data["results"][0]["bilty_no"], BILTY)
