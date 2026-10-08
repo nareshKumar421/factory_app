@@ -677,6 +677,14 @@ def sync_sales_dispatch_transport_to_plans(entry, data, user):
     consignee, and a docking-level edit would overwrite every customer's LR
     number on the truck with one value — which is what the per-consignee capture
     exists to prevent.
+
+    Freight is the truck's, entered at vehicle linking and split over its bills
+    there (`record_truck_freight`); the Service GRPO pays the transporter from
+    it. So a docking never overwrites a bill freighted at linking, and an empty
+    freight clears nothing: the docking page used to send its blank freight
+    boxes with every save, which wiped the linked freight off every bill on the
+    truck. A freight sent here only fills bills linked before freight was asked
+    for at linking.
     """
     fields = {
         "eway_bill",
@@ -691,9 +699,12 @@ def sync_sales_dispatch_transport_to_plans(entry, data, user):
         return
 
     total_amount = data.get("total_freight") if "total_freight" in data else None
-    if total_amount is None and "freight" in data:
+    if total_amount in (None, "") and "freight" in data:
         total_amount = data.get("freight")
-    allocations = allocate_freight_to_dispatch_plans(plans, total_amount)
+    unfreighted = [plan for plan in plans if plan.freight_approval_id is None]
+    allocations = (
+        allocate_freight_to_dispatch_plans(unfreighted, total_amount) if unfreighted else None
+    ) or {}
 
     for plan in plans:
         update_fields = ["updated_by", "updated_at"]
@@ -702,16 +713,9 @@ def sync_sales_dispatch_transport_to_plans(entry, data, user):
                 setattr(plan, field, data.get(field) or "")
                 update_fields.append(field)
 
-        if allocations is not None:
-            allocated_amount = allocations.get(plan.id)
-            plan.freight = allocated_amount
-            plan.total_freight = allocated_amount
+        if plan.id in allocations:
+            plan.freight = plan.total_freight = allocations[plan.id]
             update_fields.extend(["freight", "total_freight"])
-        else:
-            for field in ("freight", "total_freight"):
-                if field in data:
-                    setattr(plan, field, data.get(field))
-                    update_fields.append(field)
 
         plan.updated_by = user
         plan.save(update_fields=list(dict.fromkeys(update_fields)))
