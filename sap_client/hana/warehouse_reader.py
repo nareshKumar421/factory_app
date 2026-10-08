@@ -11,11 +11,50 @@ logger = logging.getLogger(__name__)
 
 
 class HanaWarehouseReader:
+    """Reads warehouses from SAP HANA.
 
-    def __init__(self, context):
+    When HANA cannot be reached, the active warehouse list (``sap_mirror``,
+    list ``warehouses``) and the transfer print's letterhead (list
+    ``warehouse_print_info``) come from the app's nightly copy.
+    ``use_copy=False`` is for the job that takes the copy.
+    """
+
+    #: The letterhead copy's row for the company itself.
+    COMPANY_ROW = "__company__"
+
+    def __init__(self, context, *, use_copy: bool = True):
         self.connection = HanaConnection(context.hana)
+        company_code = getattr(context, "company_code", None)
+        self._copy_company = company_code if use_copy and isinstance(company_code, str) else None
+
+    def _copy(self, exc, name):
+        """A copied list's rows for a failed read, or re-raise ``exc``."""
+        from sap_mirror import services as sap_mirror
+
+        if not self._copy_company or not sap_mirror.hana_unreachable(exc):
+            raise exc
+        try:
+            copy = sap_mirror.copied_rows(self._copy_company, getattr(sap_mirror, name))
+        except Exception:  # noqa: BLE001 -- a broken copy must not change what the caller sees
+            logger.exception("SAP warehouse copy could not answer for %s", self._copy_company)
+            raise exc
+        if copy is None:
+            raise exc
+        logger.warning("HANA unreachable; %s for %s answered from the copy", name, self._copy_company)
+        return copy[0]
 
     def get_active_warehouses(self) -> List[WarehouseDTO]:
+        try:
+            return self._active_warehouses_live()
+        except (SAPConnectionError, SAPDataError) as exc:
+            # Same rows as the copied WMS list: active OWHS, code and name.
+            rows = self._copy(exc, "WAREHOUSES")
+            return sorted(
+                (WarehouseDTO(warehouse_code=r["code"], warehouse_name=r["name"]) for r in rows),
+                key=lambda warehouse: warehouse.warehouse_code,
+            )
+
+    def _active_warehouses_live(self) -> List[WarehouseDTO]:
         conn = None
         cursor = None
 
@@ -231,7 +270,28 @@ class HanaWarehouseReader:
         codes = [str(code).strip() for code in (warehouse_codes or []) if str(code).strip()]
         if not codes:
             return {"company_name": "", "company_email": "", "warehouses": {}}
+        try:
+            return self._print_info_live(codes)
+        except (SAPConnectionError, SAPDataError) as exc:
+            rows = {row["code"]: row for row in self._copy(exc, "WAREHOUSE_PRINT_INFO")}
+            company = rows.pop(self.COMPANY_ROW, {})
+            return {
+                "company_name": company.get("company_name", ""),
+                "company_email": company.get("company_email", ""),
+                "warehouses": {code: rows[code] for code in codes if code in rows},
+            }
 
+    def all_print_info_for_copy(self) -> List[dict]:
+        """Every warehouse's letterhead, and the company's, as the nightly copy keeps them."""
+        info = self._print_info_live(None)
+        return [
+            {"code": self.COMPANY_ROW, "company_name": info["company_name"],
+             "company_email": info["company_email"]},
+            *info["warehouses"].values(),
+        ]
+
+    def _print_info_live(self, codes) -> dict:
+        """``codes`` None: every warehouse."""
         conn = None
         cursor = None
 
@@ -252,7 +312,9 @@ class HanaWarehouseReader:
             company_name = (row[0] or "").strip() if row else ""
             company_email = (row[1] or "").strip() if row else ""
 
-            placeholders = ", ".join("?" for _ in codes)
+            where = (
+                f'WHERE W."WhsCode" IN ({", ".join("?" for _ in codes)})' if codes else ""
+            )
             cursor.execute(
                 f"""
                 SELECT
@@ -271,9 +333,9 @@ class HanaWarehouseReader:
                 FROM "{schema}"."OWHS" W
                 LEFT JOIN "{schema}"."OBPL" B ON B."BPLId" = W."BPLid"
                 LEFT JOIN "{schema}"."OCST" S ON S."Code" = W."State"
-                WHERE W."WhsCode" IN ({placeholders})
+                {where}
                 """,
-                codes,
+                codes or [],
             )
 
             warehouses = {}

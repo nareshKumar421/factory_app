@@ -100,7 +100,12 @@ class HanaDispatchBillReader:
         bill["items"] = self.list_bill_lines(bill["doc_entry"])
         return bill
 
-    def list_bills_by_doc_entries(self, doc_entries: List[int]) -> List[Dict[str, Any]]:
+    def list_bills_by_doc_entries(
+        self, doc_entries: List[int], *, partial_ok: bool = False
+    ) -> List[Dict[str, Any]]:
+        """These bills. ``partial_ok``: when answered from the copy, return the
+        ones it holds rather than fail over one it does not -- for a list that is
+        only shown or enriched, never for a caller that acts on every bill."""
         doc_entries = [int(doc_entry) for doc_entry in dict.fromkeys(doc_entries or [])]
         if not doc_entries:
             return []
@@ -108,6 +113,7 @@ class HanaDispatchBillReader:
             {
                 "doc_entries": doc_entries,
                 "limit": len(doc_entries),
+                "partial_ok": partial_ok,
             }
         )
 
@@ -324,6 +330,30 @@ class HanaDispatchBillReader:
             for row in self._execute(query, [created_from])
         }
 
+    def bill_versions_for(self, doc_entries) -> Dict[int, str]:
+        """``bill_versions`` for particular bills, whatever their age -- the bills
+        still in dispatch planning that are older than the copy's window."""
+        entries = [int(entry) for entry in dict.fromkeys(doc_entries or [])]
+        if not entries:
+            return {}
+        schema = self.connection.schema
+        header_columns = self._table_columns("OINV")
+        update_ts = 'H."UpdateTS"' if "UpdateTS" in header_columns else "NULL"
+        versions: Dict[int, str] = {}
+        for start in range(0, len(entries), 500):
+            chunk = entries[start:start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            query = f"""
+                SELECT H."DocEntry", H."UpdateDate", {update_ts}
+                FROM "{schema}"."OINV" H
+                WHERE H."CANCELED" = 'N' AND H."DocEntry" IN ({placeholders})
+            """
+            for row in self._execute(query, chunk):
+                versions[int(row[0])] = (
+                    f"{self._format_date(row[1]) or ''}|{'' if row[2] is None else row[2]}"
+                )
+        return versions
+
     def credited_doc_entries(self, created_from) -> Set[int]:
         """Bills created since ``created_from`` that a live credit note is based on.
 
@@ -371,6 +401,25 @@ class HanaDispatchBillReader:
               AND CN."BaseEntry" IN ({placeholders}){unstamped}
         """
         return {int(row[0]) for row in self._execute(query, entries) if row[0] is not None}
+
+    def credited_among(self, doc_entries) -> Set[int]:
+        """``credited_doc_entries`` for particular bills, whatever their age."""
+        entries = [int(entry) for entry in dict.fromkeys(doc_entries or [])]
+        schema = self.connection.schema
+        credited: Set[int] = set()
+        for start in range(0, len(entries), 500):
+            chunk = entries[start:start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            query = f"""
+                SELECT DISTINCT CN."BaseEntry"
+                FROM "{schema}"."RIN1" CN
+                JOIN "{schema}"."ORIN" CH ON CH."DocEntry" = CN."DocEntry"
+                WHERE CN."BaseType" = 13
+                  AND IFNULL(CH."CANCELED", 'N') = 'N'
+                  AND CN."BaseEntry" IN ({placeholders})
+            """
+            credited |= {int(row[0]) for row in self._execute(query, chunk) if row[0] is not None}
+        return credited
 
     def list_stamped_bills(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Invoices already carrying a dispatch stamp, with no app sheet involved.

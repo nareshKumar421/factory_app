@@ -181,8 +181,17 @@ class OitmItemService:
         try:
             rows = self._execute(sql, (oil_item_code,))
             return [row.get('ItemCode') for row in rows if row.get('ItemCode')]
-        except OitmItemReadError:
-            raise
+        except OitmItemReadError as exc:
+            # HANA down: the nightly copy of the mapping. A code it does not map
+            # may have been mapped since last night, so that is SAP being down,
+            # not "no mapping".
+            mapped = [
+                row['item_code'] for row in self._mapping_copy(exc)
+                if row.get('oil_item_code') == oil_item_code
+            ]
+            if not mapped:
+                raise
+            return mapped
         except Exception as exc:
             logger.error('Failed to fetch Jivo Mart item mapping for %s: %s', oil_item_code, exc)
             raise OitmItemReadError(str(exc))
@@ -210,7 +219,11 @@ class OitmItemService:
 
         try:
             rows = self._execute(sql, (mart_item_code,))
-        except OitmItemReadError:
+        except OitmItemReadError as exc:
+            # HANA down: the nightly copy, as for the forward lookup.
+            for row in self._mapping_copy(exc):
+                if row.get('item_code') == mart_item_code and row.get('oil_item_code'):
+                    return row['oil_item_code']
             raise
         except Exception as exc:
             logger.error('Failed to fetch Oil item mapping for Jivo Mart %s: %s', mart_item_code, exc)
@@ -221,6 +234,40 @@ class OitmItemService:
             if oil_code:
                 return oil_code
         return None
+
+    def list_oil_item_mappings_for_copy(self) -> list[dict]:
+        """Every Jivo Mart item that carries an Oil ItemCode, for the nightly
+        copy of the Oil <-> Mart mapping (``sap_mirror``, list ``oil_item_mapping``)."""
+        schema = self.client.context.config['hana']['schema']
+        sql = """
+            SELECT "ItemCode", "U_Oil_ItemCode"
+            FROM "{schema}"."{table_name}"
+            WHERE IFNULL("U_Oil_ItemCode", '') <> ''
+            ORDER BY "ItemCode"
+        """.format(schema=schema, table_name=self.TABLE_NAME)
+        return [
+            {
+                'item_code': row.get('ItemCode') or '',
+                'oil_item_code': str(row.get('U_Oil_ItemCode') or '').strip(),
+            }
+            for row in self._execute(sql)
+            if row.get('ItemCode')
+        ]
+
+    def _mapping_copy(self, exc) -> list[dict]:
+        """The copied Oil <-> Mart mapping for a failed read, or re-raise ``exc``."""
+        from sap_mirror import services as sap_mirror
+
+        if not sap_mirror.hana_unreachable(exc):
+            raise exc
+        copy = sap_mirror.copied_rows(self.company_code, sap_mirror.OIL_ITEM_MAPPING)
+        if copy is None:
+            raise exc
+        logger.warning(
+            'HANA unreachable; Oil <-> Mart item mapping for %s answered from the copy of %s',
+            self.company_code, copy[1],
+        )
+        return copy[0]
 
     @staticmethod
     def _normalize_row(row: dict) -> dict:

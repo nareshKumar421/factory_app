@@ -445,6 +445,9 @@ class DispatchPlansService:
                     "warehouse": filters.get("warehouse"),
                     "exclude_credited": filters.get("exclude_credited"),
                     "exclude_sap_dispatched": filters.get("exclude_sap_dispatched"),
+                    # A list shown, not acted on: with HANA down, show what the
+                    # copy of SAP holds rather than fail over one old bill.
+                    "partial_ok": True,
                 }
             )
         return self.reader.list_bills(filters)
@@ -774,7 +777,7 @@ class DispatchPlansService:
         if not doc_entries:
             return {}
 
-        rows = self.reader.list_bills_by_doc_entries(doc_entries)
+        rows = self.reader.list_bills_by_doc_entries(doc_entries, partial_ok=True)
         enrichment: Dict[int, Dict[str, Any]] = {}
         for row in rows:
             enrichment[row["doc_entry"]] = {
@@ -832,7 +835,7 @@ class DispatchPlansService:
         for start in range(0, len(missing), self.SHEET_ENRICHMENT_CHUNK):
             rows.extend(
                 self.reader.list_bills_by_doc_entries(
-                    missing[start : start + self.SHEET_ENRICHMENT_CHUNK]
+                    missing[start : start + self.SHEET_ENRICHMENT_CHUNK], partial_ok=True
                 )
             )
 

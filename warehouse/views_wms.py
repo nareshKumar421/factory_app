@@ -74,6 +74,15 @@ class WMSItemGroupListAPI(APIView):
             data = reader.get_item_groups()
             return Response({"item_groups": data})
         except Exception as e:
+            from sap_mirror import services as sap_mirror
+
+            if sap_mirror.hana_unreachable(e):
+                # SAP down is not a server fault: its filter is decoration on
+                # boards whose stock figures need SAP anyway.
+                return Response(
+                    {"error": "SAP is not answering; item groups cannot be read."},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
             logger.error(f"WMS Item Groups error: {e}")
             return Response(
                 {"error": str(e)},

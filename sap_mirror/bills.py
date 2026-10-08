@@ -10,6 +10,11 @@ after the truck is inside. So the copy is refreshed at every run of
    dispatch reader reads it (header, lines, picking lines);
 3. a bill SAP no longer lists -- cancelled, or older than the window -- leaves.
 
+Besides the window, the copy holds every bill still in dispatch planning,
+whatever its age (:func:`planned_doc_entries`): planning reaches far back -- on
+2026-10-06, 380 of 407 pending plans were older than 30 days -- and the Plan
+page asks for exactly those bills.
+
 An A/R invoice's lines cannot change once posted, only its user fields (the
 dispatch stamp) can, and those move the stamp; so a bill is read once and then
 only when SAP says it changed.
@@ -40,6 +45,35 @@ WINDOW_DAYS = 30
 CHUNK = 200
 #: The reader's own ceiling on a list.
 MAX_BILL_ROWS = 20000
+#: Plans dispatched this recently stay in the copy: the Plan page opens on the
+#: last month of dispatch dates, and a bill invoiced earlier still shows there.
+PLANNING_LOOKBACK_DAYS = 45
+
+
+def planned_doc_entries(company, today):
+    """Every bill dispatch planning may ask for, whatever its age.
+
+    Selected for planning, pending or booked (not yet gone), or dispatched in
+    the last :data:`PLANNING_LOOKBACK_DAYS` -- what the Plan page and the gate's
+    expected-dispatch view list.
+    """
+    from django.db.models import Q
+
+    from dispatch_plans.models import DispatchPlan, SelectedDispatchBill
+
+    entries = set(
+        SelectedDispatchBill.objects.filter(company=company, is_active=True)
+        .values_list("sap_invoice_doc_entry", flat=True)
+    )
+    entries |= set(
+        DispatchPlan.objects.filter(company=company, is_active=True)
+        .filter(
+            Q(booking_status__in=["PENDING", "BOOKED"])
+            | Q(dispatch_date__gte=today - timedelta(days=PLANNING_LOOKBACK_DAYS))
+        )
+        .values_list("sap_invoice_doc_entry", flat=True)
+    )
+    return {int(entry) for entry in entries if entry}
 
 
 def window_start(today):
@@ -71,6 +105,11 @@ def refresh(company, state, now) -> int:
     if not versions and state.row_count:
         raise KeepCopy("SAP answered with no bills; the previous copy was kept.")
     credited = reader.credited_doc_entries(created_from)
+    # Older bills still in planning, kept beside the window.
+    older = sorted(planned_doc_entries(company, today) - set(versions))
+    if older:
+        versions.update(reader.bill_versions_for(older))
+        credited |= reader.credited_among(older)
 
     stored = dict(
         MirroredBill.objects.filter(company=company).values_list("doc_entry", "version")
@@ -212,8 +251,12 @@ def list_bills(company_code, filters):
     invoice_doc_num = (filters.get("invoice_doc_num") or "").strip()
     if doc_entries:
         bills = bills.filter(doc_entry__in=doc_entries)
-        if bills.values("doc_entry").distinct().count() < len(set(doc_entries)):
-            return None  # a bill older than the window, or newer than the copy
+        missing = bills.values("doc_entry").distinct().count() < len(set(doc_entries))
+        if missing and not filters.get("partial_ok"):
+            # A bill the copy does not hold -- newer than it, or old and out of
+            # planning -- is SAP being down, not "no such bill". A caller that
+            # only shows the list may take what the copy has instead.
+            return None
     elif invoice_doc_num:
         bills = bills.filter(doc_num=invoice_doc_num)
         if not bills.exists():
@@ -244,9 +287,10 @@ def list_bills(company_code, filters):
     limit = min(max(int(raw_limit) if raw_limit else MAX_BILL_ROWS, 1), MAX_BILL_ROWS)
     as_of = _as_of(state)
     bills = bills.order_by("-create_date", "-create_time", "-doc_num_sort")
-    if doc_entries or invoice_doc_num:
+    if (doc_entries or invoice_doc_num) and not filters.get("partial_ok"):
         # Particular bills, which is how a docking, a barcode session, a bill
-        # summary or a short dispatch takes one: worth checking afterwards.
+        # summary or a short dispatch takes one: worth checking afterwards. A
+        # list only shown (partial_ok) is not -- nothing was done with it.
         rows = list(bills[:limit])
         _record_served(state, rows)
         return [{**unpack(row.bill), "sap_copy_as_of": as_of} for row in rows]

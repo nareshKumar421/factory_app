@@ -29,11 +29,16 @@ NIGHTLY_OVERDUE = timedelta(hours=26)
 _STALE_KEY = "sap-mirror:stale"
 
 
-def _overdue(dataset, now) -> bool:
+def _overdue(dataset, now, hana_up_since=None) -> bool:
+    """Overdue counting from the later of its last refresh and HANA coming back:
+    a copy cannot refresh while HANA is down, so the clock only starts once it
+    could have. Without that, the first check after an outage cried wolf over
+    copies the next run was about to take (20:42 on 2026-10-06)."""
     if dataset.synced_at is None:
         return True
+    since = max(dataset.synced_at, hana_up_since) if hana_up_since else dataset.synced_at
     limit = FREQUENT_OVERDUE if dataset.name in FREQUENT else NIGHTLY_OVERDUE
-    return now - dataset.synced_at > limit
+    return now - since > limit
 
 
 def freshness(company_code):
@@ -57,14 +62,14 @@ def freshness(company_code):
     }
 
 
-def stale_copies(now=None):
+def stale_copies(now=None, hana_up_since=None):
     """``[(company, list label, synced_at)]`` for every copy that is overdue."""
     from .services import DATASETS
 
     now = now or timezone.now()
     stale = []
     for dataset in MirrorDataset.objects.select_related("company").order_by("company__code", "name"):
-        if dataset.name in DATASETS and _overdue(dataset, now):
+        if dataset.name in DATASETS and _overdue(dataset, now, hana_up_since):
             stale.append((dataset.company.code, DATASETS[dataset.name].label, dataset.synced_at))
     return stale
 
@@ -82,7 +87,7 @@ def watch(snap, now=None):
     if hana.get("status") != health.UP:
         return None
     now = now or timezone.now()
-    stale = stale_copies(now)
+    stale = stale_copies(now, _parsed(hana.get("since")))
     keys = sorted(f"{code}:{label}" for code, label, _ in stale)
     try:
         cache = caches["shared"]
@@ -96,6 +101,19 @@ def watch(snap, now=None):
     elif before and not keys:
         _alert([], now, recovered=True)
     return keys
+
+
+def _parsed(value):
+    """The snapshot's ISO timestamp as an aware datetime, or ``None``."""
+    from datetime import datetime
+
+    if not value:
+        return None
+    try:
+        when = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return when if timezone.is_aware(when) else timezone.make_aware(when)
 
 
 def _alert(stale, now, *, recovered):

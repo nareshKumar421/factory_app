@@ -865,7 +865,7 @@ class DispatchSheetCostTests(DispatchSheetAPITests):
         self._plan(2)
 
         service = self._real_enrichment_on_a_mock()
-        service.reader.list_bills_by_doc_entries.side_effect = lambda entries: [
+        service.reader.list_bills_by_doc_entries.side_effect = lambda entries, **_: [
             {"doc_entry": entry, "doc_date": "2026-03-31"} for entry in entries
         ]
 

@@ -98,6 +98,14 @@ class FakeReader:
         self._check()
         return set(self.credited)
 
+    def bill_versions_for(self, entries):
+        self._check()
+        return {entry: self.bills[entry][3] for entry in entries if entry in self.bills}
+
+    def credited_among(self, entries):
+        self._check()
+        return set(self.credited) & set(entries)
+
     def list_bills(self, filters):
         self._check()
         self.read.extend(filters["doc_entries"])

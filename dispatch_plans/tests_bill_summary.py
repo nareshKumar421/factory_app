@@ -135,7 +135,7 @@ class _Reader:
     def list_pickable_lines(self, doc_entries):
         return list(self.lines)
 
-    def list_bills_by_doc_entries(self, doc_entries):
+    def list_bills_by_doc_entries(self, doc_entries, **_):
         if isinstance(self.dispatched, Exception):
             raise self.dispatched
         wanted = {int(d) for d in doc_entries}

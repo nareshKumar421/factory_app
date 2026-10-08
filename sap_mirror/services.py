@@ -88,6 +88,20 @@ def _replace_list(fetch, key, search_text):
     return refresh
 
 
+def _fetch_warehouse_print_info(company_code):
+    from sap_client.context import CompanyContext
+    from sap_client.hana.warehouse_reader import HanaWarehouseReader
+
+    # use_copy=False: a HANA failure half-way fails this run, not the copy.
+    return HanaWarehouseReader(CompanyContext(company_code), use_copy=False).all_print_info_for_copy()
+
+
+def _fetch_oil_item_mapping(company_code):
+    from barcode.services.oitm_item_service import OitmItemService
+
+    return OitmItemService(company_code).list_oil_item_mappings_for_copy()
+
+
 def _fetch_vendors(company_code):
     from dataclasses import asdict
 
@@ -118,12 +132,16 @@ class Dataset:
     refresh: Callable
     #: How often it is due; ``None`` is once a night (:data:`NIGHT_STARTS`).
     every: timedelta | None = None
+    #: Only these companies have it; empty is every company.
+    companies: tuple = ()
 
 
 FG_ITEMS = "fg_items"
 WAREHOUSES = "warehouses"
 PRODUCTION_BOMS = "boms"
 VENDORS = "vendors"
+WAREHOUSE_PRINT_INFO = "warehouse_print_info"
+OIL_ITEM_MAPPING = "oil_item_mapping"
 PURCHASE_ORDERS = "purchase_orders"
 BILLS = "bills"
 
@@ -159,6 +177,28 @@ DATASETS = {
             ),
         ),
     ),
+    # A transfer's printed letterhead: each warehouse's address, branch and GSTIN,
+    # and the company's name. Fetched on every transfer page, not only to print.
+    WAREHOUSE_PRINT_INFO: Dataset(
+        label="Warehouse letterheads",
+        refresh=_replace_list(
+            fetch=lambda code: _fetch_warehouse_print_info(code),
+            key=lambda row: row["code"],
+            search_text=lambda row: f"{row['code']} {row.get('name', '')}".lower(),
+        ),
+    ),
+    # An Oil <-> Mart transfer (an invoice BST) maps every Oil item to its Mart
+    # item. The mapping is a column on Mart's own items (U_Oil_ItemCode), so it
+    # is copied for Mart only.
+    OIL_ITEM_MAPPING: Dataset(
+        label="Oil to Mart item mapping",
+        refresh=_replace_list(
+            fetch=lambda code: _fetch_oil_item_mapping(code),
+            key=lambda row: row["item_code"],
+            search_text=lambda row: f"{row['item_code']} {row['oil_item_code']}".lower(),
+        ),
+        companies=("JIVO_MART",),
+    ),
     # The gate: the supplier a truck comes from...
     VENDORS: Dataset(
         label="Active vendors",
@@ -175,11 +215,11 @@ DATASETS = {
         refresh=lambda company, state, now: _refresh_purchase_orders(company, state, now),
         every=timedelta(minutes=10),
     ),
-    # Dispatch: the last 30 days of A/R bills. Booked the same day they load, so
-    # due at every 15-minute run -- a little under 15, so timer jitter never
-    # skips one. See ``bills``.
+    # Dispatch: the last 30 days of A/R bills, and every older bill still in
+    # dispatch planning. Booked the same day they load, so due at every 15-minute
+    # run -- a little under 15, so timer jitter never skips one. See ``bills``.
     BILLS: Dataset(
-        label="A/R bills (last 30 days)",
+        label="A/R bills (last 30 days and in planning)",
         refresh=lambda company, state, now: _refresh_bills(company, state, now),
         every=timedelta(minutes=10),
     ),
@@ -248,6 +288,8 @@ def sync_due(now=None, *, force=False):
     refreshed = []
     for company in Company.objects.filter(code__in=list(settings.COMPANY_DB)).order_by("code"):
         for name, spec in DATASETS.items():
+            if spec.companies and company.code not in spec.companies:
+                continue
             if force or is_due(states.get((company.id, name)), now, spec.every):
                 refreshed.append(refresh(company, name, now))
     return refreshed

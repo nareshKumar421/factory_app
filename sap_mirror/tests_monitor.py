@@ -87,7 +87,7 @@ class WatchTests(CopyTestCase):
         self.assertEqual(self.sent.call_count, 1)
         call = self.sent.call_args.kwargs
         self.assertEqual(call["title"], "The app's copy of SAP has stopped refreshing")
-        self.assertIn("JIVO_OIL A/R bills (last 30 days): last taken", call["body"])
+        self.assertIn("JIVO_OIL A/R bills (last 30 days and in planning): last taken", call["body"])
         self.assertEqual(call["users"], [self.manager])
 
     def test_another_copy_stopping_is_told_again(self):
@@ -107,6 +107,19 @@ class WatchTests(CopyTestCase):
         monitor.watch(snap(), NOW)
 
         self.assertEqual(self.sent.call_args.kwargs["title"], "The app's copy of SAP is refreshing again")
+
+    def test_just_after_an_outage_the_copy_gets_its_next_run_first(self):
+        # HANA back at 10:55; the copies, last taken during the outage, are
+        # refreshed by the 11:00 run -- not "stopped" at 10:58.
+        self.copy("bills", 120)
+        back = (NOW - timedelta(minutes=5)).isoformat()
+        hana_back = {"components": {health.HANA: {"status": health.UP, "since": back}}}
+
+        self.assertEqual(monitor.watch(hana_back, NOW - timedelta(minutes=2)), [])
+        self.sent.assert_not_called()
+        # Still not refreshed 45 minutes after HANA came back: that is stopped.
+        monitor.watch(hana_back, NOW + timedelta(minutes=41))
+        self.assertEqual(self.sent.call_count, 1)
 
     def test_with_hana_down_an_old_copy_is_expected(self):
         self.copy("bills", 120)
