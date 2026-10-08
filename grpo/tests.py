@@ -17,7 +17,7 @@ from gate_core.enums import GateEntryStatus
 from company.models import Company, UserCompany, UserRole
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
 from driver_management.models import VehicleEntry, Driver
-from vehicle_management.models import Transporter, Vehicle, VehicleType
+from vehicle_management.models import Transporter, TransporterSAPLink, Vehicle, VehicleType
 from raw_material_gatein.models import POReceipt, POItemReceipt
 from quality_control.enums import ArrivalSlipStatus, InspectionStatus, InspectionWorkflowStatus
 from quality_control.models import MaterialArrivalSlip, RawMaterialInspection
@@ -1988,7 +1988,21 @@ class GRPOServiceTests(TestCase):
             "VE-DISP-001",
         )
 
+        # Its SAP vendor in this company comes with it; another company's code does not.
+        elsewhere = Company.objects.create(name="Elsewhere", code="ELSEWHERE")
+        TransporterSAPLink.objects.create(
+            transporter=transporter, company=elsewhere, card_code="VENDA999999", card_name="ARNAV (ELSEWHERE)"
+        )
+        TransporterSAPLink.objects.create(
+            transporter=transporter,
+            company=self.company,
+            card_code="VENDA000956",
+            card_name="ARNAV TRANSPORT SERVICE",
+        )
+
         preview = service.get_service_grpo_preview_data(dispatch_plan.id)
+        self.assertEqual(preview["default_vendor_code"], "VENDA000956")
+        self.assertEqual(preview["default_vendor_name"], "ARNAV TRANSPORT SERVICE")
         self.assertEqual(preview["vehicle_no"], "HR55AA1234")
         self.assertEqual(preview["driver_name"], "Ramesh Driver")
         self.assertEqual(preview["transporter_name"], "ARNAV TRANSPORT SERVICE")
@@ -2001,6 +2015,7 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(serializer_data["driver_name"], "Ramesh Driver")
         self.assertEqual(serializer_data["transporter_name"], "ARNAV TRANSPORT SERVICE")
         self.assertEqual(serializer_data["transporter_gstin"], "07ABCDE1234F1Z5")
+        self.assertEqual(serializer_data["default_vendor_code"], "VENDA000956")
         self.assertEqual(serializer_data["linked_vehicle_entry_id"], linked_entry.id)
         self.assertEqual(serializer_data["linked_vehicle_entry_no"], "VE-DISP-001")
 

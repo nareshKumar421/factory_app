@@ -484,6 +484,9 @@ class ServiceGRPOPreviewSerializer(ServiceGRPOPendingEntrySerializer):
 
     is_ready_for_grpo = serializers.BooleanField()
     default_amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    # The transporter's SAP vendor in this company, when it was picked from SAP.
+    default_vendor_code = serializers.CharField(allow_blank=True, required=False)
+    default_vendor_name = serializers.CharField(allow_blank=True, required=False)
     default_service_description = serializers.CharField()
     default_place_of_supply = serializers.CharField(allow_blank=True)
     default_effective_month = serializers.DateField(

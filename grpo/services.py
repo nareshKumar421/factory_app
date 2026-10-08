@@ -887,6 +887,28 @@ class GRPOService:
             return dispatch_plan.vehicle.transporter
         return None
 
+    @classmethod
+    def _dispatch_transporter_vendor(cls, dispatch_plan: DispatchPlan):
+        """The SAP vendor the bill's transporter is, in the bill's company.
+
+        Known when the transporter was picked from SAP for its vehicle, or linked
+        from the mapping sheet; a transporter typed by hand has none, and the
+        operator picks the vendor as before. Of several codes in one company,
+        the latest link.
+        """
+        from vehicle_management.models import TransporterSAPLink
+
+        transporter = cls._dispatch_transporter(dispatch_plan)
+        if transporter is None:
+            return None
+        return (
+            TransporterSAPLink.objects.filter(
+                transporter=transporter, company_id=dispatch_plan.company_id
+            )
+            .order_by("-created_at", "-id")
+            .first()
+        )
+
     def _dispatch_transporter_name(self, dispatch_plan: DispatchPlan) -> str:
         if dispatch_plan.transporter_name:
             return dispatch_plan.transporter_name
@@ -3059,6 +3081,7 @@ class GRPOService:
         driver_name = self.get_service_display_driver_name(dispatch_plan)
         transporter_name = self._dispatch_transporter_name(dispatch_plan)
         transporter_gstin = self._dispatch_transporter_gstin(dispatch_plan)
+        transporter_vendor = self._dispatch_transporter_vendor(dispatch_plan)
 
         latest_grpo = self._latest_service_grpo_for_group(group_plans)
         bill_snapshot = self._get_dispatch_bill_snapshot(dispatch_plan)
@@ -3166,6 +3189,8 @@ class GRPOService:
             "driver_name": driver_name,
             "transporter_name": transporter_name,
             "transporter_gstin": transporter_gstin,
+            "default_vendor_code": transporter_vendor.card_code if transporter_vendor else "",
+            "default_vendor_name": transporter_vendor.card_name if transporter_vendor else "",
             "bilty_no": dispatch_plan.bilty_no,
             "bilty_date": dispatch_plan.bilty_date,
             "freight": dispatch_plan.freight,
