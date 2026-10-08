@@ -180,3 +180,91 @@ class ServiceGRPOQueueSearchTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(response.data["results"][0]["bilty_no"], BILTY)
+
+
+ALL_URL = "/api/v1/dispatch/bilty-grpo/all/"
+
+
+class ServiceGRPOAllListTests(TestCase):
+    """The All tab: bilties still to post and GRPOs already posted, in one list.
+
+    The queue's fixture bilty (no bilty document, so AWAITING_BILTY) plus a
+    second bilty on the same truck, posted.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from django.utils import timezone
+
+        from grpo.models import GRPOStatus, ServiceGRPOLinePosting, ServiceGRPOPosting
+
+        ServiceGRPOQueueSearchTests.setUp(self)
+        # A second bilty on the same truck, posted to SAP.
+        self.posted_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=39001,
+            sap_invoice_doc_num="608260500",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            dispatch_date=date(2026, 7, 3),
+            vehicle=self.vehicle,
+            transporter=self.transporter,
+            bilty_no="12001",
+            bilty_date=date(2026, 7, 3),
+            created_by=self.user,
+            updated_by=self.user,
+        )
+        self.posting = ServiceGRPOPosting.objects.create(
+            dispatch_plan=self.posted_plan,
+            vendor_code="VENDA000636",
+            vendor_name="DELHI PUNJAB TRANSPORT CO",
+            sap_doc_entry=5501,
+            sap_doc_num=4401,
+            sap_doc_total=Decimal("9100.00"),
+            status=GRPOStatus.POSTED,
+            posted_at=timezone.now(),
+        )
+        ServiceGRPOLinePosting.objects.create(
+            service_grpo_posting=self.posting,
+            dispatch_plan=self.posted_plan,
+            service_description="Oil",
+            amount=Decimal("9100.00"),
+        )
+
+    def _all(self, **params):
+        with patch.object(GRPOService, "get_dispatch_bill_snapshots", return_value={}):
+            return self.client.get(ALL_URL, {"all_months": 1, **params}, **self.hdr)
+
+    def test_pending_and_posted_come_back_together_posted_newest_first(self):
+        response = self._all()
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.data["results"]
+        self.assertEqual([row["stage"] for row in rows], ["POSTED", "AWAITING_BILTY"])
+        posted, pending = rows
+        self.assertEqual(posted["posting_id"], self.posting.id)
+        self.assertEqual(posted["sap_doc_num"], "4401")
+        self.assertEqual(posted["amount"], "9100.00")
+        self.assertEqual(posted["invoice_numbers"], ["608260500"])
+        self.assertIsNone(pending["posting_id"])
+        self.assertEqual(sorted(pending["invoice_numbers"]), sorted(INVOICES))
+
+    def test_the_stage_filter_takes_posted_too(self):
+        self.assertEqual([r["stage"] for r in self._all(stage="POSTED").data["results"]], ["POSTED"])
+        self.assertEqual([r["stage"] for r in self._all(stage="AWAITING_BILTY").data["results"]], ["AWAITING_BILTY"])
+
+    def test_a_posted_grpo_is_found_by_its_sap_number(self):
+        rows = self._all(search="4401").data["results"]
+
+        self.assertEqual([row["posting_id"] for row in rows], [self.posting.id])
+
+    def test_without_the_history_right_only_the_queue_is_listed(self):
+        self.user.user_permissions.set(
+            Permission.objects.filter(content_type__app_label="grpo", codename="can_view_pending_grpo")
+        )
+        self.user = User.objects.get(pk=self.user.pk)  # drop the cached permissions
+        self.client.force_authenticate(self.user)
+
+        rows = self._all().data["results"]
+
+        self.assertEqual([row["stage"] for row in rows], ["AWAITING_BILTY"])

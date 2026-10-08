@@ -453,6 +453,18 @@ class ServiceGRPOPendingEntrySerializer(serializers.Serializer):
     age_days = serializers.IntegerField(required=False, allow_null=True)
 
 
+class ServiceGRPOAllEntrySerializer(ServiceGRPOPendingEntrySerializer):
+    """A row of the Service GRPO All list: a bilty to post, or a posted GRPO."""
+
+    # Set for a posted GRPO (stage POSTED), which opens its posting; null for a
+    # bilty still to post, which opens the post form.
+    posting_id = serializers.IntegerField(allow_null=True)
+    sap_doc_num = serializers.CharField(allow_blank=True)
+    # The posted GRPO's SAP total, or the bilty's freight still to post.
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    posted_at = serializers.DateTimeField(allow_null=True)
+
+
 class ServiceGRPOInvoiceLinePreviewSerializer(serializers.Serializer):
     dispatch_plan_id = serializers.IntegerField()
     sap_invoice_doc_entry = serializers.IntegerField()

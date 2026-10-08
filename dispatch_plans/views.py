@@ -20,6 +20,7 @@ from company.models import Company
 from company.permissions import HasBoardCompanyContext, HasCompanyContext
 from gate_core.services.user_scope import user_company_ids, wants_all_companies
 from grpo.serializers import (
+    ServiceGRPOAllEntrySerializer,
     ServiceGRPOOptionsSerializer,
     ServiceGRPOPendingEntrySerializer,
     ServiceGRPOPostRequestSerializer,
@@ -735,6 +736,67 @@ class DispatchPlanBulkDateAPI(APIView):
         return Response(result)
 
 
+def pending_queue_row(service, plan):
+    """One Service GRPO queue row: a bilty still to post, without any SAP call.
+
+    The SAP bill snapshot (the state) is filled in afterwards for the page being
+    rendered only, so search and pagination stay cheap.
+    """
+    return {
+        "dispatch_plan_id": plan.id,
+        "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
+        "sap_invoice_doc_num": plan.sap_invoice_doc_num,
+        "booking_status": plan.booking_status,
+        "dispatch_date": plan.dispatch_date,
+        "linked_vehicle_entry_id": plan.linked_vehicle_entry_id,
+        "linked_vehicle_entry_no": service.get_service_display_linked_entry_no(plan),
+        "vehicle_no": service.get_service_display_vehicle_no(plan),
+        "driver_name": service.get_service_display_driver_name(plan),
+        "transporter_name": service._dispatch_transporter_name(plan),
+        "transporter_gstin": service._dispatch_transporter_gstin(plan),
+        "source_state": plan.place_of_supply,
+        "bilty_no": plan.bilty_no,
+        "bilty_date": plan.bilty_date,
+        "freight": plan.freight,
+        "total_freight": plan.total_freight,
+        "invoice_count": getattr(plan, "_service_group_invoice_count", 1),
+        # Every invoice on the bilty. The row represents the whole group, so it
+        # has to be findable by any of them.
+        "invoice_numbers": getattr(plan, "_service_group_invoice_numbers", None)
+        or ([plan.sap_invoice_doc_num] if plan.sap_invoice_doc_num else []),
+        # Why a row cannot be posted yet, so the queue answers it without the
+        # operator opening the row to find out.
+        "stage": service.service_grpo_stage(plan),
+        "blockers": service.service_grpo_blockers(plan),
+        "age_days": (
+            (timezone.localdate() - plan.dispatch_date).days if plan.dispatch_date else None
+        ),
+        "created_at": plan.created_at,
+        "updated_at": plan.updated_at,
+        # Read by the All list only; the queue's serializer leaves them out.
+        "posting_id": None,
+        "sap_doc_num": "",
+        "amount": plan.total_freight if plan.total_freight is not None else plan.freight,
+        "posted_at": None,
+        "sort_date": plan.dispatch_date or timezone.localdate(plan.updated_at),
+    }
+
+
+def queue_row_matches(row, search):
+    """Whether a queue (or All) row matches the lower-cased search text."""
+    haystack = " ".join(str(row.get(field) or "") for field in (
+        "sap_invoice_doc_num", "bilty_no", "vehicle_no", "driver_name",
+        "transporter_name", "linked_vehicle_entry_no", "sap_doc_num",
+    )).lower()
+    # A grouped row stands for every invoice on its bilty, so any of those
+    # invoice numbers has to match it -- not just the group leader's, which is
+    # the one the row happens to display.
+    haystack += " " + " ".join(
+        str(number or "").lower() for number in (row.get("invoice_numbers") or [])
+    )
+    return search in haystack
+
+
 class DispatchPendingBiltyGRPOListAPI(APIView):
     permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPOQueue]
 
@@ -755,45 +817,7 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
 
         # Build lightweight rows (no SAP calls yet) so search + pagination stay
         # cheap; the SAP bill snapshot is fetched for the current page only.
-        rows = []
-        for plan in dispatch_plans:
-            rows.append(
-                {
-                    "dispatch_plan_id": plan.id,
-                    "sap_invoice_doc_entry": plan.sap_invoice_doc_entry,
-                    "sap_invoice_doc_num": plan.sap_invoice_doc_num,
-                    "booking_status": plan.booking_status,
-                    "dispatch_date": plan.dispatch_date,
-                    "linked_vehicle_entry_id": plan.linked_vehicle_entry_id,
-                    "linked_vehicle_entry_no": service.get_service_display_linked_entry_no(plan),
-                    "vehicle_no": service.get_service_display_vehicle_no(plan),
-                    "driver_name": service.get_service_display_driver_name(plan),
-                    "transporter_name": service._dispatch_transporter_name(plan),
-                    "transporter_gstin": service._dispatch_transporter_gstin(plan),
-                    "source_state": plan.place_of_supply,
-                    "bilty_no": plan.bilty_no,
-                    "bilty_date": plan.bilty_date,
-                    "freight": plan.freight,
-                    "total_freight": plan.total_freight,
-                    "invoice_count": getattr(plan, "_service_group_invoice_count", 1),
-                    # Every invoice on the bilty. The row represents the whole
-                    # group, so it has to be findable by any of them.
-                    "invoice_numbers": getattr(
-                        plan, "_service_group_invoice_numbers", None
-                    )
-                    or ([plan.sap_invoice_doc_num] if plan.sap_invoice_doc_num else []),
-                    # Why a row cannot be posted yet, so the queue answers it
-                    # without the operator opening the row to find out.
-                    "stage": service.service_grpo_stage(plan),
-                    "blockers": service.service_grpo_blockers(plan),
-                    "age_days": (
-                        (timezone.localdate() - plan.dispatch_date).days
-                        if plan.dispatch_date else None
-                    ),
-                    "created_at": plan.created_at,
-                    "updated_at": plan.updated_at,
-                }
-            )
+        rows = [pending_queue_row(service, plan) for plan in dispatch_plans]
 
         # Narrowing filters. Applied to the same rows the summary counts, so a
         # KPI tile can hand its own value straight through as a filter.
@@ -825,19 +849,7 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
                 ]
 
         if search:
-            def _matches(row):
-                haystack = " ".join(str(row.get(field) or "") for field in (
-                    "sap_invoice_doc_num", "bilty_no", "vehicle_no",
-                    "driver_name", "transporter_name", "linked_vehicle_entry_no",
-                )).lower()
-                # A grouped row stands for every invoice on its bilty, so any of
-                # those invoice numbers has to match it -- not just the group
-                # leader's, which is the one the row happens to display.
-                haystack += " " + " ".join(
-                    str(number or "").lower() for number in (row.get("invoice_numbers") or [])
-                )
-                return search in haystack
-            rows = [row for row in rows if _matches(row)]
+            rows = [row for row in rows if queue_row_matches(row, search)]
 
         page_rows, meta = paginate_list(rows, page, page_size)
 
@@ -852,6 +864,109 @@ class DispatchPendingBiltyGRPOListAPI(APIView):
 
         serializer = ServiceGRPOPendingEntrySerializer(page_rows, many=True)
         return Response(build_page(serializer.data, meta))
+
+
+class DispatchBiltyGRPOAllListAPI(APIView):
+    """GET /dispatch/bilty-grpo/all/
+
+    The queue and the posted GRPOs as one list, newest first: every bilty still
+    to post (stage READY / AWAITING_BILTY) and every GRPO posted (stage POSTED).
+    The queue's filters: ``year`` + ``month`` or ``all_months``, ``search``,
+    ``stage`` (POSTED for the posted ones only). A bilty's month is its dispatch
+    month, a posted GRPO's the month it was posted in, as on the History tab.
+
+    Failed attempts stay on the History tab: their bilty is still in the queue,
+    so here it would show twice. Posted rows need the History right as well.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewBiltyServiceGRPOQueue]
+
+    def get(self, request):
+        from grpo.models import GRPOStatus
+
+        service = GRPOService(company_code=request.company.company.code)
+        year, month = get_month_params(request)
+        all_months = (request.GET.get("all_months") or "").lower() in ("1", "true")
+        if not all_months and not (year and month):
+            now = timezone.localdate()
+            year, month = now.year, now.month
+        page, page_size = get_page_params(request)
+        search = (request.GET.get("search") or "").strip().lower()
+        stage = (request.GET.get("stage") or "").strip().upper()
+
+        rows, plans_by_id = [], {}
+        if stage != GRPOStatus.POSTED:
+            plans = service.get_pending_service_grpo_entries(
+                year=year, month=month, all_months=all_months
+            )
+            plans_by_id = {plan.id: plan for plan in plans}
+            rows += [pending_queue_row(service, plan) for plan in plans]
+        if stage in ("", GRPOStatus.POSTED) and CanViewBiltyServiceGRPOHistory().has_permission(
+            request, self
+        ):
+            postings = (
+                service.get_service_grpo_posting_history(
+                    year=None if all_months else year,
+                    month=None if all_months else month,
+                )
+                .filter(status=GRPOStatus.POSTED)
+                .select_related("dispatch_plan__driver")
+                .prefetch_related("lines__dispatch_plan")
+            )
+            rows += [posted_grpo_row(service, posting) for posting in postings]
+        if stage and stage != GRPOStatus.POSTED:
+            rows = [row for row in rows if row["stage"] == stage]
+        if search:
+            rows = [row for row in rows if queue_row_matches(row, search)]
+
+        rows.sort(key=lambda row: (row["sort_date"], row["created_at"]), reverse=True)
+        page_rows, meta = paginate_list(rows, page, page_size)
+
+        # The SAP state for the page's pending bilties only, as on the queue.
+        page_plans = [
+            plans_by_id[row["dispatch_plan_id"]]
+            for row in page_rows
+            if row["posting_id"] is None and row["dispatch_plan_id"] in plans_by_id
+        ]
+        snapshots = service.get_dispatch_bill_snapshots(page_plans) if page_plans else {}
+        for row in page_rows:
+            if row["posting_id"] is None:
+                snapshot = snapshots.get(row["dispatch_plan_id"], {})
+                row["source_state"] = snapshot.get("state", "") or row["source_state"]
+
+        serializer = ServiceGRPOAllEntrySerializer(page_rows, many=True)
+        return Response(build_page(serializer.data, meta))
+
+
+def posted_grpo_row(service, posting):
+    """A posted Service GRPO as an All-list row, alongside the queue's bilties."""
+    plan = posting.dispatch_plan
+    numbers = []
+    for line in posting.lines.all():
+        number = line.dispatch_plan.sap_invoice_doc_num if line.dispatch_plan_id else ""
+        if number and number not in numbers:
+            numbers.append(number)
+    if not numbers and plan.sap_invoice_doc_num:
+        numbers = [plan.sap_invoice_doc_num]
+    posted_at = posting.posted_at or posting.created_at
+    return {
+        **pending_queue_row(service, plan),
+        "transporter_name": posting.vendor_name or service._dispatch_transporter_name(plan),
+        "source_state": posting.place_of_supply or plan.place_of_supply,
+        "invoice_count": max(len(numbers), 1),
+        "invoice_numbers": numbers,
+        "stage": GRPO_STAGE_POSTED,
+        "blockers": [],
+        "age_days": None,
+        "posting_id": posting.id,
+        "sap_doc_num": posting.sap_doc_num or "",
+        "amount": posting.sap_doc_total,
+        "posted_at": posted_at,
+        "sort_date": timezone.localdate(posted_at),
+    }
+
+
+GRPO_STAGE_POSTED = "POSTED"
 
 
 class DispatchBiltyGRPOSummaryAPI(APIView):
