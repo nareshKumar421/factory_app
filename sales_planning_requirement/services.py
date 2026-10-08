@@ -66,7 +66,11 @@ class SalesPlanningRequirementService:
                 forecast_id=forecast_id,
                 forecast_name=forecast_name,
             )
-            rows = list(self._build_rows(result, run))
+            received = reader.received_quantities(
+                result.forecast.start_date,
+                result.forecast.end_date,
+            )
+            rows = list(self._build_rows(result, run, received))
             with transaction.atomic():
                 run.source_schema = result.source_schema
                 run.forecast_id = result.forecast.forecast_id
@@ -251,6 +255,7 @@ class SalesPlanningRequirementService:
         self,
         result: ProcedureResult,
         run: SalesPlanningRequirementRefreshRun,
+        received: Dict[str, Decimal],
     ) -> Iterable[SalesPlanningRequirementRow]:
         for raw in result.rows:
             planned_qty = self._decimal(raw.get("Planned Qty"))
@@ -280,6 +285,10 @@ class SalesPlanningRequirementService:
                 forecast_end_date=result.forecast.end_date,
                 planning_month=planning_month or "",
                 item_code=raw.get("ItemCode") or "",
+                # Shown beside Open PO, not taken off the shortage: what has
+                # been received is already in Stock In Hand, so subtracting
+                # it again would count the same goods twice.
+                received_qty=received.get(raw.get("ItemCode") or "", ZERO),
                 item_name=raw.get("ItemName") or "",
                 planned_qty=planned_qty,
                 base_required_qty=base_required_qty,
@@ -423,6 +432,9 @@ class SalesPlanningRequirementService:
             "min_stock": cls._float(row.min_stock),
             "stock_in_hand": cls._float(row.stock_in_hand),
             "required_qty": cls._float(row.required_qty),
+            "received_qty": (
+                cls._float(row.received_qty) if row.received_qty is not None else None
+            ),
             "open_po_qty": cls._float(row.open_po_qty),
             "net_shortage_qty": cls._float(row.net_shortage_qty),
             "status": "shortage" if row.net_shortage_qty > 0 else "po_covered",

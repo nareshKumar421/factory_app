@@ -55,6 +55,11 @@ NORMALIZED_COLUMN_ANALYSIS = [
         "business_meaning": "Final requirement gap after considering planned/base requirement, min stock, and stock in hand.",
     },
     {
+        "column": "received_qty",
+        "postgres_type": "numeric(24,6) nullable",
+        "business_meaning": "Quantity received on posted GRPOs (OPDN/PDN1, inventory unit) within the forecast dates.",
+    },
+    {
         "column": "open_po_qty",
         "postgres_type": "numeric(24,6)",
         "business_meaning": "Open purchase order quantity already covering the requirement where returned.",

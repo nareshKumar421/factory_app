@@ -138,6 +138,16 @@ class SalesPlanningRequirementRow(models.Model):
         decimal_places=6,
         help_text="Final quantity required after min stock and current stock adjustments.",
     )
+    received_qty = models.DecimalField(
+        max_digits=24,
+        decimal_places=6,
+        null=True,
+        blank=True,
+        help_text=(
+            "Quantity received on posted GRPOs within the forecast's dates. "
+            "Null on rows loaded before it was read."
+        ),
+    )
     open_po_qty = models.DecimalField(max_digits=24, decimal_places=6, default=0)
     net_shortage_qty = models.DecimalField(
         max_digits=24,

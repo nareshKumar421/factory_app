@@ -123,6 +123,39 @@ LIMIT ?
             parameter_value=parameter_value,
         )
 
+    def received_quantities(
+        self,
+        start_date: Optional[date],
+        end_date: Optional[date],
+    ) -> Dict[str, Decimal]:
+        """
+        What each item has been received on posted GRPOs inside the forecast's
+        own window -- the planning month the requirement is for.
+
+        In the inventory unit (`InvQty`), so it reads in the same unit as
+        Stock In Hand beside it; a carton line received in boxes of 100 would
+        otherwise be a hundred times too small. Cancelled GRPOs, and the
+        cancellation documents that undo them, are both left out.
+
+        A forecast with no dates has no month to count, so it gets nothing
+        rather than every GRPO ever posted.
+        """
+        if start_date is None or end_date is None:
+            return {}
+        query = f"""
+SELECT
+    L."ItemCode",
+    SUM(IFNULL(L."InvQty", 0)) AS "Received"
+FROM "{self.source_schema}"."OPDN" H
+JOIN "{self.source_schema}"."PDN1" L
+    ON L."DocEntry" = H."DocEntry"
+WHERE H."CANCELED" = 'N'
+  AND H."DocDate" BETWEEN ? AND ?
+GROUP BY L."ItemCode"
+"""
+        rows = self._execute(query, [start_date, end_date])
+        return {row[0]: Decimal(str(row[1] or 0)) for row in rows if row[0]}
+
     def _resolve_forecast(
         self,
         *,

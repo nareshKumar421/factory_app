@@ -33,6 +33,7 @@ class SalesPlanningRequirementServiceTests(TestCase):
 
         reader = reader_cls.return_value
         reader.source_schema = "JIVO_BEVERAGES_HANADB"
+        reader.received_quantities.return_value = {"FG0000323": Decimal("12500")}
         reader.execute_procedure.return_value = ProcedureResult(
             source_schema="JIVO_BEVERAGES_HANADB",
             forecast=ForecastSelection(
@@ -73,6 +74,11 @@ class SalesPlanningRequirementServiceTests(TestCase):
         self.assertEqual(row.required_qty, Decimal("238871"))
         self.assertEqual(row.open_po_qty, Decimal("38871"))
         self.assertEqual(row.net_shortage_qty, Decimal("200000"))
+        self.assertEqual(row.received_qty, Decimal("12500"))
+        reader.received_quantities.assert_called_once_with(
+            date(2026, 5, 1),
+            date(2026, 5, 31),
+        )
         self.assertEqual(row.raw_payload["ItemCode"], "FG0000323")
 
     def test_report_summarizes_postgres_rows(self):
