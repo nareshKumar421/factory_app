@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Transporter,Vehicle, VehicleType
+from .models import Transporter, TransporterSAPLink, Vehicle, VehicleType
 from driver_management.models import VehicleEntry
 from driver_management.serializers import DriverSerializer
 from company.serializers import CompanySerializer
@@ -18,6 +18,14 @@ class VehicleTypeSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ("id",)
 
+class TransporterSAPLinkSerializer(serializers.ModelSerializer):
+    company_code = serializers.CharField(source="company.code", read_only=True)
+
+    class Meta:
+        model = TransporterSAPLink
+        fields = ["company_code", "card_code", "card_name"]
+
+
 class TransporterSerializer(serializers.ModelSerializer):
     class Meta:
         model = Transporter
@@ -30,6 +38,38 @@ class TransporterSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ("id", "created_at")
+
+
+class TransporterWithSAPSerializer(TransporterSerializer):
+    """Plus which SAP vendor it is, per company; empty when typed by hand.
+
+    Kept off TransporterSerializer itself, which every vehicle nests: a vehicle
+    list would pay a query per row for it.
+    """
+
+    sap_links = TransporterSAPLinkSerializer(many=True, read_only=True)
+
+    class Meta(TransporterSerializer.Meta):
+        fields = TransporterSerializer.Meta.fields + ["sap_links"]
+        read_only_fields = TransporterSerializer.Meta.read_only_fields + ("sap_links",)
+
+
+class TransporterResolveSerializer(serializers.Serializer):
+    """A transporter picked from SAP (``card_code``) or typed by hand (``name``)."""
+
+    card_code = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    name = serializers.CharField(required=False, allow_blank=True, max_length=150)
+
+    def validate(self, attrs):
+        card_code = (attrs.get("card_code") or "").strip()
+        name = " ".join((attrs.get("name") or "").split())
+        if bool(card_code) == bool(name):
+            raise serializers.ValidationError(
+                "Pick a transporter from SAP or type its name, not both."
+                if card_code
+                else "Pick a transporter from SAP or type its name."
+            )
+        return {"card_code": card_code, "name": name}
 
 class TransporterNameSerializer(serializers.ModelSerializer):
     class Meta:

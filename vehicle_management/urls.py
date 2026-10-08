@@ -3,6 +3,8 @@ from vehicle_management.views import (
     TransporterDetailAPI,
     TransporterListCreateAPI,
     TransporterNameListAPI,
+    TransporterResolveAPI,
+    SapTransporterListAPI,
     VehicleDetailAPI,
     VehicleHistoryAPI,
     VehicleListCreateAPI,
@@ -18,6 +20,8 @@ urlpatterns = [
     # Transporter
     path("transporters/", TransporterListCreateAPI.as_view()),
     path("transporters/names/", TransporterNameListAPI.as_view()),
+    path("transporters/sap/", SapTransporterListAPI.as_view()),
+    path("transporters/resolve/", TransporterResolveAPI.as_view()),
     path("transporters/<int:id>/", TransporterDetailAPI.as_view()),
 
     # Vehicle

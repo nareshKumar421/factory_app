@@ -8,12 +8,16 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 
 from company.permissions import HasCompanyContext
+from sap_client.exceptions import SAPConnectionError, SAPDataError
 from driver_management.models import VehicleEntry
 from vehicle_management.models.vehicle import VehicleType
+from . import sap_transporters
 from .models import Transporter, Vehicle
 from .serializers import (
     TransporterNameSerializer,
+    TransporterResolveSerializer,
     TransporterSerializer,
+    TransporterWithSAPSerializer,
     VehicleNameSerializer,
     VehicleSerializer,
     VehicleEntrySerializer,
@@ -25,8 +29,8 @@ class TransporterListCreateAPI(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = Transporter.objects.all().order_by("name")
-        return Response(TransporterSerializer(qs, many=True).data)
+        qs = Transporter.objects.prefetch_related("sap_links__company").order_by("name")
+        return Response(TransporterWithSAPSerializer(qs, many=True).data)
 
     def post(self, request):
         serializer = TransporterSerializer(data=request.data)
@@ -43,6 +47,71 @@ class TransporterNameListAPI(APIView):
         return Response(TransporterNameSerializer(qs, many=True).data)
     
 
+class SapTransporterListAPI(APIView):
+    """
+    GET /vehicle-management/transporters/sap/
+
+    The company's active SAP vendors to pick a vehicle's transporter from, the
+    TRANSPORTER group first. With HANA down, the nightly vendor copy answers and
+    ``sap_copy_as_of`` says when it was taken.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def get(self, request):
+        try:
+            vendors, copy_as_of = sap_transporters.list_vendors(request.company.company.code)
+        except SAPConnectionError:
+            return Response(
+                {"detail": "SAP system is currently unavailable. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SAPDataError:
+            return Response(
+                {"detail": "Failed to retrieve vendor data from SAP."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response({"results": vendors, "sap_copy_as_of": copy_as_of})
+
+
+class TransporterResolveAPI(APIView):
+    """
+    POST /vehicle-management/transporters/resolve/
+
+    ``{"card_code": ...}`` for a vendor picked from SAP, or ``{"name": ...}`` for
+    one typed by hand. Answers the app Transporter to put on the vehicle: the one
+    it already is, or a new one.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext]
+
+    def post(self, request):
+        serializer = TransporterResolveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if data["card_code"]:
+            try:
+                transporter = sap_transporters.transporter_from_sap(
+                    request.company.company, data["card_code"], request.user
+                )
+            except sap_transporters.VendorNotFound as exc:
+                return Response({"card_code": [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
+            except SAPConnectionError:
+                return Response(
+                    {"detail": "SAP system is currently unavailable. Type the transporter's name instead."},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            except SAPDataError:
+                return Response(
+                    {"detail": "Failed to retrieve vendor data from SAP."},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+        else:
+            transporter = sap_transporters.transporter_by_name(data["name"], request.user)
+        transporter = Transporter.objects.prefetch_related("sap_links__company").get(pk=transporter.pk)
+        return Response(TransporterWithSAPSerializer(transporter).data)
+
+
 class TransporterDetailAPI(APIView):
     """
     Get or update transporter details by ID
@@ -51,7 +120,7 @@ class TransporterDetailAPI(APIView):
 
     def get(self, request, id):
         transporter = get_object_or_404(Transporter, id=id)
-        serializer = TransporterSerializer(transporter)
+        serializer = TransporterWithSAPSerializer(transporter)
         return Response(serializer.data)
 
     def put(self, request, id):
