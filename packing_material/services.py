@@ -30,7 +30,11 @@ from sap_client.context import CompanyContext
 
 from .app_reader import PackingMaterialAppReader
 from .constants import (
+    CONVERSION_NONE,
+    CONVERSION_PIECES,
+    CONVERSION_UOM_GROUP,
     DISPATCH_BASIS,
+    MANUAL_UOM_GROUP,
     MAX_LISTED_DRIVERS,
     MAX_LISTED_ITEMS,
     MAX_LISTED_PO_LINES,
@@ -39,12 +43,14 @@ from .constants import (
     PLAN_LIST_LIMIT,
     FG_ITEM_GROUP,
     PM_ITEM_GROUP,
+    PIECE_UOM_CODES,
     PM_ITEM_GROUP_NAME,
     RANKED_BY,
     SOURCE_APP,
     SOURCE_SAP,
     consumption_warehouses,
     intercompany_card_codes,
+    pieces_excluded_warehouses,
     stock_warehouses,
     supply_warehouses,
 )
@@ -934,6 +940,234 @@ def plan_coverage_summary(
     }
 
 
+# ---------------------------------------------------------------------------
+# The pieces board -- arithmetic, no SAP, no Django, no company
+# ---------------------------------------------------------------------------
+
+#: The family an item with no ``U_Sub_Group`` is filed under, so it is
+#: counted in the family split instead of dropping out of it.
+NO_FAMILY = "(no family)"
+
+
+def is_piece_uom(code: str) -> bool:
+    """Whether a unit code means a single piece -- 'PCS', 'Nos.', 'pc'."""
+    normalised = (code or "").upper().replace(".", "").replace(" ", "")
+    return normalised in PIECE_UOM_CODES
+
+
+def piece_factors(
+    uom_items: Iterable[Dict[str, Any]],
+    group_rows: Iterable[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Pieces per inventory unit for every item, and how that was found.
+
+    Three outcomes, never a guess:
+
+    * the inventory unit IS a piece -- factor 1, ``conversion = pieces``;
+    * the item's UoM group has both its inventory unit and a piece unit --
+      factor from the two rows, ``conversion = uom_group``;
+    * neither -- factor ``None``, ``conversion = none``. The item keeps its
+      own unit and stays out of every pieces total.
+
+    A ``UGP1`` row says ``alt_qty`` of the unit equals ``base_qty`` of the
+    group's base unit, so a unit is worth ``base_qty / alt_qty`` base units and
+    pieces per inventory unit is the inventory unit's worth over a piece's.
+    A row with a zero on either side is unusable and treated as absent.
+    """
+    by_group: Dict[int, List[Dict[str, Any]]] = {}
+    for row in group_rows:
+        if row.get("alt_qty") and row.get("base_qty"):
+            by_group.setdefault(row["ugp_entry"], []).append(row)
+
+    factors: Dict[str, Dict[str, Any]] = {}
+    for item in uom_items:
+        code = item.get("item_code") or ""
+        if not code:
+            continue
+        uom = item.get("uom") or ""
+
+        if is_piece_uom(uom):
+            factors[code] = {"conversion": CONVERSION_PIECES, "pieces_per_uom": 1.0}
+            continue
+
+        rows = by_group.get(item.get("ugp_entry", MANUAL_UOM_GROUP), [])
+        inventory_row = None
+        if item.get("iuom_entry") is not None:
+            inventory_row = next(
+                (r for r in rows if r["uom_entry"] == item["iuom_entry"]), None
+            )
+        if inventory_row is None:
+            inventory_row = next(
+                (r for r in rows if r["uom_code"].strip().upper() == uom.strip().upper()),
+                None,
+            )
+        piece_row = next((r for r in rows if is_piece_uom(r["uom_code"])), None)
+
+        if inventory_row is None or piece_row is None:
+            factors[code] = {"conversion": CONVERSION_NONE, "pieces_per_uom": None}
+            continue
+
+        inventory_worth = inventory_row["base_qty"] / inventory_row["alt_qty"]
+        piece_worth = piece_row["base_qty"] / piece_row["alt_qty"]
+        factors[code] = {
+            "conversion": CONVERSION_UOM_GROUP,
+            "pieces_per_uom": round(inventory_worth / piece_worth, 6),
+        }
+    return factors
+
+
+def _share(part: float, whole: float) -> float:
+    return round(part / whole * 100, 2) if whole else 0.0
+
+
+def build_pieces_board(
+    stock_rows: Iterable[Dict[str, Any]],
+    master: Dict[str, Dict[str, Any]],
+    factors: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Every packaging item in pieces, split by store and by family.
+
+    ``stock_rows`` are ``pm_stock_all_warehouses`` rows. An item with no route
+    to pieces is still listed, with ``pcs_qty`` null, and counted in the
+    ``unconverted_*`` figures -- it is never added into a pieces total, where
+    a kilo of film would read as one more bottle.
+
+    Value is in rupees and needs no conversion, so it covers every item.
+    """
+    items: Dict[str, Dict[str, Any]] = {}
+    warehouses: Dict[str, Dict[str, Any]] = {}
+
+    for row in stock_rows:
+        code = row.get("item_code") or ""
+        whs = row.get("warehouse") or ""
+        if not code or not whs:
+            continue
+        qty = float(row.get("stock_qty", 0) or 0)
+        value = float(row.get("stock_value", 0) or 0)
+
+        factor = factors.get(code) or {"conversion": CONVERSION_NONE, "pieces_per_uom": None}
+        per = factor["pieces_per_uom"]
+        pcs = round(qty * per, 3) if per is not None else None
+
+        item = items.get(code)
+        if item is None:
+            item = _describe(code, master)
+            item.pop("unit_price", None)
+            item.update(
+                {
+                    "sub_group": item["sub_group"] or NO_FAMILY,
+                    "conversion": factor["conversion"],
+                    "pieces_per_uom": per,
+                    "stock_qty": 0.0,
+                    "pcs_qty": 0.0 if per is not None else None,
+                    "stock_value": 0.0,
+                    "warehouses": [],
+                }
+            )
+            items[code] = item
+        item["stock_qty"] += qty
+        item["stock_value"] += value
+        if pcs is not None:
+            item["pcs_qty"] += pcs
+        item["warehouses"].append(
+            {"code": whs, "stock_qty": qty, "pcs_qty": pcs, "stock_value": value}
+        )
+
+        store = warehouses.setdefault(
+            whs,
+            {
+                "code": whs,
+                "name": row.get("warehouse_name") or whs,
+                "inactive": bool(row.get("inactive", False)),
+                "item_codes": set(),
+                "unconverted_codes": set(),
+                "pcs_qty": 0.0,
+                "stock_value": 0.0,
+            },
+        )
+        store["item_codes"].add(code)
+        store["stock_value"] += value
+        if pcs is None:
+            store["unconverted_codes"].add(code)
+        else:
+            store["pcs_qty"] += pcs
+
+    item_list = list(items.values())
+    for item in item_list:
+        item["stock_qty"] = round(item["stock_qty"], 3)
+        item["stock_value"] = round(item["stock_value"], 2)
+        if item["pcs_qty"] is not None:
+            item["pcs_qty"] = round(item["pcs_qty"], 3)
+        item["warehouses"].sort(key=lambda w: -abs(w["stock_qty"]))
+
+    converted = [item for item in item_list if item["pcs_qty"] is not None]
+    unconverted = [item for item in item_list if item["pcs_qty"] is None]
+    total_pcs = sum(item["pcs_qty"] for item in converted)
+    total_value = sum(item["stock_value"] for item in item_list)
+
+    # Converted items by pieces, then the unconverted ones by value: a single
+    # sort key would have to pretend a kilo compares with a piece.
+    converted.sort(key=lambda item: -item["pcs_qty"])
+    unconverted.sort(key=lambda item: -item["stock_value"])
+
+    store_list = []
+    for store in warehouses.values():
+        store_list.append(
+            {
+                "code": store["code"],
+                "name": store["name"],
+                "inactive": store["inactive"],
+                "item_count": len(store["item_codes"]),
+                "unconverted_item_count": len(store["unconverted_codes"]),
+                "pcs_qty": round(store["pcs_qty"], 3),
+                "stock_value": round(store["stock_value"], 2),
+                "share_pct": _share(store["pcs_qty"], total_pcs),
+            }
+        )
+    store_list.sort(key=lambda store: -store["pcs_qty"])
+
+    families: Dict[str, Dict[str, Any]] = {}
+    for item in item_list:
+        family = families.setdefault(
+            item["sub_group"],
+            {
+                "sub_group": item["sub_group"],
+                "item_count": 0,
+                "unconverted_item_count": 0,
+                "pcs_qty": 0.0,
+                "stock_value": 0.0,
+            },
+        )
+        family["item_count"] += 1
+        family["stock_value"] += item["stock_value"]
+        if item["pcs_qty"] is None:
+            family["unconverted_item_count"] += 1
+        else:
+            family["pcs_qty"] += item["pcs_qty"]
+    family_list = []
+    for family in families.values():
+        family["pcs_qty"] = round(family["pcs_qty"], 3)
+        family["stock_value"] = round(family["stock_value"], 2)
+        family["share_pct"] = _share(family["pcs_qty"], total_pcs)
+        family_list.append(family)
+    family_list.sort(key=lambda family: -family["pcs_qty"])
+
+    return {
+        "items": converted + unconverted,
+        "warehouses": store_list,
+        "sub_groups": family_list,
+        "total": {
+            "warehouse_count": len(store_list),
+            "item_count": len(item_list),
+            "converted_item_count": len(converted),
+            "unconverted_item_count": len(unconverted),
+            "pcs_qty": round(total_pcs, 3),
+            "stock_value": round(total_value, 2),
+            "unconverted_value": round(sum(i["stock_value"] for i in unconverted), 2),
+        },
+    }
+
+
 class PackingMaterialService:
     """One company's packing-material board.
 
@@ -1100,6 +1334,30 @@ class PackingMaterialService:
     # ------------------------------------------------------------------
     # Section three: the plan against what is left to buy
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # The pieces board
+    # ------------------------------------------------------------------
+
+    def get_stock_pieces(self) -> Dict[str, Any]:
+        """Every packaging item in every store, counted in pieces."""
+        master = index_master(self.reader.pm_master())
+        factors = piece_factors(self.reader.pm_uom_items(), self.reader.pm_uom_group_rows())
+        excluded = pieces_excluded_warehouses()
+        stock = [
+            row
+            for row in self.reader.pm_stock_all_warehouses()
+            if row.get("warehouse") not in excluded
+        ]
+        board = build_pieces_board(stock, master, factors)
+        board["meta"] = {
+            "company_code": self.company_code,
+            "excluded_warehouses": excluded,
+            "fetched_at": _now_iso(),
+            "piece_uom_codes": sorted(PIECE_UOM_CODES),
+            **self._group_meta(),
+        }
+        return board
 
     def get_plans(self, limit: int = PLAN_LIST_LIMIT) -> Dict[str, Any]:
         """The plan headers the board can be pointed at.

@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     PackingMaterialDispatchAPI,
+    PackingMaterialPiecesAPI,
     PackingMaterialPlanListAPI,
     PackingMaterialProductionAPI,
     PackingMaterialPurchaseOrderAPI,
@@ -11,6 +12,12 @@ from .views import (
 
 urlpatterns = [
     path("stock/", PackingMaterialStockAPI.as_view(), name="packing-material-stock"),
+    # Every store's packaging converted to pieces -- the Beverages PM Stock page.
+    path(
+        "stock-pieces/",
+        PackingMaterialPiecesAPI.as_view(),
+        name="packing-material-stock-pieces",
+    ),
     path(
         "production/",
         PackingMaterialProductionAPI.as_view(),

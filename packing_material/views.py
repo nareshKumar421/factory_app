@@ -43,6 +43,7 @@ from .serializers import (
     DispatchFilterSerializer,
     DispatchResponseSerializer,
     PeriodFilterSerializer,
+    PiecesResponseSerializer,
     PlanListFilterSerializer,
     PlanListResponseSerializer,
     ProductionResponseSerializer,
@@ -101,6 +102,24 @@ class PackingMaterialStockAPI(_PackingMaterialAPI):
         if error:
             return error
         return Response(StockResponseSerializer(board).data)
+
+
+class PackingMaterialPiecesAPI(_PackingMaterialAPI):
+    """Every packaging item in every store that holds any, in pieces.
+
+    GET /api/v1/packing-material/stock-pieces/
+
+    The Beverages PM Stock page. No warehouse list -- the stores are whatever
+    SAP says holds packaging -- and no parameters: it is stock right now, and
+    the page filters, searches and exports the one answer in the browser.
+    """
+
+    def get(self, request):
+        service = self.service(request)
+        board, error = self.guarded(service.get_stock_pieces)
+        if error:
+            return error
+        return Response(PiecesResponseSerializer(board).data)
 
 
 class PackingMaterialProductionAPI(_PackingMaterialAPI):

@@ -17,6 +17,7 @@ from django.test import SimpleTestCase
 from .constants import stock_warehouses, supply_warehouses
 from .services import (
     PackingMaterialService,
+    build_pieces_board,
     build_requirement_rows,
     build_stock_board,
     explode_dispatch,
@@ -24,7 +25,9 @@ from .services import (
     index_drivers,
     index_po_lines,
     index_master,
+    is_piece_uom,
     issue_window,
+    piece_factors,
     plan_coverage_summary,
     rank_by_qty,
     requirement_totals,
@@ -482,6 +485,18 @@ class FakeReader:
     def item_group_map(self, item_codes):
         self.calls.append("item_group_map")
         return self.rows.get("groups", {})
+
+    def pm_stock_all_warehouses(self):
+        self.calls.append("pm_stock_all_warehouses")
+        return self.rows.get("all_stock", [])
+
+    def pm_uom_items(self):
+        self.calls.append("pm_uom_items")
+        return self.rows.get("uom_items", [])
+
+    def pm_uom_group_rows(self):
+        self.calls.append("pm_uom_group_rows")
+        return self.rows.get("uom_rows", [])
 
 
 class FakeAppReader:
@@ -1713,3 +1728,193 @@ class OverPurchaseKindTests(SimpleTestCase):
             + totals["over_purchased_now_count"],
             totals["over_purchased_count"],
         )
+
+
+# ---------------------------------------------------------------------------
+# The pieces board
+# ---------------------------------------------------------------------------
+
+# Group 7: base unit PCS, a BOX of 100, and a KG that is 2,000 pieces -- written
+# the way SAP writes it, as "1 KG = 2000 PCS" on the KG row.
+UOM_ROWS = [
+    {"ugp_entry": 7, "uom_entry": 1, "uom_code": "PCS", "alt_qty": 1, "base_qty": 1},
+    {"ugp_entry": 7, "uom_entry": 2, "uom_code": "BOX", "alt_qty": 1, "base_qty": 100},
+    {"ugp_entry": 7, "uom_entry": 3, "uom_code": "KG", "alt_qty": 1, "base_qty": 2000},
+    # Group 9: base unit KG, with "1000 PCS = 1 KG" on the piece row.
+    {"ugp_entry": 9, "uom_entry": 3, "uom_code": "KG", "alt_qty": 1, "base_qty": 1},
+    {"ugp_entry": 9, "uom_entry": 4, "uom_code": "Nos.", "alt_qty": 1000, "base_qty": 1},
+    # Group 11: no piece unit at all.
+    {"ugp_entry": 11, "uom_entry": 3, "uom_code": "KG", "alt_qty": 1, "base_qty": 1},
+    {"ugp_entry": 11, "uom_entry": 5, "uom_code": "MTR", "alt_qty": 10, "base_qty": 1},
+]
+
+
+class PieceFactorTests(SimpleTestCase):
+    def test_piece_codes_match_however_they_are_written(self):
+        for code in ("PCS", "pcs", "Nos.", "NOS", " pc ", "Each"):
+            self.assertTrue(is_piece_uom(code), code)
+        for code in ("KG", "MTR", "BOX", "", "ROLL"):
+            self.assertFalse(is_piece_uom(code), code)
+
+    def test_an_item_stocked_in_pieces_needs_no_group(self):
+        factors = piece_factors(
+            [{"item_code": "A", "uom": "PCS", "ugp_entry": -1, "iuom_entry": None}], []
+        )
+        self.assertEqual(factors["A"], {"conversion": "pieces", "pieces_per_uom": 1.0})
+
+    def test_a_box_converts_up_through_the_base_unit(self):
+        factors = piece_factors(
+            [{"item_code": "A", "uom": "BOX", "ugp_entry": 7, "iuom_entry": 2}], UOM_ROWS
+        )
+        self.assertEqual(factors["A"], {"conversion": "uom_group", "pieces_per_uom": 100.0})
+
+    def test_a_kilo_converts_when_pieces_are_the_alternate_unit(self):
+        factors = piece_factors(
+            [{"item_code": "A", "uom": "KG", "ugp_entry": 9, "iuom_entry": 3}], UOM_ROWS
+        )
+        self.assertEqual(factors["A"]["pieces_per_uom"], 1000.0)
+
+    def test_the_inventory_row_is_found_by_code_without_iuom_entry(self):
+        factors = piece_factors(
+            [{"item_code": "A", "uom": "kg", "ugp_entry": 7, "iuom_entry": None}], UOM_ROWS
+        )
+        self.assertEqual(factors["A"]["pieces_per_uom"], 2000.0)
+
+    def test_no_piece_unit_means_no_conversion_not_a_guess(self):
+        factors = piece_factors(
+            [
+                {"item_code": "FILM", "uom": "KG", "ugp_entry": 11, "iuom_entry": 3},
+                {"item_code": "TAPE", "uom": "MTR", "ugp_entry": -1, "iuom_entry": None},
+            ],
+            UOM_ROWS,
+        )
+        self.assertEqual(factors["FILM"], {"conversion": "none", "pieces_per_uom": None})
+        self.assertEqual(factors["TAPE"], {"conversion": "none", "pieces_per_uom": None})
+
+    def test_a_zero_quantity_row_is_unusable(self):
+        rows = [
+            {"ugp_entry": 7, "uom_entry": 1, "uom_code": "PCS", "alt_qty": 1, "base_qty": 1},
+            {"ugp_entry": 7, "uom_entry": 2, "uom_code": "BOX", "alt_qty": 0, "base_qty": 100},
+        ]
+        factors = piece_factors(
+            [{"item_code": "A", "uom": "BOX", "ugp_entry": 7, "iuom_entry": 2}], rows
+        )
+        self.assertEqual(factors["A"]["conversion"], "none")
+
+
+PIECES_MASTER = index_master(
+    [
+        {"item_code": "CAP", "item_name": "CAP 28MM", "uom": "PCS", "sub_group": "CAPS", "unit_price": 0.5},
+        {"item_code": "PRE", "item_name": "PREFORM 20G", "uom": "BOX", "sub_group": "PREFORM", "unit_price": 150},
+        {"item_code": "FILM", "item_name": "SHRINK FILM", "uom": "KG", "sub_group": "SHRINK", "unit_price": 140},
+        {"item_code": "LBL", "item_name": "LABEL 500ML", "uom": "PCS", "sub_group": "", "unit_price": 0.2},
+    ]
+)
+PIECES_FACTORS = {
+    "CAP": {"conversion": "pieces", "pieces_per_uom": 1.0},
+    "PRE": {"conversion": "uom_group", "pieces_per_uom": 100.0},
+    "FILM": {"conversion": "none", "pieces_per_uom": None},
+    "LBL": {"conversion": "pieces", "pieces_per_uom": 1.0},
+}
+PIECES_STOCK = [
+    {"warehouse": "BH-PM", "warehouse_name": "Packaging Materials", "inactive": False,
+     "item_code": "CAP", "stock_qty": 5000, "stock_value": 2500},
+    {"warehouse": "BH-PP", "warehouse_name": "Production Process", "inactive": False,
+     "item_code": "CAP", "stock_qty": 1000, "stock_value": 500},
+    {"warehouse": "BH-PM", "warehouse_name": "Packaging Materials", "inactive": False,
+     "item_code": "PRE", "stock_qty": 20, "stock_value": 3000},
+    {"warehouse": "BH-PM", "warehouse_name": "Packaging Materials", "inactive": False,
+     "item_code": "FILM", "stock_qty": 50, "stock_value": 7000},
+    {"warehouse": "BH-PP", "warehouse_name": "Production Process", "inactive": False,
+     "item_code": "LBL", "stock_qty": 3000, "stock_value": 600},
+]
+
+
+class PiecesBoardTests(SimpleTestCase):
+    def setUp(self):
+        self.board = build_pieces_board(PIECES_STOCK, PIECES_MASTER, PIECES_FACTORS)
+
+    def test_the_total_counts_pieces_and_leaves_kilos_out(self):
+        total = self.board["total"]
+        # 6,000 caps + 20 boxes x 100 preforms + 3,000 labels. The 50 kg of
+        # film is not 50 more pieces.
+        self.assertEqual(total["pcs_qty"], 11000)
+        self.assertEqual(total["item_count"], 4)
+        self.assertEqual(total["converted_item_count"], 3)
+        self.assertEqual(total["unconverted_item_count"], 1)
+        self.assertEqual(total["unconverted_value"], 7000)
+        # Rupees need no conversion, so the value covers the film too.
+        self.assertEqual(total["stock_value"], 13600)
+
+    def test_items_are_one_row_each_across_stores(self):
+        cap = next(i for i in self.board["items"] if i["item_code"] == "CAP")
+        self.assertEqual(cap["pcs_qty"], 6000)
+        self.assertEqual([w["code"] for w in cap["warehouses"]], ["BH-PM", "BH-PP"])
+
+    def test_unconverted_items_come_last_with_null_pieces(self):
+        codes = [i["item_code"] for i in self.board["items"]]
+        self.assertEqual(codes, ["CAP", "LBL", "PRE", "FILM"])
+        film = self.board["items"][-1]
+        self.assertIsNone(film["pcs_qty"])
+        self.assertEqual(film["stock_qty"], 50)
+        self.assertEqual(film["uom"], "KG")
+
+    def test_stores_are_ranked_by_pieces_with_shares(self):
+        stores = {w["code"]: w for w in self.board["warehouses"]}
+        self.assertEqual(stores["BH-PM"]["pcs_qty"], 7000)
+        self.assertEqual(stores["BH-PM"]["unconverted_item_count"], 1)
+        self.assertEqual(stores["BH-PP"]["pcs_qty"], 4000)
+        self.assertEqual(self.board["warehouses"][0]["code"], "BH-PM")
+        self.assertAlmostEqual(stores["BH-PM"]["share_pct"], 63.64)
+
+    def test_an_item_with_no_family_is_still_in_the_family_split(self):
+        families = {f["sub_group"]: f for f in self.board["sub_groups"]}
+        self.assertEqual(families["(no family)"]["pcs_qty"], 3000)
+        self.assertEqual(families["SHRINK"]["unconverted_item_count"], 1)
+        self.assertEqual(families["SHRINK"]["pcs_qty"], 0)
+
+    def test_an_item_missing_from_the_factor_map_is_not_converted(self):
+        board = build_pieces_board(PIECES_STOCK[:1], PIECES_MASTER, {})
+        self.assertIsNone(board["items"][0]["pcs_qty"])
+        self.assertEqual(board["total"]["pcs_qty"], 0)
+
+
+class PiecesServiceTests(SimpleTestCase):
+    def test_get_stock_pieces_wires_the_three_reads_together(self):
+        reader = FakeReader(
+            master=[
+                {"item_code": "PRE", "item_name": "PREFORM", "uom": "BOX", "sub_group": "PREFORM", "unit_price": 1},
+            ],
+            all_stock=[
+                {"warehouse": "BH-PM", "warehouse_name": "PM", "inactive": False,
+                 "item_code": "PRE", "stock_qty": 3, "stock_value": 30},
+            ],
+            uom_items=[{"item_code": "PRE", "uom": "BOX", "ugp_entry": 7, "iuom_entry": 2}],
+            uom_rows=UOM_ROWS,
+        )
+        service = PackingMaterialService(
+            "JIVO_BEVERAGES", reader=reader, app_reader=FakeAppReader()
+        )
+        board = service.get_stock_pieces()
+        self.assertEqual(board["total"]["pcs_qty"], 300)
+        self.assertEqual(board["meta"]["company_code"], "JIVO_BEVERAGES")
+        self.assertTrue(board["meta"]["pm_item_group_matches"])
+        self.assertIn("PCS", board["meta"]["piece_uom_codes"])
+
+    def test_wastage_is_left_out_of_the_board(self):
+        reader = FakeReader(
+            master=[],
+            all_stock=[
+                {"warehouse": "BH-PM", "warehouse_name": "PM", "inactive": False,
+                 "item_code": "CAP", "stock_qty": 10, "stock_value": 5},
+                {"warehouse": "BH-WST", "warehouse_name": "WASTAGE", "inactive": False,
+                 "item_code": "CAP", "stock_qty": 90, "stock_value": 45},
+            ],
+            uom_items=[{"item_code": "CAP", "uom": "PCS", "ugp_entry": -1, "iuom_entry": None}],
+        )
+        board = PackingMaterialService(
+            "JIVO_BEVERAGES", reader=reader, app_reader=FakeAppReader()
+        ).get_stock_pieces()
+        self.assertEqual([w["code"] for w in board["warehouses"]], ["BH-PM"])
+        self.assertEqual(board["total"]["pcs_qty"], 10)
+        self.assertEqual(board["meta"]["excluded_warehouses"], ["BH-WST"])

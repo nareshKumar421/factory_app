@@ -145,6 +145,77 @@ class StockResponseSerializer(serializers.Serializer):
 
 
 # ---------------------------------------------------------------------------
+# Output -- the pieces board
+# ---------------------------------------------------------------------------
+
+
+class PiecesItemWarehouseSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    stock_qty = serializers.FloatField()
+    pcs_qty = serializers.FloatField(allow_null=True)
+    stock_value = serializers.FloatField()
+
+
+class PiecesItemSerializer(serializers.Serializer):
+    item_code = serializers.CharField()
+    item_name = serializers.CharField(allow_blank=True)
+    sub_group = serializers.CharField(allow_blank=True)
+    uom = serializers.CharField(allow_blank=True)
+    # 'pieces', 'uom_group' or 'none'; null pieces only with 'none'.
+    conversion = serializers.CharField()
+    pieces_per_uom = serializers.FloatField(allow_null=True)
+    stock_qty = serializers.FloatField()
+    pcs_qty = serializers.FloatField(allow_null=True)
+    stock_value = serializers.FloatField()
+    warehouses = PiecesItemWarehouseSerializer(many=True)
+
+
+class PiecesWarehouseSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    name = serializers.CharField(allow_blank=True)
+    inactive = serializers.BooleanField()
+    item_count = serializers.IntegerField()
+    unconverted_item_count = serializers.IntegerField()
+    pcs_qty = serializers.FloatField()
+    stock_value = serializers.FloatField()
+    share_pct = serializers.FloatField()
+
+
+class PiecesFamilySerializer(serializers.Serializer):
+    sub_group = serializers.CharField()
+    item_count = serializers.IntegerField()
+    unconverted_item_count = serializers.IntegerField()
+    pcs_qty = serializers.FloatField()
+    stock_value = serializers.FloatField()
+    share_pct = serializers.FloatField()
+
+
+class PiecesTotalSerializer(serializers.Serializer):
+    warehouse_count = serializers.IntegerField()
+    item_count = serializers.IntegerField()
+    converted_item_count = serializers.IntegerField()
+    unconverted_item_count = serializers.IntegerField()
+    pcs_qty = serializers.FloatField()
+    stock_value = serializers.FloatField()
+    unconverted_value = serializers.FloatField()
+
+
+class PiecesMetaSerializer(ItemGroupMetaSerializer):
+    company_code = serializers.CharField()
+    excluded_warehouses = serializers.ListField(child=serializers.CharField())
+    fetched_at = serializers.CharField()
+    piece_uom_codes = serializers.ListField(child=serializers.CharField())
+
+
+class PiecesResponseSerializer(serializers.Serializer):
+    items = PiecesItemSerializer(many=True)
+    warehouses = PiecesWarehouseSerializer(many=True)
+    sub_groups = PiecesFamilySerializer(many=True)
+    total = PiecesTotalSerializer()
+    meta = PiecesMetaSerializer()
+
+
+# ---------------------------------------------------------------------------
 # Output -- the two top lists
 # ---------------------------------------------------------------------------
 

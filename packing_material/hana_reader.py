@@ -886,6 +886,129 @@ LEFT JOIN "{schema}"."OITM" M
         ]
 
     # ------------------------------------------------------------------
+    # 13. The pieces board: every store, and each item's route to pieces
+    # ------------------------------------------------------------------
+
+    def pm_stock_all_warehouses(self) -> List[Dict[str, Any]]:
+        """Packing material on hand in EVERY warehouse that holds any.
+
+        Unlike ``pm_stock_by_warehouse`` there is no warehouse list: the pieces
+        board answers "where is all of it", so the stores are whatever SAP says
+        holds group 105 stock. The warehouse name and active flag come back on
+        the row, so a store nobody configured still arrives labelled, and an
+        inactive one arrives flagged rather than dropped.
+
+        Value is priced the same way as ``pm_stock_by_warehouse``, so the two
+        boards put the same rupee figure on the same pallet.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    W."WhsCode",
+    COALESCE(MAX(H."WhsName"), '')    AS "WhsName",
+    COALESCE(MAX(H."Inactive"), 'N')  AS "Inactive",
+    W."ItemCode",
+    ROUND(COALESCE(SUM(W."OnHand"), 0), 3) AS "OnHand",
+    ROUND(
+        COALESCE(
+            SUM(
+                W."OnHand" * CASE
+                    WHEN COALESCE(W."AvgPrice", 0) <> 0 THEN W."AvgPrice"
+                    WHEN COALESCE(M."AvgPrice", 0) <> 0 THEN M."AvgPrice"
+                    ELSE COALESCE(M."LastPurPrc", 0)
+                END
+            ),
+            0
+        ),
+        2
+    ) AS "StockValue"
+FROM "{schema}"."OITW" W
+INNER JOIN "{schema}"."OITM" M
+    ON M."ItemCode" = W."ItemCode"
+LEFT JOIN "{schema}"."OWHS" H
+    ON H."WhsCode" = W."WhsCode"
+WHERE M."ItmsGrpCod" = {PM_ITEM_GROUP}
+  AND COALESCE(W."OnHand", 0) <> 0
+GROUP BY W."WhsCode", W."ItemCode"
+"""
+        return [
+            {
+                "warehouse": r[0] or "",
+                "warehouse_name": r[1] or "",
+                "inactive": (r[2] or "N") == "Y",
+                "item_code": r[3] or "",
+                "stock_qty": float(r[4] or 0),
+                "stock_value": float(r[5] or 0),
+            }
+            for r in self._execute(query, [])
+        ]
+
+    def pm_uom_items(self) -> List[Dict[str, Any]]:
+        """Each packaging item's inventory unit and the UoM group it sits in.
+
+        ``IUoMEntry`` -- the inventory unit's entry in the group -- is read
+        only where this schema has the column; without it the service matches
+        the group's rows on the ``InvntryUom`` text instead. ``UgpEntry`` of -1
+        is SAP's "Manual": no group, one unit.
+        """
+        schema = self._schema()
+        iuom_entry = 'M."IUoMEntry"' if "IUoMEntry" in self._table_columns("OITM") else "NULL"
+
+        query = f"""
+SELECT
+    M."ItemCode",
+    COALESCE(M."InvntryUom", '') AS "Uom",
+    COALESCE(M."UgpEntry", -1)   AS "UgpEntry",
+    {iuom_entry}                 AS "IUoMEntry"
+FROM "{schema}"."OITM" M
+WHERE M."ItmsGrpCod" = {PM_ITEM_GROUP}
+"""
+        return [
+            {
+                "item_code": r[0] or "",
+                "uom": r[1] or "",
+                "ugp_entry": int(r[2]) if r[2] is not None else -1,
+                "iuom_entry": int(r[3]) if r[3] is not None else None,
+            }
+            for r in self._execute(query, [])
+        ]
+
+    def pm_uom_group_rows(self) -> List[Dict[str, Any]]:
+        """Every unit row of every UoM group a packaging item uses.
+
+        One row per (group, unit): ``AltQty`` of this unit equals ``BaseQty``
+        of the group's base unit. The unit's code comes from ``OUOM`` so the
+        service can find the piece row by name.
+        """
+        schema = self._schema()
+        query = f"""
+SELECT
+    G."UgpEntry",
+    G."UomEntry",
+    COALESCE(U."UomCode", '') AS "UomCode",
+    COALESCE(G."AltQty", 0)   AS "AltQty",
+    COALESCE(G."BaseQty", 0)  AS "BaseQty"
+FROM "{schema}"."UGP1" G
+INNER JOIN "{schema}"."OUOM" U
+    ON U."UomEntry" = G."UomEntry"
+WHERE G."UgpEntry" IN (
+    SELECT DISTINCT M."UgpEntry"
+    FROM "{schema}"."OITM" M
+    WHERE M."ItmsGrpCod" = {PM_ITEM_GROUP}
+)
+"""
+        return [
+            {
+                "ugp_entry": int(r[0]),
+                "uom_entry": int(r[1]),
+                "uom_code": r[2] or "",
+                "alt_qty": float(r[3] or 0),
+                "base_qty": float(r[4] or 0),
+            }
+            for r in self._execute(query, [])
+        ]
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 

@@ -471,3 +471,53 @@ MAX_LISTED_DRIVERS = 8
 # buyer chases supplier by supplier -- on Oil no packing material has had more
 # than a dozen lines open at once, so in practice nothing is cut.
 MAX_LISTED_PO_LINES = 12
+
+# ---------------------------------------------------------------------------
+# The pieces board (Beverages PM Stock)
+# ---------------------------------------------------------------------------
+#
+# The stock cards above add ``OITW.OnHand`` across items, and ``OnHand`` is in
+# each item's INVENTORY unit: caps in pieces, shrink film in kilos, tape in
+# metres. That total is a count of nothing. The pieces board converts every
+# item to pieces first, through the item's own SAP unit-of-measure group, and
+# keeps whatever cannot be converted OUT of the pieces total -- listed on its
+# own in its own unit, rather than guessed at from the item name.
+#
+# The conversion, read off ``UGP1``: a row says ``AltQty`` of that unit equals
+# ``BaseQty`` of the group's base unit. So one inventory unit is
+# ``BaseQty/AltQty`` base units, one piece is the same ratio on the piece row,
+# and pieces per inventory unit is the first ratio over the second. The
+# inventory unit's row is found by ``OITM.IUoMEntry`` where SAP has the column,
+# and by matching ``InvntryUom`` against ``OUOM.UomCode`` where it does not.
+#
+# NOT VERIFIED LIVE. Written on 8 October 2026 while the Beverages HANA login
+# was refusing every read, so which Beverages items carry a UoM group, and what
+# their piece unit is called, is unknown. The response says per item which way
+# it was converted, and the page lists the unconverted ones, so a gap here
+# shows up as a visible list rather than as a quietly short total.
+
+#: Unit codes that ARE a piece. Compared upper-cased with dots and spaces
+#: stripped, so 'Nos.' and 'PCS' both match.
+PIECE_UOM_CODES = frozenset(
+    {"PCS", "PC", "PIECE", "PIECES", "NOS", "NO", "NUMBER", "NUMBERS", "EA", "EACH", "UNIT", "UNITS"}
+)
+
+#: ``OITM.UgpEntry`` for an item with no UoM group ("Manual" in SAP). Such an
+#: item has one unit only, the free-text ``InvntryUom``.
+MANUAL_UOM_GROUP = -1
+
+#: How an item reached its piece count -- the ``conversion`` field.
+CONVERSION_PIECES = "pieces"  # stocked in pieces already
+CONVERSION_UOM_GROUP = "uom_group"  # converted through its SAP UoM group
+CONVERSION_NONE = "none"  # no route to pieces; shown in its own unit
+
+#: Stores the pieces board leaves out entirely -- tiles, totals, families and
+#: export. BH-WST is wastage: packaging already written off as scrap, which is
+#: not stock anybody can use. Removed on the business's instruction, 8 October
+#: 2026. Overridable from ``PACKING_MATERIAL_PIECES_EXCLUDED_WAREHOUSES``.
+DEFAULT_PIECES_EXCLUDED_WAREHOUSES: Sequence[str] = ("BH-WST",)
+
+
+def pieces_excluded_warehouses() -> List[str]:
+    override = getattr(settings, "PACKING_MATERIAL_PIECES_EXCLUDED_WAREHOUSES", None)
+    return _clean(override if override is not None else DEFAULT_PIECES_EXCLUDED_WAREHOUSES)
