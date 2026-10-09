@@ -142,15 +142,79 @@ class _Tally:
         ]
 
 
+class _SkuBook:
+    """The month's cost SKU by SKU.
+
+    A sheet is written for the floor, not for a SKU, so a day's money is
+    split between the SKUs its runs filled by their share of the day's boxes,
+    and each SKU's boxes are that share of the sheet's own boxes — a day that
+    ran one SKU gives it the sheet's figures exactly. A saved day with no runs
+    has no SKU to go to and is kept apart as unassigned.
+    """
+
+    def __init__(self):
+        self.skus = OrderedDict()
+        self.loose_days = []
+        self.loose_cases = ZERO
+        self.loose_total = ZERO
+
+    def add_day(self, on, tally, day_skus):
+        run_cases = sum((Decimal(row['cases']) for row in day_skus), ZERO)
+        if run_cases <= 0:
+            self.loose_days.append(on.isoformat())
+            self.loose_cases += tally.cases
+            self.loose_total += tally.total
+            return
+        for row in day_skus:
+            share = Decimal(row['cases']) / run_cases
+            cases = tally.cases * share
+            total = tally.total * share
+            pieces = row['pieces_per_case']
+            key = (row['product'], pieces, row['litres_per_piece'])
+            sku = self.skus.setdefault(key, {
+                'product': row['product'], 'sku': row['sku'], 'pieces_per_case': pieces,
+                'litres_per_piece': row['litres_per_piece'],
+                'cases': ZERO, 'total': ZERO, 'days': []})
+            sku['cases'] += cases
+            sku['total'] += total
+            sku['days'].append({
+                'date': on.isoformat(),
+                'share': _q(share * 100),
+                'cases': _q(cases),
+                'total': _q(total),
+                'per_case': _per(total, cases),
+                'per_bottle': _per(total, cases * pieces, FOUR) if pieces else None,
+            })
+
+    def rows(self):
+        """Each SKU's month, most boxes first, with the days it ran."""
+        out = []
+        for sku in sorted(self.skus.values(), key=lambda s: -s['cases']):
+            pieces = sku['pieces_per_case']
+            out.append({
+                **sku,
+                'days_run': len(sku['days']),
+                'cases': _q(sku['cases']),
+                'total': _q(sku['total']),
+                'per_case': _per(sku['total'], sku['cases']),
+                'per_bottle': (_per(sku['total'], sku['cases'] * pieces, FOUR)
+                               if pieces else None),
+            })
+        return out
+
+    def unassigned(self):
+        """Saved days whose runs filled nothing, or None when there are none."""
+        if not self.loose_days:
+            return None
+        return {'days': self.loose_days, 'cases': _q(self.loose_cases),
+                'total': _q(self.loose_total)}
+
+
 def _made(company, day, shift=''):
     """``(bottles a case, SKUs)`` of what ``day``'s (``shift``'s) runs filled."""
     made = production(company, day, shift)
     ratio = made.bottles / made.cases if made.cases > 0 and made.bottles > 0 else None
     return ratio, sku_rows(made)
-
-
-def _bottles_a_case(company, day, shift=''):
-    return _made(company, day, shift)[0]
 
 
 def board(company, month, day):
@@ -160,12 +224,14 @@ def board(company, month, day):
 
     month_tally = _Tally()
     days = []
+    sku_book = _SkuBook()
     for on in sorted(by_day):
-        ratio = _bottles_a_case(company, on)
+        ratio, day_skus = _made(company, on)
         tally = _Tally()
         for sheet in by_day[on]:
             tally.add_sheet(sheet, ratio)
         month_tally.add(tally)
+        sku_book.add_day(on, tally, day_skus)
         days.append({'date': on.isoformat(),
                      'kept_by': 'shift' if by_day[on][0].shift else 'day',
                      **tally.figures()})
@@ -223,6 +289,8 @@ def board(company, month, day):
                      'days_entered': len(prev_days)},
         'heads': month_tally.head_rows(),
         'days': days,
+        'skus': sku_book.rows(),
+        'unassigned': sku_book.unassigned(),
         'day': day_block,
         'selected_day': day.isoformat(),
     }

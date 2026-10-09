@@ -112,6 +112,25 @@ class FillingCostBoardTests(APITestCase):
         self.assertEqual(self._board()['previous'],
                          {'month': '2026-08', 'per_case': '2.50', 'days_entered': 1})
 
+    def test_each_sku_gets_its_share_of_the_days_it_ran(self):
+        data = self._board()
+        skus = {s['pieces_per_case']: s for s in data['skus']}
+        # 24 a case ran on the 27th (the whole day) and by day on the 28th,
+        # which it takes 3,000 of 8,655 boxes of: 11,655 x 3,000 / 8,655.
+        bottles_24 = skus[24]
+        self.assertEqual(bottles_24['days_run'], 2)
+        self.assertEqual((bottles_24['cases'], bottles_24['total'], bottles_24['per_case']),
+                         ('4000.00', '5039.86', '1.26'))
+        self.assertEqual(bottles_24['per_bottle'], '0.0525')
+        self.assertEqual([(d['date'], d['total'], d['per_case']) for d in bottles_24['days']],
+                         [('2026-09-27', '1000.00', '1.00'), ('2026-09-28', '4039.86', '1.35')])
+        bottles_12 = skus[12]
+        self.assertEqual((bottles_12['days_run'], bottles_12['cases'], bottles_12['total']),
+                         (1, '5655.00', '7615.14'))
+        # The 26th was saved but nothing ran: its money belongs to no SKU.
+        self.assertEqual(data['unassigned'],
+                         {'days': ['2026-09-26'], 'cases': '10.00', 'total': '10.00'})
+
     # -- the day -------------------------------------------------------------------
 
     def test_the_day_shows_every_head_and_each_shift(self):
