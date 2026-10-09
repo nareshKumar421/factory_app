@@ -12,3 +12,10 @@ class CanCreateAPInvoiceDraft(BasePermission):
 
     def has_permission(self, request, view):
         return request.user.has_perm('ap_invoice_draft.can_create_ap_invoice_draft')
+
+
+class CanReviewAPInvoiceDraft(BasePermission):
+    """Marking a check OK or Not OK overrides what the app found."""
+
+    def has_permission(self, request, view):
+        return request.user.has_perm('ap_invoice_draft.can_review_ap_invoice_draft')

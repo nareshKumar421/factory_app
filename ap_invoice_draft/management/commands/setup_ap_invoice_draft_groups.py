@@ -6,8 +6,10 @@ Usage::
     python manage.py setup_ap_invoice_draft_groups           # create / update groups
     python manage.py setup_ap_invoice_draft_groups --list    # show what each group holds
 
-The store makes the entries, and with them the SAP drafts. Everybody else who
-needs to see where a bill stands gets the viewer group.
+The store makes the entries (and with them the SAP drafts); whoever audits the
+bills marks the checks the app cannot settle by itself -- a signature, a QC
+record kept on paper. Everybody else who needs to see where a bill stands gets
+the viewer group.
 """
 
 from django.contrib.auth.models import Group, Permission
@@ -17,6 +19,10 @@ AP_INVOICE_DRAFT_GROUPS = {
     "AP Invoice Draft Maker": [
         "ap_invoice_draft.can_view_ap_invoice_draft",
         "ap_invoice_draft.can_create_ap_invoice_draft",
+    ],
+    "AP Invoice Draft Auditor": [
+        "ap_invoice_draft.can_view_ap_invoice_draft",
+        "ap_invoice_draft.can_review_ap_invoice_draft",
     ],
     "AP Invoice Draft Viewer": [
         "ap_invoice_draft.can_view_ap_invoice_draft",

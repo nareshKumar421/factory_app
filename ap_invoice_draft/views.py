@@ -12,11 +12,17 @@ from gate_core.services.user_scope import user_company_ids, wants_all_companies
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .models import APInvoiceDraft
-from .permissions import CanCreateAPInvoiceDraft, CanViewAPInvoiceDraft
+from .permissions import (
+    CanCreateAPInvoiceDraft,
+    CanReviewAPInvoiceDraft,
+    CanViewAPInvoiceDraft,
+)
 from .serializers import (
+    APInvoiceDraftCheckSerializer,
     APInvoiceDraftCreateSerializer,
     APInvoiceDraftDetailSerializer,
     APInvoiceDraftListSerializer,
+    CheckReviewSerializer,
     OpenGRPOSerializer,
 )
 from .services import APInvoiceDraftService
@@ -38,7 +44,8 @@ def _entry(request, pk) -> APInvoiceDraft:
         APInvoiceDraft.objects.filter(
             pk=pk, company_id__in=user_company_ids(request), is_active=True,
         )
-        .select_related("company", "created_by")
+        .select_related("company", "created_by", "grpo_posting__vehicle_entry")
+        .prefetch_related("checks__reviewed_by")
         .first()
     )
     if entry is None:
@@ -47,7 +54,7 @@ def _entry(request, pk) -> APInvoiceDraft:
 
 
 def _detail(request, entry, code=status.HTTP_200_OK):
-    entry = _entry(request, entry.pk)  # fresh
+    entry = _entry(request, entry.pk)  # fresh, with its checks
     return Response(
         APInvoiceDraftDetailSerializer(entry, context={"request": request}).data, status=code,
     )
@@ -115,6 +122,20 @@ class APInvoiceDraftDetailAPI(APIView):
         return _detail(request, _entry(request, pk))
 
 
+class APInvoiceDraftReadInvoiceAPI(APIView):
+    """Read the bill again (OCR, on this server) and re-run the checks."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateAPInvoiceDraft]
+
+    def post(self, request, pk):
+        entry = _entry(request, pk)
+        try:
+            APInvoiceDraftService(entry.company).read_invoice(entry)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return _detail(request, entry)
+
+
 class APInvoiceDraftSendToSapAPI(APIView):
     """Try the SAP draft again; links the one SAP has if it made it after all."""
 
@@ -122,5 +143,44 @@ class APInvoiceDraftSendToSapAPI(APIView):
 
     def post(self, request, pk):
         entry = _entry(request, pk)
-        APInvoiceDraftService(entry.company).send_to_sap(entry, request.user)
+        service = APInvoiceDraftService(entry.company)
+        service.send_to_sap(entry, request.user)
+        service.run_checks(entry)
         return _detail(request, entry)
+
+
+class APInvoiceDraftRecheckAPI(APIView):
+    """Re-run the checks against SAP as it stands now."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewAPInvoiceDraft]
+
+    def post(self, request, pk):
+        entry = _entry(request, pk)
+        APInvoiceDraftService(entry.company).run_checks(entry)
+        return _detail(request, entry)
+
+
+class APInvoiceDraftCheckReviewAPI(APIView):
+    """A person's OK / Not OK on one check; a blank decision clears it."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanReviewAPInvoiceDraft]
+
+    def post(self, request, pk, key):
+        entry = _entry(request, pk)
+        serializer = CheckReviewSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"detail": "Invalid data.", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            check = APInvoiceDraftService(entry.company).review_check(
+                entry,
+                key,
+                serializer.validated_data["decision"],
+                serializer.validated_data.get("remark", ""),
+                request.user,
+            )
+        except ValueError as exc:
+            return _bad_request(exc)
+        return Response(APInvoiceDraftCheckSerializer(check).data)

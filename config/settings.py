@@ -191,7 +191,8 @@ INSTALLED_APPS = [
     'short_dispatch',
     'invoice_approval',
     'ar_invoice',
-    # A vendor's bill put into SAP as an A/P invoice draft against its GRPO.
+    # A vendor's bill put into SAP as an A/P invoice draft against its GRPO,
+    # with the audit checklist that says whether it is fit to pay.
     'ap_invoice_draft',
     'document_control',
     # The label and carton artwork register: what is printed on every

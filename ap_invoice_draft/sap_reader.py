@@ -1,5 +1,5 @@
-"""HANA reads behind A/P invoice drafts: open GRPOs, one GRPO with its lines,
-the A/P drafts SAP already holds for a GRPO, and the series a draft goes into.
+"""HANA reads behind A/P invoice drafts: open GRPOs, one GRPO with its PO lines,
+and the A/P drafts SAP already holds for a GRPO.
 
 A GRPO is "open" while it has lines not yet copied to an A/P invoice; once
 accounts adds the invoice SAP closes it, which is what takes it off the picker.
@@ -54,9 +54,9 @@ SELECT DISTINCT L."BaseEntry", D."DocEntry", D."DocNum", D."CreateDate"
 """
 
 _GRPO_HEADER_SQL = """
-SELECT H."DocEntry", H."DocNum", H."DocDate", H."TaxDate",
-       H."CardCode", H."CardName", H."NumAtCard", H."DocTotal",
-       H."BPLId", H."DocStatus", H."CANCELED", H."DocType", H."GSTTranTyp"
+SELECT H."DocEntry", H."DocNum", H."DocDate", H."TaxDate", H."CreateDate", H."DocTime",
+       H."CardCode", H."CardName", H."NumAtCard", H."DocTotal", H."VatSum",
+       H."BPLId", H."Comments", H."DocStatus", H."CANCELED", H."DocType", H."GSTTranTyp"
   FROM "{schema}"."OPDN" H
  WHERE H."DocEntry" = ?
 """
@@ -76,9 +76,19 @@ SELECT S."Series", S."SeriesName", DAYS_BETWEEN(P."F_RefDate", P."T_RefDate") AS
  ORDER BY "Span", S."Series"
 """
 
+# Each GRPO line beside the PO line it was copied from. ``BaseOpnQty`` is what
+# was still open on that PO line when the GRPO took it -- the quantity SAP's own
+# 110% rule (SBO_SP_TransactionNotification, error 200017) is measured against.
 _GRPO_LINES_SQL = """
-SELECT L."LineNum", L."ItemCode", L."Dscription", L."Quantity", L."Price", L."WhsCode", L."LineStatus"
+SELECT L."LineNum", L."ItemCode", L."Dscription", L."Quantity", L."Price", L."LineTotal",
+       L."WhsCode", L."TaxCode", L."VatPrcnt", L."VatSum", L."LineStatus",
+       L."BaseType", L."BaseEntry", L."BaseLine", L."BaseOpnQty",
+       P."DocNum" AS "PoDocNum", PL."Price" AS "PoPrice", PL."Quantity" AS "PoQuantity",
+       PL."TaxCode" AS "PoTaxCode", PL."VatPrcnt" AS "PoVatPrcnt"
   FROM "{schema}"."PDN1" L
+  LEFT JOIN "{schema}"."POR1" PL
+         ON L."BaseType" = 22 AND PL."DocEntry" = L."BaseEntry" AND PL."LineNum" = L."BaseLine"
+  LEFT JOIN "{schema}"."OPOR" P ON P."DocEntry" = PL."DocEntry"
  WHERE L."DocEntry" = ?
  ORDER BY L."LineNum"
 """
@@ -178,7 +188,7 @@ class GRPOReader:
         return (int(rows[0]["Series"]), _text(rows[0]["SeriesName"])) if rows else None
 
     def grpo(self, doc_entry: int):
-        """One GRPO with its lines, or ``None``."""
+        """One GRPO with every line beside its PO line, or ``None``."""
         header = self._rows(_GRPO_HEADER_SQL, [int(doc_entry)], what="GRPO")
         if not header:
             return None
@@ -189,11 +199,15 @@ class GRPOReader:
             "doc_num": str(h["DocNum"]),
             "doc_date": _day(h["DocDate"]),
             "tax_date": _day(h["TaxDate"]),
+            # When the GRPO was actually made: DocDate can be typed backwards.
+            "created_on": _day(h["CreateDate"]),
             "reference": _text(h["NumAtCard"]),
             "vendor_code": _text(h["CardCode"]),
             "vendor_name": _text(h["CardName"]),
             "total": _dec(h["DocTotal"]),
+            "tax_total": _dec(h["VatSum"]),
             "branch_id": int(h["BPLId"]) if h["BPLId"] is not None else None,
+            "comments": _text(h["Comments"]),
             "is_open": h["DocStatus"] == "O",
             "is_cancelled": h["CANCELED"] != "N",
             "is_service": h["DocType"] == "S",
@@ -205,8 +219,21 @@ class GRPOReader:
                     "description": _text(r["Dscription"]),
                     "quantity": _dec(r["Quantity"]),
                     "price": _dec(r["Price"]),
+                    "line_total": _dec(r["LineTotal"]),
                     "warehouse": _text(r["WhsCode"]),
+                    "tax_code": _text(r["TaxCode"]),
+                    "tax_rate": _dec(r["VatPrcnt"]),
+                    "tax_amount": _dec(r["VatSum"]),
                     "is_open": r["LineStatus"] == "O",
+                    "from_po": r["BaseType"] == 22,
+                    "po_doc_entry": int(r["BaseEntry"]) if r["BaseType"] == 22 else None,
+                    "po_line": int(r["BaseLine"]) if r["BaseType"] == 22 else None,
+                    "po_num": str(r["PoDocNum"]) if r["PoDocNum"] is not None else "",
+                    "po_open_qty": _dec(r["BaseOpnQty"]) if r["BaseType"] == 22 else None,
+                    "po_price": _dec(r["PoPrice"]) if r["PoPrice"] is not None else None,
+                    "po_quantity": _dec(r["PoQuantity"]) if r["PoQuantity"] is not None else None,
+                    "po_tax_code": _text(r["PoTaxCode"]),
+                    "po_tax_rate": _dec(r["PoVatPrcnt"]) if r["PoVatPrcnt"] is not None else None,
                 }
                 for r in lines
             ],
