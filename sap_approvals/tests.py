@@ -19,6 +19,7 @@ right. SAP is mocked where the views look ``SAPClient`` up. What is pinned:
 """
 
 import logging
+from datetime import date
 from io import StringIO
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.core.management import call_command
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -42,7 +44,6 @@ ALL_PERMISSIONS = [
     "can_view_sap_approval_inbox",
     "can_decide_sap_approvals",
     "can_withdraw_own_sap_approvals",
-    "can_view_sap_rejection_history",
 ]
 TYPED = "Typed-S3cret!pw"
 
@@ -620,6 +621,9 @@ def _rejection(**overrides):
         "total_amount": "2052.00",
         "gl_account": "5680022",
         "gl_account_name": "COMPUTER AND HARDWARE",
+        "raised_on": "2026-10-07",
+        "reference": "HF2707I007629873",
+        "now": {"stage": "POSTED", "via": "reference", "doc_num": 726093200, "posted": True},
     }
     row.update(overrides)
     return row
@@ -635,7 +639,7 @@ class RejectionHistoryTests(SapApprovalsTestCase):
     def test_the_window_defaults_to_this_month_and_filters_pass_through(self, sap):
         sap.return_value.list_approval_rejections.return_value = []
         with patch("sap_approvals.views.timezone.localdate") as today:
-            today.return_value = __import__("datetime").date(2026, 10, 9)
+            today.return_value = date(2026, 10, 9)
             response = self._get()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual((response.data["date_from"], response.data["date_to"]),
@@ -656,7 +660,6 @@ class RejectionHistoryTests(SapApprovalsTestCase):
             company=self.company, wdd_code=77046, action="REJECT", category="IMPREST",
             created_by=self.user,
         )
-        # An older pick for the same request, and an approval, are not the category.
         SapApprovalDecision.objects.create(
             company=self.company, wdd_code=77046, action="APPROVE", created_by=self.user,
         )
@@ -673,6 +676,26 @@ class RejectionHistoryTests(SapApprovalsTestCase):
             [("Imprest", "app"), ("FREIGHT AND CARTAGE", "gl"), ("Outgoing Payment", "document")],
         )
 
+    def test_a_rejection_later_approved_still_counts(self, sap):
+        """SAP keeps only the latest decision; this app's record brings it back."""
+        decision = SapApprovalDecision.objects.create(
+            company=self.company, wdd_code=500, action="REJECT", category="FUEL",
+            signed_as="USER03", remarks="Budget", created_by=self.user,
+        )
+        sap.return_value.list_approval_rejections.return_value = [
+            _rejection(wdd_code=500, rejected_at=None, rejected_by=None, remarks=None,
+                       now={"stage": "APPROVED", "via": "same_request", "doc_num": None,
+                            "posted": False}),
+        ]
+        row = self._get().data["results"][0]
+        self.assertEqual(sap.return_value.list_approval_rejections.call_args.kwargs["also_codes"], [500])
+        self.assertEqual((row["rejected_by"], row["reason"], row["category_label"]),
+                         ("USER03", "Budget", "Fuel"))
+        self.assertEqual(
+            row["rejected_at"], timezone.localtime(decision.created_at).strftime("%Y-%m-%dT%H:%M:00")
+        )
+        self.assertEqual(row["now"]["stage"], "APPROVED")
+
     def test_the_reason_is_shown_as_it_was_typed(self, sap):
         sap.return_value.list_approval_rejections.return_value = [
             _rejection(remarks="GL — Bhawani (Factory app)"),
@@ -685,24 +708,61 @@ class RejectionHistoryTests(SapApprovalsTestCase):
             ["GL", "Rate — not GST", "", "Typed in the SAP client"],
         )
 
-    def test_originators_are_ranked_by_how_many_rejections_they_had(self, sap):
+    def test_originators_are_ranked_and_their_uncorrected_ones_counted(self, sap):
+        still = {"stage": "STILL_REJECTED", "via": None, "doc_num": None, "posted": False}
         sap.return_value.list_approval_rejections.return_value = [
             _rejection(originator_code="USER08", originator_name="DIVJOT", total_amount="57.00"),
-            _rejection(originator_code="USER39", total_amount="2052.00"),
+            _rejection(originator_code="USER39", total_amount="2052.00", now=still),
             _rejection(originator_code="USER39", total_amount="7000.00"),
             _rejection(originator_code="USER07", originator_name="HARSH", total_amount="1161061.00"),
         ]
         ranked = self._get().data["by_originator"]
         self.assertEqual(
-            [(g["originator_code"], g["count"], g["amount"]) for g in ranked],
-            [("USER39", 2, "9052.00"), ("USER07", 1, "1161061.00"), ("USER08", 1, "57.00")],
+            [(g["originator_code"], g["count"], g["still_rejected"], g["amount"]) for g in ranked],
+            [("USER39", 2, 1, "9052.00"), ("USER07", 1, 0, "1161061.00"),
+             ("USER08", 1, 0, "57.00")],
         )
 
-    def test_only_the_history_right_opens_it(self, sap):
+    def test_all_companies_reads_each_company_the_user_belongs_to(self, sap):
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        UserCompany.objects.create(user=self.user, company=mart, role=self.role)
+        # A company with no SAP database is not asked.
+        other = Company.objects.create(name="Jivo Wellness", code="JIVO_WELLNESS")
+        UserCompany.objects.create(user=self.user, company=other, role=self.role)
+        sap.return_value.list_approval_rejections.side_effect = [
+            [_rejection(wdd_code=1, rejected_at="2026-10-08T10:00:00")],
+            [_rejection(wdd_code=2, rejected_at="2026-10-08T11:00:00")],
+        ]
+        data = self._get(all_companies="true").data
+        self.assertEqual([c["code"] for c in data["companies"]], ["JIVO_MART", "JIVO_OIL"])
+        self.assertEqual(
+            [(r["wdd_code"], r["company_code"]) for r in data["results"]],
+            [(2, "JIVO_OIL"), (1, "JIVO_MART")],
+        )
+        self.assertEqual(
+            [call.kwargs["company_code"] for call in sap.call_args_list],
+            ["JIVO_MART", "JIVO_OIL"],
+        )
+
+    def test_a_company_sap_cannot_answer_for_is_named_not_dropped(self, sap):
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        UserCompany.objects.create(user=self.user, company=mart, role=self.role)
+        sap.return_value.list_approval_rejections.side_effect = [
+            SAPConnectionError("down"), [_rejection()],
+        ]
+        data = self._get(all_companies="true").data
+        self.assertEqual(data["unavailable"], [{"code": "JIVO_MART", "name": "Jivo Mart"}])
+        self.assertEqual(data["count"], 1)
+
+        sap.return_value.list_approval_rejections.side_effect = SAPConnectionError("down")
+        self.assertEqual(self._get().status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    def test_anyone_who_can_open_the_inbox_can_open_it(self, sap):
         sap.return_value.list_approval_rejections.return_value = []
-        self.revoke("can_view_sap_rejection_history")
+        self.revoke("can_decide_sap_approvals", "can_withdraw_own_sap_approvals")
+        self.assertEqual(self._get().status_code, status.HTTP_200_OK)
+        self.revoke("can_view_sap_approval_inbox")
         self.assertEqual(self._get().status_code, status.HTTP_403_FORBIDDEN)
-        sap.return_value.list_approval_rejections.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1092,7 +1152,6 @@ class GroupCommandTests(TestCase):
         granted = {code for codes in SAP_APPROVALS_GROUPS.values() for code in codes}
         checked = {
             guards.VIEW_PERMISSION, guards.DECIDE_PERMISSION, guards.WITHDRAW_PERMISSION,
-            guards.HISTORY_PERMISSION,
         }
         self.assertEqual(checked - granted, set())
 

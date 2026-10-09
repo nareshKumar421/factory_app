@@ -73,7 +73,6 @@ class SapApprovalDecision(BaseModel):
             ("can_view_sap_approval_inbox", "Can view the SAP approvals inbox"),
             ("can_decide_sap_approvals", "Can approve or reject SAP approval requests"),
             ("can_withdraw_own_sap_approvals", "Can withdraw SAP approval requests they raised"),
-            ("can_view_sap_rejection_history", "Can view every SAP rejection and who raised it"),
         ]
 
     def __str__(self):

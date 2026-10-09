@@ -48,8 +48,10 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from company.models import UserCompany
 from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
+from sap_client.registry import COMPANY_SAP_REGISTRY
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 from sap_client.hana.approval_inbox_reader import (
     OBJECT_TYPE_LABELS,
@@ -67,7 +69,6 @@ from .permissions import (
     WITHDRAW_PERMISSION,
     CanDecideSapApprovals,
     CanViewSapApprovalInbox,
-    CanViewSapRejectionHistory,
     CanWithdrawOwnSapApprovals,
 )
 from .serializers import (
@@ -701,17 +702,23 @@ def typed_reason(remarks: str | None) -> str:
 
 
 class RejectionHistoryAPI(_InboxView):
-    """GET ?date_from&date_to&originator — every rejection in the company over a
-    window (default: this month to date), newest first, and per originator how
-    many they had and what they were worth.
+    """GET ?date_from&date_to&originator&all_companies — every entry rejected in
+    the window (default: this month to date), newest first, where each stands
+    now, and per originator how many they had and what they were worth.
 
     Read from SAP, so rejections taken in the SAP client count as well as ones
-    taken here. The category is the one picked in this app when it was
-    rejected; for a rejection taken anywhere else it is the GL account's name
+    taken here. A rejection this app recorded counts even after it was changed
+    to approved — SAP itself keeps only the latest decision. The category is
+    the one picked here when it was rejected; otherwise the GL account's name,
     and ``category_source`` says ``"gl"``.
+
+    Anyone who can open the inbox can open this: the desk wants every user to
+    see what comes back and why. ``all_companies`` reads every SAP company the
+    caller belongs to; a company SAP cannot answer for is named in
+    ``unavailable`` rather than silently left out.
     """
 
-    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewSapRejectionHistory]
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewSapApprovalInbox]
 
     def get(self, request):
         filters = RejectionFilterSerializer(data=request.query_params)
@@ -721,12 +728,60 @@ class RejectionHistoryAPI(_InboxView):
         date_to = data["date_to"] or today
         date_from = data["date_from"] or date_to.replace(day=1)
 
-        rows = self.client().list_approval_rejections(
-            date_from=date_from, date_to=date_to, originator_code=data["originator"]
+        companies = self._companies(data["all_companies"])
+        rows, unavailable, truncated = [], [], False
+        for company in companies:
+            try:
+                found = self._company_rows(company, date_from, date_to, data["originator"])
+            except (SAPConnectionError, SAPDataError) as exc:
+                if not data["all_companies"]:
+                    raise
+                logger.warning("Rejection history: %s skipped: %s", company.code, exc)
+                unavailable.append({"code": company.code, "name": company.name})
+                continue
+            truncated = truncated or len(found) >= REJECTIONS_LIMIT
+            rows.extend(found)
+        rows.sort(key=lambda r: (r["rejected_at"] or "", r["wdd_code"]), reverse=True)
+
+        return Response({
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "companies": [{"code": c.code, "name": c.name} for c in companies],
+            "unavailable": unavailable,
+            "results": rows,
+            "count": len(rows),
+            "truncated": truncated,
+            "by_originator": self._by_originator(rows),
+            "categories": [{"value": v, "label": l} for v, l in RejectionCategory.choices],
+        })
+
+    def _companies(self, all_companies: bool) -> list:
+        """The header's company, or every SAP company the caller is a member of."""
+        if not all_companies:
+            return [self.company]
+        memberships = (
+            UserCompany.objects.filter(user=self.request.user, is_active=True)
+            .select_related("company")
+            .order_by("company__name")
         )
-        categories = self._categories([row["wdd_code"] for row in rows])
+        return [m.company for m in memberships if m.company.code in COMPANY_SAP_REGISTRY]
+
+    def _company_rows(self, company, date_from, date_to, originator: str) -> list[dict]:
+        decisions = self._app_rejections(company, date_from, date_to)
+        rows = SAPClient(company_code=company.code).list_approval_rejections(
+            date_from=date_from,
+            date_to=date_to,
+            originator_code=originator,
+            also_codes=list(decisions),
+        )
         for row in rows:
-            picked = categories.get(row["wdd_code"])
+            decision = decisions.get(row["wdd_code"])
+            if row["rejected_at"] is None and decision is not None:
+                # SAP no longer holds this rejection: it was changed to approved.
+                row["rejected_at"] = timezone.localtime(decision.created_at).strftime("%Y-%m-%dT%H:%M:00")
+                row["rejected_by"] = decision.signed_as or None
+                row["remarks"] = decision.remarks or None
+            picked = decision.category if decision is not None else ""
             if picked:
                 row["category"] = picked
                 row["category_label"] = RejectionCategory(picked).label
@@ -736,46 +791,42 @@ class RejectionHistoryAPI(_InboxView):
                 row["category_label"] = row["gl_account_name"] or row["object_type_label"]
                 row["category_source"] = "gl" if row["gl_account_name"] else "document"
             row["reason"] = typed_reason(row["remarks"])
+            row["company_code"] = company.code
+            row["company_name"] = company.name
+        return rows
 
-        return Response({
-            "date_from": date_from.isoformat(),
-            "date_to": date_to.isoformat(),
-            "results": rows,
-            "count": len(rows),
-            "truncated": len(rows) >= REJECTIONS_LIMIT,
-            "by_originator": self._by_originator(rows),
-            "categories": [{"value": v, "label": l} for v, l in RejectionCategory.choices],
-        })
-
-    def _categories(self, wdd_codes: list[int]) -> dict[int, str]:
-        """The latest category picked here for each request, if any."""
-        if not wdd_codes:
-            return {}
+    @staticmethod
+    def _app_rejections(company, date_from, date_to) -> dict:
+        """The latest reject this app recorded per request in the window."""
         found = (
             SapApprovalDecision.objects.filter(
-                company=self.company,
-                wdd_code__in=wdd_codes,
+                company=company,
                 action=DecisionAction.REJECT,
+                created_at__date__gte=date_from,
+                created_at__date__lte=date_to,
             )
-            .exclude(category="")
             .order_by("wdd_code", "-created_at", "-id")
-            .values_list("wdd_code", "category")
         )
-        out: dict[int, str] = {}
-        for wdd_code, category in found:
-            out.setdefault(wdd_code, category)
+        out: dict = {}
+        for decision in found:
+            out.setdefault(decision.wdd_code, decision)
         return out
 
     @staticmethod
     def _by_originator(rows: list[dict]) -> list[dict]:
-        """Most rejections first; the amount breaks a tie."""
-        groups: dict[str, dict] = defaultdict(lambda: {"count": 0, "amount": Decimal(0)})
+        """Most rejections first; the amount breaks a tie. ``still_rejected``
+        counts the ones nobody has corrected yet."""
+        groups: dict[str, dict] = defaultdict(
+            lambda: {"count": 0, "still_rejected": 0, "amount": Decimal(0)}
+        )
         for row in rows:
             code = row["originator_code"] or ""
             group = groups[code]
             group["originator_code"] = code or None
             group["originator_name"] = row["originator_name"]
             group["count"] += 1
+            if (row.get("now") or {}).get("stage") == "STILL_REJECTED":
+                group["still_rejected"] += 1
             group["amount"] += Decimal(row["total_amount"] or 0)
         ranked = sorted(groups.values(), key=lambda g: (-g["count"], -g["amount"]))
         return [{**g, "amount": f"{g['amount']:.2f}"} for g in ranked]

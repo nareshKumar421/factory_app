@@ -65,6 +65,7 @@ the list. On :meth:`HanaApprovalInboxReader.current_stage` — which gates the
 approve button's write — the duplicate read raises instead.
 """
 
+import datetime as _dt
 import logging
 from contextlib import contextmanager
 from decimal import Decimal
@@ -126,6 +127,12 @@ TWIN_DRAFT_TYPES = ("14", "19")
 SCOPES = ("waiting_on_me", "raised_by_me", "all")
 # The rejection history's ceiling: a month of the busiest company is ~300.
 REJECTIONS_LIMIT = 2000
+# How many values one IN (...) list binds.
+_IN_CHUNK = 500
+# A correction keyed without the vendor's reference is matched on party and
+# amount instead — but only this soon after: rent and salaries repeat the same
+# amount every month, and next month's bill is not this one's correction.
+CORRECTION_BY_AMOUNT_DAYS = 15
 STATUSES = tuple(rule.APP_FILTER_TO_OWDD)
 
 _STAGE_STATUS = {"W": "PENDING", "Y": "APPROVED", "N": "REJECTED"}
@@ -167,6 +174,83 @@ def inbox_status(owdd_status, is_draft, draft_status, superseded: bool) -> str:
     if superseded and owdd_status == "W" and rule.is_draft_flag(is_draft):
         return "C"
     return rule.effective_status(owdd_status, is_draft, draft_status)
+
+
+def _day(value):
+    """A HANA date or an ISO string, as a ``date``."""
+    if value is None:
+        return None
+    if hasattr(value, "year"):
+        return value if not hasattr(value, "date") else value.date()
+    return _dt.date.fromisoformat(str(value)[:10])
+
+
+# What a correction's draft says, in the history's words.
+_DRAFT_NOW = {"W": "PENDING", "Y": "APPROVED", "N": "REJECTED_AGAIN", "P": "POSTED", "A": "POSTED"}
+
+
+def entry_now(row: dict, *, own_status, drafts: list, posted: list) -> dict:
+    """Where a rejected entry stands now.
+
+    First its own draft: if SAP took it forward (resubmitted, approved after a
+    changed decision, posted), that is the answer. Otherwise the correction
+    keyed as a new document: a later draft or posted document of the same type
+    for the same party, carrying the same vendor reference — or, without one,
+    the same amount within :data:`CORRECTION_BY_AMOUNT_DAYS`. A posted copy
+    beats a draft; the newest draft beats an older one.
+
+    ``stage`` is one of STILL_REJECTED, PENDING, APPROVED, POSTED,
+    REJECTED_AGAIN or CLOSED (closed and never keyed again); ``via`` says how it
+    was found: ``same_request``, ``reference``, ``amount`` or None.
+    """
+    def answer(stage, via=None, doc_num=None, posted_doc=False):
+        return {"stage": stage, "via": via, "doc_num": doc_num, "posted": posted_doc}
+
+    if own_status in ("W", "Y", "P", "A"):
+        return answer({"W": "PENDING", "Y": "APPROVED"}.get(own_status, "POSTED"), "same_request")
+
+    draft_entry = row.get("draft_entry")
+    raised = _day(row.get("raised_on"))
+    ref = (row.get("reference") or "").strip()
+    total = Decimal(row["total_amount"]) if row.get("total_amount") else None
+
+    def matches(doc) -> str | None:
+        created = _day(doc.get("CreateDate"))
+        if raised is None or created is None or created < raised:
+            return None
+        if ref and _clean(doc.get("NumAtCard")) == ref:
+            return "reference"
+        if (
+            total is not None and doc.get("DocTotal") is not None
+            and Decimal(str(doc["DocTotal"])) == total
+            and (created - raised).days <= CORRECTION_BY_AMOUNT_DAYS
+        ):
+            return "amount"
+        return None
+
+    best = None  # (by reference first, posted first, newest)
+    for doc in posted:
+        if draft_entry is not None and _int(doc.get("draftKey")) == draft_entry:
+            continue
+        via = matches(doc)
+        if via:
+            rank = (via == "reference", True, int(doc["DocEntry"]))
+            if best is None or rank > best[0]:
+                best = (rank, answer("POSTED", via, _int(doc.get("DocNum")), True))
+    for doc in drafts:
+        if draft_entry is not None and int(doc["DocEntry"]) == draft_entry:
+            continue
+        stage = _DRAFT_NOW.get(_clean(doc.get("WddStatus")))
+        via = matches(doc) if stage else None
+        if via:
+            rank = (via == "reference", stage == "POSTED", int(doc["DocEntry"]))
+            if best is None or rank > best[0]:
+                best = (rank, answer(stage, via, _int(doc.get("DocNum"))))
+    if best:
+        return best[1]
+    # Not taken forward and not keyed again: still rejected, or its draft was
+    # closed (or deleted) without a replacement.
+    return answer("STILL_REJECTED" if own_status == "N" else "CLOSED")
 
 
 def stale_message(stage: dict) -> str:
@@ -495,72 +579,115 @@ class HanaApprovalInboxReader:
     # ------------------------------------------------------------------
 
     def list_rejections(
-        self, *, date_from, date_to, originator_code: str = "", limit: int = REJECTIONS_LIMIT
+        self,
+        *,
+        date_from,
+        date_to,
+        originator_code: str = "",
+        also_codes=(),
+        limit: int = REJECTIONS_LIMIT,
     ) -> list[dict]:
-        """Every request rejected in the window, company-wide, newest first.
+        """Every request rejected in the window, company-wide, newest first,
+        each with where its entry stands now (``now``).
 
         A rejection is a ``WDD1`` line SAP holds at ``'N'``, dated by that
         line's ``UpdateDate`` — so it counts whether it was rejected from this
-        app or in the SAP client, and a request rejected, edited and rejected
-        again counts twice (SAP opens a new request for the edit). One row per
-        request: a stage with two authorizers who both rejected is still one
-        rejected entry, shown as the later of the two.
+        app or in the SAP client. One row per request: a stage with two
+        authorizers who both rejected is still one rejected entry.
 
-        A rejection later changed to approved is gone from here: SAP keeps only
-        the latest decision on a line.
+        SAP keeps only the latest decision on a line, so a rejection later
+        changed to approved is no longer an ``'N'`` there. ``also_codes`` are
+        requests this app rejected that the caller wants back regardless; they
+        come back with ``rejected_at``/``rejected_by``/``remarks`` empty for the
+        caller to fill from its own record. Codes already found are skipped.
 
         ``gl_account`` is the draft's first line's account, the fallback for a
         rejection that has no category recorded in this app. Payment drafts
         have none.
         """
         limit = max(1, min(int(limit), REJECTIONS_LIMIT))
-        params = [date_from, date_to]
-        owner_clause = ""
+        owner_clause, owner_params = "", []
         if originator_code:
             owner_clause = 'AND UPPER(O."USER_CODE") = ?'
-            params.append(_clean(originator_code).upper())
+            owner_params = [_clean(originator_code).upper()]
         with self._session() as session:
             found = session.rows(
-                f"""
-                SELECT x.*, A."AcctName" AS "AcctName"
-                FROM (
-                    SELECT W."WddCode" AS "WddCode", W."ObjType" AS "ObjType",
-                           W."DraftEntry" AS "DraftEntry",
-                           R."UpdateDate" AS "RejectedDate", R."UpdateTime" AS "RejectedTime",
-                           R."Remarks" AS "Remarks",
-                           RU."USER_CODE" AS "RejectedBy", RU."U_NAME" AS "RejectedByName",
-                           O."USER_CODE" AS "OwnerCode", O."U_NAME" AS "OwnerName",
-                           COALESCE(DR."DocNum", PD."DocNum") AS "DocNum",
-                           COALESCE(DR."CardCode", PD."CardCode") AS "CardCode",
-                           COALESCE(DR."CardName", PD."CardName") AS "CardName",
-                           COALESCE(DR."DocTotal", PD."DocTotal") AS "DocTotal",
-                           COALESCE(DR."DocDate", PD."DocDate") AS "DocDate",
-                           (SELECT MAX(L."AcctCode") FROM "{{schema}}"."DRF1" L
-                             WHERE L."DocEntry" = DR."DocEntry"
-                               AND L."LineNum" = (SELECT MIN(L2."LineNum") FROM "{{schema}}"."DRF1" L2
-                                                  WHERE L2."DocEntry" = DR."DocEntry")) AS "AcctCode"
-                    FROM (
-                        SELECT S."WddCode", S."UpdateDate", S."UpdateTime", S."Remarks", S."UserID",
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY S."WddCode"
-                                   ORDER BY S."UpdateDate" DESC, S."UpdateTime" DESC, S."StepCode" DESC
-                               ) AS "Rn"
-                        FROM "{{schema}}"."WDD1" S
-                        WHERE S."Status" = 'N' AND S."UpdateDate" >= ? AND S."UpdateDate" <= ?
-                    ) R
-                    JOIN "{{schema}}"."OWDD" W ON W."WddCode" = R."WddCode"
-                    {_DRAFT_JOINS}
-                    LEFT JOIN "{{schema}}"."OUSR" O ON O."USERID" = W."OwnerID"
-                    LEFT JOIN "{{schema}}"."OUSR" RU ON RU."USERID" = R."UserID"
-                    WHERE R."Rn" = 1 {owner_clause}
-                ) x
-                LEFT JOIN "{{schema}}"."OACT" A ON A."AcctCode" = x."AcctCode"
-                ORDER BY x."RejectedDate" DESC, x."RejectedTime" DESC, x."WddCode" DESC
-                LIMIT {limit}
-                """,
-                params,
+                self._rejection_sql(
+                    """
+                    SELECT S."WddCode", S."UpdateDate", S."UpdateTime", S."Remarks", S."UserID",
+                           ROW_NUMBER() OVER (
+                               PARTITION BY S."WddCode"
+                               ORDER BY S."UpdateDate" DESC, S."UpdateTime" DESC, S."StepCode" DESC
+                           ) AS "Rn"
+                    FROM "{schema}"."WDD1" S
+                    WHERE S."Status" = 'N' AND S."UpdateDate" >= ? AND S."UpdateDate" <= ?
+                    """,
+                    owner_clause,
+                    limit,
+                ),
+                [date_from, date_to, *owner_params],
             )
-        return [self._rejection(r) for r in found]
+            seen = {int(r["WddCode"]) for r in found}
+            extra = sorted({int(c) for c in also_codes} - seen)
+            for start in range(0, len(extra), _IN_CHUNK):
+                chunk = extra[start:start + _IN_CHUNK]
+                found += session.rows(
+                    self._rejection_sql(
+                        f"""
+                        SELECT W0."WddCode", CAST(NULL AS DATE) AS "UpdateDate",
+                               CAST(NULL AS INTEGER) AS "UpdateTime",
+                               CAST(NULL AS NVARCHAR(254)) AS "Remarks",
+                               CAST(NULL AS INTEGER) AS "UserID", 1 AS "Rn"
+                        FROM "{{schema}}"."OWDD" W0
+                        WHERE W0."WddCode" IN ({_placeholders(chunk)})
+                        """,
+                        owner_clause,
+                        limit,
+                    ),
+                    [*chunk, *owner_params],
+                )
+            rows = [self._rejection(r) for r in found]
+            try:
+                self._attach_now(session, rows, found)
+            except SAPDataError:
+                # Where it stands now is decoration; the register is the point.
+                logger.warning("Rejection history: follow-up lookup skipped for %d rows", len(rows))
+        return rows
+
+    @staticmethod
+    def _rejection_sql(rejected_lines: str, owner_clause: str, limit: int) -> str:
+        """The register's columns over ``rejected_lines`` (alias R, one row per request at Rn 1)."""
+        return f"""
+            SELECT x.*, A."AcctName" AS "AcctName"
+            FROM (
+                SELECT W."WddCode" AS "WddCode", W."ObjType" AS "ObjType",
+                       W."DraftEntry" AS "DraftEntry", W."CreateDate" AS "RaisedDate",
+                       R."UpdateDate" AS "RejectedDate", R."UpdateTime" AS "RejectedTime",
+                       R."Remarks" AS "Remarks",
+                       RU."USER_CODE" AS "RejectedBy", RU."U_NAME" AS "RejectedByName",
+                       O."USER_CODE" AS "OwnerCode", O."U_NAME" AS "OwnerName",
+                       {rule.DRAFT_STATUS_SQL} AS "DraftStatus",
+                       COALESCE(DR."DocNum", PD."DocNum") AS "DocNum",
+                       COALESCE(DR."CardCode", PD."CardCode") AS "CardCode",
+                       COALESCE(DR."CardName", PD."CardName") AS "CardName",
+                       DR."NumAtCard" AS "NumAtCard",
+                       COALESCE(DR."DocTotal", PD."DocTotal") AS "DocTotal",
+                       COALESCE(DR."DocDate", PD."DocDate") AS "DocDate",
+                       (SELECT MAX(L."AcctCode") FROM "{{schema}}"."DRF1" L
+                         WHERE L."DocEntry" = DR."DocEntry"
+                           AND L."LineNum" = (SELECT MIN(L2."LineNum") FROM "{{schema}}"."DRF1" L2
+                                              WHERE L2."DocEntry" = DR."DocEntry")) AS "AcctCode"
+                FROM ({rejected_lines}) R
+                JOIN "{{schema}}"."OWDD" W ON W."WddCode" = R."WddCode"
+                {_DRAFT_JOINS}
+                LEFT JOIN "{{schema}}"."OUSR" O ON O."USERID" = W."OwnerID"
+                LEFT JOIN "{{schema}}"."OUSR" RU ON RU."USERID" = R."UserID"
+                WHERE R."Rn" = 1 {owner_clause}
+            ) x
+            LEFT JOIN "{{schema}}"."OACT" A ON A."AcctCode" = x."AcctCode"
+            ORDER BY x."RejectedDate" DESC, x."RejectedTime" DESC, x."WddCode" DESC
+            LIMIT {limit}
+        """
 
     @staticmethod
     def _rejection(r: dict) -> dict:
@@ -571,6 +698,7 @@ class HanaApprovalInboxReader:
             "object_type": obj_type,
             "object_type_label": OBJECT_TYPE_LABELS.get(obj_type, f"Object {obj_type}"),
             "draft_entry": _int(r.get("DraftEntry")),
+            "raised_on": _date(r.get("RaisedDate")),
             "rejected_at": _iso(r.get("RejectedDate"), r.get("RejectedTime")),
             "rejected_by": _clean(r.get("RejectedBy")) or None,
             "rejected_by_name": _clean(r.get("RejectedByName")) or None,
@@ -581,10 +709,67 @@ class HanaApprovalInboxReader:
             "doc_date": _date(r.get("DocDate")),
             "card_code": _clean(r.get("CardCode")) or None,
             "party_name": _clean(r.get("CardName")) or _clean(r.get("CardCode")) or None,
+            "reference": _clean(r.get("NumAtCard")) or None,
             "total_amount": _amount(r.get("DocTotal")),
             "gl_account": account,
             "gl_account_name": (_clean(r.get("AcctName")) or None) if account else None,
+            "now": None,
         }
+
+    def _attach_now(self, session: _Session, rows: list[dict], raw: list[dict]) -> None:
+        """Where each rejected entry stands now (:func:`entry_now`).
+
+        Nobody fixes a rejected draft in place in this estate: the draft is
+        closed or left rejected and the entry is keyed again as a new draft. So
+        besides the request's own draft, every later document for the same
+        party and type is read — drafts, and the posted table — and
+        :func:`entry_now` picks the one that is the correction.
+        """
+        own = {int(r["WddCode"]): r for r in raw}
+        wanted = [
+            row for row in rows
+            if row["object_type"] in POSTED_TABLE and row["card_code"] and row["raised_on"]
+        ]
+        drafts: dict[tuple, list] = {}
+        posted: dict[tuple, list] = {}
+        if wanted:
+            since = min(row["raised_on"] for row in wanted)
+            types = sorted({row["object_type"] for row in wanted})
+            cards = sorted({row["card_code"] for row in wanted})
+            for start in range(0, len(cards), _IN_CHUNK):
+                chunk = cards[start:start + _IN_CHUNK]
+                marks = _placeholders(chunk)
+                for d in session.rows(
+                    f"""
+                    SELECT "DocEntry", "ObjType", "CardCode", "NumAtCard", "DocTotal",
+                           "CreateDate", "DocNum", "WddStatus"
+                    FROM "{{schema}}"."ODRF"
+                    WHERE "CardCode" IN ({marks}) AND "CreateDate" >= ?
+                      AND "ObjType" IN ({_placeholders(types)})
+                    """,
+                    [*chunk, since, *types],
+                ):
+                    drafts.setdefault((_clean(d["ObjType"]), _clean(d["CardCode"])), []).append(d)
+                for obj_type in types:
+                    for p in session.rows(
+                        f"""
+                        SELECT "DocEntry", "CardCode", "NumAtCard", "DocTotal", "CreateDate",
+                               "DocNum", "draftKey"
+                        FROM "{{schema}}"."{POSTED_TABLE[obj_type]}"
+                        WHERE "CardCode" IN ({marks}) AND "CreateDate" >= ? AND "CANCELED" = 'N'
+                        """,
+                        [*chunk, since],
+                    ):
+                        posted.setdefault((obj_type, _clean(p["CardCode"])), []).append(p)
+        for row in rows:
+            r = own.get(row["wdd_code"], {})
+            key = (row["object_type"], row["card_code"] or "")
+            row["now"] = entry_now(
+                row,
+                own_status=_clean(r.get("DraftStatus")) or None,
+                drafts=drafts.get(key, []),
+                posted=posted.get(key, []),
+            )
 
     # ------------------------------------------------------------------
     # One request

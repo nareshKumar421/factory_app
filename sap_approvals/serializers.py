@@ -110,6 +110,8 @@ class RejectionFilterSerializer(serializers.Serializer):
     originator = serializers.CharField(
         required=False, allow_blank=True, default="", max_length=50
     )
+    # Every SAP company the caller belongs to, instead of the one in the header.
+    all_companies = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         if attrs["date_from"] and attrs["date_to"] and attrs["date_from"] > attrs["date_to"]:

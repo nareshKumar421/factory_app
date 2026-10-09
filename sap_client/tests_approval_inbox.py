@@ -196,6 +196,69 @@ def _posted(doc_entry, doc_num):
     return {"doc_entry": doc_entry, "doc_num": doc_num, "doc_date": "2026-09-16", "table": "ORIN"}
 
 
+class EntryNowTests(SimpleTestCase):
+    """Where a rejected entry stands now — its own draft first, else the
+    correction keyed as a new document."""
+
+    ROW = {"draft_entry": 100, "raised_on": "2026-09-10", "reference": "INV-7",
+           "total_amount": "5000.00"}
+
+    @staticmethod
+    def _draft(entry, status, *, ref="INV-7", total=5000, created=date(2026, 9, 12), num=None):
+        return {"DocEntry": entry, "WddStatus": status, "NumAtCard": ref, "DocTotal": total,
+                "CreateDate": created, "DocNum": num or entry}
+
+    @staticmethod
+    def _posted(entry, *, ref="INV-7", total=5000, created=date(2026, 9, 14), draft_key=None):
+        return {"DocEntry": entry, "NumAtCard": ref, "DocTotal": total, "CreateDate": created,
+                "DocNum": 9000 + entry, "draftKey": draft_key}
+
+    def now(self, own="N", drafts=(), posted=(), **row):
+        return inbox.entry_now({**self.ROW, **row}, own_status=own,
+                               drafts=list(drafts), posted=list(posted))
+
+    def test_untouched_is_still_rejected_and_a_closed_draft_is_closed(self):
+        self.assertEqual(self.now("N")["stage"], "STILL_REJECTED")
+        self.assertEqual(self.now("C")["stage"], "CLOSED")
+        self.assertEqual(self.now(None)["stage"], "CLOSED")
+
+    def test_its_own_draft_taken_forward_is_the_answer(self):
+        for own, stage in (("W", "PENDING"), ("Y", "APPROVED"), ("P", "POSTED"), ("A", "POSTED")):
+            with self.subTest(own=own):
+                self.assertEqual(self.now(own), {"stage": stage, "via": "same_request",
+                                                 "doc_num": None, "posted": False})
+
+    def test_a_re_keyed_draft_with_the_same_reference_gives_its_stage(self):
+        for status, stage in (("W", "PENDING"), ("Y", "APPROVED"), ("N", "REJECTED_AGAIN")):
+            with self.subTest(status=status):
+                found = self.now("C", drafts=[self._draft(101, status)])
+                self.assertEqual((found["stage"], found["via"], found["doc_num"]),
+                                 (stage, "reference", 101))
+
+    def test_a_posted_copy_beats_a_draft_and_the_own_draft_is_never_its_correction(self):
+        found = self.now(
+            "C",
+            drafts=[self._draft(100, "W"), self._draft(101, "W")],
+            posted=[self._posted(7, draft_key=100), self._posted(8, draft_key=101)],
+        )
+        self.assertEqual((found["stage"], found["posted"], found["doc_num"]), ("POSTED", True, 9008))
+
+    def test_without_the_reference_only_the_same_amount_soon_after_counts(self):
+        soon = self._draft(101, "W", ref="", created=date(2026, 9, 20))
+        late = self._draft(102, "W", ref="", created=date(2026, 10, 10))
+        other = self._draft(103, "W", ref="", total=4999)
+        before = self._draft(104, "W", created=date(2026, 9, 1))
+        self.assertEqual(self.now("N", drafts=[soon])["via"], "amount")
+        for draft in (late, other, before):
+            with self.subTest(draft=draft["DocEntry"]):
+                self.assertEqual(self.now("N", drafts=[draft])["stage"], "STILL_REJECTED")
+
+    def test_a_reference_match_beats_an_amount_match(self):
+        found = self.now("C", drafts=[self._draft(105, "W", ref="", num=55),
+                                      self._draft(101, "Y", total=4800, num=11)])
+        self.assertEqual((found["stage"], found["doc_num"]), ("APPROVED", 11))
+
+
 class PostedDuplicatesTests(SimpleTestCase):
     def test_a_pending_request_whose_twin_draft_already_posted_is_a_duplicate(self):
         row = {"status": "PENDING", "duplicate_of_posted": [_posted(1963, 626096824)]}
