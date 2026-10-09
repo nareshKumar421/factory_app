@@ -1783,6 +1783,55 @@ class BSTInvoiceFlowTests(TestCase):
         self.assertEqual(box.company_id, destination.id)
         self.assertEqual(box.item_code, "MART-1")  # remapped to the JIVO MART catalogue
 
+    def _oil_to_mart_invoice(self, item_codes):
+        from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
+
+        source = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        destination = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        fake_doc = {
+            "doc_entry": 910, "doc_num": "INV-910", "doc_date": date(2026, 10, 8),
+            "card_code": "CUSTA000606", "card_name": "Jivo Mart", "warehouses": "WH-A",
+            "line_count": len(item_codes), "total_quantity": 10 * len(item_codes),
+            "total_boxes": 0,
+            "items": [
+                {"line_num": n, "item_code": code, "item_name": code, "quantity": 10,
+                 "uom": "PCS", "warehouse_code": "WH-A", "total_boxes": 0}
+                for n, code in enumerate(item_codes)
+            ],
+        }
+        data = {
+            "document_type": "INVOICE", "sap_doc_entries": [910],
+            "destination_company": destination, "vehicle": None, "driver": None,
+            "requires_gate": False, "remarks": "",
+        }
+        assign_test_warehouses(self.sender, source)
+        with patch.object(SalesDispatchDocumentService, "get_document", return_value=fake_doc):
+            return BSTService(source.code, self.sender).create_transfer(data)
+
+    @patch("barcode.services.box_ownership.OitmItemService")
+    def test_create_oil_to_mart_invoice_skips_mapping_for_pm_lines(self, mock_oitm):
+        # PM is never scanned, so its code is never remapped on receipt: an
+        # unmapped PM line must not stop the BST being raised.
+        mapped = {"FG0000001": ["MART-FG-1"]}
+        mock_oitm.return_value.find_item_codes_by_oil_item_code.side_effect = (
+            lambda code: mapped.get(code, [])
+        )
+
+        transfer = self._oil_to_mart_invoice(["PM0000008", "FG0000001"])
+
+        self.assertEqual(
+            sorted(transfer.items.values_list("item_code", flat=True)),
+            ["FG0000001", "PM0000008"],
+        )
+        mock_oitm.return_value.find_item_codes_by_oil_item_code.assert_called_once_with("FG0000001")
+
+    @patch("barcode.services.box_ownership.OitmItemService")
+    def test_create_oil_to_mart_invoice_still_refuses_unmapped_fg_line(self, mock_oitm):
+        mock_oitm.return_value.find_item_codes_by_oil_item_code.return_value = []
+
+        with self.assertRaisesMessage(BSTError, "Oil ItemCode: FG0000001"):
+            self._oil_to_mart_invoice(["PM0000008", "FG0000001"])
+
     def test_create_invoice_transfer_snapshots_customer_and_destination(self):
         from gate_core.services.sales_dispatch_documents import SalesDispatchDocumentService
 

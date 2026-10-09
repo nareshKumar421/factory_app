@@ -749,8 +749,11 @@ class BSTService:
                 raise BSTError("All selected invoices must be for the same customer.")
             # Fail early (at create) if the cross-company item-code mapping is
             # missing/ambiguous, rather than surprising the receiver at accept time.
+            # PM lines are left out: they carry no boxes, so nothing ever remaps
+            # their code on receipt.
             item_codes = [
                 line.get("item_code") for sap in saps for line in sap.get("lines", [])
+                if not is_pm_item_code(line.get("item_code"))
             ]
             try:
                 resolve_destination_item_code_map(self.company, destination, item_codes)
