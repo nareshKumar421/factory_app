@@ -42,6 +42,7 @@ ALL_PERMISSIONS = [
     "can_view_sap_approval_inbox",
     "can_decide_sap_approvals",
     "can_withdraw_own_sap_approvals",
+    "can_view_sap_rejection_history",
 ]
 TYPED = "Typed-S3cret!pw"
 
@@ -450,7 +451,7 @@ class DecisionGuardTests(SapApprovalsTestCase):
     def test_rejecting_a_duplicate_is_never_blocked(self, sap):
         sap.return_value.approval_inbox_stage.return_value = _stage(posted_duplicates=[POSTED])
         sap.return_value.decide_approval_request.return_value = {"message": "ok", "signed_as": "USER37"}
-        response = self._post({"approve": False, "remarks": "duplicate"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "duplicate"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(sap.return_value.approval_inbox_stage.call_args.kwargs["with_duplicates"])
 
@@ -547,11 +548,35 @@ class DecisionGuardTests(SapApprovalsTestCase):
         sap.return_value.decide_approval_request.return_value = {"message": "ok", "signed_as": "USER37"}
         self.assertEqual(self._post({"approve": False}).status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
-            self._post({"approve": False, "remarks": "wrong rate"}).status_code, status.HTTP_200_OK
+            self._post({"approve": False, "category": "OTHER", "remarks": "wrong rate"}).status_code, status.HTTP_200_OK
         )
         remarks = sap.return_value.decide_approval_request.call_args.kwargs["remarks"]
         self.assertTrue(remarks.startswith("wrong rate — Honey Singh"))
-        self.assertEqual(SapApprovalDecision.objects.get().action, "REJECT")
+        audit = SapApprovalDecision.objects.get()
+        self.assertEqual((audit.action, audit.category), ("REJECT", "OTHER"))
+
+    def test_reject_needs_a_category_which_stays_out_of_sap(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = _stage()
+        sap.return_value.decide_approval_request.return_value = {"message": "ok", "signed_as": "USER37"}
+        response = self._post({"approve": False, "remarks": "GL"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("category", response.data)
+        response = self._post({"approve": False, "remarks": "GL", "category": "PETROL"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        sap.return_value.decide_approval_request.assert_not_called()
+
+        response = self._post({"approve": False, "remarks": "GL", "category": "ELECTRICITY"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        remarks = sap.return_value.decide_approval_request.call_args.kwargs["remarks"]
+        self.assertNotIn("ELECTRICITY", remarks.upper())
+        self.assertEqual(SapApprovalDecision.objects.get().category, "ELECTRICITY")
+
+    def test_an_approval_keeps_no_category(self, sap):
+        sap.return_value.approval_inbox_stage.return_value = _stage()
+        sap.return_value.decide_approval_request.return_value = {"message": "ok", "signed_as": "USER37"}
+        response = self._post({"approve": True, "category": "FUEL"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(SapApprovalDecision.objects.get().category, "")
 
     def test_a_missing_request_is_404(self, sap):
         sap.return_value.approval_inbox_stage.return_value = None
@@ -568,6 +593,116 @@ class DecisionGuardTests(SapApprovalsTestCase):
             with self.assertLogs("sap_approvals.views", level="ERROR"):
                 response = self._post({"approve": True})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Rejection history
+# ---------------------------------------------------------------------------
+
+
+def _rejection(**overrides):
+    """One A/P invoice USER39 raised, rejected from the app by USER03."""
+    row = {
+        "wdd_code": 77046,
+        "object_type": "18",
+        "object_type_label": "A/P Invoice",
+        "draft_entry": 58129,
+        "rejected_at": "2026-10-08T13:25:00",
+        "rejected_by": "USER03",
+        "rejected_by_name": "BHAWANI",
+        "remarks": "GL — Bhawani (Factory app)",
+        "originator_code": "USER39",
+        "originator_name": "MUQEEM",
+        "doc_num": 726093130,
+        "doc_date": "2026-09-26",
+        "card_code": "ORGV000052",
+        "party_name": "SUSHIL KUMAR SINGH IT 20000 IMPREST JWPL0010",
+        "total_amount": "2052.00",
+        "gl_account": "5680022",
+        "gl_account_name": "COMPUTER AND HARDWARE",
+    }
+    row.update(overrides)
+    return row
+
+
+@patch("sap_approvals.views.SAPClient")
+class RejectionHistoryTests(SapApprovalsTestCase):
+    url = f"{BASE}rejections/"
+
+    def _get(self, **params):
+        return self.client.get(self.url, params, **self.headers)
+
+    def test_the_window_defaults_to_this_month_and_filters_pass_through(self, sap):
+        sap.return_value.list_approval_rejections.return_value = []
+        with patch("sap_approvals.views.timezone.localdate") as today:
+            today.return_value = __import__("datetime").date(2026, 10, 9)
+            response = self._get()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual((response.data["date_from"], response.data["date_to"]),
+                         ("2026-10-01", "2026-10-09"))
+
+        self._get(date_from="2026-09-01", date_to="2026-09-30", originator=" user39 ")
+        kwargs = sap.return_value.list_approval_rejections.call_args.kwargs
+        self.assertEqual(str(kwargs["date_from"]), "2026-09-01")
+        self.assertEqual(str(kwargs["date_to"]), "2026-09-30")
+        self.assertEqual(kwargs["originator_code"], "USER39")
+        self.assertEqual(
+            self._get(date_from="2026-09-30", date_to="2026-09-01").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    def test_the_category_picked_here_wins_and_the_gl_name_fills_in(self, sap):
+        SapApprovalDecision.objects.create(
+            company=self.company, wdd_code=77046, action="REJECT", category="IMPREST",
+            created_by=self.user,
+        )
+        # An older pick for the same request, and an approval, are not the category.
+        SapApprovalDecision.objects.create(
+            company=self.company, wdd_code=77046, action="APPROVE", created_by=self.user,
+        )
+        sap.return_value.list_approval_rejections.return_value = [
+            _rejection(),
+            _rejection(wdd_code=19724, remarks="Bad copy", gl_account="5670001",
+                       gl_account_name="FREIGHT AND CARTAGE"),
+            _rejection(wdd_code=9, object_type_label="Outgoing Payment", gl_account=None,
+                       gl_account_name=None, remarks=None),
+        ]
+        rows = self._get().data["results"]
+        self.assertEqual(
+            [(r["category_label"], r["category_source"]) for r in rows],
+            [("Imprest", "app"), ("FREIGHT AND CARTAGE", "gl"), ("Outgoing Payment", "document")],
+        )
+
+    def test_the_reason_is_shown_as_it_was_typed(self, sap):
+        sap.return_value.list_approval_rejections.return_value = [
+            _rejection(remarks="GL — Bhawani (Factory app)"),
+            _rejection(remarks="Rate — not GST — changed to rejected by Bhawani (Factory app)"),
+            _rejection(remarks="Changed to rejected by Bhawani (Factory app)"),
+            _rejection(remarks="Typed in the SAP client"),
+        ]
+        self.assertEqual(
+            [r["reason"] for r in self._get().data["results"]],
+            ["GL", "Rate — not GST", "", "Typed in the SAP client"],
+        )
+
+    def test_originators_are_ranked_by_how_many_rejections_they_had(self, sap):
+        sap.return_value.list_approval_rejections.return_value = [
+            _rejection(originator_code="USER08", originator_name="DIVJOT", total_amount="57.00"),
+            _rejection(originator_code="USER39", total_amount="2052.00"),
+            _rejection(originator_code="USER39", total_amount="7000.00"),
+            _rejection(originator_code="USER07", originator_name="HARSH", total_amount="1161061.00"),
+        ]
+        ranked = self._get().data["by_originator"]
+        self.assertEqual(
+            [(g["originator_code"], g["count"], g["amount"]) for g in ranked],
+            [("USER39", 2, "9052.00"), ("USER07", 1, "1161061.00"), ("USER08", 1, "57.00")],
+        )
+
+    def test_only_the_history_right_opens_it(self, sap):
+        sap.return_value.list_approval_rejections.return_value = []
+        self.revoke("can_view_sap_rejection_history")
+        self.assertEqual(self._get().status_code, status.HTTP_403_FORBIDDEN)
+        sap.return_value.list_approval_rejections.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +742,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
     def test_the_approver_changes_approved_to_rejected(self, sap):
         sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
         self._sap_accepts(sap)
-        response = self._post({"approve": False, "remarks": "wrong party"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "wrong party"})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.data["action"], "REJECT")
@@ -662,7 +797,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
         for outcome, approve, word in (("APPROVED", True, "approved"), ("REJECTED", False, "rejected")):
             with self.subTest(outcome=outcome):
                 sap.return_value.approval_inbox_stage.return_value = self._decided(outcome)
-                response = self._post({"approve": approve, "remarks": "again"})
+                response = self._post({"approve": approve, "remarks": "again", "category": "OTHER"})
                 self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
                 self.assertEqual(response.data["code"], "STALE_REQUEST")
                 self.assertIn(f"already {word}", response.data["error"])
@@ -673,7 +808,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
             with self.subTest(outcome=outcome):
                 sap.return_value.approval_inbox_stage.return_value = self._decided(outcome)
                 for approve in (True, False):
-                    response = self._post({"approve": approve, "remarks": "change"})
+                    response = self._post({"approve": approve, "remarks": "change", "category": "OTHER"})
                     self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
                     self.assertEqual(response.data["code"], "STALE_REQUEST")
         sap.return_value.decide_approval_request.assert_not_called()
@@ -684,7 +819,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
         sap.return_value.approval_inbox_stage.return_value = self._decided(
             "APPROVED", stale_pending=True
         )
-        response = self._post({"approve": False, "remarks": "change"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change"})
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertIn("nothing left to approve or reject", response.data["error"])
         sap.return_value.decide_approval_request.assert_not_called()
@@ -693,7 +828,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
         sap.return_value.approval_inbox_stage.return_value = self._decided(
             "APPROVED", decided_by="USER24", decided_by_name="PANKAJ"
         )
-        response = self._post({"approve": False, "remarks": "change", "sap_password": TYPED})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change", "sap_password": TYPED})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertIn("approved by USER24 (PANKAJ)", response.data["error"])
         self.assertIn("You act as USER37", response.data["error"])
@@ -703,7 +838,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
         sap.return_value.approval_inbox_stage.return_value = self._decided(
             "APPROVED", decided_by="USER24", originator_code="USER37"
         )
-        response = self._post({"approve": False, "remarks": "change"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change"})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         sap.return_value.decide_approval_request.assert_not_called()
 
@@ -719,7 +854,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
     def test_an_unmapped_user_is_403(self, sap):
         self.unmap()
         sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
-        response = self._post({"approve": False, "remarks": "change"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change"})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertIn("SAP Identities", response.data["error"])
         sap.return_value.decide_approval_request.assert_not_called()
@@ -730,7 +865,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
         )
         self._sap_accepts(sap)
         self.assertEqual(
-            self._post({"approve": False, "remarks": "change"}).status_code, status.HTTP_200_OK
+            self._post({"approve": False, "category": "OTHER", "remarks": "change"}).status_code, status.HTTP_200_OK
         )
         self.assertEqual(
             sap.return_value.decide_approval_request.call_args.kwargs["approver"], "User37"
@@ -762,13 +897,13 @@ class ChangeDecisionTests(SapApprovalsTestCase):
     @override_settings(SAP_APPROVER_CREDENTIALS={})
     def test_nothing_to_sign_with_is_400_and_a_typed_password_signs(self, sap):
         sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
-        response = self._post({"approve": False, "remarks": "change"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("No SAP password is stored for USER37", response.data["error"])
         sap.return_value.decide_approval_request.assert_not_called()
 
         self._sap_accepts(sap)
-        response = self._post({"approve": False, "remarks": "change", "sap_password": TYPED})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change", "sap_password": TYPED})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
             sap.return_value.decide_approval_request.call_args.kwargs["password"], TYPED
@@ -781,7 +916,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
         sap.return_value.decide_approval_request.side_effect = SAPValidationError(
             "(-2028) No matching records found"
         )
-        response = self._post({"approve": False, "remarks": "change"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("-2028", response.data["error"])
         self.assertFalse(SapApprovalDecision.objects.exists())
@@ -789,7 +924,7 @@ class ChangeDecisionTests(SapApprovalsTestCase):
     def test_changing_needs_the_decide_right(self, sap):
         self.revoke("can_decide_sap_approvals")
         sap.return_value.approval_inbox_stage.return_value = self._decided("APPROVED")
-        response = self._post({"approve": False, "remarks": "change"})
+        response = self._post({"approve": False, "category": "OTHER", "remarks": "change"})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         sap.return_value.approval_inbox_stage.assert_not_called()
 
@@ -955,7 +1090,10 @@ class GroupCommandTests(TestCase):
 
     def test_every_right_the_api_checks_is_granted_by_some_group(self):
         granted = {code for codes in SAP_APPROVALS_GROUPS.values() for code in codes}
-        checked = {guards.VIEW_PERMISSION, guards.DECIDE_PERMISSION, guards.WITHDRAW_PERMISSION}
+        checked = {
+            guards.VIEW_PERMISSION, guards.DECIDE_PERMISSION, guards.WITHDRAW_PERMISSION,
+            guards.HISTORY_PERMISSION,
+        }
         self.assertEqual(checked - granted, set())
 
     def test_a_rerun_changes_nothing_and_adds_no_members(self):

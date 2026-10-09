@@ -785,6 +785,15 @@ class SAPClient:
 
         return HanaApprovalInboxReader(self.context).waiting_count(sap_user_code)
 
+    def list_approval_rejections(self, **filters) -> list[dict]:
+        """Every approval request rejected in a window, company-wide.
+
+        Filters: ``date_from``, ``date_to``, ``originator_code``.
+        """
+        from .hana.approval_inbox_reader import HanaApprovalInboxReader
+
+        return HanaApprovalInboxReader(self.context).list_rejections(**filters)
+
     def approval_inbox_detail(self, wdd_code: int, sap_user_code: str | None) -> dict | None:
         """One request with its stages and the draft's lines; None if SAP has none."""
         from .hana.approval_inbox_reader import HanaApprovalInboxReader

@@ -39,6 +39,11 @@ SAP_APPROVALS_GROUPS = {
         "sap_approvals.can_decide_sap_approvals",
         "sap_approvals.can_withdraw_own_sap_approvals",
     ],
+    # Whoever reviews the desk: every rejection, by who raised it.
+    "SAP Approvals - Reviewer": [
+        "sap_approvals.can_view_sap_approval_inbox",
+        "sap_approvals.can_view_sap_rejection_history",
+    ],
 }
 
 

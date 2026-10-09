@@ -9,6 +9,7 @@ from .views import (
     ApprovalRequestListAPI,
     ApprovalRequestWithdrawAPI,
     PendingCountAPI,
+    RejectionHistoryAPI,
 )
 
 urlpatterns = [
@@ -41,4 +42,5 @@ urlpatterns = [
         name="sap-approvals-attachment-download",
     ),
     path("pending-count/", PendingCountAPI.as_view(), name="sap-approvals-pending-count"),
+    path("rejections/", RejectionHistoryAPI.as_view(), name="sap-approvals-rejections"),
 ]

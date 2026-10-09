@@ -124,6 +124,8 @@ POSTED_TABLE = {
 TWIN_DRAFT_TYPES = ("14", "19")
 
 SCOPES = ("waiting_on_me", "raised_by_me", "all")
+# The rejection history's ceiling: a month of the busiest company is ~300.
+REJECTIONS_LIMIT = 2000
 STATUSES = tuple(rule.APP_FILTER_TO_OWDD)
 
 _STAGE_STATUS = {"W": "PENDING", "Y": "APPROVED", "N": "REJECTED"}
@@ -487,6 +489,102 @@ class HanaApprovalInboxReader:
                 [user_id],
             )
         return int(found[0]["N"]) if found else 0
+
+    # ------------------------------------------------------------------
+    # Rejection history
+    # ------------------------------------------------------------------
+
+    def list_rejections(
+        self, *, date_from, date_to, originator_code: str = "", limit: int = REJECTIONS_LIMIT
+    ) -> list[dict]:
+        """Every request rejected in the window, company-wide, newest first.
+
+        A rejection is a ``WDD1`` line SAP holds at ``'N'``, dated by that
+        line's ``UpdateDate`` — so it counts whether it was rejected from this
+        app or in the SAP client, and a request rejected, edited and rejected
+        again counts twice (SAP opens a new request for the edit). One row per
+        request: a stage with two authorizers who both rejected is still one
+        rejected entry, shown as the later of the two.
+
+        A rejection later changed to approved is gone from here: SAP keeps only
+        the latest decision on a line.
+
+        ``gl_account`` is the draft's first line's account, the fallback for a
+        rejection that has no category recorded in this app. Payment drafts
+        have none.
+        """
+        limit = max(1, min(int(limit), REJECTIONS_LIMIT))
+        params = [date_from, date_to]
+        owner_clause = ""
+        if originator_code:
+            owner_clause = 'AND UPPER(O."USER_CODE") = ?'
+            params.append(_clean(originator_code).upper())
+        with self._session() as session:
+            found = session.rows(
+                f"""
+                SELECT x.*, A."AcctName" AS "AcctName"
+                FROM (
+                    SELECT W."WddCode" AS "WddCode", W."ObjType" AS "ObjType",
+                           W."DraftEntry" AS "DraftEntry",
+                           R."UpdateDate" AS "RejectedDate", R."UpdateTime" AS "RejectedTime",
+                           R."Remarks" AS "Remarks",
+                           RU."USER_CODE" AS "RejectedBy", RU."U_NAME" AS "RejectedByName",
+                           O."USER_CODE" AS "OwnerCode", O."U_NAME" AS "OwnerName",
+                           COALESCE(DR."DocNum", PD."DocNum") AS "DocNum",
+                           COALESCE(DR."CardCode", PD."CardCode") AS "CardCode",
+                           COALESCE(DR."CardName", PD."CardName") AS "CardName",
+                           COALESCE(DR."DocTotal", PD."DocTotal") AS "DocTotal",
+                           COALESCE(DR."DocDate", PD."DocDate") AS "DocDate",
+                           (SELECT MAX(L."AcctCode") FROM "{{schema}}"."DRF1" L
+                             WHERE L."DocEntry" = DR."DocEntry"
+                               AND L."LineNum" = (SELECT MIN(L2."LineNum") FROM "{{schema}}"."DRF1" L2
+                                                  WHERE L2."DocEntry" = DR."DocEntry")) AS "AcctCode"
+                    FROM (
+                        SELECT S."WddCode", S."UpdateDate", S."UpdateTime", S."Remarks", S."UserID",
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY S."WddCode"
+                                   ORDER BY S."UpdateDate" DESC, S."UpdateTime" DESC, S."StepCode" DESC
+                               ) AS "Rn"
+                        FROM "{{schema}}"."WDD1" S
+                        WHERE S."Status" = 'N' AND S."UpdateDate" >= ? AND S."UpdateDate" <= ?
+                    ) R
+                    JOIN "{{schema}}"."OWDD" W ON W."WddCode" = R."WddCode"
+                    {_DRAFT_JOINS}
+                    LEFT JOIN "{{schema}}"."OUSR" O ON O."USERID" = W."OwnerID"
+                    LEFT JOIN "{{schema}}"."OUSR" RU ON RU."USERID" = R."UserID"
+                    WHERE R."Rn" = 1 {owner_clause}
+                ) x
+                LEFT JOIN "{{schema}}"."OACT" A ON A."AcctCode" = x."AcctCode"
+                ORDER BY x."RejectedDate" DESC, x."RejectedTime" DESC, x."WddCode" DESC
+                LIMIT {limit}
+                """,
+                params,
+            )
+        return [self._rejection(r) for r in found]
+
+    @staticmethod
+    def _rejection(r: dict) -> dict:
+        obj_type = _clean(r.get("ObjType"))
+        account = _clean(r.get("AcctCode")) or None
+        return {
+            "wdd_code": int(r["WddCode"]),
+            "object_type": obj_type,
+            "object_type_label": OBJECT_TYPE_LABELS.get(obj_type, f"Object {obj_type}"),
+            "draft_entry": _int(r.get("DraftEntry")),
+            "rejected_at": _iso(r.get("RejectedDate"), r.get("RejectedTime")),
+            "rejected_by": _clean(r.get("RejectedBy")) or None,
+            "rejected_by_name": _clean(r.get("RejectedByName")) or None,
+            "remarks": _clean(r.get("Remarks")) or None,
+            "originator_code": _clean(r.get("OwnerCode")) or None,
+            "originator_name": _clean(r.get("OwnerName")) or None,
+            "doc_num": _int(r.get("DocNum")),
+            "doc_date": _date(r.get("DocDate")),
+            "card_code": _clean(r.get("CardCode")) or None,
+            "party_name": _clean(r.get("CardName")) or _clean(r.get("CardCode")) or None,
+            "total_amount": _amount(r.get("DocTotal")),
+            "gl_account": account,
+            "gl_account_name": (_clean(r.get("AcctName")) or None) if account else None,
+        }
 
     # ------------------------------------------------------------------
     # One request

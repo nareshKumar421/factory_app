@@ -8,6 +8,8 @@
   decision already taken.
 * ``POST requests/<wdd_code>/withdraw/`` — the originator cancels a pending one.
 * ``GET pending-count/`` — how many wait on the caller (the sidebar badge).
+* ``GET rejections/`` — every rejection in the company over a window, and how
+  many each originator had: the accounts desk's mistakes register.
 
 Ported from SAP Portal's ``routes/sap.js`` ``/approval-requests`` routes
 (~2780–3013) and ``services/sapApprovals.js``. What changed and why is in
@@ -36,7 +38,11 @@ reason: a leftover or a duplicate is reported before anyone types one.
 """
 
 import logging
+import re
+from collections import defaultdict
+from decimal import Decimal
 
+from django.utils import timezone
 from django.views.decorators.debug import sensitive_variables
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -45,21 +51,31 @@ from rest_framework.response import Response
 from company.permissions import HasCompanyContext
 from sap_client.client import SAPClient
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
-from sap_client.hana.approval_inbox_reader import OBJECT_TYPE_LABELS, stale_message
+from sap_client.hana.approval_inbox_reader import (
+    OBJECT_TYPE_LABELS,
+    REJECTIONS_LIMIT,
+    stale_message,
+)
 from sap_documents import services as document_services
 from sap_documents.constants import DOCUMENT_TYPES
 from warehouse.views_sap_approval_base import SapApprovalViewBase
 
-from .constants import DecisionAction
+from .constants import DecisionAction, RejectionCategory
 from .models import SapApprovalDecision
 from .permissions import (
     DECIDE_PERMISSION,
     WITHDRAW_PERMISSION,
     CanDecideSapApprovals,
     CanViewSapApprovalInbox,
+    CanViewSapRejectionHistory,
     CanWithdrawOwnSapApprovals,
 )
-from .serializers import DecisionSerializer, RequestFilterSerializer, WithdrawSerializer
+from .serializers import (
+    DecisionSerializer,
+    RejectionFilterSerializer,
+    RequestFilterSerializer,
+    WithdrawSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +182,7 @@ class _InboxView(SapApprovalViewBase):
 
     def write_audit(self, stage: dict, action: str, signed_as: str, remarks: str,
                     typed: bool, confirmed_duplicate: bool = False,
-                    changed_from: str = "") -> None:
+                    changed_from: str = "", category: str = "") -> None:
         """After SAP accepted. A bookkeeping failure never undoes SAP's record."""
         try:
             SapApprovalDecision.objects.create(
@@ -180,6 +196,7 @@ class _InboxView(SapApprovalViewBase):
                 typed_password=typed,
                 confirmed_duplicate=confirmed_duplicate,
                 changed_from=changed_from,
+                category=category,
                 created_by=self.request.user,
             )
         except Exception:
@@ -388,6 +405,7 @@ class ApprovalRequestDecisionAPI(_InboxView):
         approve = body.validated_data["approve"]
         remarks = body.validated_data["remarks"]
         confirm_duplicate = body.validated_data["confirm_duplicate"]
+        category = body.validated_data["category"]
         typed = body.typed_password()
 
         client = self.client()
@@ -467,6 +485,7 @@ class ApprovalRequestDecisionAPI(_InboxView):
             typed=typed is not None,
             confirmed_duplicate=bool(approve and posted),
             changed_from=stage["status"] if change else "",
+            category=category,
         )
         return Response({
             "message": result.get("message") or "Decision recorded in SAP.",
@@ -664,3 +683,99 @@ class PendingCountAPI(_InboxView):
         if not mine:
             return Response({"total": 0})
         return Response({"total": self.client().count_approval_inbox_waiting(mine)})
+
+
+# What the app appends to a decision's remarks in SAP (``_remarks`` above and
+# ``decision_remarks``): " — <name> (Factory app)", or " — changed to rejected
+# by <name> (Factory app)". The history shows the reason as it was typed.
+_APP_SIGNATURE = re.compile(r"\s+—\s+[^—]*\(Factory app\)\s*$")
+
+
+def typed_reason(remarks: str | None) -> str:
+    """``"GL — Bhawani (Factory app)"`` → ``"GL"``; SAP-client remarks as they are."""
+    text = (remarks or "").strip()
+    if text.endswith("(Factory app)") and "—" not in text:
+        # A change of decision with no reason typed: the signature is all there is.
+        return ""
+    return _APP_SIGNATURE.sub("", text)
+
+
+class RejectionHistoryAPI(_InboxView):
+    """GET ?date_from&date_to&originator — every rejection in the company over a
+    window (default: this month to date), newest first, and per originator how
+    many they had and what they were worth.
+
+    Read from SAP, so rejections taken in the SAP client count as well as ones
+    taken here. The category is the one picked in this app when it was
+    rejected; for a rejection taken anywhere else it is the GL account's name
+    and ``category_source`` says ``"gl"``.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanViewSapRejectionHistory]
+
+    def get(self, request):
+        filters = RejectionFilterSerializer(data=request.query_params)
+        filters.is_valid(raise_exception=True)
+        data = filters.validated_data
+        today = timezone.localdate()
+        date_to = data["date_to"] or today
+        date_from = data["date_from"] or date_to.replace(day=1)
+
+        rows = self.client().list_approval_rejections(
+            date_from=date_from, date_to=date_to, originator_code=data["originator"]
+        )
+        categories = self._categories([row["wdd_code"] for row in rows])
+        for row in rows:
+            picked = categories.get(row["wdd_code"])
+            if picked:
+                row["category"] = picked
+                row["category_label"] = RejectionCategory(picked).label
+                row["category_source"] = "app"
+            else:
+                row["category"] = ""
+                row["category_label"] = row["gl_account_name"] or row["object_type_label"]
+                row["category_source"] = "gl" if row["gl_account_name"] else "document"
+            row["reason"] = typed_reason(row["remarks"])
+
+        return Response({
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "results": rows,
+            "count": len(rows),
+            "truncated": len(rows) >= REJECTIONS_LIMIT,
+            "by_originator": self._by_originator(rows),
+            "categories": [{"value": v, "label": l} for v, l in RejectionCategory.choices],
+        })
+
+    def _categories(self, wdd_codes: list[int]) -> dict[int, str]:
+        """The latest category picked here for each request, if any."""
+        if not wdd_codes:
+            return {}
+        found = (
+            SapApprovalDecision.objects.filter(
+                company=self.company,
+                wdd_code__in=wdd_codes,
+                action=DecisionAction.REJECT,
+            )
+            .exclude(category="")
+            .order_by("wdd_code", "-created_at", "-id")
+            .values_list("wdd_code", "category")
+        )
+        out: dict[int, str] = {}
+        for wdd_code, category in found:
+            out.setdefault(wdd_code, category)
+        return out
+
+    @staticmethod
+    def _by_originator(rows: list[dict]) -> list[dict]:
+        """Most rejections first; the amount breaks a tie."""
+        groups: dict[str, dict] = defaultdict(lambda: {"count": 0, "amount": Decimal(0)})
+        for row in rows:
+            code = row["originator_code"] or ""
+            group = groups[code]
+            group["originator_code"] = code or None
+            group["originator_name"] = row["originator_name"]
+            group["count"] += 1
+            group["amount"] += Decimal(row["total_amount"] or 0)
+        ranked = sorted(groups.values(), key=lambda g: (-g["count"], -g["amount"]))
+        return [{**g, "amount": f"{g['amount']:.2f}"} for g in ranked]

@@ -18,6 +18,7 @@ from rest_framework.permissions import BasePermission
 VIEW_PERMISSION = "sap_approvals.can_view_sap_approval_inbox"
 DECIDE_PERMISSION = "sap_approvals.can_decide_sap_approvals"
 WITHDRAW_PERMISSION = "sap_approvals.can_withdraw_own_sap_approvals"
+HISTORY_PERMISSION = "sap_approvals.can_view_sap_rejection_history"
 
 
 def _authenticated(request):
@@ -55,3 +56,16 @@ class CanWithdrawOwnSapApprovals(BasePermission):
 
     def has_permission(self, request, view):
         return _authenticated(request) and request.user.has_perm(WITHDRAW_PERMISSION)
+
+
+class CanViewSapRejectionHistory(BasePermission):
+    """Every rejection in the company and who raised it — not only the caller's.
+
+    A right of its own: the inbox shows a person what involves them, this shows
+    everybody's mistakes side by side, which is for whoever reviews the desk.
+    """
+
+    message = "You do not have permission to view the SAP rejection history."
+
+    def has_permission(self, request, view):
+        return _authenticated(request) and request.user.has_perm(HISTORY_PERMISSION)

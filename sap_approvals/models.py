@@ -20,7 +20,7 @@ from django.db import models
 from company.models import Company
 from gate_core.models.base import BaseModel
 
-from .constants import DecisionAction
+from .constants import DecisionAction, RejectionCategory
 
 
 class SapApprovalDecision(BaseModel):
@@ -58,6 +58,10 @@ class SapApprovalDecision(BaseModel):
         default="",
         help_text="The request's earlier outcome, when this decision changed it.",
     )
+    # A reject only: what kind of entry it was, for the rejection history.
+    category = models.CharField(
+        max_length=20, choices=RejectionCategory.choices, blank=True, default=""
+    )
 
     class Meta:
         ordering = ["-created_at", "-id"]
@@ -69,6 +73,7 @@ class SapApprovalDecision(BaseModel):
             ("can_view_sap_approval_inbox", "Can view the SAP approvals inbox"),
             ("can_decide_sap_approvals", "Can approve or reject SAP approval requests"),
             ("can_withdraw_own_sap_approvals", "Can withdraw SAP approval requests they raised"),
+            ("can_view_sap_rejection_history", "Can view every SAP rejection and who raised it"),
         ]
 
     def __str__(self):
