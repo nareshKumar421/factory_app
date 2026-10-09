@@ -96,6 +96,7 @@ urlpatterns = [
     path("api/v1/leave/", include("leave.urls")),
     path("api/v1/invoice-approvals/", include("invoice_approval.urls")),
     path("api/v1/ar-invoices/", include("ar_invoice.urls")),
+    path("api/v1/ap-invoice-drafts/", include("ap_invoice_draft.urls")),
     path("api/v1/artwork/", include("artwork.urls")),
     path("api/v1/sap-reports/", include("sap_reports.urls")),
     path("api/v1/universal-search/", include("universal_search.urls")),

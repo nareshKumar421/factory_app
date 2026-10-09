@@ -17,3 +17,20 @@ class APInvoiceWriter(_ServiceLayerDocWriter):
     endpoint = "PurchaseInvoices"
     label = "A/P Invoice"
     DOC_OBJECT_CODE = "oPurchaseInvoices"
+
+
+class APInvoiceDraftWriter(_ServiceLayerDocWriter):
+    """Saves an A/P invoice as a SAP draft (``ODRF``, object 18) -- never posts it.
+
+    ``POST /b1s/v2/Drafts`` with ``DocObjectCode: oPurchaseInvoices`` answers
+    201 with the draft's DocEntry. Nothing is booked and no approval procedure
+    runs: those happen when someone adds the draft in SAP. Used by
+    ``ap_invoice_draft``, where the warehouse prepares the invoice and accounts
+    adds it.
+    """
+    endpoint = "Drafts"
+    label = "A/P Invoice draft"
+    DOC_OBJECT_CODE = "oPurchaseInvoices"
+
+    def create(self, payload: dict) -> dict:
+        return super().create({**payload, "DocObjectCode": self.DOC_OBJECT_CODE})

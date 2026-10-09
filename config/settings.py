@@ -191,6 +191,8 @@ INSTALLED_APPS = [
     'short_dispatch',
     'invoice_approval',
     'ar_invoice',
+    # A vendor's bill put into SAP as an A/P invoice draft against its GRPO.
+    'ap_invoice_draft',
     'document_control',
     # The label and carton artwork register: what is printed on every
     # packaging item, held as its PDF and CorelDRAW source.

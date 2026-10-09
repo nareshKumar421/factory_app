@@ -26,7 +26,7 @@ from .hana.stock_transfer_reader import HanaStockTransferReader
 from .hana.transfer_request_reader import HanaTransferRequestReader
 from .hana.warehouse_reader import HanaWarehouseReader
 from .hana.vendor_reader import HanaVendorReader
-from .service_layer.ap_invoice_writer import APInvoiceWriter
+from .service_layer.ap_invoice_writer import APInvoiceDraftWriter, APInvoiceWriter
 from .service_layer.ar_invoice_writer import ARInvoiceWriter
 from .service_layer.approval_writer import ApprovalRequestWriter
 from .service_layer.budget_writer import BudgetWriter
@@ -853,6 +853,15 @@ class SAPClient:
         of a posted document — see ``APInvoiceWriter``."""
         writer = APInvoiceWriter(self.context)
         return writer.create(payload)
+
+    def create_ap_invoice_draft(self, payload: dict) -> dict:
+        """Save an A/P invoice as a SAP draft. Never posts; nothing is booked
+        until someone adds the draft in SAP — see ``APInvoiceDraftWriter``."""
+        return APInvoiceDraftWriter(self.context).create(payload)
+
+    def update_ap_invoice_draft(self, draft_entry: int, payload: dict) -> None:
+        """PATCH an A/P invoice draft (e.g. to attach the bill after the fact)."""
+        APInvoiceDraftWriter(self.context).patch_draft(draft_entry, payload)
 
     def create_ar_invoice(self, payload: dict):
         """Post an A/R invoice. When SAP routes it into an approval procedure
