@@ -7,6 +7,7 @@ from django.test import SimpleTestCase
 from gate_core.services.box_packing import (
     box_invoice_units,
     is_csd_item,
+    load_box_count,
     pieces_per_box,
     split_line,
 )
@@ -144,3 +145,85 @@ class SalFactor3OptInTests(SimpleTestCase):
         packing = split_line(2, 16, "SOME ITEM", 16)
         self.assertEqual(packing.boxes, 2)
         self.assertEqual(packing.loose, Decimal("0"))
+
+
+def _line(item_code, quantity, sal_factor2=1, item_name="", uom="PCS", sal_factor3=0,
+          litres_each=0):
+    return {
+        "item_code": item_code,
+        "item_name": item_name,
+        "quantity": Decimal(str(quantity)),
+        "uom": uom,
+        "litres": Decimal(str(quantity)) * Decimal(str(litres_each)),
+        "sal_factor2": Decimal(str(sal_factor2)),
+        "sal_factor3": Decimal(str(sal_factor3)),
+    }
+
+
+class LoadBoxCountTests(SimpleTestCase):
+    """Every box a bill goes out in -- the dispatch plan export's Boxes column."""
+
+    def test_full_boxes_divide_by_the_pack_size(self):
+        self.assertEqual(load_box_count([_line("FG0000002", 100, 4)]), 25)
+
+    def test_a_part_box_is_one_more_box(self):
+        # 37 of a 20-PCS item: 1 full box + 17 pieces repacked into a second.
+        self.assertEqual(load_box_count([_line("FG0000002", 37, 20)]), 2)
+
+    def test_less_than_a_box_is_still_a_box(self):
+        # The Mart shape that used to read 0: 3 pieces of a 12-PCS item.
+        self.assertEqual(load_box_count([_line("FG0000004", 3, 12)]), 1)
+
+    def test_lines_of_one_item_are_split_together_like_the_scan(self):
+        # 13 + 3 pieces of a 16-PCS item fill one box, not two.
+        lines = [_line("FG0000142", 13, 16), _line("fg0000142 ", 3, 16)]
+        self.assertEqual(load_box_count(lines), 1)
+
+    def test_different_items_are_counted_apart(self):
+        lines = [_line("FG0000142", 13, 16), _line("FG0000143", 3, 16)]
+        self.assertEqual(load_box_count(lines), 2)
+
+    def test_csd_counts_one_box_per_billed_unit(self):
+        line = _line("FG0000394", 143, 1, "JIVO EXTRA LIGHT OLIVE OIL 1 LTR 16 PCS ( CSD )")
+        self.assertEqual(load_box_count([line]), 143)
+
+    def test_sal_factor3_counts_one_carton_per_billed_unit(self):
+        # FG0000013 REFINED OIL 1000 MLS: no CSD in the name, SalFactor3 = 20.
+        line = _line("FG0000013", 5, 1, "REFINED OIL 1000 MLS", sal_factor3=20)
+        self.assertEqual(load_box_count([line]), 5)
+
+    def test_a_big_unboxed_unit_is_one_box_each(self):
+        # 15 LTR tins carry SalFactor2 = 1: each tin goes on the truck by itself.
+        tins = _line("FG0000015", 16, 1, "REFINED OIL 15 LTR", litres_each=15)
+        self.assertEqual(load_box_count([tins]), 16)
+        drums = _line("FG0000034", 3, 1, "EXTRA LIGHT OLIVE 200 LTR 1 PCS", litres_each=200)
+        self.assertEqual(load_box_count([drums]), 3)
+        sets = _line("SL0000029", 2, 1, "COLD PRESS 5 LTR + 1 LTR", "SET", litres_each=6)
+        self.assertEqual(load_box_count([sets]), 2)
+
+    def test_small_unboxed_goods_fill_at_least_one_box_not_one_each(self):
+        # FG0000381: 300 bottles of 10 ML are a few cartons, never 300 boxes. SAP gives
+        # no pack size, so the item counts the one box it surely fills.
+        bottles = _line("FG0000381", 300, 1, "EXTRA VIRGIN OLIVE OIL 10ML", litres_each="0.01")
+        self.assertEqual(load_box_count([bottles]), 1)
+        spices = _line("FG0000196", 16, 1, "SPICES BLACK PEPPER 100 GMS", "NOS")
+        self.assertEqual(load_box_count([bottles, spices]), 2)
+
+    def test_bulk_billed_by_measure_has_no_boxes(self):
+        lines = [
+            _line("RM0000002", 36780.555, 1, "CANOLA COLD PRESS LOOSE OIL", "LTR"),
+            _line("RM0000067", 5040, 1, "DESI GHEE KGS", "KGS"),
+        ]
+        self.assertEqual(load_box_count(lines), 0)
+
+    def test_packaging_and_service_lines_are_left_out(self):
+        lines = [
+            _line("PM0000003", 161924, 1, "CAPS 5 LTR/15 LTR"),
+            _line("PM0000634", 40, 20, "CARTON"),
+            _line("", 1, 0, "IT consulting and support services", ""),
+            _line("FG0000002", 20, 20),
+        ]
+        self.assertEqual(load_box_count(lines), 1)
+
+    def test_no_lines_is_no_boxes(self):
+        self.assertEqual(load_box_count([]), 0)

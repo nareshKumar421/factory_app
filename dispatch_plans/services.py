@@ -10,7 +10,9 @@ from django.db.models import Count, Prefetch
 
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
+from gate_core.services.box_packing import load_box_count
 from sap_client.context import CompanyContext
+from sap_client.exceptions import SAPConnectionError, SAPDataError
 from vehicle_management.models import Transporter, Vehicle
 
 from .hana_reader import MAX_BILL_ROWS, HanaDispatchBillReader
@@ -83,6 +85,10 @@ def record_bilty_attachment_audit(
 # The window is resolved to doc-entries first and fetched by key, so this bounds
 # the size of that IN-list rather than a date scan.
 MAX_DISPATCH_WINDOW_BILLS = 2000
+
+# Bills per SAP read when the export asks for box counts, so a wide window is a
+# few IN-lists of sane length rather than one of thousands.
+LOAD_BOX_CHUNK = 500
 
 
 # ---------------------------------------------------------------------------
@@ -634,11 +640,42 @@ class DispatchPlansService:
         page_rows, pagination = paginate_bill_rows(
             data, filters.get("page"), filters.get("page_size")
         )
+        if filters.get("with_load_boxes"):
+            self._attach_load_boxes(page_rows)
         return {
             "data": page_rows,
             "meta": meta,
             "pagination": pagination,
         }
+
+    def _attach_load_boxes(self, rows: List[Dict[str, Any]]) -> None:
+        """Stamp each row's ``load_boxes`` -- every box the bill goes out in.
+
+        Asked for by the Plan page's Excel export only. It is one more SAP read of the
+        bills' lines, which the screen itself has no use for, and ``total_boxes`` stays
+        as it is: the docking and BST scan locks are calibrated on that one. The rule
+        is ``box_packing.load_box_count``.
+
+        A failed line read leaves the figure out (None) rather than failing the
+        export -- the bills are already in hand, and a blank Boxes column is the
+        honest answer when SAP could not say.
+        """
+        entries = [row["doc_entry"] for row in rows]
+        lines_by_bill: Dict[int, List[Dict[str, Any]]] = {entry: [] for entry in entries}
+        try:
+            for start in range(0, len(entries), LOAD_BOX_CHUNK):
+                chunk = entries[start:start + LOAD_BOX_CHUNK]
+                for line in self.reader.list_pickable_lines(chunk):
+                    lines_by_bill.setdefault(int(line["doc_entry"]), []).append(line)
+        except (SAPConnectionError, SAPDataError):
+            logger.warning(
+                "Could not read bill lines for box counts (%s)", self.company_code, exc_info=True
+            )
+            for row in rows:
+                row["load_boxes"] = None
+            return
+        for row in rows:
+            row["load_boxes"] = load_box_count(lines_by_bill.get(row["doc_entry"], []))
 
     def reconcile_selection(self, *, shown_doc_entries, selected_doc_entries, user=None):
         """Apply a bill-selection Submit — reconciling ONLY the bills that were shown.

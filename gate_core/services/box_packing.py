@@ -206,3 +206,73 @@ def is_full_box(box_pieces: Any, sal_factor2: Any, item_name: Any = "") -> bool:
     if per_box is None or per_box <= 1:
         return True
     return to_decimal(box_pieces) >= per_box
+
+
+
+# Units a line can be counted in one by one. Anything else (LTR, KGS, GMS, MTR) is bulk
+# -- loose ghee by the litre, oil by the tanker -- and has no box count at all.
+PIECE_UNITS = frozenset({"PCS", "PC", "NOS", "NO", "UNT", "UNIT", "SET", "EA"})
+
+# A unit this big travels on its own: a 5 LTR bottle, a 15 LTR or 15 KGS tin, a 200 LTR
+# drum, a 5 + 1 LTR set. Smaller goods SAP gives no box size to -- a 10 ML sample
+# bottle, a 100 GMS spice pack, a gift box -- are packed into cartons by the floor, so
+# one of them is never one box.
+SINGLE_UNIT_MIN_LITRES = Decimal("5")
+
+
+def load_box_count(lines) -> int:
+    """Boxes ONE bill puts on the truck -- the figure the dispatch plan export carries.
+
+    Built the way the docking scan builds its target (``sales_dispatch_gatepass.
+    split_lines_target``): lines are grouped per item and split once, since two lines of
+    13 and 3 pieces of a 16-PCS item are one box on the floor, not two; and packaging
+    material is left out, because it carries no box label and nobody scans it.
+
+    Where the scan target stops at full boxes, this counts every box the goods actually
+    travel in, so no bill of goods reads 0 just because they are not whole cartons:
+
+    * A part box is a box. The remainder of an uneven split is repacked into one more
+      carton -- "116 boxes + 4 loose is loaded as at least 117 boxes, the last holding
+      just the 4 loose pieces" (``sales_dispatch_box_match.remaining_expected_boxes``).
+      So a Mart bill of 3 pieces of a 12-PCS item is 1 box, not 0.
+    * ``SalFactor3 > 1`` marks a line billed in whole cartons (``pieces_per_box``), so
+      FG0000013, invoiced as 1, is the one 20-bottle carton it is.
+    * An item SAP does not box (SalFactor2 = 1, not CSD), billed in pieces, is one box
+      per unit when the unit holds :data:`SINGLE_UNIT_MIN_LITRES` or more -- each 15 LTR
+      tin is its own scan on the dock. A smaller one has no pack size anywhere, so all
+      that is known is that the item fills at least one box: it counts 1. That is a
+      floor, not a count -- maintaining SalFactor2 on the item makes it exact.
+    * Billed in LTR or KGS it is bulk and adds nothing.
+
+    ``lines`` are dicts carrying ``item_code``, ``item_name``, ``quantity``, ``uom``,
+    ``litres`` (the line's total), ``sal_factor2`` and ``sal_factor3`` -- the picking
+    sheet's lines (``HanaDispatchBillReader.list_pickable_lines``).
+    """
+    grouped: dict = {}
+    for line in lines:
+        code = str(line.get("item_code") or "").strip().upper()
+        # No item code is a service line (freight, IT support): nothing physical ships.
+        if not code or is_pm_item_code(code):
+            continue
+        grouped.setdefault(code, []).append(line)
+
+    total = 0
+    for group in grouped.values():
+        quantity = sum((to_decimal(line.get("quantity")) for line in group), Decimal("0"))
+        if quantity <= 0:
+            continue
+        head = group[0]
+        per_box = pieces_per_box(
+            head.get("sal_factor2"), head.get("item_name"), head.get("sal_factor3")
+        )
+        if per_box is not None:
+            total += math.ceil(quantity / per_box)
+            continue
+        if str(head.get("uom") or "").strip().upper() not in PIECE_UNITS:
+            continue
+        litres = sum((to_decimal(line.get("litres")) for line in group), Decimal("0"))
+        if litres / quantity >= SINGLE_UNIT_MIN_LITRES:
+            total += math.ceil(quantity)
+        else:
+            total += 1
+    return total

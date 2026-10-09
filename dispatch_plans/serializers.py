@@ -152,6 +152,9 @@ class DispatchBillFilterSerializer(serializers.Serializer):
     by_dispatch_date = serializers.BooleanField(required=False, default=False)
     # The Plan page passes this so only bills chosen on the Bill Selection page show.
     selected_only = serializers.BooleanField(required=False, default=False)
+    # Count every box each bill goes out in (``load_boxes``). Costs one more SAP read
+    # of the bills' lines, so only the Plan page's Excel export asks for it.
+    with_load_boxes = serializers.BooleanField(required=False, default=False)
     # With ``by_dispatch_date``, also return selected bills that have no dispatch
     # date yet. The Plan page is where dispatch dates get assigned, so windowing
     # strictly on that date would hide the very bills waiting to be scheduled.
@@ -654,6 +657,10 @@ class DispatchBillSerializer(serializers.Serializer):
     total_boxes = serializers.FloatField()
     # Pieces not in a full box — the other half of the bill's printed "Box + Loose" pair.
     total_loose = serializers.FloatField(required=False)
+    # Every box the bill goes out in, part boxes and tins included
+    # (``box_packing.load_box_count``). Only sent when ``with_load_boxes`` asked for
+    # it; None when SAP could not give the lines.
+    load_boxes = serializers.IntegerField(required=False)
     total_weight = serializers.FloatField()
     total_line_amount = serializers.FloatField()
     total_gross_amount = serializers.FloatField()

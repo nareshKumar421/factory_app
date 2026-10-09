@@ -10,11 +10,13 @@ from django.test import SimpleTestCase, TestCase
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
 from gate_core.enums import GateEntryStatus
+from sap_client.exceptions import SAPConnectionError
 from vehicle_management.models import Transporter, Vehicle, VehicleType
 
 from .hana_reader import HanaDispatchBillReader
 from .models import DispatchPlan, SelectedDispatchBill
 from .serializers import (
+    DispatchBillFilterSerializer,
     DispatchBillSelectionSerializer,
     DispatchPlanBulkDateSerializer,
     DispatchPlanSerializer,
@@ -1467,6 +1469,79 @@ class GetBillsWindowTruncationTests(TestCase):
 
         self.assertEqual(meta["total_bills"], 0)
         self.assertTrue(meta["window_truncated"])
+
+
+class GetBillsLoadBoxesTests(TestCase):
+    """``with_load_boxes``: the Plan page's Excel export asks for a box count per bill."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.service = DispatchPlansService(company_code=self.company.code)
+        self.service.reader = MagicMock()
+        self.service.reader.list_bills.return_value = [
+            {
+                "doc_entry": doc_entry,
+                "doc_num": str(doc_entry),
+                "doc_total": 10.0,
+                "total_litres": 1.0,
+                "total_boxes": 0.0,
+                "card_name": "Party",
+                "city": "Delhi",
+                "doc_date": "2026-06-20",
+                "create_date": "2026-06-20",
+                "create_time": "10:00",
+            }
+            for doc_entry in (11, 12, 13)
+        ]
+
+    @staticmethod
+    def _line(doc_entry, item_code, quantity, sal_factor2, uom="PCS", litres_each="0"):
+        return {
+            "doc_entry": doc_entry,
+            "item_code": item_code,
+            "item_name": "",
+            "quantity": Decimal(quantity),
+            "uom": uom,
+            "litres": Decimal(quantity) * Decimal(litres_each),
+            "sal_factor2": Decimal(sal_factor2),
+            "sal_factor3": Decimal("0"),
+        }
+
+    def _bills(self, **extra):
+        filters = {"date_from": date(2026, 6, 1), "date_to": date(2026, 6, 30), **extra}
+        return {row["doc_entry"]: row for row in self.service.get_bills(filters)["data"]}
+
+    def test_each_bill_gets_its_own_count(self):
+        self.service.reader.list_pickable_lines.return_value = [
+            self._line(11, "FG0000002", "37", "20"),   # 1 full + 1 part box
+            self._line(12, "FG0000015", "16", "1", litres_each="15"),  # 16 tins
+            self._line(13, "RM0000002", "500", "1", uom="LTR"),  # bulk
+        ]
+        bills = self._bills(with_load_boxes=True)
+
+        self.assertEqual({k: v["load_boxes"] for k, v in bills.items()}, {11: 2, 12: 16, 13: 0})
+        self.service.reader.list_pickable_lines.assert_called_once_with([11, 12, 13])
+        # The scan locks' figure is not touched.
+        self.assertEqual(bills[11]["total_boxes"], 0.0)
+
+    def test_not_asked_for_means_no_extra_sap_read(self):
+        bills = self._bills()
+
+        self.assertNotIn("load_boxes", bills[11])
+        self.service.reader.list_pickable_lines.assert_not_called()
+
+    def test_only_the_page_sent_out_is_counted(self):
+        self.service.reader.list_pickable_lines.return_value = []
+        self._bills(with_load_boxes=True, page=1, page_size=2)
+
+        (entries,), _ = self.service.reader.list_pickable_lines.call_args
+        self.assertEqual(len(entries), 2)
+
+    def test_sap_failing_on_the_lines_leaves_the_count_blank_not_the_export(self):
+        self.service.reader.list_pickable_lines.side_effect = SAPConnectionError("down")
+        bills = self._bills(with_load_boxes=True)
+
+        self.assertEqual([row["load_boxes"] for row in bills.values()], [None, None, None])
 
 
 class GetBillsAllCompaniesTests(TestCase):
