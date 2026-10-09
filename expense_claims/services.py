@@ -2,6 +2,8 @@
 Everything that moves an expense claim goes through here.
 """
 
+import pathlib
+
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
@@ -11,9 +13,9 @@ from company.models import Company
 from sap_client.exceptions import SAPDataError
 
 from . import notifications
-from .constants import COMPANY_LABELS
+from .constants import ATTACHMENT_EXTENSIONS, COMPANY_LABELS, MAX_ATTACHMENT_BYTES
 from .hana_reader import ExpenseSapReader
-from .models import ExpenseClaim, ExpenseClaimStatus
+from .models import ExpenseClaim, ExpenseClaimAttachment, ExpenseClaimStatus
 
 
 def companies():
@@ -90,6 +92,19 @@ def submit(*, user, company, budget_code, gl_account_code, gl_description, comme
     return claim
 
 
+def _own_unapproved(user, claim_id):
+    """The caller's own expense, locked for the change, while it can still change."""
+    try:
+        claim = ExpenseClaim.objects.select_for_update().get(pk=claim_id, is_active=True)
+    except ExpenseClaim.DoesNotExist:
+        raise NotFound("No such expense.")
+    if claim.created_by_id != user.pk:
+        raise PermissionDenied("You can only change an expense you put in yourself.")
+    if claim.status == ExpenseClaimStatus.APPROVED:
+        raise ValidationError({"detail": "This expense is approved and can no longer be changed."})
+    return claim
+
+
 @transaction.atomic
 def edit(
     *, user, claim_id, company, budget_code, gl_account_code, gl_description, comment, amount
@@ -100,14 +115,7 @@ def edit(
     the old verdict is cleared, and the approvers are told. A correction to
     one already waiting is not news to them.
     """
-    try:
-        claim = ExpenseClaim.objects.select_for_update().get(pk=claim_id, is_active=True)
-    except ExpenseClaim.DoesNotExist:
-        raise NotFound("No such expense.")
-    if claim.created_by_id != user.pk:
-        raise PermissionDenied("You can only change an expense you put in yourself.")
-    if claim.status == ExpenseClaimStatus.APPROVED:
-        raise ValidationError({"detail": "This expense is approved and can no longer be changed."})
+    claim = _own_unapproved(user, claim_id)
 
     fields = _checked(
         company=company,
@@ -158,6 +166,60 @@ def decide(*, user, claim_id, approve: bool, note=""):
 
     transaction.on_commit(lambda: notifications.decided(claim, actor=user))
     return claim
+
+
+def _check_upload(upload):
+    """A photograph or a PDF, not empty and not too big. Returns its name and size."""
+    name = getattr(upload, "name", "") or ""
+    if pathlib.Path(name).suffix.lower() not in ATTACHMENT_EXTENSIONS:
+        raise ValidationError(
+            {
+                "file": f"{name or 'That file'} is not a photograph or a PDF "
+                f"({', '.join(sorted(ATTACHMENT_EXTENSIONS))})."
+            }
+        )
+    size = getattr(upload, "size", 0) or 0
+    if size <= 0:
+        raise ValidationError({"file": f"{name} is empty."})
+    if size > MAX_ATTACHMENT_BYTES:
+        raise ValidationError(
+            {
+                "file": f"{name} is {size / 1024 / 1024:.1f} MB. The most that can "
+                f"be attached is {MAX_ATTACHMENT_BYTES // 1024 // 1024} MB."
+            }
+        )
+    return name[:255], size
+
+
+@transaction.atomic
+def attach(*, user, claim_id, upload):
+    """Put a bill on an expense you put in, any time before it is approved.
+
+    It does not send a rejected expense again by itself: saving the form does.
+    """
+    claim = _own_unapproved(user, claim_id)
+    name, size = _check_upload(upload)
+    return ExpenseClaimAttachment.objects.create(
+        claim=claim,
+        file=upload,
+        original_filename=name,
+        size_bytes=size,
+        created_by=user,
+        updated_by=user,
+    )
+
+
+@transaction.atomic
+def remove_attachment(*, user, attachment_id):
+    """Take a file off an expense before it is approved, and off the disk with it."""
+    try:
+        attachment = ExpenseClaimAttachment.objects.get(pk=attachment_id)
+    except ExpenseClaimAttachment.DoesNotExist:
+        raise NotFound("No such attachment.")
+    _own_unapproved(user, attachment.claim_id)
+    attachment.delete()
+    # Only once the row is surely gone: a rolled-back delete keeps its file.
+    transaction.on_commit(lambda: attachment.file.delete(save=False))
 
 
 def counts(queryset):

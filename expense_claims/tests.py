@@ -6,20 +6,25 @@ talks to HANA, so patching it keeps the suite offline without weakening what
 is tested.
 """
 
+import os
+import shutil
+import tempfile
 from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
+from django.test import override_settings
 from rest_framework.test import APITestCase
 
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 
 from .constants import APPROVER_GROUP, SUBMITTER_GROUP
-from .models import ExpenseClaim, ExpenseClaimStatus
+from .models import ExpenseClaim, ExpenseClaimAttachment, ExpenseClaimStatus
 
 User = get_user_model()
 
@@ -279,6 +284,93 @@ class EditTests(ExpenseClaimTestCase):
 
     def test_only_the_submitter_can_change_it(self):
         self.assertEqual(self.edit(self.claim(), user=self.approver).status_code, 403)
+
+
+MEDIA = tempfile.mkdtemp(prefix="expense-claims-test-media-")
+
+
+@override_settings(MEDIA_ROOT=MEDIA)
+class AttachmentTests(ExpenseClaimTestCase):
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(MEDIA, ignore_errors=True)
+
+    def upload(self, claim, *files, user=None):
+        self.as_user(user or self.worker)
+        return self.client.post(
+            f"{BASE}/claims/{claim.id}/attachments/", {"files": list(files)}, format="multipart"
+        )
+
+    def bill(self, name="bill.jpg", content=b"jpeg bytes"):
+        return SimpleUploadedFile(name, content, content_type="image/jpeg")
+
+    def test_the_submitter_attaches_bills_and_both_lists_link_them(self):
+        claim = self.claim()
+        response = self.upload(claim, self.bill(), self.bill("page 2.pdf"))
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            [row["original_filename"] for row in response.data["attached"]],
+            ["bill.jpg", "page 2.pdf"],
+        )
+        self.assertTrue(response.data["attached"][0]["url"].startswith("http://testserver/"))
+
+        self.as_user(self.approver)
+        row = self.client.get(f"{BASE}/claims/").data["results"][0]
+        self.assertEqual([a["original_filename"] for a in row["attachments"]], ["bill.jpg", "page 2.pdf"])
+        self.assertTrue(row["attachments"][0]["url"].startswith("http://testserver/"))
+
+    def test_a_bad_file_is_refused_and_the_good_ones_still_attach(self):
+        claim = self.claim()
+        response = self.upload(claim, self.bill(), self.bill("sheet.xlsx"), self.bill("empty.png", b""))
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(len(response.data["attached"]), 1)
+        self.assertEqual(
+            [row["filename"] for row in response.data["refused"]], ["sheet.xlsx", "empty.png"]
+        )
+
+    def test_nothing_attached_answers_400(self):
+        response = self.upload(self.claim(), self.bill("notes.txt"))
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(ExpenseClaimAttachment.objects.exists())
+
+    def test_only_the_submitter_attaches(self):
+        self.assertEqual(self.upload(self.claim(), self.bill(), user=self.approver).status_code, 403)
+        self.assertEqual(self.upload(self.claim(), self.bill(), user=self.outsider).status_code, 403)
+        self.assertFalse(ExpenseClaimAttachment.objects.exists())
+
+    def test_an_approved_expense_takes_no_more_files(self):
+        claim = self.claim()
+        self.decide(claim, self.approver, True)
+        self.assertEqual(self.upload(claim, self.bill()).status_code, 400)
+
+    def test_attaching_to_a_rejected_expense_does_not_send_it_again(self):
+        claim = self.claim()
+        self.decide(claim, self.approver, False, "No bill attached")
+        self.assertEqual(self.upload(claim, self.bill()).status_code, 201)
+        claim.refresh_from_db()
+        self.assertEqual(claim.status, ExpenseClaimStatus.REJECTED)
+
+    def test_the_submitter_removes_a_file_and_it_leaves_the_disk(self):
+        claim = self.claim()
+        attachment_id = self.upload(claim, self.bill()).data["attached"][0]["id"]
+        path = ExpenseClaimAttachment.objects.get(pk=attachment_id).file.path
+        self.assertTrue(os.path.exists(path))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.delete(f"{BASE}/attachments/{attachment_id}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(ExpenseClaimAttachment.objects.exists())
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_file_on_an_approved_expense_stays(self):
+        claim = self.claim()
+        attachment_id = self.upload(claim, self.bill()).data["attached"][0]["id"]
+        self.decide(claim, self.approver, True)
+        self.as_user(self.worker)
+        self.assertEqual(self.client.delete(f"{BASE}/attachments/{attachment_id}/").status_code, 400)
+        self.as_user(self.other_approver)
+        self.assertEqual(self.client.delete(f"{BASE}/attachments/{attachment_id}/").status_code, 403)
+        self.assertTrue(ExpenseClaimAttachment.objects.filter(pk=attachment_id).exists())
 
 
 class ApprovalTests(ExpenseClaimTestCase):

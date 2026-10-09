@@ -42,3 +42,11 @@ MAX_LIST_ROWS = 500
 
 #: Rows returned by one G/L account search.
 GL_ACCOUNT_SEARCH_LIMIT = 50
+
+#: What an attachment may be: a photograph or a PDF, which is what a bill
+#: reaches the office as.
+ATTACHMENT_EXTENSIONS = frozenset({".pdf", ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"})
+
+#: The project's own upload ceiling, repeated here so the refusal is a
+#: sentence about the file rather than a 500 from the request parser.
+MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024

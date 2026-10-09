@@ -3,8 +3,10 @@ The expense claims API. Two screens sit on it:
 
 * **Expense Entry** -- the expenses you put in (``claims/?by_me=1``), a form
   to put in another (``claims/`` POST), and the same form to change one
-  (``claims/<id>/`` PUT) until it is approved. ``companies/``, ``budgets/``
-  and ``gl-accounts/`` feed its pickers.
+  (``claims/<id>/`` PUT) until it is approved. Its bills go up after it is
+  saved (``claims/<id>/attachments/`` POST) and come off with
+  ``attachments/<id>/`` DELETE. ``companies/``, ``budgets/`` and
+  ``gl-accounts/`` feed its pickers.
 * **Expense Approval** -- every expense (``claims/``), approved or rejected
   by an expense approver (``claims/<id>/decide/``).
 
@@ -13,7 +15,8 @@ the request header. The SAP pickers read the company the form names instead.
 """
 
 from rest_framework import status
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -34,6 +37,7 @@ from .permissions import CanApproveExpenseClaims, CanSubmitExpenseClaim
 from .serializers import (
     BudgetSerializer,
     DecideClaimSerializer,
+    ExpenseClaimAttachmentSerializer,
     ExpenseClaimSerializer,
     GLAccountSerializer,
     SubmitClaimSerializer,
@@ -68,8 +72,10 @@ class ExpenseClaimListCreateAPI(APIView):
         return [p() for p in (SUBMITTER if self.request.method == "POST" else BASE_PERMISSIONS)]
 
     def get(self, request):
-        claims = ExpenseClaim.objects.filter(is_active=True).select_related(
-            "company", "created_by", "decided_by"
+        claims = (
+            ExpenseClaim.objects.filter(is_active=True)
+            .select_related("company", "created_by", "decided_by")
+            .prefetch_related("attachments")
         )
         if request.query_params.get("by_me") in ("1", "true"):
             claims = claims.filter(created_by=request.user)
@@ -79,7 +85,9 @@ class ExpenseClaimListCreateAPI(APIView):
         shown = claims.filter(status=wanted) if wanted in ExpenseClaimStatus.values else claims
         return Response(
             {
-                "results": ExpenseClaimSerializer(shown[:MAX_LIST_ROWS], many=True).data,
+                "results": ExpenseClaimSerializer(
+                    shown[:MAX_LIST_ROWS], many=True, context={"request": request}
+                ).data,
                 "counts": services.counts(claims),
             }
         )
@@ -89,7 +97,10 @@ class ExpenseClaimListCreateAPI(APIView):
             claim = services.submit(user=request.user, **_form(request))
         except SAPConnectionError as exc:
             return _sap_unavailable(exc)
-        return Response(ExpenseClaimSerializer(claim).data, status=status.HTTP_201_CREATED)
+        return Response(
+            ExpenseClaimSerializer(claim, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ExpenseClaimDetailAPI(APIView):
@@ -102,7 +113,50 @@ class ExpenseClaimDetailAPI(APIView):
             claim = services.edit(user=request.user, claim_id=pk, **_form(request))
         except SAPConnectionError as exc:
             return _sap_unavailable(exc)
-        return Response(ExpenseClaimSerializer(claim).data)
+        return Response(ExpenseClaimSerializer(claim, context={"request": request}).data)
+
+
+class ExpenseClaimAttachmentAPI(APIView):
+    """POST ``files`` (multipart, several at once): bills on an expense you put in.
+
+    Each file is checked on its own and one bad file does not throw the others
+    away; the answer says what was attached and what was refused.
+    """
+
+    permission_classes = SUBMITTER
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, pk):
+        uploads = request.FILES.getlist("files") or request.FILES.getlist("file")
+        if not uploads:
+            raise ValidationError({"files": "Pick a file to attach."})
+
+        attached, refused = [], []
+        for upload in uploads:
+            try:
+                attached.append(services.attach(user=request.user, claim_id=pk, upload=upload))
+            except ValidationError as exc:
+                refused.append({"filename": getattr(upload, "name", ""), "reason": exc.detail})
+
+        return Response(
+            {
+                "attached": ExpenseClaimAttachmentSerializer(
+                    attached, many=True, context={"request": request}
+                ).data,
+                "refused": refused,
+            },
+            status=status.HTTP_201_CREATED if attached else status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ExpenseClaimAttachmentDetailAPI(APIView):
+    """DELETE a file off an expense you put in, until it is approved."""
+
+    permission_classes = SUBMITTER
+
+    def delete(self, request, pk):
+        services.remove_attachment(user=request.user, attachment_id=pk)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ExpenseClaimDecideAPI(APIView):
@@ -119,7 +173,7 @@ class ExpenseClaimDecideAPI(APIView):
             approve=serializer.validated_data["approve"],
             note=serializer.validated_data["note"],
         )
-        return Response(ExpenseClaimSerializer(claim).data)
+        return Response(ExpenseClaimSerializer(claim, context={"request": request}).data)
 
 
 class CompanyListAPI(APIView):

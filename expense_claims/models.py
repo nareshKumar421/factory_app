@@ -6,12 +6,12 @@ Two people touch a claim:
 1. **The submitter** fills it in on one page -- which company (the page's
    "Branch"), which SAP budget (dimension 3), which SAP expense G/L account
    or, when they do not know it, what it is for in their own words, a
-   comment and the amount.
+   comment and the amount -- and the bill, as one or more attachments.
 2. **An expense approver** approves or rejects it. A rejection must say why;
    it goes back to the submitter as a notification.
 
-The submitter can change any of it until it is approved. Changing a rejected
-expense sends it again.
+The submitter can change any of it, attachments included, until it is
+approved. Changing a rejected expense sends it again.
 
 The budget and the account are *snapshots*: code and name both, as SAP read
 when the claim was saved. The list then reads back in full when SAP is down,
@@ -130,3 +130,32 @@ class ExpenseClaim(BaseModel):
 
     def __str__(self):
         return f"Expense #{self.pk} {self.amount} ({self.status})"
+
+
+def _attachment_path(instance, filename):
+    """Where a file lands on disk: one folder per expense."""
+    return f"expense_claims/{instance.claim_id}/{filename}"
+
+
+class ExpenseClaimAttachment(BaseModel):
+    """A bill, receipt or photograph behind an expense.
+
+    Several per expense, because a bill is often more than one sheet of paper.
+    ``created_by`` is whoever attached it.
+    """
+
+    claim = models.ForeignKey(
+        ExpenseClaim, on_delete=models.CASCADE, related_name="attachments"
+    )
+    file = models.FileField(upload_to=_attachment_path)
+    #: What it was called on the way in. The stored name is sanitised by
+    #: Django, and a reader should still see the name they recognise.
+    original_filename = models.CharField(max_length=255)
+    size_bytes = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["id"]
+        default_permissions = ()
+
+    def __str__(self):
+        return f"{self.original_filename} on expense #{self.claim_id}"

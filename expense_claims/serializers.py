@@ -3,13 +3,32 @@ from decimal import Decimal
 from rest_framework import serializers
 
 from .constants import COMPANY_LABELS
-from .models import ExpenseClaim
+from .models import ExpenseClaim, ExpenseClaimAttachment
 
 
 def _name(user):
     if user is None:
         return None
     return user.full_name or user.email
+
+
+class ExpenseClaimAttachmentSerializer(serializers.ModelSerializer):
+    """One file on an expense. ``url`` is absolute, built from the request."""
+
+    url = serializers.SerializerMethodField()
+    uploaded_at = serializers.DateTimeField(source="created_at")
+
+    class Meta:
+        model = ExpenseClaimAttachment
+        fields = ["id", "original_filename", "size_bytes", "url", "uploaded_at"]
+        read_only_fields = fields
+
+    def get_url(self, attachment):
+        if not attachment.file:
+            return None
+        url = attachment.file.url
+        request = self.context.get("request")
+        return request.build_absolute_uri(url) if request else url
 
 
 class ExpenseClaimSerializer(serializers.ModelSerializer):
@@ -22,6 +41,7 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
     submitted_by_name = serializers.SerializerMethodField()
     submitted_at = serializers.DateTimeField(source="created_at")
     decided_by_name = serializers.SerializerMethodField()
+    attachments = ExpenseClaimAttachmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = ExpenseClaim
@@ -36,6 +56,7 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
             "gl_description",
             "comment",
             "amount",
+            "attachments",
             "status",
             "status_label",
             "submitted_by",
