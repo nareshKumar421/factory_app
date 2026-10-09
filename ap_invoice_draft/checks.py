@@ -214,14 +214,19 @@ def bill_gst(invoice: dict, tax_total: Decimal) -> dict:
     two equal halves of the GRPO's tax are printed. IGST when an IGST row
     carries a rate or the whole tax. A header that only names "SGST" over a
     value column does not count; nor does the interest clause's 18%.
+
+    CGST and SGST are always equal, so on a bill that labels them one half of
+    the GRPO's tax printed is the tax printed: a handwritten bill's other half
+    may not read (GRAPHIC-368's CGST 75.6 came back "K61").
     """
     rows = [row for row in _rows(invoice) if not NOT_TAX.search(row)]
     amounts = [amount for row in rows for amount in _amounts(row)]
     half = tax_total / 2
     halves = sum(1 for amount in amounts if abs(amount - half) <= GST_AMOUNT_SLACK)
     total_printed = any(abs(amount - tax_total) <= GST_AMOUNT_SLACK for amount in amounts)
+    labelled = any(CGST_WORD.search(row) and _percents(row) for row in rows)
     kinds = set()
-    if halves >= 2 or any(CGST_WORD.search(row) and _percents(row) for row in rows):
+    if halves >= 2 or labelled:
         kinds.add("CGST+SGST")
     if any(
         IGST_WORD.search(row)
@@ -232,7 +237,11 @@ def bill_gst(invoice: dict, tax_total: Decimal) -> dict:
     rates = set()
     for row in rows:
         rates |= _percents(row)
-    return {"kinds": kinds, "rates": rates, "total_printed": total_printed or halves >= 2}
+    return {
+        "kinds": kinds,
+        "rates": rates,
+        "total_printed": total_printed or halves >= 2 or (labelled and halves >= 1),
+    }
 
 
 def check_gst(grpo: dict, invoice: Optional[dict]) -> Finding:
@@ -475,13 +484,18 @@ def _numbers(text: str) -> list[Decimal]:
     return [Decimal(m.replace(",", "")) for m in NUMBER.findall(text)]
 
 
-def bill_quantities_at(invoice: dict, rate) -> list[list[Decimal]]:
+def bill_quantities_at(invoice: dict, rate, expected=()) -> list[list[Decimal]]:
     """For each row of the bill priced at ``rate`` (to the paisa), the numbers
     on it that times the rate make an amount printed beside them.
 
     An item row prints its quantity among other numbers -- the HSN code, the
     boxes, the weight, the GST %, the amount with tax -- and the product is
     what tells the quantity apart.
+
+    Where no such number was read, a handwritten qty misread (GRAPHIC-368's 1500
+    read as "150"), the row's amount stands in for an ``expected`` quantity
+    it is the exact price of: 420 at 0.28 is 1500. A row at the rate that
+    gives neither comes back empty.
     """
     wanted = Decimal(rate).quantize(PAISA)
     found = []
@@ -501,8 +515,14 @@ def bill_quantities_at(invoice: dict, rate) -> list[list[Decimal]]:
                     for a, amount in enumerate(numbers)
                 ):
                     quantities.append(qty)
-        if quantities:
-            found.append(quantities)
+        if not any(n > 0 and n.quantize(PAISA) == wanted for n in numbers):
+            continue
+        if not quantities:
+            quantities = [
+                qty for qty in expected
+                if any(abs(qty * wanted - n) <= max(PAISA, n * LINE_AMOUNT_SLACK) for n in numbers if n > 0)
+            ][:1]
+        found.append(quantities)
     return found
 
 
@@ -526,13 +546,14 @@ def check_invoice_qty(grpo: dict, invoice: Optional[dict]) -> Finding:
     for line in grpo["lines"]:
         by_rate.setdefault(Decimal(line["price"]).quantize(PAISA), []).append(line)
 
-    rows, off, missing = [], [], []
+    rows, off, missing, unsure = [], [], [], []
     for rate, lines in by_rate.items():
         wanted = [line["quantity"] for line in lines]
+        at_rate = bill_quantities_at(invoice, rate, expected=wanted)
         # Of a row's candidates, the one the GRPO expects if it is there.
         on_bill = [
             next((q for q in candidates if any(_same_qty(q, w) for w in wanted)), candidates[0])
-            for candidates in bill_quantities_at(invoice, rate)
+            for candidates in at_rate if candidates
         ]
         unpaired, paired = list(on_bill), []
         for line in lines:
@@ -567,7 +588,8 @@ def check_invoice_qty(grpo: dict, invoice: Optional[dict]) -> Finding:
         if bill_qty is None:
             missing.append(row)
         elif not _same_qty(bill_qty, grpo_qty):
-            off.append(row)
+            # A row at the rate whose quantity did not read may hold the rest.
+            (unsure if len(on_bill) < len(at_rate) else off).append(row)
 
     def lines_said(found):
         return "; ".join(
@@ -578,12 +600,14 @@ def check_invoice_qty(grpo: dict, invoice: Optional[dict]) -> Finding:
 
     if off:
         return _finding("invoice_qty", CheckStatus.FAIL, f"Quantity differs. {lines_said(off)}.", lines=rows)
-    if missing:
+    if missing or unsure:
+        said = []
+        if missing:
+            said.append(f"No line at the GRPO's rate could be read off the bill for {lines_said(missing)}.")
+        if unsure:
+            said.append(f"Not every line at the GRPO's rate could be read off the bill for {lines_said(unsure)}.")
         return _finding(
-            "invoice_qty", CheckStatus.REVIEW,
-            f"No line at the GRPO's rate could be read off the bill for {lines_said(missing)}. "
-            "Compare the quantity by eye.",
-            lines=rows,
+            "invoice_qty", CheckStatus.REVIEW, " ".join(said + ["Compare the quantity by eye."]), lines=rows,
         )
     return _finding("invoice_qty", CheckStatus.PASS, "Every line's quantity on the bill matches the GRPO.", lines=rows)
 

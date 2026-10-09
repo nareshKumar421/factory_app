@@ -27,6 +27,7 @@ from .invoice_reader import (
     fill_rate_blanks,
     gate_stamp_date,
     group_rows,
+    mend_slash_dashes,
     rate_check_marks,
     read_invoice,
 )
@@ -130,6 +131,22 @@ RAJ_GRPO = {
     "doc_entry": 27467, "reference": "SNP-0969/26-27", "tax_total": D("18322.2"),
     "lines": [_line(0, "PM0000916", "351", "290", "220926043", 13723, "350", tax="CG+SG@18", rate="18")],
 }
+
+GRAPHIC_GRPO = {
+    **RAJ_GRPO,
+    "reference": "368", "tax_total": D("151.2"),
+    "lines": [
+        _line(0, "PM0000001", "1500", "0.28", "221026001", 14000, "1500", tax="CG+SG@18", rate="18"),
+        _line(1, "PM0000002", "1500", "0.28", "221026001", 14000, "1500", tax="CG+SG@18", rate="18"),
+    ],
+}
+
+#: GRAPHIC-368's item rows, handwritten, as read: the first row's qty 1500 came
+#: back "150", and "118h" is the HSN code 4811.
+GRAPHIC_ITEM_ROWS = [
+    "TiKki Bomude CSD 118h 150 0.28/- 420/-",
+    "Tikki Borwade CSD 41 1500 0.28/- 420/-",
+]
 
 
 def _status(finding):
@@ -239,6 +256,18 @@ class GSTCheckTests(SimpleTestCase):
         finding = checks.check_gst(SSY_GRPO, bill)
         self.assertEqual(finding.status, CheckStatus.REVIEW)
         self.assertIn("₹13,527.50 is not printed", finding.detail)
+
+    def test_one_half_is_enough_where_the_bill_labels_cgst_and_sgst(self):
+        # GRAPHIC-368 by hand: the SGST half read, the CGST half did not.
+        bill = _bill(["+SGST@ 9 % 75.6/-", "+CGST@ 9 % K61"])
+        finding = checks.check_gst(GRAPHIC_GRPO, bill)
+        self.assertEqual(finding.status, CheckStatus.PASS)
+        self.assertIn("CGST+SGST at 9%, ₹151.20", finding.detail)
+
+    def test_one_half_alone_does_not_say_the_bill_is_cgst_sgst(self):
+        bill = _bill(["Tax 9,161.00", "18%"])
+        finding = checks.check_gst(RAJ_GRPO, bill)
+        self.assertEqual(finding.status, CheckStatus.REVIEW)
 
     def test_nothing_readable_needs_a_look(self):
         bill = _bill(["TAX INVOICE", "Total 7,574 PCS"])
@@ -403,6 +432,26 @@ class InvoiceQtyCheckTests(SimpleTestCase):
         grpo["lines"] = [grpo["lines"][0] | {"price": D("3.3217")}]
         bill = _bill(["Pet Preform 21 Gms 2,00,448 PCS 3.32 PCS 6,65,828.12"])
         self.assertEqual(_status(checks.check_invoice_qty(grpo, bill)), CheckStatus.PASS)
+
+    def test_a_misread_handwritten_qty_is_worked_back_from_the_amount(self):
+        # 420 at 0.28 is the GRPO's 1500, though the qty read "150".
+        finding = checks.check_invoice_qty(GRAPHIC_GRPO, _bill(GRAPHIC_ITEM_ROWS))
+        self.assertEqual(finding.status, CheckStatus.PASS)
+        self.assertEqual([r["invoice_qty"] for r in finding.facts["lines"]], ["1500", "1500"])
+
+    def test_the_amount_holds_the_bill_to_what_it_charges(self):
+        grpo = copy.deepcopy(GRAPHIC_GRPO)
+        grpo["lines"][0]["quantity"] = D("1400")
+        finding = checks.check_invoice_qty(grpo, _bill(GRAPHIC_ITEM_ROWS))
+        # Both rows charge 420, the price of 1500, against 1400 received.
+        self.assertEqual(finding.status, CheckStatus.FAIL)
+        self.assertIn("GRPO 2900, bill 3000", finding.detail)
+
+    def test_a_row_at_the_rate_that_did_not_read_needs_a_look_not_a_fail(self):
+        bill = _bill(["TiKki Bomude CSD 118h 150 0.28/- —1166", GRAPHIC_ITEM_ROWS[1]])
+        finding = checks.check_invoice_qty(GRAPHIC_GRPO, bill)
+        self.assertEqual(finding.status, CheckStatus.REVIEW)
+        self.assertIn("GRPO 3000, bill 1500", finding.detail)
 
     def test_no_line_at_the_rate_needs_a_look(self):
         bill = _bill(["TAX INVOICE", "Total 7,574 PCS 2,84,077.00"])
@@ -956,6 +1005,30 @@ class RowsTests(SimpleTestCase):
         self.assertEqual(gate_stamp_date(lines[:1]), "")
 
 
+
+class SlashDashTests(SimpleTestCase):
+    """Handwritten figures closed with "/-", its stroke read as a 1 (GRAPHIC-368)."""
+
+    def _texts(self, *texts):
+        lines = [{"page": 1, "text": text, "score": 0.9, "box": [0, 40 * i, 200, 40 * i + 30]}
+                 for i, text in enumerate(texts)]
+        return mend_slash_dashes(lines)
+
+    def test_the_stroke_is_not_a_digit(self):
+        lines = self._texts("4201-", "0.281-", "75.61-", "991|-", "840|—")
+        self.assertEqual([line["text"] for line in lines], ["420/-", "0.28/-", "75.6/-", "991/-", "840/-"])
+        self.assertEqual(lines[0]["ocr_text"], "4201-")
+
+    def test_printed_figures_dates_and_numbers_are_left_alone(self):
+        texts = [
+            "Rs. 4,201/-", "Dated 21-10-26", "KILLAN NO 17/21/1.1 26-27/1979", "GE-2026-9786",
+            "Add : CGST @ 9.00 % 9,161.00", "0.28-", "840", "SNP-0969/26-27",
+        ]
+        lines = self._texts(*texts)
+        self.assertEqual([line["text"] for line in lines], texts)
+        self.assertFalse(any("ocr_text" in line for line in lines))
+
+
 def _rate_blank(rate=""):
     """A hand-filled bill book's GST line: "+SGST@", a dotted blank with the
     rate written over it, and "%", between the table's rules."""
@@ -985,12 +1058,6 @@ GRAPHIC_TAX_LINES = [
     {"page": 1, "text": "+IGST @..", "score": 0.942, "box": [817, 1717, 993, 1763]},
     {"page": 1, "text": "Grand Total", "score": 0.994, "box": [1053, 1780, 1223, 1828]},
 ]
-GRAPHIC_GRPO = {
-    **RAJ_GRPO,
-    "reference": "368", "tax_total": D("151.2"),
-    "lines": [_line(0, "PM0000001", "3000", "0.28", "221026001", 14000, "3000", tax="CG+SG@18", rate="18")],
-}
-
 
 @skipUnless(_HAS_OCR, "the OCR packages are not installed")
 class RateBlankTests(SimpleTestCase):
@@ -1023,9 +1090,9 @@ class RateBlankTests(SimpleTestCase):
         before = checks.check_gst(GRAPHIC_GRPO, {"rows": group_rows(GRAPHIC_TAX_LINES)})
         self.assertIn("could not be read clearly", before.detail)
         after = checks.check_gst(GRAPHIC_GRPO, {"rows": group_rows(lines)})
-        # The handwritten CGST amount is still unreadable, so a person checks the amounts.
-        self.assertEqual(after.status, CheckStatus.REVIEW)
-        self.assertIn("charges CGST+SGST at 9% like the PO", after.detail)
+        # The CGST amount still reads "K61"; the SGST half is enough.
+        self.assertEqual(after.status, CheckStatus.PASS)
+        self.assertIn("CGST+SGST at 9%, ₹151.20", after.detail)
 
     def test_a_digit_read_among_the_dots_is_used_as_it_is(self):
         lines = [

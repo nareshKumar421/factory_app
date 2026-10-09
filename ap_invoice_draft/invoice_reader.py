@@ -20,7 +20,9 @@ nothing (0.00–0.13 on the samples); a pen signature left about 1.0.
 Small vendors' bill books print the GST lines with a dotted blank for the rate,
 "+SGST@..........%", and the rate is written in by hand. OCR reads the dots
 and drops the handwritten 9 among them. Such a line is read a second time with
-the printed rules and dots erased (``fill_rate_blanks``).
+the printed rules and dots erased (``fill_rate_blanks``). Their figures are
+written closed with "/-" (no paise), whose stroke OCR reads as a 1: 420/- comes
+back "4201-" and is put right (``mend_slash_dashes``).
 """
 
 import logging
@@ -63,6 +65,9 @@ GST_RATE_BLANK = re.compile(r"(?:C|S|I|UT)\s*GST\s*@", re.I)
 RATE_IN_BLANK = re.compile(r"@[^\d%]*(\d{1,2}(?:\.\d{1,2})?)")
 #: How sure the recognizer must be of a re-read blank to use it.
 BLANK_MIN_SCORE = 0.5
+#: A figure closed with "/-", its stroke read as a 1 or a bar: "4201-" for
+#: 420/-, "0.281-" for 0.28/-, "75.61-" for 75.6/-. Not a date: 21-10-26.
+SLASH_DASH = re.compile(r"(?<![\w.,])(\d[\d,]*(?:\.\d+)?)[1|lI/\\!\]]\s*[-–—~_]+(?![\w.,])")
 
 _engine = None
 _engine_lock = threading.Lock()
@@ -93,7 +98,7 @@ def read_invoice(content: bytes, filename: str) -> tuple[dict[str, Any], str]:
     lines: list[dict] = []
     rate_check: dict = {"found": False}
     for page, image in enumerate(images, start=1):
-        page_lines = fill_rate_blanks(image, _ocr(image, page))
+        page_lines = mend_slash_dashes(fill_rate_blanks(image, _ocr(image, page)))
         lines.extend(page_lines)
         if not rate_check["found"]:
             rate_check = rate_check_marks(image, page_lines)
@@ -336,6 +341,26 @@ def _erase_printed_leaders(crop, h: int):
             )
     clean = np.where(keep[labels], 0, 255).astype(np.uint8)
     return cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR)
+
+
+# ---------------------------------------------------------------------------
+# Figures closed with "/-"
+# ---------------------------------------------------------------------------
+
+def mend_slash_dashes(page_lines: list[dict]) -> list[dict]:
+    """Put back the "/-" a handwritten figure was closed with.
+
+    OCR reads its stroke as a 1 (GRAPHIC-368: 420/- as "4201-", 0.28/- as
+    "0.281-"), which makes 420 into 4201. A figure printed "4,201/-" reads
+    the same before and after.
+    """
+    mended = []
+    for line in page_lines:
+        text = SLASH_DASH.sub(lambda m: f"{m.group(1)}/-", line["text"])
+        if text != line["text"]:
+            line = {**line, "text": text, "ocr_text": line.get("ocr_text", line["text"])}
+        mended.append(line)
+    return mended
 
 
 # ---------------------------------------------------------------------------
