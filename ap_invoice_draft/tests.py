@@ -22,7 +22,14 @@ from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPDataError, SAPOutcomeUnknown, SAPValidationError
 
 from . import checks
-from .invoice_reader import InvoiceReadError, gate_stamp_date, group_rows, rate_check_marks, read_invoice
+from .invoice_reader import (
+    InvoiceReadError,
+    fill_rate_blanks,
+    gate_stamp_date,
+    group_rows,
+    rate_check_marks,
+    read_invoice,
+)
 from .models import (
     APInvoiceDraft,
     CheckStatus,
@@ -947,6 +954,106 @@ class RowsTests(SimpleTestCase):
         ]
         self.assertEqual(gate_stamp_date(lines), "3/10/26")
         self.assertEqual(gate_stamp_date(lines[:1]), "")
+
+
+def _rate_blank(rate=""):
+    """A hand-filled bill book's GST line: "+SGST@", a dotted blank with the
+    rate written over it, and "%", between the table's rules."""
+    import cv2
+    image = _page(900, 200)
+    for y in (60, 140):
+        cv2.line(image, (40, y), (860, y), (0, 0, 0), 3)
+    cv2.line(image, (620, 60), (620, 140), (0, 0, 0), 3)
+    cv2.putText(image, "+SGST@", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 3)
+    for x in range(185, 545, 11):
+        cv2.rectangle(image, (x, 114), (x + 5, 119), (0, 0, 0), -1)
+    cv2.putText(image, rate, (330, 112), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.6, (120, 40, 30), 3)
+    cv2.putText(image, "%", (550, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 3)
+    return image
+
+
+#: What OCR read off GRAPHIC-368's tax block (Graphics Elite, 2026-10-09): the
+#: printed dots of each blank, without the 9 written in them.
+GRAPHIC_TAX_LINES = [
+    {"page": 1, "text": "Total", "score": 1.0, "box": [818, 1516, 942, 1582]},
+    {"page": 1, "text": "840", "score": 0.998, "box": [1276, 1530, 1395, 1599]},
+    {"page": 1, "text": "+SGST@.....%", "score": 0.774, "box": [814, 1584, 1206, 1643]},
+    {"page": 1, "text": "75.61-", "score": 0.834, "box": [1271, 1593, 1451, 1663]},
+    {"page": 1, "text": "+CGST@..", "score": 0.999, "box": [815, 1654, 1003, 1702]},
+    {"page": 1, "text": "...%", "score": 0.518, "box": [1038, 1645, 1198, 1707]},
+    {"page": 1, "text": "K61", "score": 0.66, "box": [1286, 1655, 1432, 1721]},
+    {"page": 1, "text": "+IGST @..", "score": 0.942, "box": [817, 1717, 993, 1763]},
+    {"page": 1, "text": "Grand Total", "score": 0.994, "box": [1053, 1780, 1223, 1828]},
+]
+GRAPHIC_GRPO = {
+    **RAJ_GRPO,
+    "reference": "368", "tax_total": D("151.2"),
+    "lines": [_line(0, "PM0000001", "3000", "0.28", "221026001", 14000, "3000", tax="CG+SG@18", rate="18")],
+}
+
+
+@skipUnless(_HAS_OCR, "the OCR packages are not installed")
+class RateBlankTests(SimpleTestCase):
+    """GST rates written by hand into a printed "+SGST@.....%" blank."""
+
+    BLANK = {"page": 1, "text": "+SGST@..........%", "score": 0.8, "box": [41, 70, 582, 133]}
+
+    def test_the_rate_is_read_off_the_blank_with_its_dots_and_rules_erased(self):
+        for rate in ("9", "2.5", "18"):
+            with self.subTest(rate=rate):
+                lines = fill_rate_blanks(_rate_blank(rate), [dict(self.BLANK)])
+                self.assertEqual([line["text"] for line in lines], [f"+SGST@ {rate} %"])
+                self.assertEqual(lines[0]["ocr_text"], "+SGST@..........%")
+
+    def test_a_blank_nobody_wrote_in_stays_as_read(self):
+        self.assertEqual(fill_rate_blanks(_rate_blank(), [dict(self.BLANK)]), [self.BLANK])
+
+    def test_graphic_368_reads_cgst_sgst_at_9_percent(self):
+        reads = [("+SGST@ 9 %", 0.968), ("+CGST@ 9.%", 0.946), ("+IGST@%", 0.996)]
+        with mock.patch("ap_invoice_draft.invoice_reader._recognize", side_effect=reads) as recognize:
+            lines = fill_rate_blanks(_page(1600, 1900), copy.deepcopy(GRAPHIC_TAX_LINES))
+        # The CGST blank is cut out to the end of its "%" box, and that box joins the line.
+        self.assertEqual(recognize.call_args_list[1].args[0].shape[1], 1198 - 815)
+        self.assertEqual(
+            [row["text"] for row in group_rows(lines)],
+            ["Total 840", "+SGST@ 9 % 75.61-", "+CGST@ 9 % K61", "+IGST @..", "Grand Total"],
+        )
+        self.assertEqual(lines[4]["box"], [815, 1645, 1198, 1707])
+
+        before = checks.check_gst(GRAPHIC_GRPO, {"rows": group_rows(GRAPHIC_TAX_LINES)})
+        self.assertIn("could not be read clearly", before.detail)
+        after = checks.check_gst(GRAPHIC_GRPO, {"rows": group_rows(lines)})
+        # The handwritten CGST amount is still unreadable, so a person checks the amounts.
+        self.assertEqual(after.status, CheckStatus.REVIEW)
+        self.assertIn("charges CGST+SGST at 9% like the PO", after.detail)
+
+    def test_a_digit_read_among_the_dots_is_used_as_it_is(self):
+        lines = [
+            {"page": 1, "text": "+SGST@..", "score": 0.9, "box": [41, 84, 203, 133]},
+            {"page": 1, "text": "9", "score": 0.9, "box": [323, 75, 364, 117]},
+            {"page": 1, "text": "..%", "score": 0.9, "box": [529, 89, 581, 127]},
+        ]
+        with mock.patch("ap_invoice_draft.invoice_reader._recognize") as recognize:
+            filled = fill_rate_blanks(_page(), lines)
+        recognize.assert_not_called()
+        self.assertEqual([line["text"] for line in filled], ["+SGST@ 9 %"])
+
+    def test_a_printed_rate_is_left_alone(self):
+        lines = [{"page": 1, "text": "Add : CGST @ 9.00 % 9,161.00", "score": 1.0, "box": [750, 349, 1300, 371]}]
+        with mock.patch("ap_invoice_draft.invoice_reader._recognize") as recognize:
+            self.assertEqual(fill_rate_blanks(_page(), copy.deepcopy(lines)), lines)
+        recognize.assert_not_called()
+
+    def test_an_unsure_second_reading_is_not_used(self):
+        with mock.patch("ap_invoice_draft.invoice_reader._recognize", return_value=("+SGST@ 9 %", 0.3)):
+            self.assertEqual(fill_rate_blanks(_rate_blank("9"), [dict(self.BLANK)]), [self.BLANK])
+
+    def test_the_engine_still_finds_text_after_reading_a_blank(self):
+        """RapidOCR keeps a call's use_det=False for the calls after it."""
+        import cv2
+        fill_rate_blanks(_rate_blank("9"), [dict(self.BLANK)])
+        data, _ = read_invoice(cv2.imencode(".png", _rate_blank("18"))[1].tobytes(), "bill.png")
+        self.assertIn("+SGST@ 18 %", [row["text"] for row in data["rows"]])
 
 
 @skipUnless(_HAS_OCR, "the OCR packages are not installed")

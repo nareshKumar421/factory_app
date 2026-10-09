@@ -16,6 +16,11 @@ needs is a signature. That is judged from the pixels instead: the "Rate Check"
 label is found by OCR, the stamp's own printed rule beside it is erased, and
 whatever ink is left is measured against the label's height. A blank line left
 nothing (0.00–0.13 on the samples); a pen signature left about 1.0.
+
+Small vendors' bill books print the GST lines with a dotted blank for the rate,
+"+SGST@..........%", and the rate is written in by hand. OCR reads the dots
+and drops the handwritten 9 among them. Such a line is read a second time with
+the printed rules and dots erased (``fill_rate_blanks``).
 """
 
 import logging
@@ -52,6 +57,12 @@ GATE_STAMP_LABEL = re.compile(r"\bG\s*\.\s*:?\s*No", re.I)
 PO_NUMBER = re.compile(r"(?<!\d)2\d{8}(?!\d)")
 #: A handwritten date, day first: 3/10/26, 01-10-2026.
 DATE = re.compile(r"\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{2,4}")
+#: A GST line printed with a blank for its rate: "+SGST@..........%".
+GST_RATE_BLANK = re.compile(r"(?:C|S|I|UT)\s*GST\s*@", re.I)
+#: The rate in a re-read blank: "+SGST@ 9 %", "+CGST@ 9.%", "@ 2.5%".
+RATE_IN_BLANK = re.compile(r"@[^\d%]*(\d{1,2}(?:\.\d{1,2})?)")
+#: How sure the recognizer must be of a re-read blank to use it.
+BLANK_MIN_SCORE = 0.5
 
 _engine = None
 _engine_lock = threading.Lock()
@@ -82,7 +93,7 @@ def read_invoice(content: bytes, filename: str) -> tuple[dict[str, Any], str]:
     lines: list[dict] = []
     rate_check: dict = {"found": False}
     for page, image in enumerate(images, start=1):
-        page_lines = _ocr(image, page)
+        page_lines = fill_rate_blanks(image, _ocr(image, page))
         lines.extend(page_lines)
         if not rate_check["found"]:
             rate_check = rate_check_marks(image, page_lines)
@@ -159,7 +170,9 @@ def _get_engine():
 
 def _ocr(image, page: int) -> list[dict]:
     with _engine_lock:
-        result = _get_engine()(image)
+        # RapidOCR keeps a call's use_* flags for the calls after it, so a
+        # ``_recognize`` would otherwise leave the engine finding no text.
+        result = _get_engine()(image, use_det=True, use_cls=True, use_rec=True)
     lines = []
     for box, text, score in zip(result.boxes if result.boxes is not None else [], result.txts or (), result.scores or ()):
         xs, ys = [p[0] for p in box], [p[1] for p in box]
@@ -170,6 +183,15 @@ def _ocr(image, page: int) -> list[dict]:
             "box": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
         })
     return lines
+
+
+def _recognize(image) -> tuple[str, float]:
+    """Read one line of text that is already cut out: no finding, no turning."""
+    with _engine_lock:
+        result = _get_engine()(image, use_det=False, use_cls=False, use_rec=True)
+    if not result.txts:
+        return "", 0.0
+    return str(result.txts[0]), float(result.scores[0])
 
 
 def group_rows(lines: list[dict]) -> list[dict]:
@@ -196,6 +218,124 @@ def group_rows(lines: list[dict]) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# GST rates written into a printed blank
+# ---------------------------------------------------------------------------
+
+def fill_rate_blanks(image, page_lines: list[dict]) -> list[dict]:
+    """Read the GST rate a person wrote into a printed "+SGST@.....%" blank.
+
+    OCR finds such a line but reads it as the printed dots, with the
+    handwritten 9 dropped among them (GRAPHIC-368, 2026-10-09); the "%" may
+    come as a box of its own. Cut out from the label to the "%", with the
+    table's rules and the dots erased, the same recognizer reads "+SGST@ 9 %".
+    That replaces the line, and any box of dots it covered, only when a rate
+    is read with confidence. A blank nobody wrote in stays as OCR read it.
+    """
+    lines = list(page_lines)
+    for line in page_lines:
+        if line not in lines:
+            continue
+        match = GST_RATE_BLANK.search(line["text"])
+        if not match:
+            continue
+        x0, y0, x1, y1 = line["box"]
+        h = max(1, y1 - y0)
+        middle = (y0 + y1) / 2
+        after = sorted(
+            (
+                other for other in lines
+                if other is not line and other["page"] == line["page"]
+                and other["box"][0] >= x1 - 5
+                and abs((other["box"][1] + other["box"][3]) / 2 - middle) <= 0.5 * h
+            ),
+            key=lambda other: other["box"][0],
+        )
+        # The blank runs to the "%": in the line's own box, or in a box of its
+        # own further on, with whatever OCR made of the blank in between.
+        percent = next(
+            (other for other in after if "%" in other["text"] and other["box"][0] - x1 <= 10 * h), None,
+        )
+        if "%" in line["text"][match.end():]:
+            covered, end = [], x1
+        elif percent is not None:
+            covered = [other for other in after if other["box"][0] <= percent["box"][0]]
+            end = percent["box"][2]
+        else:
+            # No "%" found: up to what is printed next on the row.
+            covered = []
+            end = min(x1 + 6 * h, after[0]["box"][0] - 5 if after else image.shape[1])
+        read = " ".join([line["text"]] + [other["text"] for other in covered])
+        if re.search(r"@\s*\d|\d\s*%", read):
+            continue  # Printed, or read, as the checks can take it.
+        end = min(end, image.shape[1])
+        top = min([y0] + [other["box"][1] for other in covered])
+        bottom = max([y1] + [other["box"][3] for other in covered])
+        # A digit OCR did read, but among the dots ("+SGST@.. 9 ..%"), is used
+        # as it is; otherwise the blank is read again.
+        rate, score = RATE_IN_BLANK.search(read[match.start():]), line["score"]
+        if rate is None and end > x0:
+            crop = image[max(0, top - h // 4): min(image.shape[0], bottom + h // 10), x0:end]
+            text, score = _recognize(_erase_printed_leaders(crop, h))
+            rate = RATE_IN_BLANK.search(text)
+        if rate is None or score < BLANK_MIN_SCORE:
+            continue
+        lines[lines.index(line)] = {
+            "page": line["page"],
+            "text": f"{line['text'][:match.end()]} {rate.group(1)} %",
+            "score": round(score, 3),
+            "box": [x0, top, end, bottom],
+            # What OCR read before the blank was filled in.
+            "ocr_text": read,
+        }
+        lines = [other for other in lines if not any(other is c for c in covered)]
+    return lines
+
+
+def _erase_printed_leaders(crop, h: int):
+    """The cut-out line, black on white, without the table's rules or the dots.
+
+    A dot is small beside the line's letters. One sitting close between two
+    strokes is kept: the point of a handwritten 2.5.
+    """
+    import cv2
+    import numpy as np
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    ink = (gray < 150).astype(np.uint8) * 255
+    horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(1.5 * h)), 1))
+    vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(0.8 * ink.shape[0]))))
+    rules = cv2.morphologyEx(ink, cv2.MORPH_OPEN, horizontal) | cv2.morphologyEx(ink, cv2.MORPH_OPEN, vertical)
+    ink = cv2.subtract(ink, cv2.dilate(rules, np.ones((3, 3), np.uint8)))
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(ink)
+    keep = np.zeros(count, bool)
+    if count > 1:
+        heights = [int(s[cv2.CC_STAT_HEIGHT]) for s in stats[1:]]
+        letter = float(np.median([x for x in heights if x >= 0.5 * max(heights)]))
+        dot, near = 0.45 * letter, 0.6 * letter
+
+        def size(s):
+            return max(s[cv2.CC_STAT_WIDTH], s[cv2.CC_STAT_HEIGHT])
+
+        strokes = [
+            (int(s[cv2.CC_STAT_LEFT]), int(s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH]))
+            for s in stats[1:] if size(s) > dot
+        ]
+        for index in range(1, count):
+            s = stats[index]
+            if size(s) > dot:
+                keep[index] = True
+                continue
+            left, right = int(s[cv2.CC_STAT_LEFT]), int(s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH])
+            keep[index] = (
+                any(r <= right and left - r <= near for _, r in strokes)
+                and any(l >= left and l - right <= near for l, _ in strokes)
+            )
+    clean = np.where(keep[labels], 0, 255).astype(np.uint8)
+    return cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR)
 
 
 # ---------------------------------------------------------------------------
