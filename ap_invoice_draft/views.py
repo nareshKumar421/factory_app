@@ -15,6 +15,7 @@ from .models import APInvoiceDraft
 from .permissions import (
     CanCreateAPInvoiceDraft,
     CanReviewAPInvoiceDraft,
+    CanSeeGRPOAPStatus,
     CanViewAPInvoiceDraft,
 )
 from .serializers import (
@@ -67,11 +68,40 @@ class OpenGRPOListAPI(APIView):
 
     def get(self, request):
         service = APInvoiceDraftService(request.company.company)
+        doc_entry = request.GET.get("doc_entry")
+        if doc_entry is not None and not doc_entry.isdigit():
+            return _bad_request("doc_entry must be a number.")
         try:
-            rows = service.open_grpos(request.GET.get("search") or "")
+            rows = service.open_grpos(
+                request.GET.get("search") or "",
+                doc_entry=int(doc_entry) if doc_entry else None,
+            )
         except (SAPConnectionError, SAPDataError) as exc:
             return _sap_down(exc)
         return Response(OpenGRPOSerializer(rows, many=True).data)
+
+
+#: GRPOs one status request may ask about (a page of posting history).
+GRPO_STATUS_LIMIT = 200
+
+
+class GRPOAPStatusAPI(APIView):
+    """``?doc_entries=27481,27479``: where each GRPO's A/P invoice stands."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanSeeGRPOAPStatus]
+
+    def get(self, request):
+        raw = [part.strip() for part in (request.GET.get("doc_entries") or "").split(",") if part.strip()]
+        if not all(part.isdigit() for part in raw):
+            return _bad_request("doc_entries must be GRPO DocEntry numbers, comma separated.")
+        entries = list(dict.fromkeys(int(part) for part in raw))[:GRPO_STATUS_LIMIT]
+        if not entries:
+            return Response({})
+        try:
+            status_by_grpo = APInvoiceDraftService(request.company.company).grpo_ap_status(entries)
+        except (SAPConnectionError, SAPDataError) as exc:
+            return _sap_down(exc)
+        return Response({str(grpo_entry): value for grpo_entry, value in status_by_grpo.items()})
 
 
 class APInvoiceDraftListCreateAPI(APIView):

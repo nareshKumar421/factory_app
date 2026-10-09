@@ -418,14 +418,22 @@ class FakeReader:
     def open_ap_drafts(self, entries):
         return {e: self.drafts[e] for e in entries if e in self.drafts}
 
-    def open_grpos(self, search=""):
+    def open_grpos(self, search="", doc_entry=None):
         g = self.grpo_data
+        if doc_entry is not None and doc_entry != g["doc_entry"]:
+            return []
         return [{
             "doc_entry": g["doc_entry"], "doc_num": g["doc_num"], "doc_date": g["doc_date"],
             "reference": g["reference"], "vendor_code": g["vendor_code"], "vendor_name": g["vendor_name"],
             "total": g["total"], "comments": "", "warehouses": ["BH-PM"],
             "sap_draft_entries": self.drafts.get(g["doc_entry"], []),
         }]
+
+    def ap_invoice_states(self, entries):
+        states = getattr(self, "states", {
+            27481: {"grpo_open": True, "grpo_cancelled": False, "invoices": [], "draft_entries": []},
+        })
+        return {e: copy.deepcopy(states[e]) for e in entries if e in states}
 
     def ap_invoice_series(self, posting_date, branch_id, gst_type):
         self.series_asked = (posting_date, branch_id, gst_type)
@@ -665,6 +673,37 @@ class ReviewTests(ServiceTestCase):
         self.assertIsNone(check.reviewed_by)
 
 
+class GRPOAPStatusTests(ServiceTestCase):
+    def _state(self, open_=True, cancelled=False, invoices=(), drafts=()):
+        return {"grpo_open": open_, "grpo_cancelled": cancelled,
+                "invoices": list(invoices), "draft_entries": list(drafts)}
+
+    def test_each_way_a_grpos_a_p_invoice_can_stand(self):
+        invoice = {"doc_entry": 52342, "doc_num": "626094326", "doc_date": date(2026, 10, 6)}
+        self.reader.states = {
+            1: self._state(),
+            2: self._state(drafts=[58620]),
+            3: self._state(open_=False, invoices=[invoice]),
+            4: self._state(open_=True, invoices=[invoice]),
+            5: self._state(open_=False),
+            6: self._state(cancelled=True),
+        }
+        status = self.service.grpo_ap_status([1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(
+            {k: v["status"] for k, v in status.items()},
+            {1: "NONE", 2: "DRAFT", 3: "POSTED", 4: "PARTIAL", 5: "CLOSED", 6: "CLOSED"},
+        )
+        self.assertEqual(status[3]["invoices"][0]["doc_num"], "626094326")
+        self.assertNotIn(7, status)  # SAP has no such GRPO
+
+    def test_the_apps_own_entry_is_named(self):
+        entry = self.service.create(27481, _pdf(), self.user)
+        status = self.service.grpo_ap_status([27481])[27481]
+        self.assertEqual(status["status"], "DRAFT")
+        self.assertEqual(status["entry"]["entry_no"], entry.entry_no)
+        self.assertEqual(status["entry"]["sap_draft_entry"], 59001)
+
+
 # ---------------------------------------------------------------------------
 # The API
 # ---------------------------------------------------------------------------
@@ -728,6 +767,25 @@ class APITests(ServiceTestCase):
         response = self._as(self.maker).post(f"{API}{entry_id}/send-to-sap/", HTTP_COMPANY_CODE="JIVO_OIL")
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["sap_status"], "CREATED")
+
+    def test_the_form_can_ask_for_one_grpo(self):
+        url = f"{API}grpos/?doc_entry=27481"
+        [row] = self._as(self.maker).get(url, HTTP_COMPANY_CODE="JIVO_OIL").json()
+        self.assertEqual(row["doc_entry"], 27481)
+        self.assertEqual(self._as(self.maker).get(f"{API}grpos/?doc_entry=1", HTTP_COMPANY_CODE="JIVO_OIL").json(), [])
+        self.assertEqual(self._as(self.maker).get(f"{API}grpos/?doc_entry=x", HTTP_COMPANY_CODE="JIVO_OIL").status_code, 400)
+
+    def test_grpo_history_viewers_see_the_a_p_status(self):
+        store = get_user_model().objects.create(email="grpo@jivo.in", full_name="GRPO viewer")
+        UserCompany.objects.create(user=store, company=self.company, role=UserRole.objects.first(), is_active=True)
+        store.user_permissions.add(Permission.objects.get(content_type__app_label="grpo", codename="can_view_grpo_history"))
+        response = self._as(store).get(f"{API}grpo-status/?doc_entries=27481,1", HTTP_COMPANY_CODE="JIVO_OIL")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json(), {"27481": {
+            "status": "NONE", "invoices": [], "sap_draft_entries": [], "entry": None,
+        }})
+        self.assertEqual(self._as(self.nobody).get(f"{API}grpo-status/?doc_entries=27481", HTTP_COMPANY_CODE="JIVO_OIL").status_code, 403)
+        self.assertEqual(self._as(store).get(f"{API}grpo-status/?doc_entries=a,b", HTTP_COMPANY_CODE="JIVO_OIL").status_code, 400)
 
     def test_auditor_cannot_create_nobody_cannot_see(self):
         response = self._as(self.auditor).post(

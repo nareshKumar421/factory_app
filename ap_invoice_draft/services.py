@@ -94,10 +94,11 @@ class APInvoiceDraftService:
     # Reads
     # ------------------------------------------------------------------
 
-    def open_grpos(self, search: str = "") -> list:
+    def open_grpos(self, search: str = "", doc_entry: Optional[int] = None) -> list:
         """The picker: open material GRPOs, each saying whether the app or SAP
-        already has an A/P draft for it."""
-        rows = GRPOReader(self.company_code).open_grpos(search)
+        already has an A/P draft for it. ``doc_entry`` asks for one GRPO, as a
+        GRPO's own page does when it opens the form on itself."""
+        rows = GRPOReader(self.company_code).open_grpos(search, doc_entry=doc_entry)
         taken = dict(
             APInvoiceDraft.objects.filter(
                 company=self.company,
@@ -108,6 +109,46 @@ class APInvoiceDraftService:
         for row in rows:
             row["entry_no"] = taken.get(row["doc_entry"], "")
         return rows
+
+    def grpo_ap_status(self, grpo_entries: list) -> dict:
+        """Where each GRPO's A/P invoice stands, for the GRPO pages.
+
+        POSTED: SAP has an A/P invoice for all of it (the GRPO is closed).
+        PARTIAL: an A/P invoice took some lines; the GRPO is still open.
+        DRAFT: no invoice yet, but an A/P draft is waiting in SAP.
+        CLOSED: the GRPO was closed or cancelled without an invoice.
+        NONE: nothing yet. A GRPO SAP does not have is left out.
+        """
+        states = GRPOReader(self.company_code).ap_invoice_states(grpo_entries)
+        entries = {
+            entry.grpo_doc_entry: entry
+            for entry in APInvoiceDraft.objects.filter(
+                company=self.company, is_active=True, grpo_doc_entry__in=list(states),
+            )
+        }
+        result = {}
+        for grpo_entry, state in states.items():
+            entry = entries.get(grpo_entry)
+            if state["invoices"]:
+                status = "PARTIAL" if state["grpo_open"] else "POSTED"
+            elif state["draft_entries"] or (entry and entry.sap_draft_entry):
+                status = "DRAFT"
+            elif state["grpo_cancelled"] or not state["grpo_open"]:
+                status = "CLOSED"
+            else:
+                status = "NONE"
+            result[grpo_entry] = {
+                "status": status,
+                "invoices": state["invoices"],
+                "sap_draft_entries": state["draft_entries"],
+                "entry": {
+                    "id": entry.pk,
+                    "entry_no": entry.entry_no,
+                    "sap_status": entry.sap_status,
+                    "sap_draft_entry": entry.sap_draft_entry,
+                } if entry else None,
+            }
+        return result
 
     def list_entries(self, company_ids, search: Optional[str] = None):
         qs = (

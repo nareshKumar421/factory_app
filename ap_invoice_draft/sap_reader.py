@@ -9,6 +9,7 @@ in dispatch and are left out.
 
 import logging
 from decimal import Decimal
+from typing import Optional
 
 from hdbcli import dbapi
 
@@ -30,12 +31,32 @@ SELECT TOP {limit} H."DocEntry", H."DocNum", H."DocDate", H."NumAtCard", H."Card
  ORDER BY H."DocDate" DESC, H."DocEntry" DESC
 """
 
+_ONE_GRPO_SQL = """
+   AND H."DocEntry" = ?
+"""
+
 _SEARCH_SQL = """
    AND (CAST(H."DocNum" AS NVARCHAR(20)) LIKE ?
         OR UPPER(IFNULL(H."NumAtCard", '')) LIKE ?
         OR UPPER(H."CardName") LIKE ?
         OR UPPER(H."CardCode") LIKE ?
         OR UPPER(IFNULL(H."Comments", '')) LIKE ?)
+"""
+
+# A/P invoices made from a GRPO: any of their lines copied from it. A cancelled
+# invoice and its cancellation both carry CANCELED <> 'N' and count for nothing.
+_POSTED_INVOICES_SQL = """
+SELECT DISTINCT L."BaseEntry", P."DocEntry", P."DocNum", P."DocDate"
+  FROM "{schema}"."OPCH" P
+  JOIN "{schema}"."PCH1" L ON L."DocEntry" = P."DocEntry"
+ WHERE L."BaseType" = 20 AND L."BaseEntry" IN ({entries}) AND P."CANCELED" = 'N'
+ ORDER BY P."DocEntry"
+"""
+
+_GRPO_STATES_SQL = """
+SELECT H."DocEntry", H."DocStatus", H."CANCELED"
+  FROM "{schema}"."OPDN" H
+ WHERE H."DocEntry" IN ({entries})
 """
 
 _LINE_WAREHOUSES_SQL = """
@@ -119,13 +140,17 @@ class GRPOReader:
             except Exception:
                 pass
 
-    def open_grpos(self, search: str = "") -> list:
+    def open_grpos(self, search: str = "", doc_entry: Optional[int] = None) -> list:
         """Open material GRPOs, newest first, matching ``search`` on the GRPO
-        number, the bill number, the vendor or the comments (the gate entry)."""
+        number, the bill number, the vendor or the comments (the gate entry);
+        or just the one ``doc_entry``, if it is open."""
         search = (search or "").strip().upper()
         params = []
         clause = ""
-        if search:
+        if doc_entry is not None:
+            clause = _ONE_GRPO_SQL
+            params = [int(doc_entry)]
+        elif search:
             like = f"%{search}%"
             clause = _SEARCH_SQL
             params = [like, like, like, like, like]
@@ -178,6 +203,37 @@ class GRPOReader:
         ):
             found.setdefault(int(r["BaseEntry"]), []).append(int(r["DocEntry"]))
         return found
+
+    def ap_invoice_states(self, grpo_entries: list) -> dict:
+        """Where each GRPO's A/P invoice stands in SAP.
+
+        ``{grpo doc-entry: {"grpo_open", "grpo_cancelled", "invoices": [...],
+        "draft_entries": [...]}}``; a GRPO SAP does not have is left out.
+        """
+        entries = [int(e) for e in grpo_entries]
+        if not entries:
+            return {}
+        marks = ",".join("?" * len(entries))
+        states = {
+            int(r["DocEntry"]): {
+                "grpo_open": r["DocStatus"] == "O",
+                "grpo_cancelled": r["CANCELED"] != "N",
+                "invoices": [],
+                "draft_entries": [],
+            }
+            for r in self._rows(_GRPO_STATES_SQL.replace("{entries}", marks), entries, what="GRPOs")
+        }
+        for r in self._rows(_POSTED_INVOICES_SQL.replace("{entries}", marks), entries, what="A/P invoices"):
+            state = states.get(int(r["BaseEntry"]))
+            if state is not None:
+                state["invoices"].append({
+                    "doc_entry": int(r["DocEntry"]),
+                    "doc_num": str(r["DocNum"]),
+                    "doc_date": _day(r["DocDate"]),
+                })
+        for grpo_entry, drafts in self.open_ap_drafts(list(states)).items():
+            states[grpo_entry]["draft_entries"] = drafts
+        return states
 
     def ap_invoice_series(self, posting_date, branch_id: int, gst_type: str):
         """``(series, name)`` an A/P invoice dated ``posting_date`` takes in
