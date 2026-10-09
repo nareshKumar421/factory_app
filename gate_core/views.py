@@ -2,7 +2,7 @@ import datetime as dt
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
-from django.db.models import Count, Prefetch
+from django.db.models import Count, Exists, OuterRef, Prefetch
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -2749,6 +2749,10 @@ class EmptyVehicleEligibleEntriesView(APIView):
             VehicleEntry.objects
             .filter(company_id__in=company_ids)
             .filter(status__in=list(GRPO_READY_STATUSES))
+            # A SALES_DISPATCH entry is the docking's own entry, and it reaches
+            # COMPLETED only when the truck is dispatched: it has already left
+            # loaded. Its empty leg is the EMPTY_VEHICLE entry the plan links to.
+            .exclude(entry_type="SALES_DISPATCH")
             .select_related(
                 "vehicle",
                 "vehicle__vehicle_type",
@@ -2762,27 +2766,24 @@ class EmptyVehicleEligibleEntriesView(APIView):
             .prefetch_related("po_receipts__items")
             .order_by("-entry_time")
         )
-        completed_gate_out_entry_ids = EmptyVehicleGateOut.objects.filter(
+        # Both exclusions are NOT EXISTS, never exclude(id__in=<subquery>). That
+        # compiles to NOT IN, which Postgres hashes only while the subquery fits
+        # in work_mem; the box-scan one returns a row per scanned box, and past
+        # ~250k scans it was re-read in full for every entry (20-65 s on live).
+        completed_gate_out = EmptyVehicleGateOut.objects.filter(
+            vehicle_entry_id=OuterRef("pk"),
             company_id__in=company_ids,
             is_active=True,
             status="COMPLETED",
-        ).values("vehicle_entry_id")
-        qs = qs.exclude(id__in=completed_gate_out_entry_ids)
-
+        )
         # A dispatch vehicle stays eligible to leave empty until box scanning
         # starts at docking. Once any box is scanned against a plan linked to
         # this entry, the vehicle is committed to loading and no longer eligible.
-        scanned_entry_ids = (
-            SalesDispatchBoxScan.objects.filter(
-                is_active=True,
-                sales_dispatch__dispatch_plan__linked_vehicle_entry__isnull=False,
-            )
-            .values_list(
-                "sales_dispatch__dispatch_plan__linked_vehicle_entry_id",
-                flat=True,
-            )
+        scanned_box = SalesDispatchBoxScan.objects.filter(
+            is_active=True,
+            sales_dispatch__dispatch_plan__linked_vehicle_entry_id=OuterRef("pk"),
         )
-        qs = qs.exclude(id__in=scanned_entry_ids)
+        qs = qs.filter(~Exists(completed_gate_out), ~Exists(scanned_box))
 
         entry_type = request.query_params.get("entry_type")
         from_date = request.query_params.get("from_date")
