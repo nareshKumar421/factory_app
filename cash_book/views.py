@@ -914,8 +914,12 @@ class AdvanceHolderListAPI(APIView):
         return Response(
             {
                 "holders": AdvanceHolderSerializer(rows, many=True).data,
+                # Only the people holding cash. A negative balance is money the
+                # factory owes somebody, not cash out with them -- netting it
+                # in understated this against the cash book's "Advance given".
                 "total_outstanding": sum(
-                    (row["balance"] for row in rows), Decimal("0.00")
+                    (row["balance"] for row in rows if row["balance"] > 0),
+                    Decimal("0.00"),
                 ),
             }
         )

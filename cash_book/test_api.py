@@ -1072,6 +1072,73 @@ class AdvanceCancelEndpointTests(CashBookAPITestCase):
         self.assertEqual(self.balance(), Decimal("0.00"))
 
 
+class HolderTotalLeavesOutWhatIsOwedTests(CashBookAPITestCase):
+    """The Advances page's "Out with people" figure.
+
+    It summed every balance, so somebody the factory owes 1,600 took 1,600 off
+    the cash out with everybody else: the page read 53,397 while the cash
+    book's "Advance given" read 54,997, and neither said which was right.
+    """
+
+    def setUp(self):
+        super().setUp()
+        User = get_user_model()
+        self.holder = User.objects.create(
+            email="holder@cash-book.local", full_name="Holder", is_active=False
+        )
+        self.owed = User.objects.create(
+            email="owed@cash-book.local", full_name="Owed", is_active=False
+        )
+        services.record_advance(
+            user=self.custodian,
+            company=self.company,
+            person=self.holder,
+            entry_date="2026-06-04",
+            direction=AdvanceDirection.GIVEN,
+            amount=Decimal("5000.00"),
+            detail="Cash given",
+        )
+        # Paid for it out of their own pocket and explained it: owed, not held.
+        services.record_entry(
+            user=self.custodian,
+            company=self.company,
+            entry_date="2026-06-04",
+            direction=CashDirection.OUT,
+            amount=Decimal("1600.00"),
+            detail="Cash paid to Owed for courier",
+            branch=self.branch,
+            gl_account_code="5680023",
+            gl_account_name="POSTAGE & COURIER",
+            advance_holder=self.owed,
+            approver=self.approver,
+        )
+
+    def fetch(self):
+        self.as_user(self.viewer)
+        response = self.client.get(f"{BASE}/advances/holders/")
+        self.assertEqual(response.status_code, 200)
+        return response.data
+
+    def test_what_is_owed_is_not_taken_off_what_is_out(self):
+        self.assertEqual(
+            Decimal(str(self.fetch()["total_outstanding"])), Decimal("5000.00")
+        )
+
+    def test_it_matches_the_cash_books_advance_given(self):
+        self.assertEqual(
+            Decimal(str(self.fetch()["total_outstanding"])),
+            services.reconciliation(self.company)["advance_given"],
+        )
+
+    def test_the_owed_person_is_still_listed(self):
+        """Left out of the total, not out of the list."""
+        balances = {
+            row["person"]["id"]: Decimal(row["balance"])
+            for row in self.fetch()["holders"]
+        }
+        self.assertEqual(balances[self.owed.id], Decimal("-1600.00"))
+
+
 class TakenOutRowsAreStillReadableTests(CashBookAPITestCase):
     """Seeing what was taken out of somebody's ledger.
 
