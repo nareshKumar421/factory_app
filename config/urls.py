@@ -154,6 +154,12 @@ urlpatterns = [
         "api/v1/dashboards/operations-report/",
         include("operations_report.urls"),
     ),
+    # Production & Dispatch -- Oil's output against its sales, per SKU and day,
+    # in pallets, with FAST / SLOW movement.
+    path(
+        "api/v1/dashboards/production-dispatch/",
+        include("production_dispatch.urls"),
+    ),
     # The dashboard builder: the card palette, the saved boards, and the one
     # composed read every built board is served through.
     path("api/v1/dashboards/builder/", include("board_builder.urls")),

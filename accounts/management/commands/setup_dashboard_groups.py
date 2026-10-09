@@ -160,6 +160,11 @@ PAGE_GROUPS: dict[str, list[str]] = {
     # none of them may open it. Setting the RM / PM / FG owners is the action
     # group "Amounts Owners" below.
     "Amounts": ["amounts_board.can_view_amounts_board"],
+    # /dashboards/production-dispatch — Oil's production against its dispatch
+    # per SKU and day, in pallets, with FAST / SLOW movement. A right of its own
+    # (production_dispatch migration 0001): it shows SKU-level sales volumes,
+    # which no production or stock right carried before.
+    "Production & Dispatch": ["production_dispatch.can_view_production_dispatch"],
     # /dashboards/plant-board — the whole plant on one wall in the order
     # material moves: bought, stored, made, shifted. Also covers
     # /dashboards/plant-board/settings, which is gated on these same rights

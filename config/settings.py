@@ -283,6 +283,11 @@ INSTALLED_APPS = [
     # cost. Reads the runs, the waste register, the labour gate and Daily
     # Electricity++; owns no data, so no migration and no permission row.
     'operations_report.apps.OperationsReportConfig',
+    # Production & Dispatch. Oil's finished goods made against sold, SKU by SKU
+    # and day by day, in boxes, litres, tons and pallets, with each SKU's FAST /
+    # SLOW movement -- the "Production & Dispatch- PALLET" workbook made live.
+    # Reads SAP only; the migration carries its view right and nothing else.
+    'production_dispatch.apps.ProductionDispatchConfig',
     # The control boards' shared access layer: one read right per DATA FEED
     # a board consumes, so a Dashboards group can grant a board without
     # granting the operational module behind it (which would reveal that
