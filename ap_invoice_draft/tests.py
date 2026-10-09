@@ -84,6 +84,9 @@ SSY_ROWS = [
     "SSY CONTAINERS PRIVATE LIMITED Invoice No. e-Way Bill No. Dated",
     "KILLAN NO 17/21/1.1 26-27/1979 372347234423 2-Oct-26",
     "GSTIN/UIN: 06AAOCS0564L1ZY",
+    "1 CARTON JIVO 1 LTR X 20 PCS NEW (435X340X295) 481910 2,334 PCS 37.88 PCS 88,411.92",
+    "2 CARTON JIVO 1 LTR X 20 PCS 52GM PLAIN BOX 481910 2,000 PCS 34.45 PCS 68,900.00",
+    "3 CARTON JIVO 1 LTR X 20 PCS 52GM OLIVE 481910 3,240 PCS 34.95 PCS 1,13,238.00",
     "OUTPUT SGST 2.5% 2.50 % 6,763.75",
     "OUTPUT CGST 2.5% 2.50 % 6,763.75",
     "Total 7,574 PCS 2,84,077.00",
@@ -106,6 +109,8 @@ FRYSTAL_GRPO = {
 FRYSTAL_INVOICE = _bill([
     "Invoice No. : NINV/26-27/1113 Transport Name : Kunal Cargo Movers",
     "1 Pet Preform 21 Gms CTC Box 39239090 174 BOX 4,209.4080 KGS 2,00,448 PCS 3.321 PCS 6,65,687.81 18% 7,85,511.62",
+    "JIVO WELLNESS PVT. LTD. Pet Preform A0.0 Gms CTC (26/20mm) Clear 89239090 96 BOX 2,304.0000 KGS 57,600 PCS "
+    "6.180 PCS 3,55,968.00 18% 4,20,042.24",
     "IGST CGST Total Amount",
     # Names SGST over a value column without charging it.
     "SGST Total Ass. Value 10,21,655.81",
@@ -350,6 +355,58 @@ class PORateCheckTests(SimpleTestCase):
         self.assertIn("GRPO 34.45, PO 33.95", finding.detail)
 
 
+class InvoiceQtyCheckTests(SimpleTestCase):
+    def test_each_line_found_on_the_bill_by_its_rate(self):
+        finding = checks.check_invoice_qty(SSY_GRPO, SSY_INVOICE)
+        self.assertEqual(finding.status, CheckStatus.PASS)
+        self.assertEqual([r["invoice_qty"] for r in finding.facts["lines"]], ["2000", "2334", "3240"])
+
+    def test_the_quantity_among_boxes_weight_and_hsn(self):
+        # Frystal prints boxes, KGS and PCS on the row; only PCS x rate is the amount.
+        finding = checks.check_invoice_qty(FRYSTAL_GRPO, FRYSTAL_INVOICE)
+        self.assertEqual(finding.status, CheckStatus.PASS)
+        self.assertEqual([r["invoice_qty"] for r in finding.facts["lines"]], ["200448", "57600"])
+
+    def test_decimals_on_the_bill(self):
+        bill = _bill(["1. 20LTR_MSR_NRB_IVORY_1300 39231090 19BAG X 18+9PCS 351.00 PCS. 290.00 1,01,790.00"])
+        self.assertEqual(_status(checks.check_invoice_qty(RAJ_GRPO, bill)), CheckStatus.PASS)
+
+    def test_a_bill_for_more_than_was_received_fails(self):
+        grpo = copy.deepcopy(SSY_GRPO)
+        grpo["lines"][1]["quantity"] = D("2300")
+        finding = checks.check_invoice_qty(grpo, SSY_INVOICE)
+        self.assertEqual(finding.status, CheckStatus.FAIL)
+        self.assertIn("line 2 (PM0000825) at 37.88: GRPO 2300, bill 2334", finding.detail)
+
+    def test_po_lines_merged_at_one_rate_are_held_to_the_bill_as_one(self):
+        grpo = copy.deepcopy(SSY_GRPO)
+        grpo["lines"] = [
+            _line(0, "PM0000920", "1500", "34.45", "220926152", 14125, "1500"),
+            _line(1, "PM0000920", "500", "34.45", "220926153", 14126, "500"),
+        ]
+        bill = _bill(["2 CARTON JIVO 1 LTR X 20 PCS 52GM PLAIN BOX 481910 2,000 PCS 34.45 PCS 68,900.00"])
+        finding = checks.check_invoice_qty(grpo, bill)
+        self.assertEqual(finding.status, CheckStatus.PASS)
+        [row] = finding.facts["lines"]
+        self.assertEqual((row["line"], row["grpo_qty"], row["invoice_qty"]), ("1, 2", "2000", "2000"))
+
+    def test_a_rate_printed_to_the_paisa(self):
+        # Worked at 3.3217 a piece, printed as 3.32.
+        grpo = copy.deepcopy(FRYSTAL_GRPO)
+        grpo["lines"] = [grpo["lines"][0] | {"price": D("3.3217")}]
+        bill = _bill(["Pet Preform 21 Gms 2,00,448 PCS 3.32 PCS 6,65,828.12"])
+        self.assertEqual(_status(checks.check_invoice_qty(grpo, bill)), CheckStatus.PASS)
+
+    def test_no_line_at_the_rate_needs_a_look(self):
+        bill = _bill(["TAX INVOICE", "Total 7,574 PCS 2,84,077.00"])
+        finding = checks.check_invoice_qty(SSY_GRPO, bill)
+        self.assertEqual(finding.status, CheckStatus.REVIEW)
+        self.assertIn("line 1 (PM0000920) at 34.45", finding.detail)
+
+    def test_waits_for_the_bill(self):
+        self.assertEqual(_status(checks.check_invoice_qty(SSY_GRPO, None)), CheckStatus.UNKNOWN)
+
+
 class OverReceiptCheckTests(SimpleTestCase):
     def test_one_over_on_a_350_line_is_within_ten_percent(self):
         self.assertEqual(_status(checks.check_over_receipt(RAJ_GRPO, False)), CheckStatus.PASS)
@@ -388,10 +445,10 @@ class QCCheckTests(SimpleTestCase):
 
 
 class RunChecksTests(SimpleTestCase):
-    def test_nine_findings_in_order(self):
+    def test_ten_findings_in_order(self):
         findings = checks.run_checks(SSY_GRPO, SSY_INVOICE, {})
         self.assertEqual([f.key for f in findings], checks.ORDER)
-        self.assertEqual(len(findings), 9)
+        self.assertEqual(len(findings), 10)
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +802,7 @@ class APITests(ServiceTestCase):
         self.assertEqual(response.status_code, 201, response.content)
         body = response.json()
         self.assertEqual(body["sap_status"], "CREATED")
-        self.assertEqual(len(body["checks"]), 9)
+        self.assertEqual(len(body["checks"]), 10)
         self.assertTrue(body["invoice_file_url"].startswith("http://testserver/"))
 
         listed = self._as(self.maker).get(API, HTTP_COMPANY_CODE="JIVO_OIL").json()

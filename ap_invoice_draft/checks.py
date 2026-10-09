@@ -2,7 +2,7 @@
 
 Pure functions: everything they judge is handed in (``services.gather_context``
 does the reading), so each rule can be tested on its own and re-run without
-touching SAP. Each returns a ``Finding``; ``run_checks`` returns all nine in
+touching SAP. Each returns a ``Finding``; ``run_checks`` returns all ten in
 checklist order.
 
 A finding is PASS or FAIL when the app can say so from the records, REVIEW when
@@ -55,7 +55,8 @@ LABELS = {
     "rate_check_signature": f"{RATE_CHECKER}'s signature on the invoice's Rate Check stamp",
     "po_approver": f"PO print approved by {PO_APPROVER}",
     "po_rate": "PO rate matches GRPO rate",
-    "over_receipt": "Received within PO + 10% (as on the gate)",
+    "invoice_qty": "Invoice qty matches GRPO qty",
+    "over_receipt":"Received within PO + 10% (as on the gate)",
     "qc": "QC approved",
 }
 
@@ -459,7 +460,136 @@ def check_po_rate(grpo: dict) -> Finding:
 
 
 # ---------------------------------------------------------------------------
-# 8. Over-receipt
+# 8. Invoice qty vs GRPO qty
+# ---------------------------------------------------------------------------
+
+#: Any number as a bill prints it: 2,00,448 / 351.00 / 4,209.4080 / 5970.
+NUMBER = re.compile(r"(?<![\d.,])(\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?![\d])")
+#: How far qty x rate may miss the amount printed beside them. A bill that
+#: prints its rate to the paisa can work the amount from more places.
+LINE_AMOUNT_SLACK = Decimal("0.001")
+QTY_SLACK = Decimal("0.001")
+
+
+def _numbers(text: str) -> list[Decimal]:
+    return [Decimal(m.replace(",", "")) for m in NUMBER.findall(text)]
+
+
+def bill_quantities_at(invoice: dict, rate) -> list[list[Decimal]]:
+    """For each row of the bill priced at ``rate`` (to the paisa), the numbers
+    on it that times the rate make an amount printed beside them.
+
+    An item row prints its quantity among other numbers -- the HSN code, the
+    boxes, the weight, the GST %, the amount with tax -- and the product is
+    what tells the quantity apart.
+    """
+    wanted = Decimal(rate).quantize(PAISA)
+    found = []
+    for text in _rows(invoice):
+        numbers = _numbers(text)
+        quantities = []
+        for r, printed_rate in enumerate(numbers):
+            if printed_rate <= 0 or printed_rate.quantize(PAISA) != wanted:
+                continue
+            for q, qty in enumerate(numbers):
+                if q == r or qty <= 0:
+                    continue
+                product = qty * printed_rate
+                if any(
+                    a not in (q, r) and amount > 0
+                    and abs(product - amount) <= max(PAISA, amount * LINE_AMOUNT_SLACK)
+                    for a, amount in enumerate(numbers)
+                ):
+                    quantities.append(qty)
+        if quantities:
+            found.append(quantities)
+    return found
+
+
+def _same_qty(a, b) -> bool:
+    return abs(Decimal(a) - Decimal(b)) <= QTY_SLACK
+
+
+def check_invoice_qty(grpo: dict, invoice: Optional[dict]) -> Finding:
+    """Each GRPO line's quantity against the bill's line at the same rate.
+
+    Lines are held to the bill by rate, since the bill does not print SAP's
+    item codes. Lines sharing a rate are compared as one total, so two PO
+    lines of one item merged into a GRPO still match the bill's single line.
+    """
+    if invoice is None:
+        return _finding("invoice_qty", CheckStatus.UNKNOWN, NOT_READ)
+    if not grpo["lines"]:
+        return _finding("invoice_qty", CheckStatus.UNKNOWN, "The GRPO has no lines.", lines=[])
+
+    by_rate: dict[Decimal, list] = {}
+    for line in grpo["lines"]:
+        by_rate.setdefault(Decimal(line["price"]).quantize(PAISA), []).append(line)
+
+    rows, off, missing = [], [], []
+    for rate, lines in by_rate.items():
+        wanted = [line["quantity"] for line in lines]
+        # Of a row's candidates, the one the GRPO expects if it is there.
+        on_bill = [
+            next((q for q in candidates if any(_same_qty(q, w) for w in wanted)), candidates[0])
+            for candidates in bill_quantities_at(invoice, rate)
+        ]
+        unpaired, paired = list(on_bill), []
+        for line in lines:
+            match = next((q for q in unpaired if _same_qty(q, line["quantity"])), None)
+            if match is None:
+                break
+            unpaired.remove(match)
+            paired.append((line, match))
+        if len(paired) == len(lines) and not unpaired:
+            rows.extend(
+                {
+                    "line": str(line["line_num"] + 1),
+                    "item_code": line["item_code"],
+                    "po_num": line.get("po_num") or "",
+                    "grpo_price": _out(line["price"], 4),
+                    "grpo_qty": _out(line["quantity"], 3),
+                    "invoice_qty": _out(qty, 3),
+                }
+                for line, qty in paired
+            )
+            continue
+        grpo_qty, bill_qty = sum(wanted), sum(on_bill) if on_bill else None
+        row = {
+            "line": ", ".join(str(line["line_num"] + 1) for line in lines),
+            "item_code": ", ".join(line["item_code"] for line in lines),
+            "po_num": ", ".join(dict.fromkeys(line.get("po_num") or "" for line in lines)),
+            "grpo_price": _out(lines[0]["price"], 4),
+            "grpo_qty": _out(grpo_qty, 3),
+            "invoice_qty": _out(bill_qty, 3),
+        }
+        rows.append(row)
+        if bill_qty is None:
+            missing.append(row)
+        elif not _same_qty(bill_qty, grpo_qty):
+            off.append(row)
+
+    def lines_said(found):
+        return "; ".join(
+            f"line{'s' if ',' in r['line'] else ''} {r['line']} ({r['item_code']}) at {r['grpo_price']}"
+            + (f": GRPO {r['grpo_qty']}, bill {r['invoice_qty']}" if r["invoice_qty"] is not None else "")
+            for r in found
+        )
+
+    if off:
+        return _finding("invoice_qty", CheckStatus.FAIL, f"Quantity differs. {lines_said(off)}.", lines=rows)
+    if missing:
+        return _finding(
+            "invoice_qty", CheckStatus.REVIEW,
+            f"No line at the GRPO's rate could be read off the bill for {lines_said(missing)}. "
+            "Compare the quantity by eye.",
+            lines=rows,
+        )
+    return _finding("invoice_qty", CheckStatus.PASS, "Every line's quantity on the bill matches the GRPO.", lines=rows)
+
+
+# ---------------------------------------------------------------------------
+# 9. Over-receipt
 # ---------------------------------------------------------------------------
 
 def check_over_receipt(grpo: dict, vendor_exempt: bool) -> Finding:
@@ -497,7 +627,7 @@ def check_over_receipt(grpo: dict, vendor_exempt: bool) -> Finding:
 
 
 # ---------------------------------------------------------------------------
-# 9. QC
+# 10. QC
 # ---------------------------------------------------------------------------
 
 def check_qc(qc_items: Optional[list]) -> Finding:
@@ -531,7 +661,7 @@ def check_qc(qc_items: Optional[list]) -> Finding:
 # ---------------------------------------------------------------------------
 
 def run_checks(grpo: dict, invoice: Optional[dict], context: dict) -> list[Finding]:
-    """All nine findings, in checklist order. ``invoice`` is None until read."""
+    """All ten findings, in checklist order. ``invoice`` is None until read."""
     return [
         check_invoice_number(grpo, invoice),
         check_warehouse(grpo),
@@ -540,6 +670,7 @@ def run_checks(grpo: dict, invoice: Optional[dict], context: dict) -> list[Findi
         check_rate_check_signature(invoice),
         check_po_approver(context.get("po_approvals")),
         check_po_rate(grpo),
+        check_invoice_qty(grpo, invoice),
         check_over_receipt(grpo, bool(context.get("vendor_exempt"))),
         check_qc(context.get("qc_items")),
     ]
