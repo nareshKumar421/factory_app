@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from .models import (
+    CivilWork,
     DailyLog,
     EstimateLine,
     ExpenseBatch,
@@ -93,3 +94,10 @@ class ExpenseAdmin(admin.ModelAdmin):
     list_filter = ("category", "payment_mode", "batch__status")
     search_fields = ("project__code", "description", "paid_to", "reference_no")
     date_hierarchy = "spend_date"
+
+
+@admin.register(CivilWork)
+class CivilWorkAdmin(admin.ModelAdmin):
+    list_display = ("name", "parent", "company", "status", "start_date", "end_date", "is_active")
+    list_filter = ("company", "status", "is_active")
+    search_fields = ("name", "contractor")

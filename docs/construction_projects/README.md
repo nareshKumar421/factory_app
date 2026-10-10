@@ -387,6 +387,34 @@ with transaction.atomic():
 > `gate_core.SalesDispatchGatepassSequence.next_gatepass_no()` is the pattern to
 > copy.
 
+### 2.11 `CivilWork` — the civil projects sheet
+
+The site's Excel sheet ("JIVO CIVIL PROJECTS 2026"), kept here instead. Projects
+numbered 1, 2, 3; the works under each lettered A, B, C; every row planned by
+**area** between an expected start and finish. Not linked to `Project`: no
+budget, no approval, only the schedule.
+
+```python
+company     FK Company, PROTECT
+parent      FK self, CASCADE, null    # the project; null on a project row
+position    PositiveIntegerField      # order among siblings; 1/2/3 and A/B/C are derived
+name        CharField(200)
+area        Decimal(12,2), null
+area_unit   SQFT | RFT | CUFT | NOS   # a drain runs in rft, a shutter is counted
+status      NOT_STARTED | IN_PROGRESS | ON_HOLD | COMPLETE
+stage       CharField(200)            # the sheet's own words: "7th layer", "WBM complete"
+start_date  DateField, null
+end_date    DateField, null
+days        PositiveIntegerField, null  # end − start once both dates exist (min 1); typed before
+contractor  CharField(200)
+remarks     TextField
+# derived: per_day = area / days; is_late (past end, not complete);
+#          is_late_start (past start, still not started)
+```
+
+One level deep: a work under a work is refused (`civil_work_too_deep`). Removing
+a project soft-removes its works with it.
+
 ---
 
 ## 3. The rules that matter
@@ -545,7 +573,8 @@ Every queryset filters on `request.company.company`, resolved by
 
 ## 4. Permissions
 
-Nine, and **exactly** nine. Declared on `Project.Meta.permissions`, enforced by
+Eleven, and **exactly** eleven. Nine declared on `Project.Meta.permissions`, two
+on `CivilWork.Meta.permissions`, enforced by
 DRF permission classes in `permissions.py` copying `maintenance/permissions.py`'s
 `DjangoPermission` shape.
 
@@ -567,6 +596,8 @@ here. `tests/test_permissions.py` fails if a seventh model reintroduces them.
 | `can_record_expense` | Record spend |
 | `can_approve_expense` | Check the day's payments. A different job from sanctioning a budget, and usually a different person — the PM, not the director |
 | `can_close_project` | Complete, hold, resume, cancel |
+| `can_view_civil_works` | See the civil works sheet |
+| `can_edit_civil_works` | Add, change, reorder and remove its rows |
 
 ### Three groups
 
@@ -584,9 +615,9 @@ re-runnable after any permission change.
 
 | Group | Holds |
 |---|---|
-| `construction_site` | `can_view_project`, `can_log_daily_work`, `can_record_expense` |
+| `construction_site` | `can_view_project`, `can_log_daily_work`, `can_record_expense`, `can_view_civil_works`, `can_edit_civil_works` |
 | `construction_manager` | the above + `can_create_project`, `can_edit_project`, `can_close_project`, `can_view_all_projects`, `can_approve_expense` |
-| `construction_approver` | `can_view_all_projects`, `can_view_project`, `can_approve_project` |
+| `construction_approver` | `can_view_all_projects`, `can_view_project`, `can_approve_project`, `can_view_civil_works` |
 
 The approver group is deliberately separate and holds nothing else: the person
 who sanctions the money does not also record the spend.
@@ -710,6 +741,20 @@ by `stopped_reason`. Two charts and the extension justification, from one call.
 `approvals/` is the approver's queue: projects `PENDING_APPROVAL` and revisions
 `PENDING`, in one list, oldest first.
 
+### The civil works sheet
+
+| Method | Path | Permission |
+|---|---|---|
+| `GET` | `civil-works/` | `can_view_civil_works` |
+| `POST` | `civil-works/` | `can_edit_civil_works` |
+| `PATCH DELETE` | `civil-works/<id>/` | `can_edit_civil_works` |
+| `POST` | `civil-works/<id>/move/` `{"direction": "up" \| "down"}` | `can_edit_civil_works` |
+
+`GET` returns the whole sheet in order: an array of project rows, each with
+`works: [...]`. Every row carries `days`, `per_day`, `is_late` and
+`is_late_start` worked out. `POST` with `parent` adds a work under that project;
+without it, a project at the bottom. `days` is ignored when both dates are sent.
+
 ---
 
 ## 6. Build order
@@ -827,6 +872,7 @@ src/modules/construction/
 | `/construction/projects` | List — one project per row, budget bar and time bar | view |
 | `/construction/projects/:id` | Detail — header + three tabs | view |
 | `/construction/approvals` | Projects and revisions waiting | `APPROVE_PROJECT` |
+| `/construction/civil-works` | The civil projects sheet: projects, works, area, dates | `VIEW_CIVIL_WORKS` |
 
 **Neither the project form nor the day has a route of its own.** Both were
 pages once. A project is raised from the register and edited from the project,

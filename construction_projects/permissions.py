@@ -62,3 +62,11 @@ class CanReviewAnything(BasePermission):
 
 class CanCloseProject(DjangoPermission):
     permission = "construction_projects.can_close_project"
+
+
+class CanViewCivilWorks(DjangoPermission):
+    permission = "construction_projects.can_view_civil_works"
+
+
+class CanEditCivilWorks(DjangoPermission):
+    permission = "construction_projects.can_edit_civil_works"

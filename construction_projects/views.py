@@ -27,6 +27,7 @@ from .constants import (
     RevisionStatus,
 )
 from .models import (
+    CivilWork,
     DailyLog,
     Expense,
     ExpenseBatch,
@@ -39,13 +40,19 @@ from .permissions import (
     CanApproveProject,
     CanCloseProject,
     CanCreateProject,
+    CanEditCivilWorks,
     CanEditProject,
     CanLogDailyWork,
     CanRecordExpense,
     CanReviewAnything,
+    CanViewCivilWorks,
     CanViewProject,
 )
 from .serializers import (
+    CivilProjectSerializer,
+    CivilWorkMoveSerializer,
+    CivilWorkSerializer,
+    CivilWorkWriteSerializer,
     CompleteProjectSerializer,
     DailyLogPhotoSerializer,
     DailyLogPhotoWriteSerializer,
@@ -929,3 +936,77 @@ class ApprovalQueueAPI(APIView):
             ).data
 
         return Response(payload)
+
+
+# ---------------------------------------------------------------------------
+# The civil works sheet
+# ---------------------------------------------------------------------------
+
+
+def _civil_work_or_404(pk, request):
+    return get_object_or_404(
+        CivilWork.objects.filter(company=request.company.company, is_active=True),
+        pk=pk,
+    )
+
+
+class CivilWorkListCreateAPI(APIView):
+    """GET  : the whole sheet, projects in order with their works under them.
+    POST : add a project, or with ``parent`` a work under one.
+    """
+
+    def get_permissions(self):
+        gate = CanEditCivilWorks if self.request.method == "POST" else CanViewCivilWorks
+        return [IsAuthenticated(), HasCompanyContext(), gate()]
+
+    def get(self, request):
+        projects = services.civil_works_sheet(request.company.company)
+        return Response(CivilProjectSerializer(projects, many=True).data)
+
+    def post(self, request):
+        serializer = CivilWorkWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        parent_id = data.pop("parent", None)
+        parent = _civil_work_or_404(parent_id, request) if parent_id else None
+        work = services.create_civil_work(
+            company=request.company.company, user=request.user, parent=parent, **data
+        )
+        return Response(CivilWorkSerializer(work).data, status=status.HTTP_201_CREATED)
+
+
+class CivilWorkDetailAPI(APIView):
+    """PATCH : change a row. DELETE : take it off the sheet, works and all."""
+
+    def get_permissions(self):
+        return [IsAuthenticated(), HasCompanyContext(), CanEditCivilWorks()]
+
+    def patch(self, request, pk):
+        work = _civil_work_or_404(pk, request)
+        serializer = CivilWorkWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        data.pop("parent", None)
+        work = services.update_civil_work(work, user=request.user, **data)
+        return Response(CivilWorkSerializer(work).data)
+
+    def delete(self, request, pk):
+        work = _civil_work_or_404(pk, request)
+        services.remove_civil_work(work, user=request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class CivilWorkMoveAPI(APIView):
+    """POST {"direction": "up" | "down"} : one place along the sheet."""
+
+    def get_permissions(self):
+        return [IsAuthenticated(), HasCompanyContext(), CanEditCivilWorks()]
+
+    def post(self, request, pk):
+        work = _civil_work_or_404(pk, request)
+        serializer = CivilWorkMoveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        work = services.move_civil_work(
+            work, direction=serializer.validated_data["direction"]
+        )
+        return Response(CivilWorkSerializer(work).data)

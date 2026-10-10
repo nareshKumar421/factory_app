@@ -106,6 +106,35 @@ class PaymentMode(models.TextChoices):
     CREDIT = "CREDIT", "On credit (not yet paid)"
 
 
+
+class CivilWorkStatus(models.TextChoices):
+    """Where a row of the civil works sheet stands.
+
+    The sheet's STATUS column is free text ("7th layer", "WBM complete",
+    "material purchasing start"), which is fine to read and impossible to
+    count. These four are what that text boils down to; the site's own words
+    stay beside it in ``CivilWork.stage``.
+    """
+
+    NOT_STARTED = "NOT_STARTED", "Not started"
+    IN_PROGRESS = "IN_PROGRESS", "In progress"
+    ON_HOLD = "ON_HOLD", "On hold"
+    COMPLETE = "COMPLETE", "Complete"
+
+
+class AreaUnit(models.TextChoices):
+    """What a civil work's area is counted in.
+
+    Nearly always square feet. A drain or a wall is measured along its run, and
+    a shutter is counted, so the sheet's "9" against SHUTTER means nine of them,
+    not nine square feet.
+    """
+
+    SQFT = "SQFT", "sq ft"
+    RFT = "RFT", "running ft"
+    CUFT = "CUFT", "cu ft"
+    NOS = "NOS", "nos"
+
 #: A project may be edited in place only at these statuses. Past approval the
 #: budget and the end date move through a ProjectRevision instead.
 EDITABLE_STATUSES = frozenset({ProjectStatus.DRAFT, ProjectStatus.REJECTED})

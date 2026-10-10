@@ -2,6 +2,9 @@ from django.urls import path
 
 from .views import (
     ApprovalQueueAPI,
+    CivilWorkDetailAPI,
+    CivilWorkListCreateAPI,
+    CivilWorkMoveAPI,
     DailyLogDetailAPI,
     DailyLogListCreateAPI,
     DailyLogPhotoAPI,
@@ -87,4 +90,17 @@ urlpatterns = [
 
     # --- the approver's queue ---------------------------------------------
     path("approvals/", ApprovalQueueAPI.as_view(), name="construction-approvals"),
+
+    # --- the civil works sheet: projects, their works, area and dates -----
+    path("civil-works/", CivilWorkListCreateAPI.as_view(), name="construction-civil-works"),
+    path(
+        "civil-works/<int:pk>/",
+        CivilWorkDetailAPI.as_view(),
+        name="construction-civil-work-detail",
+    ),
+    path(
+        "civil-works/<int:pk>/move/",
+        CivilWorkMoveAPI.as_view(),
+        name="construction-civil-work-move",
+    ),
 ]

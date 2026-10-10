@@ -23,7 +23,9 @@ from django.utils import timezone
 from gate_core.models.base import BaseModel
 
 from .constants import (
+    AreaUnit,
     AttachmentKind,
+    CivilWorkStatus,
     DimensionUnit,
     ExpenseBatchStatus,
     ExpenseCategory,
@@ -723,3 +725,99 @@ class Expense(BaseModel):
     def is_editable(self):
         """Only while its batch is still the site's to change."""
         return self.batch.is_editable
+
+
+class CivilWork(BaseModel):
+    """One row of the civil projects sheet: a project, or a work inside one.
+
+    The site keeps a sheet, "JIVO CIVIL PROJECTS 2026", that numbers its projects
+    1, 2, 3 and lists each one's works under it as A, B, C -- the 40K shed's soil
+    layers, its WBM, its flooring. Each row is planned by AREA: so many square
+    feet between a start and a finish date, which says how much a day has to get
+    done. A project with nothing under it (an interlock strip along the main
+    road) carries its own area and dates.
+
+    Nothing to do with :class:`Project`, which is a budget being sanctioned and
+    spent. This is only the schedule, so it has no approval and no money: who
+    is doing what, how much of it, and by when.
+
+    One level deep and no more. ``parent`` is a project row; a project row has
+    no parent; a work never has works of its own.
+    """
+
+    company = models.ForeignKey(
+        "company.Company", on_delete=models.PROTECT, related_name="civil_works"
+    )
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="works",
+        help_text="The project this work is part of; empty for a project",
+    )
+    #: Order on the sheet, among the rows that share a parent. The 1, 2, 3 and
+    #: A, B, C are worked out from it, never stored, so moving a row renumbers
+    #: everything after it without anybody retyping a letter.
+    position = models.PositiveIntegerField(default=0)
+
+    name = models.CharField(max_length=200)
+    area = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    area_unit = models.CharField(
+        max_length=10, choices=AreaUnit.choices, default=AreaUnit.SQFT
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=CivilWorkStatus.choices,
+        default=CivilWorkStatus.NOT_STARTED,
+    )
+    stage = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="Where it stands, in the site's words: 7th layer, WBM complete",
+    )
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    #: Worked out from the two dates when both are set, the way the sheet
+    #: counts them (end minus start). Typed only while there are no dates yet,
+    #: for the rows the sheet writes as "60 days when it starts".
+    days = models.PositiveIntegerField(null=True, blank=True)
+    contractor = models.CharField(max_length=200, blank=True, default="")
+    remarks = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["position", "id"]
+        verbose_name = "Civil Work"
+        verbose_name_plural = "Civil Works"
+        indexes = [models.Index(fields=["company", "parent", "position"])]
+        # Same reasoning as Project: only the rights the module checks.
+        default_permissions = ()
+        permissions = [
+            ("can_view_civil_works", "Can view the civil works sheet"),
+            ("can_edit_civil_works", "Can edit the civil works sheet"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def per_day(self):
+        """The area a day has to get through: the sheet's AVG PER DAY."""
+        if self.area is None or not self.days:
+            return None
+        return (self.area / self.days).quantize(Decimal("0.01"))
+
+    @property
+    def is_late(self):
+        """Past its finish date and not finished."""
+        if self.end_date is None or self.status == CivilWorkStatus.COMPLETE:
+            return False
+        return timezone.localdate() > self.end_date
+
+    @property
+    def is_late_start(self):
+        """Its start date has gone by and nobody has started it."""
+        if self.start_date is None or self.status != CivilWorkStatus.NOT_STARTED:
+            return False
+        return timezone.localdate() > self.start_date

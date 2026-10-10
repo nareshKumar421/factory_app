@@ -16,6 +16,10 @@ GROUPS = {
         "can_view_project",
         "can_log_daily_work",
         "can_record_expense",
+        # The civil works sheet is the site's own schedule, kept up to date
+        # from the site, so the site writes it.
+        "can_view_civil_works",
+        "can_edit_civil_works",
     ],
     "construction_manager": [
         # The project manager checks the day's payments. Sanctioning a budget is
@@ -28,11 +32,14 @@ GROUPS = {
         "can_close_project",
         "can_log_daily_work",
         "can_record_expense",
+        "can_view_civil_works",
+        "can_edit_civil_works",
     ],
     "construction_approver": [
         "can_view_project",
         "can_view_all_projects",
         "can_approve_project",
+        "can_view_civil_works",
     ],
 }
 

@@ -14,7 +14,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, Max, Q, Sum
+from django.db.models import Count, Max, Prefetch, Q, Sum
 from django.db.models.functions import TruncMonth
 from django.utils import timezone
 from rest_framework.exceptions import APIException
@@ -30,6 +30,7 @@ from .constants import (
     RevisionStatus,
 )
 from .models import (
+    CivilWork,
     DailyLog,
     EstimateLine,
     ExpenseBatch,
@@ -1080,3 +1081,117 @@ def spend_summary(project):
         "days_lost": days_lost,
         "days_lost_total": logs.filter(work_stopped=True).count(),
     }
+
+
+# ---------------------------------------------------------------------------
+# The civil works sheet
+# ---------------------------------------------------------------------------
+
+
+def civil_works_sheet(company):
+    """The sheet as it reads: projects in order, each with its works under it.
+
+    The works land on ``active_works`` rather than replacing ``works``, so a
+    removed work can never leak back in through the plain relation.
+    """
+    works = CivilWork.objects.filter(is_active=True).order_by("position", "id")
+    return (
+        CivilWork.objects.filter(company=company, parent__isnull=True, is_active=True)
+        .prefetch_related(Prefetch("works", queryset=works, to_attr="active_works"))
+        .order_by("position", "id")
+    )
+
+
+def _planned_days(start_date, end_date, days):
+    """End minus start once both dates are known, which is how the sheet counts.
+
+    A job that starts and ends on the same day is one day, not zero -- zero
+    would leave the per-day figure dividing by nothing.
+    """
+    if start_date and end_date:
+        return max((end_date - start_date).days, 1)
+    return days
+
+
+def _check_civil_dates(start_date, end_date):
+    if start_date and end_date and end_date < start_date:
+        raise ConstructionError(
+            "It cannot finish before it starts.",
+            "end_before_start",
+            {"start_date": str(start_date), "end_date": str(end_date)},
+        )
+
+
+def create_civil_work(*, company, user, parent=None, **fields):
+    """Add a project to the bottom of the sheet, or a work to the bottom of one."""
+    if parent is not None and parent.parent_id is not None:
+        raise ConstructionError(
+            "A work goes under a project, not under another work.",
+            "civil_work_too_deep",
+            {"parent": parent.pk},
+        )
+    _check_civil_dates(fields.get("start_date"), fields.get("end_date"))
+    fields["days"] = _planned_days(
+        fields.get("start_date"), fields.get("end_date"), fields.get("days")
+    )
+
+    with transaction.atomic():
+        last = (
+            CivilWork.objects.select_for_update()
+            .filter(company=company, parent=parent, is_active=True)
+            .aggregate(last=Max("position"))["last"]
+        )
+        return CivilWork.objects.create(
+            company=company,
+            parent=parent,
+            position=(last or 0) + 1,
+            created_by=user,
+            updated_by=user,
+            **fields,
+        )
+
+
+def update_civil_work(work, *, user, **fields):
+    for name, value in fields.items():
+        setattr(work, name, value)
+    _check_civil_dates(work.start_date, work.end_date)
+    work.days = _planned_days(work.start_date, work.end_date, work.days)
+    work.updated_by = user
+    work.save()
+    return work
+
+
+def remove_civil_work(work, *, user):
+    """Take a row off the sheet, and with a project, every work under it.
+
+    Soft, like the rest of the module: the rows stay for the record. ``update``
+    skips ``auto_now``, so the timestamp is set by hand.
+    """
+    CivilWork.objects.filter(Q(pk=work.pk) | Q(parent=work)).update(
+        is_active=False, updated_by=user, updated_at=timezone.now()
+    )
+
+
+def move_civil_work(work, *, direction):
+    """One place up or down among the rows that share its parent.
+
+    The siblings are renumbered 1..n while they are at it, so positions left
+    with gaps by a removal, or tied by two creates in the same instant, settle
+    back into a plain sequence. A row already at the end stays where it is.
+    """
+    with transaction.atomic():
+        siblings = list(
+            CivilWork.objects.select_for_update()
+            .filter(company_id=work.company_id, parent_id=work.parent_id, is_active=True)
+            .order_by("position", "id")
+        )
+        index = next(i for i, sibling in enumerate(siblings) if sibling.pk == work.pk)
+        target = index - 1 if direction == "up" else index + 1
+        if 0 <= target < len(siblings):
+            siblings[index], siblings[target] = siblings[target], siblings[index]
+        for position, sibling in enumerate(siblings, start=1):
+            if sibling.position != position:
+                sibling.position = position
+                sibling.save(update_fields=["position"])
+    work.refresh_from_db()
+    return work

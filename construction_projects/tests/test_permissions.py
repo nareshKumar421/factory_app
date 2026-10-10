@@ -1,4 +1,4 @@
-"""The module's permission surface is exactly nine rows.
+"""The module's permission surface is exactly eleven rows.
 
 Django creates add/change/delete/view for every model unless a model says
 otherwise. Six models would mean 24 rows nothing in this module checks, and a
@@ -16,16 +16,18 @@ EXPECTED = {
     "can_approve_project",
     "can_close_project",
     "can_create_project",
+    "can_edit_civil_works",
     "can_edit_project",
     "can_log_daily_work",
     "can_record_expense",
     "can_view_all_projects",
+    "can_view_civil_works",
     "can_view_project",
 }
 
 
 class PermissionSurfaceTests(TestCase):
-    def test_exactly_the_nine_custom_permissions_exist(self):
+    def test_exactly_the_eleven_custom_permissions_exist(self):
         actual = set(
             Permission.objects.filter(
                 content_type__app_label="construction_projects"

@@ -4,7 +4,9 @@ from django.db.models import Sum
 from rest_framework import serializers
 
 from .constants import (
+    AreaUnit,
     AttachmentKind,
+    CivilWorkStatus,
     DimensionUnit,
     ExpenseBatchStatus,
     ExpenseCategory,
@@ -12,6 +14,7 @@ from .constants import (
     StopReason,
 )
 from .models import (
+    CivilWork,
     DailyLog,
     EstimateLine,
     ExpenseBatch,
@@ -623,3 +626,92 @@ class RevisionWriteSerializer(serializers.Serializer):
     )
     new_end_date = serializers.DateField(required=False, allow_null=True)
     reason = serializers.CharField(max_length=5000)
+
+
+# ---------------------------------------------------------------------------
+# The civil works sheet
+# ---------------------------------------------------------------------------
+
+
+class CivilWorkSerializer(serializers.ModelSerializer):
+    """One row of the sheet, with the two figures it works out for itself."""
+
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    area_unit_display = serializers.CharField(
+        source="get_area_unit_display", read_only=True
+    )
+    per_day = serializers.DecimalField(
+        max_digits=14, decimal_places=2, read_only=True, allow_null=True
+    )
+    is_late = serializers.BooleanField(read_only=True)
+    is_late_start = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = CivilWork
+        fields = (
+            "id",
+            "parent",
+            "position",
+            "name",
+            "area",
+            "area_unit",
+            "area_unit_display",
+            "status",
+            "status_display",
+            "stage",
+            "start_date",
+            "end_date",
+            "days",
+            "per_day",
+            "contractor",
+            "remarks",
+            "is_late",
+            "is_late_start",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+
+class CivilProjectSerializer(CivilWorkSerializer):
+    """A project row and the works under it, as the sheet groups them."""
+
+    works = serializers.SerializerMethodField()
+
+    class Meta(CivilWorkSerializer.Meta):
+        fields = CivilWorkSerializer.Meta.fields + ("works",)
+        read_only_fields = fields
+
+    def get_works(self, obj):
+        works = getattr(obj, "active_works", None)
+        if works is None:
+            works = obj.works.filter(is_active=True).order_by("position", "id")
+        return CivilWorkSerializer(works, many=True).data
+
+
+class CivilWorkWriteSerializer(serializers.Serializer):
+    """A row as typed. ``parent`` is read on create only; a work stays under
+    the project it was added to."""
+
+    parent = serializers.IntegerField(required=False, allow_null=True)
+    name = serializers.CharField(max_length=200)
+    area = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal("0"),
+        required=False,
+        allow_null=True,
+    )
+    area_unit = serializers.ChoiceField(choices=AreaUnit.choices, required=False)
+    status = serializers.ChoiceField(choices=CivilWorkStatus.choices, required=False)
+    stage = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    start_date = serializers.DateField(required=False, allow_null=True)
+    end_date = serializers.DateField(required=False, allow_null=True)
+    days = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    contractor = serializers.CharField(
+        max_length=200, required=False, allow_blank=True
+    )
+    remarks = serializers.CharField(required=False, allow_blank=True)
+
+
+class CivilWorkMoveSerializer(serializers.Serializer):
+    direction = serializers.ChoiceField(choices=("up", "down"))
