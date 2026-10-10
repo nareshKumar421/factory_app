@@ -2374,6 +2374,7 @@ class PlanBySkuTests(SimpleTestCase):
         self.assertEqual(fg1["produced_tons"], 0.4)
         self.assertEqual(fg1["balance_tons"], 0.6)
         self.assertEqual(fg1["produced_cases"], 20)
+        self.assertEqual(fg1["pieces_per_case"], 20)
         self.assertEqual(fg1["attainment_pct"], 40.0)
         self.assertEqual(fg1["pf_tons"], 0.3)
 

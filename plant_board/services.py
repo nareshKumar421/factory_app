@@ -1878,6 +1878,9 @@ class PlantBoardService:
                     "planned_qty": round(planned_qty, 2),
                     "planned_cases": round(held["planned_cases"], 2),
                     "planned_tons": _tons(planned_litres),
+                    # The plan's own case factor, so a reader can put any
+                    # piece figure on the row into cases; null off the plan.
+                    "pieces_per_case": per_case,
                     "produced_qty": round(produced_qty, 2),
                     # Only where the plan carries a case factor for the SKU.
                     "produced_cases": (
