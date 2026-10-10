@@ -626,6 +626,62 @@ class HanaDispatchBillReader:
                 stamp[field] = str(value or "").strip()
         return stamp
 
+    def invoice_receive_state(self, doc_entry: int) -> Dict[str, Any] | None:
+        """What SAP holds of an invoice's delivery, read before writing one.
+
+        The header's received date and attachment, and every line with its
+        received quantity, in ``LineNum`` order. Always read live -- never from
+        the bill copy -- because what it decides is whether to write to SAP.
+        ``None`` means the company has no such invoice.
+        """
+        header_columns = self._table_columns("OINV")
+        line_columns = self._table_columns("INV1")
+        if "U_Recv_Date" not in header_columns or "U_Recvd_Qty" not in line_columns:
+            raise SAPDataError(
+                "This company's A/R invoice has no received-date or received-qty field."
+            )
+        schema = self.connection.schema
+        header = self._execute(
+            f"""
+                SELECT H."DocNum", H."DocDate", H."CANCELED", H."U_Recv_Date", H."AtcEntry"
+                FROM "{schema}"."OINV" H
+                WHERE H."DocEntry" = ?
+            """,
+            [int(doc_entry)],
+        )
+        if not header:
+            return None
+        doc_num, doc_date, canceled, received_date, atc_entry = header[0]
+        lines = self._execute(
+            f"""
+                SELECT L."LineNum", IFNULL(L."ItemCode", ''), L."Quantity", L."U_Recvd_Qty"
+                FROM "{schema}"."INV1" L
+                WHERE L."DocEntry" = ?
+                ORDER BY L."LineNum"
+            """,
+            [int(doc_entry)],
+        )
+
+        def as_date(value):
+            return getattr(value, "date", lambda: value)() if value else None
+
+        return {
+            "doc_num": str(doc_num or ""),
+            "doc_date": as_date(doc_date),
+            "cancelled": (canceled or "N") != "N",
+            "received_date": as_date(received_date),
+            "attachment_entry": int(atc_entry) if atc_entry else None,
+            "lines": [
+                {
+                    "line_num": int(line_num),
+                    "item_code": str(item_code or "").strip(),
+                    "quantity": Decimal(str(quantity or 0)),
+                    "received": Decimal(str(received)) if received is not None else None,
+                }
+                for line_num, item_code, quantity, received in lines
+            ],
+        }
+
     def invoice_state(self, doc_entry: int) -> Dict[str, Any] | None:
         """Is this invoice this company's, and is it still a live document?
 

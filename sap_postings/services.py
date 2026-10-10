@@ -41,6 +41,7 @@ HANDLERS = {
     "grpo.material": "grpo.sap_posting.MaterialGRPOHandler",
     "short_dispatch.post": "short_dispatch.sap_posting.ShortDispatchHandler",
     "bill_summary.stamp": "dispatch_plans.sap_posting.BillSummaryStampHandler",
+    "dispatch_tracking.receive": "gate_core.services.dispatch_tracking_sap.SapReceiveHandler",
     "production_order.create": "production_orders.sap_posting.PlanHandler",
     "production_order.release": "production_orders.sap_posting.ReleaseHandler",
     "production_order.issue": "production_orders.sap_posting.IssueHandler",
@@ -56,6 +57,7 @@ KIND_LABELS = {
     "grpo.material": "Material GRPO",
     "short_dispatch.post": "Short dispatch (A/R Return)",
     "bill_summary.stamp": "Bill summary (invoice dispatch stamp)",
+    "dispatch_tracking.receive": "Delivery (invoice received stamp)",
     "production_order.create": "Production order (plan)",
     "production_order.release": "Production order release",
     "production_order.issue": "Issue for production",
@@ -71,6 +73,7 @@ KIND_SHORT = {
     "goods_return.receive": "goods returns",
     "short_dispatch.post": "short dispatches",
     "bill_summary.stamp": "bill summary stamps",
+    "dispatch_tracking.receive": "delivery stamps",
     # One phrase for the five steps of a production order.
     "production_order.create": "production orders",
     "production_order.release": "production orders",

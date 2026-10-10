@@ -171,3 +171,79 @@ class TruckDispatchPartialDeliveryItem(BaseModel):
 
     def __str__(self):
         return f"line {self.line_id} · item {self.item_id} · {self.qty_returned} returned"
+
+
+class TruckDispatchSapReceiptStatus(models.TextChoices):
+    """Where one bill's delivery stands with SAP."""
+
+    # SAP takes a received date only with the delivery's proof attached to the
+    # invoice (Oil and Mart refuse it outright), so a delivery logged without a
+    # proof waits here until one is attached.
+    NEEDS_PROOF = "NEEDS_PROOF", "Waiting for the proof of delivery"
+    # Handed to the SAP posting queue: being sent, or waiting for SAP to answer.
+    WAITING = "WAITING", "Waiting for SAP"
+    POSTED = "POSTED", "Received in SAP"
+    # SAP already shows the bill received -- typed in there by hand before the
+    # app got to it -- so it is left exactly as SAP has it.
+    ALREADY_RECEIVED = "ALREADY_RECEIVED", "Already received in SAP"
+    # SAP refuses a received date unless every line has a received quantity
+    # above zero, so a bill with an item that came back whole cannot be recorded
+    # from here at all.
+    BY_HAND = "BY_HAND", "Enter in SAP by hand"
+    REFUSED = "REFUSED", "Refused by SAP"
+    # A later delivery update on the same truck took over before this one
+    # reached SAP.
+    SUPERSEDED = "SUPERSEDED", "Replaced by a later update"
+
+
+class TruckDispatchSapReceipt(BaseModel):
+    """One bill's delivery, as it has to be written to its SAP A/R invoice.
+
+    A Delivered or Partially Delivered update is a fact about the truck; SAP
+    records it per invoice -- ``OINV.U_Recv_Date``, ``INV1.U_Recvd_Qty`` on every
+    line, and the proof as the invoice's attachment. One of these per bill on the
+    truck carries that write through the SAP posting queue
+    (``dispatch_tracking.receive``) and says how it went.
+    """
+
+    update = models.ForeignKey(
+        TruckDispatchUpdate,
+        on_delete=models.CASCADE,
+        related_name="sap_receipts",
+    )
+    document = models.ForeignKey(
+        "gate_core.SalesDispatchGateOutDocument",
+        on_delete=models.PROTECT,
+        related_name="sap_receipts",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=TruckDispatchSapReceiptStatus.choices,
+        default=TruckDispatchSapReceiptStatus.NEEDS_PROOF,
+    )
+    # The date SAP is given as received: the update's delivered date, else the
+    # day it happened.
+    received_date = models.DateField()
+    # What each item is recorded as received, in the bill's own quantity (SAP's
+    # INV1.Quantity): [{"item", "item_code", "quantity", "received"}], in the
+    # bill's line order -- which is SAP's LineNum order, how the lines are
+    # matched when the write is made.
+    lines = models.JSONField(default=list, blank=True)
+    # The SAP Attachments2 entry holding the proof once uploaded, so a retry
+    # after a lost answer reuses it instead of attaching the proof twice.
+    sap_attachment_entry = models.IntegerField(null=True, blank=True)
+    message = models.TextField(blank=True)
+    posted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [models.Index(fields=["document", "status"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["update", "document"],
+                name="unique_sap_receipt_per_update_bill",
+            )
+        ]
+
+    def __str__(self):
+        return f"update {self.update_id} · bill {self.document_id} · {self.status}"

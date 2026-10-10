@@ -6,6 +6,7 @@ from rest_framework import serializers
 from gate_core.models import (
     TruckDispatchPartialDeliveryItem,
     TruckDispatchPartialDeliveryLine,
+    TruckDispatchSapReceipt,
     TruckDispatchStatus,
     TruckDispatchUpdate,
 )
@@ -105,12 +106,44 @@ class TruckDispatchPartialLineSerializer(serializers.ModelSerializer):
         ]
 
 
+class TruckDispatchSapReceiptSerializer(serializers.ModelSerializer):
+    """Where one bill's delivery stands with SAP."""
+
+    sap_doc_num = serializers.CharField(source="document.sap_doc_num", read_only=True, default="")
+    customer_name = serializers.CharField(
+        source="document.customer_name", read_only=True, default=""
+    )
+    company = serializers.CharField(source="document.company.name", read_only=True, default="")
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = TruckDispatchSapReceipt
+        fields = [
+            "id",
+            "document",
+            "sap_doc_num",
+            "customer_name",
+            "company",
+            "status",
+            "status_display",
+            "received_date",
+            "message",
+            "posted_at",
+        ]
+
+
 class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
     """One status event in a truck's post-dispatch timeline."""
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     created_by_name = serializers.CharField(source="created_by.full_name", read_only=True, default="")
     partial_lines = TruckDispatchPartialLineSerializer(many=True, read_only=True)
+    # A delivery, bill by bill, as SAP has it. Empty for every other status.
+    sap_receipts = serializers.SerializerMethodField()
+
+    def get_sap_receipts(self, update):
+        receipts = [receipt for receipt in update.sap_receipts.all() if receipt.is_active]
+        return TruckDispatchSapReceiptSerializer(receipts, many=True).data
 
     class Meta:
         model = TruckDispatchUpdate
@@ -126,6 +159,7 @@ class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
             "proof",
             "return_note",
             "partial_lines",
+            "sap_receipts",
             "created_by_name",
             "created_at",
         ]
@@ -233,6 +267,12 @@ class TruckDispatchReturnNoteSerializer(serializers.Serializer):
     """
 
     return_note = serializers.FileField(required=True)
+
+
+class TruckDispatchProofSerializer(serializers.Serializer):
+    """Attach the proof to an existing update -- for a delivery, what SAP waits on."""
+
+    proof = serializers.FileField(required=True)
 
 
 class DispatchTrackingTruckSerializer(serializers.Serializer):

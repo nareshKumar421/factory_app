@@ -24,6 +24,8 @@ from .dispatch_tracking import (
     TERMINAL_DISPATCH_STATUSES,
     TruckDispatchPartialDeliveryItem,
     TruckDispatchPartialDeliveryLine,
+    TruckDispatchSapReceipt,
+    TruckDispatchSapReceiptStatus,
     TruckDispatchStatus,
     TruckDispatchUpdate,
 )

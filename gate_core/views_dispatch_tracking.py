@@ -25,6 +25,7 @@ from gate_core.models import (
     TERMINAL_DISPATCH_STATUSES,
     TruckDispatchPartialDeliveryItem,
     TruckDispatchPartialDeliveryLine,
+    TruckDispatchSapReceiptStatus,
     TruckDispatchStatus,
     TruckDispatchUpdate,
     VehicleArrival,
@@ -33,10 +34,12 @@ from gate_core.permissions import HasRequiredDjangoPermission
 from gate_core.serializers_dispatch_tracking import (
     DispatchTrackingTruckSerializer,
     TruckDispatchBillSerializer,
+    TruckDispatchProofSerializer,
     TruckDispatchReturnNoteSerializer,
     TruckDispatchUpdateCreateSerializer,
     TruckDispatchUpdateSerializer,
 )
+from gate_core.services import dispatch_tracking_sap
 from gate_core.services.user_scope import user_company_ids
 
 
@@ -227,7 +230,11 @@ class DispatchTrackingUpdatesView(APIView):
         updates = (
             arrival.dispatch_updates.filter(is_active=True)
             .select_related("created_by")
-            .prefetch_related("partial_lines__document", "partial_lines__items__item")
+            .prefetch_related(
+                "partial_lines__document",
+                "partial_lines__items__item",
+                "sap_receipts__document__company",
+            )
         )
         return Response(
             TruckDispatchUpdateSerializer(
@@ -335,6 +342,12 @@ class DispatchTrackingUpdatesView(APIView):
                 parent.recalculate_totals()
                 parent.save(update_fields=["qty_delivered", "qty_returned", "updated_at"])
 
+            # A delivery is written to each bill's SAP invoice. The receipts are
+            # opened with the update; sending waits for the commit, since the
+            # posting log commits on its own and must find them there.
+            if dispatch_tracking_sap.open_receipts(update, request.user):
+                dispatch_tracking_sap.send_after_commit(update.id, request.user)
+
         update.refresh_from_db()
         return Response(
             TruckDispatchUpdateSerializer(update, context={"request": request}).data,
@@ -372,6 +385,66 @@ class DispatchTrackingReturnNoteView(APIView):
         update.updated_by = request.user
         update.save(update_fields=["return_note", "updated_by", "updated_at"])
 
+        return Response(
+            TruckDispatchUpdateSerializer(update, context={"request": request}).data
+        )
+
+
+class DispatchTrackingProofView(APIView):
+    """Attach (or replace) the proof on an existing update.
+
+    A delivery waits for its proof before SAP is told -- SAP takes a received
+    date only with the proof attached to the invoice -- so attaching one sends
+    the bills that were waiting for it.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    parser_classes = [MultiPartParser, FormParser]
+    required_permissions = "gate_core.can_update_dispatch_tracking"
+
+    def post(self, request, arrival_id, update_id):
+        arrival = get_object_or_404(_dispatched_trucks_qs(request), id=arrival_id)
+        update = get_object_or_404(
+            arrival.dispatch_updates.filter(is_active=True), id=update_id
+        )
+        serializer = TruckDispatchProofSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            update.proof = serializer.validated_data["proof"]
+            update.updated_by = request.user
+            update.save(update_fields=["proof", "updated_by", "updated_at"])
+            if update.sap_receipts.filter(
+                is_active=True, status=TruckDispatchSapReceiptStatus.NEEDS_PROOF
+            ).exists():
+                dispatch_tracking_sap.send_after_commit(update.id, request.user)
+
+        update.refresh_from_db()
+        return Response(
+            TruckDispatchUpdateSerializer(update, context={"request": request}).data
+        )
+
+
+class DispatchTrackingSapSendView(APIView):
+    """Send an update's bills to SAP again: the ones waiting for SAP, and the ones
+    SAP refused (once whatever it refused them for is put right)."""
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, HasRequiredDjangoPermission]
+    required_permissions = "gate_core.can_update_dispatch_tracking"
+
+    def post(self, request, arrival_id, update_id):
+        arrival = get_object_or_404(_dispatched_trucks_qs(request), id=arrival_id)
+        update = get_object_or_404(
+            arrival.dispatch_updates.filter(is_active=True), id=update_id
+        )
+        if not update.proof:
+            raise ValidationError(
+                {"proof": "Attach the proof of delivery first; SAP will not take the "
+                          "received date without it."}
+            )
+        dispatch_tracking_sap.send_receipts(update.id, request.user, retry_refused=True)
+
+        update.refresh_from_db()
         return Response(
             TruckDispatchUpdateSerializer(update, context={"request": request}).data
         )
