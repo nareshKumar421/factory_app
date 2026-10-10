@@ -41,6 +41,13 @@ HANDLERS = {
     "grpo.material": "grpo.sap_posting.MaterialGRPOHandler",
     "short_dispatch.post": "short_dispatch.sap_posting.ShortDispatchHandler",
     "bill_summary.stamp": "dispatch_plans.sap_posting.BillSummaryStampHandler",
+    "production_order.create": "production_orders.sap_posting.PlanHandler",
+    "production_order.release": "production_orders.sap_posting.ReleaseHandler",
+    "production_order.issue": "production_orders.sap_posting.IssueHandler",
+    "production_order.receipt": "production_orders.sap_posting.ReceiptHandler",
+    "production_order.close": "production_orders.sap_posting.CloseHandler",
+    "production_order.replan": "production_orders.sap_posting.ReplanHandler",
+    "production_order.unrelease": "production_orders.sap_posting.UnreleaseHandler",
 }
 
 #: kind -> what a person calls that kind of posting, for the log's filter.
@@ -49,6 +56,13 @@ KIND_LABELS = {
     "grpo.material": "Material GRPO",
     "short_dispatch.post": "Short dispatch (A/R Return)",
     "bill_summary.stamp": "Bill summary (invoice dispatch stamp)",
+    "production_order.create": "Production order (plan)",
+    "production_order.release": "Production order release",
+    "production_order.issue": "Issue for production",
+    "production_order.receipt": "Receipt from production",
+    "production_order.close": "Production order close",
+    "production_order.replan": "Production order change (planned)",
+    "production_order.unrelease": "Production order back to planned",
 }
 
 #: kind -> what the "SAP is down" banner calls it, in a list of what waits.
@@ -57,12 +71,20 @@ KIND_SHORT = {
     "goods_return.receive": "goods returns",
     "short_dispatch.post": "short dispatches",
     "bill_summary.stamp": "bill summary stamps",
+    # One phrase for the five steps of a production order.
+    "production_order.create": "production orders",
+    "production_order.release": "production orders",
+    "production_order.issue": "production orders",
+    "production_order.receipt": "production orders",
+    "production_order.close": "production orders",
+    "production_order.replan": "production orders",
+    "production_order.unrelease": "production orders",
 }
 
 
 def waiting_kinds():
-    """What waits for SAP and posts by itself, as the banner lists it."""
-    return [KIND_SHORT.get(kind, kind_label(kind)) for kind in HANDLERS]
+    """What waits for SAP and posts by itself, as the banner lists it (each once)."""
+    return list(dict.fromkeys(KIND_SHORT.get(kind, kind_label(kind)) for kind in HANDLERS))
 
 
 def kind_label(kind):

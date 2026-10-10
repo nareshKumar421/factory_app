@@ -236,6 +236,10 @@ INSTALLED_APPS = [
     # of the trees already in SAP. Not warehouse.BOMRequest -- that is
     # production asking the store for material against a BOM.
     'bom_changes.apps.BomChangesConfig',
+    # Production entries posted as SAP production orders (order, issue, receipt,
+    # close), each step under the SAP login of the person who takes it, through
+    # the sap_postings queue. Separate from production_execution's run screens.
+    'production_orders.apps.ProductionOrdersConfig',
     # SAP Portal's customer and vendor registration, merged in: public forms
     # (no login) → a verifier checks and corrects → an approver sets the SAP
     # master data and the business partner is created in that company's SAP.
