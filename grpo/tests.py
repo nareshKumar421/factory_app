@@ -2019,6 +2019,43 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(serializer_data["linked_vehicle_entry_id"], linked_entry.id)
         self.assertEqual(serializer_data["linked_vehicle_entry_no"], "VE-DISP-001")
 
+    @patch.object(GRPOService, "_get_active_budget_codes", return_value={})
+    @patch.object(GRPOService, "_get_active_dimension_codes", return_value={})
+    @patch.object(GRPOService, "_get_dispatch_bill_snapshot", return_value={})
+    def test_service_grpo_preview_defaults_mart_freight_sac(self, *_mocks):
+        """Mart has none of Oil's 9965/9967 freight SACs, so the form found no
+        default and showed SAC blank; Mart books freight under 00997136."""
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        plan = DispatchPlan.objects.create(
+            company=mart,
+            sap_invoice_doc_entry=726050001,
+            sap_invoice_doc_num="726050001",
+            booking_status=DispatchPlanStatus.BOOKED,
+        )
+        service = GRPOService(company_code="JIVO_MART")
+
+        preview = service.get_service_grpo_preview_data(plan.id)
+        self.assertEqual(preview["default_sac_entry"], -426)
+        self.assertEqual(preview["default_sac_code"], "00997136")
+
+        # A SAC already chosen on the plan still wins.
+        plan.sac_entry, plan.sac_code = -451, "00996791"
+        plan.save(update_fields=["sac_entry", "sac_code"])
+        preview = service.get_service_grpo_preview_data(plan.id)
+        self.assertEqual(preview["default_sac_entry"], -451)
+        self.assertEqual(preview["default_sac_code"], "00996791")
+
+        # Oil and Beverages keep leaving it to the form.
+        oil_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626050002,
+            sap_invoice_doc_num="626050002",
+            booking_status=DispatchPlanStatus.BOOKED,
+        )
+        preview = GRPOService(company_code="TC001").get_service_grpo_preview_data(oil_plan.id)
+        self.assertIsNone(preview["default_sac_entry"])
+        self.assertEqual(preview["default_sac_code"], "")
+
     def test_pending_service_grpo_includes_dispatched_plans(self):
         """A plan stays on the Service GRPO pending list after the truck leaves
         the gate (booking flips BOOKED -> DISPATCHED); freight is settled post

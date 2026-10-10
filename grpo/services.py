@@ -116,6 +116,13 @@ class GRPOService:
         DispatchPlanStatus.BOOKED,
         DispatchPlanStatus.DISPATCHED,
     })
+    # The SAC a company books outward freight under, for a plan that names none.
+    # Oil and Beverages have freight SACs of their own (9965/9967, 996812), which
+    # the Service GRPO form finds by itself. Mart has none, and books every
+    # freight line under SAP's standard 00997136 (AbsEntry -426 in every company).
+    SERVICE_FREIGHT_DEFAULT_SAC = {
+        "JIVO_MART": (-426, "00997136"),
+    }
     STATE_NAME_CODES = {
         "HARYANA": "HR",
         "DELHI": "DL",
@@ -842,6 +849,11 @@ class GRPOService:
     @staticmethod
     def _infer_service_sub_account(bill_snapshot: Dict[str, Any]) -> str:
         return "SALES" if bill_snapshot.get("card_code") else ""
+
+    def _infer_service_sac(self, dispatch_plan: DispatchPlan) -> tuple:
+        if dispatch_plan.sac_entry is not None or dispatch_plan.sac_code:
+            return dispatch_plan.sac_entry, dispatch_plan.sac_code
+        return self.SERVICE_FREIGHT_DEFAULT_SAC.get(self.company_code, (None, ""))
 
     @staticmethod
     def _dispatch_linked_vehicle_entry_id(dispatch_plan: DispatchPlan) -> Optional[int]:
@@ -3101,6 +3113,7 @@ class GRPOService:
             service_description,
         )
         delivery_point = self._infer_budget_delivery_point(dispatch_plan)
+        sac_entry, sac_code = self._infer_service_sac(dispatch_plan)
         source_state = bill_snapshot.get("state", "") or dispatch_plan.place_of_supply
         invoice_lines = []
         total_litres = Decimal("0.000")
@@ -3207,8 +3220,8 @@ class GRPOService:
             "default_budget_delivery_point": delivery_point,
             "default_location_code": dispatch_plan.service_location_code,
             "default_location_name": dispatch_plan.service_location_name,
-            "default_sac_entry": dispatch_plan.sac_entry,
-            "default_sac_code": dispatch_plan.sac_code,
+            "default_sac_entry": sac_entry,
+            "default_sac_code": sac_code,
             "default_product_variety": product_variety,
             "default_product_dimension": product_dimension,
             "default_total_litres": total_litres,
