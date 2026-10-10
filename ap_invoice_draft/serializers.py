@@ -81,6 +81,7 @@ class APInvoiceDraftDetailSerializer(APInvoiceDraftListSerializer):
             "invoice_file_url", "invoice_filename",
             "invoice_data", "invoice_read_error", "invoice_read_model", "invoice_read_at",
             "sap_error", "sap_attachment_entry", "sap_attachment_error", "sap_created_at",
+            "tds_code", "tds_taxable", "tds_amount", "tds_note",
             "grpo_posting", "gate_entry_no", "checks", "checks_run_at",
         ]
 

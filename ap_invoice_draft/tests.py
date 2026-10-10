@@ -21,7 +21,7 @@ from rest_framework.test import APIClient
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPDataError, SAPOutcomeUnknown, SAPValidationError
 
-from . import checks
+from . import checks, tds
 from .invoice_reader import (
     InvoiceReadError,
     fill_rate_blanks,
@@ -500,6 +500,52 @@ class QCCheckTests(SimpleTestCase):
         self.assertEqual(_status(checks.check_qc(None)), CheckStatus.REVIEW)
 
 
+class TdsDecisionTests(SimpleTestCase):
+    SETUP = {
+        "liable": True, "allowed": True, "active": True, "rate": D("0.1"),
+        "threshold": D("5000000"), "year_to_date": D("0"),
+    }
+
+    def _decide(self, bill="100000", **setup):
+        return tds.decide({**self.SETUP, **setup}, D(bill))
+
+    def test_the_year_runs_april_to_march(self):
+        self.assertEqual(tds.financial_year(date(2026, 10, 3)), (date(2026, 4, 1), date(2027, 3, 31)))
+        self.assertEqual(tds.financial_year(date(2027, 3, 31)), (date(2026, 4, 1), date(2027, 3, 31)))
+        self.assertEqual(tds.financial_year(date(2027, 4, 1)), (date(2027, 4, 1), date(2028, 3, 31)))
+
+    def test_past_the_limit_the_whole_bill_is_taxed(self):
+        decision = self._decide(year_to_date=D("5000000"))
+        self.assertEqual((decision.code, decision.taxable), ("1031", D("100000")))
+        self.assertIn("TDS 1031 at 0.1%", decision.note)
+
+    def test_the_bill_that_crosses_the_limit_is_taxed_whole_and_names_the_part(self):
+        # BR Agrotech, 626084298: ₹46,78,210.24 before a ₹3,36,331.20 bill.
+        decision = self._decide(bill="336331.20", year_to_date=D("4678210.24"))
+        self.assertEqual((decision.code, decision.taxable), ("1031", D("336331.20")))
+        self.assertIn("due only on the ₹14,541.44 above the limit", decision.note)
+
+    def test_under_the_limit_there_is_none(self):
+        decision = self._decide(bill="100000", year_to_date=D("4900000"))
+        self.assertEqual((decision.code, decision.taxable), ("", None))
+        self.assertIn("₹50,00,000.00 with this bill, within", decision.note)
+
+    def test_a_vendor_sap_does_not_set_up_for_it_gets_none(self):
+        self.assertIn("not liable", tds.decide(None, D("1")).note)
+        self.assertIn("not liable", self._decide(liable=False, year_to_date=D("9000000")).note)
+        self.assertIn("does not list 1031", self._decide(allowed=False, year_to_date=D("9000000")).note)
+        self.assertIn("no active", self._decide(active=False, year_to_date=D("9000000")).note)
+        for decision in (
+            self._decide(liable=False, year_to_date=D("9000000")),
+            self._decide(allowed=False, year_to_date=D("9000000")),
+            self._decide(active=False, year_to_date=D("9000000")),
+        ):
+            self.assertEqual(decision.code, "")
+
+    def test_a_code_without_a_limit_always_applies(self):
+        self.assertEqual(self._decide(threshold=D("0")).code, "1031")
+
+
 class RunChecksTests(SimpleTestCase):
     def test_ten_findings_in_order(self):
         findings = checks.run_checks(SSY_GRPO, SSY_INVOICE, {})
@@ -552,6 +598,16 @@ class FakeReader:
         self.series_asked = (posting_date, branch_id, gst_type)
         return None if getattr(self, "no_series", False) else (3686, "HR_G1026")
 
+    #: SSY Containers as live SAP has it: TDS-liable with 1031, long past ₹50 lakh.
+    tds_setup = {
+        "liable": True, "allowed": True, "active": True, "rate": D("0.1"),
+        "threshold": D("5000000"), "year_to_date": D("13225396.70"),
+    }
+
+    def goods_tds(self, vendor_code, code, year_start, year_end):
+        self.tds_asked = (vendor_code, code, year_start, year_end)
+        return copy.deepcopy(self.tds_setup)
+
 
 class FakeSAP:
     def __init__(self):
@@ -572,7 +628,9 @@ class FakeSAP:
         self.payloads.append(payload)
         if self.create_error:
             raise self.create_error
-        return {"DocEntry": 59001, "DocNum": 59001}
+        # SAP works the TDS out itself, as on accounts' draft 58620 for this GRPO.
+        taxed = "WithholdingTaxDataCollection" in payload
+        return {"DocEntry": 59001, "DocNum": 59001, "WTAmount": 271.0 if taxed else 0.0}
 
     def po_print(self, doc_entry):
         return {"doc_num": 0, "approval": {"is_approved": True, "approver": self.approver}}
@@ -623,9 +681,34 @@ class CreateTests(ServiceTestCase):
         self.assertEqual(payload["AttachmentEntry"], 181900)
         self.assertEqual(
             payload["DocumentLines"],
-            [{"BaseType": 20, "BaseEntry": 27481, "BaseLine": n} for n in range(3)],
+            [{"BaseType": 20, "BaseEntry": 27481, "BaseLine": n, "WTLiable": "tYES"} for n in range(3)],
         )
         self.assertIn("Based On Goods Receipt PO 2026106506.", payload["Comments"])
+
+    def test_puts_the_vendors_tds_on_as_accounts_do(self):
+        entry = self.service.create(27481, _pdf(), self.user)
+
+        payload = self.sap.payloads[0]
+        self.assertEqual(payload["WithholdingTaxDataCollection"], [{"WTCode": "1031"}])
+        self.assertEqual(
+            self.reader.tds_asked, ("VENDA000936", "1031", date(2026, 4, 1), date(2027, 3, 31)),
+        )
+        self.assertEqual(entry.tds_code, "1031")
+        self.assertEqual(entry.tds_taxable, D("270549.92"))
+        self.assertEqual(entry.tds_amount, D("271"))
+        self.assertIn("already ₹1,32,25,396.70, past the ₹50,00,000.00 limit", entry.tds_note)
+
+    def test_no_tds_while_the_vendor_is_under_the_limit(self):
+        self.reader.tds_setup = {**FakeReader.tds_setup, "year_to_date": D("1000000")}
+        entry = self.service.create(27481, _pdf(), self.user)
+
+        payload = self.sap.payloads[0]
+        self.assertNotIn("WithholdingTaxDataCollection", payload)
+        self.assertEqual({line["WTLiable"] for line in payload["DocumentLines"]}, {"tNO"})
+        self.assertEqual(entry.tds_code, "")
+        self.assertIsNone(entry.tds_taxable)
+        self.assertIsNone(entry.tds_amount)
+        self.assertIn("₹12,70,549.92 with this bill, within the ₹50,00,000.00 limit", entry.tds_note)
 
     def test_reads_the_bill_and_runs_every_check_in_the_same_go(self):
         entry = self.service.create(27481, _pdf(), self.user)
@@ -664,6 +747,8 @@ class CreateTests(ServiceTestCase):
         self.assertEqual(entry.sap_draft_entry, 58620)
         self.assertTrue(entry.sap_draft_adopted)
         self.assertEqual(self.sap.payloads, [])
+        # Accounts' own draft carries whatever TDS they put on it.
+        self.assertEqual((entry.tds_code, entry.tds_note), ("", ""))
 
     def test_a_refusal_keeps_the_entry_with_sap_reason(self):
         self.sap.create_error = SAPValidationError("Period is locked")

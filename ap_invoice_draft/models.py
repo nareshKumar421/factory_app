@@ -100,6 +100,14 @@ class APInvoiceDraft(BaseModel):
     sap_attachment_error = models.TextField(blank=True)
     sap_created_at = models.DateTimeField(null=True, blank=True)
 
+    # The TDS the app put on the draft it made (``tds.py``): the withholding
+    # code (blank for none), the base, what SAP worked out, and why. Left blank
+    # on a draft made in SAP, which carries whatever accounts put on it.
+    tds_code = models.CharField(max_length=20, blank=True)
+    tds_taxable = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    tds_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    tds_note = models.TextField(blank=True)
+
     checks_run_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

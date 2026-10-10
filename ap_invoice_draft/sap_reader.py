@@ -1,5 +1,5 @@
 """HANA reads behind A/P invoice drafts: open GRPOs, one GRPO with its PO lines,
-and the A/P drafts SAP already holds for a GRPO.
+the A/P drafts SAP already holds for a GRPO, and a vendor's standing for TDS.
 
 A GRPO is "open" while it has lines not yet copied to an A/P invoice; once
 accounts adds the invoice SAP closes it, which is what takes it off the picker.
@@ -95,6 +95,33 @@ SELECT S."Series", S."SeriesName", DAYS_BETWEEN(P."F_RefDate", P."T_RefDate") AS
    AND S."BPLId" = ? AND IFNULL(S."DocSubType", '--') = ?
    AND IFNULL(S."Locked", 'N') = 'N' AND S."SeriesName" NOT LIKE 'CN%'
  ORDER BY "Span", S."Series"
+"""
+
+# Whether a vendor takes a withholding code: TDS-liable, with the code among
+# its allowed ones (OCRD.WTCode is left blank here; CRD4 holds them), and the
+# code's rate and yearly limit.
+_VENDOR_TDS_SQL = """
+SELECT C."WTLiable",
+       (SELECT COUNT(*) FROM "{schema}"."CRD4" W
+         WHERE W."CardCode" = C."CardCode" AND W."WTCode" = ?) AS "Allowed",
+       T."Rate", T."Threshold", T."Inactive"
+  FROM "{schema}"."OCRD" C
+  LEFT JOIN "{schema}"."OWHT" T ON T."WTCode" = ?
+ WHERE C."CardCode" = ?
+"""
+
+# What the year's posted A/P invoices from a vendor come to before GST, less
+# its A/P credit notes. A cancelled document and its cancellation both carry
+# CANCELED <> 'N'.
+_YEAR_PURCHASES_SQL = """
+SELECT IFNULL((SELECT SUM(L."LineTotal")
+                 FROM "{schema}"."OPCH" P JOIN "{schema}"."PCH1" L ON L."DocEntry" = P."DocEntry"
+                WHERE P."CardCode" = ? AND P."CANCELED" = 'N' AND P."DocDate" BETWEEN ? AND ?), 0)
+     - IFNULL((SELECT SUM(L."LineTotal")
+                 FROM "{schema}"."ORPC" P JOIN "{schema}"."RPC1" L ON L."DocEntry" = P."DocEntry"
+                WHERE P."CardCode" = ? AND P."CANCELED" = 'N' AND P."DocDate" BETWEEN ? AND ?), 0)
+       AS "Amount"
+  FROM DUMMY
 """
 
 # Each GRPO line beside the PO line it was copied from. ``BaseOpnQty`` is what
@@ -242,6 +269,30 @@ class GRPOReader:
             _AP_SERIES_SQL, [posting_date, int(branch_id), gst_type or "--"], what="A/P invoice series",
         )
         return (int(rows[0]["Series"]), _text(rows[0]["SeriesName"])) if rows else None
+
+    def goods_tds(self, vendor_code: str, code: str, year_start, year_end):
+        """The vendor's standing for withholding ``code`` (see ``tds.py``), or
+        ``None`` when SAP has no such vendor."""
+        rows = self._rows(_VENDOR_TDS_SQL, [code, code, vendor_code], what="vendor TDS")
+        if not rows:
+            return None
+        v = rows[0]
+        setup = {
+            "liable": v["WTLiable"] == "Y",
+            "allowed": bool(v["Allowed"]),
+            "active": v["Rate"] is not None and v["Inactive"] != "Y",
+            "rate": _dec(v["Rate"]),
+            "threshold": _dec(v["Threshold"]),
+            "year_to_date": Decimal("0"),
+        }
+        if setup["liable"] and setup["allowed"]:
+            bought = self._rows(
+                _YEAR_PURCHASES_SQL,
+                [vendor_code, year_start, year_end, vendor_code, year_start, year_end],
+                what="vendor purchases",
+            )
+            setup["year_to_date"] = _dec(bought[0]["Amount"])
+        return setup
 
     def grpo(self, doc_entry: int):
         """One GRPO with every line beside its PO line, or ``None``."""

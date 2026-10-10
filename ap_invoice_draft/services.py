@@ -17,6 +17,7 @@ The order matters for what the user is left holding when something fails:
 import json
 import logging
 import re
+from decimal import Decimal
 from typing import Optional
 
 from django.db import IntegrityError, transaction
@@ -37,7 +38,7 @@ from sap_client.exceptions import (
     SAPValidationError,
 )
 
-from . import checks
+from . import checks, tds
 from .invoice_reader import InvoiceReadError, mime_type_for, read_invoice
 from .models import (
     APInvoiceDraft,
@@ -259,10 +260,11 @@ class APInvoiceDraftService:
                         f"SAP has no open A/P invoice series for branch {grpo['branch_id']} on "
                         f"{grpo['doc_date']:%d %b %Y} ({grpo['gst_type']}). Ask the SAP team to open one.",
                     )
+            withholding = self._goods_tds(reader, grpo)
             client = SAPClient(self.company_code)
             attachment_entry = self._attach_bill(entry, client)
             result = client.create_ap_invoice_draft(
-                self._draft_payload(entry, grpo, user, attachment_entry, series)
+                self._draft_payload(entry, grpo, user, attachment_entry, series, withholding)
             )
         except SAPValidationError as exc:
             return self._mark_failed(entry, f"SAP refused the draft: {sap_message(exc)}")
@@ -278,7 +280,19 @@ class APInvoiceDraftService:
         draft_entry = result.get("DocEntry")
         if not draft_entry:
             return self._mark_failed(entry, "SAP answered without a draft number.")
-        return self._mark_created(entry, int(draft_entry), adopted=False)
+        return self._mark_created(
+            entry, int(draft_entry), adopted=False, withholding=withholding,
+            tds_amount=result.get("WTAmount"),
+        )
+
+    @staticmethod
+    def _goods_tds(reader: GRPOReader, grpo: dict) -> tds.TdsDecision:
+        """The TDS accounts' own copy would put on the GRPO's open lines."""
+        bill = sum((line["line_total"] for line in grpo["lines"] if line["is_open"]), Decimal("0"))
+        setup = reader.goods_tds(
+            grpo["vendor_code"], tds.GOODS_TDS_CODE, *tds.financial_year(grpo["doc_date"]),
+        )
+        return tds.decide(setup, bill)
 
     def _attach_bill(self, entry: APInvoiceDraft, client: SAPClient) -> Optional[int]:
         """Upload the bill to SAP's attachments. A failure is noted, not fatal:
@@ -305,9 +319,12 @@ class APInvoiceDraftService:
 
     def _draft_payload(
         self, entry, grpo: dict, user, attachment_entry: Optional[int], series=None,
+        withholding: Optional[tds.TdsDecision] = None,
     ) -> dict:
         """What accounts' own "Copy To A/P Invoice" makes: the GRPO's open lines,
-        its dates, branch and bill number, in the month's series for that branch."""
+        its dates, branch and bill number, in the month's series for that branch,
+        with the vendor's TDS."""
+        withholding = withholding or tds.TdsDecision()
         username = getattr(user, "email", "") or getattr(user, "username", "") or str(user)
         comments = (
             f"App: FactoryApp v2 | AP Draft: {entry.entry_no} | User: {username} | "
@@ -320,11 +337,16 @@ class APInvoiceDraftService:
             "TaxDate": (grpo["tax_date"] or grpo["doc_date"]).isoformat(),
             "Comments": comments[:SAP_COMMENTS_MAX_LENGTH],
             "DocumentLines": [
-                {"BaseType": 20, "BaseEntry": grpo["doc_entry"], "BaseLine": line["line_num"]}
+                {
+                    "BaseType": 20, "BaseEntry": grpo["doc_entry"], "BaseLine": line["line_num"],
+                    "WTLiable": "tYES" if withholding.code else "tNO",
+                }
                 for line in grpo["lines"]
                 if line["is_open"]
             ],
         }
+        if withholding.code:
+            payload["WithholdingTaxDataCollection"] = [{"WTCode": withholding.code}]
         if grpo["branch_id"] is not None:
             payload["BPL_IDAssignedToInvoice"] = grpo["branch_id"]
         if series:
@@ -335,15 +357,23 @@ class APInvoiceDraftService:
             payload["AttachmentEntry"] = attachment_entry
         return payload
 
-    def _mark_created(self, entry, draft_entry: int, *, adopted: bool) -> APInvoiceDraft:
+    def _mark_created(
+        self, entry, draft_entry: int, *, adopted: bool,
+        withholding: Optional[tds.TdsDecision] = None, tds_amount=None,
+    ) -> APInvoiceDraft:
+        withholding = withholding or tds.TdsDecision()
         entry.sap_status = SapDraftStatus.CREATED
         entry.sap_draft_entry = draft_entry
         entry.sap_draft_adopted = adopted
         entry.sap_error = ""
         entry.sap_created_at = timezone.now()
+        entry.tds_code = withholding.code
+        entry.tds_taxable = withholding.taxable
+        entry.tds_amount = Decimal(str(tds_amount)) if withholding.code and tds_amount is not None else None
+        entry.tds_note = withholding.note
         entry.save(update_fields=[
             "sap_status", "sap_draft_entry", "sap_draft_adopted", "sap_error",
-            "sap_created_at", "updated_at",
+            "sap_created_at", "tds_code", "tds_taxable", "tds_amount", "tds_note", "updated_at",
         ])
         return entry
 
