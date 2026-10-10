@@ -25,6 +25,7 @@ from sap_client.client import SAPClient
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError, SAPDataError, SAPValidationError
 from sap_client.hana.connection import HanaConnection
+from sap_client.hana.service_grpo_options_reader import OCR_VALID_TODAY_SQL
 from weighment.models import Weighment
 
 from document_control import services as document_services
@@ -123,6 +124,17 @@ class GRPOService:
     SERVICE_FREIGHT_DEFAULT_SAC = {
         "JIVO_MART": (-426, "00997136"),
     }
+    # The budget (dimension 3) a company books outward freight under, for a
+    # plan that names none. Oil and Beverages fall back to "Del Bkhp" below.
+    # Mart retired "Del Bkhp" on 2025-10-31 and books freight under
+    # SUPPLY-C, with a sub budget (dimension 4) per GRPO branch: SC-WARH from
+    # Delhi (BPL 1), SC-BHKR from Haryana; SAP's own Mart GRPOs follow that on
+    # 93 of 104 Delhi lines and 730 of 739 Haryana ones.
+    SERVICE_FREIGHT_DEFAULT_BUDGET = {
+        "JIVO_MART": "SUPPLY-C",
+    }
+    MART_SUPPLY_CHAIN_SUB_BUDGET_BY_BRANCH = {1: "SC-WARH"}
+    MART_SUPPLY_CHAIN_SUB_BUDGET_DEFAULT = "SC-BHKR"
     STATE_NAME_CODES = {
         "HARYANA": "HR",
         "DELHI": "DL",
@@ -643,12 +655,16 @@ class GRPOService:
         try:
             conn = connection.connect()
             cursor = conn.cursor()
+            # Active alone is not enough: SAP also rejects a rule outside its
+            # OCR1 validity window ("Invalid distribution rule"). Mart's
+            # "Del Bkhp" is Active but ended 2025-10-31.
             cursor.execute(
                 f"""
-                    SELECT "OcrCode", IFNULL("OcrName", '')
-                    FROM "{connection.schema}"."OOCR"
-                    WHERE "DimCode" = ?
-                      AND IFNULL("Active", 'Y') = 'Y'
+                    SELECT O."OcrCode", IFNULL(O."OcrName", '')
+                    FROM "{connection.schema}"."OOCR" O
+                    WHERE O."DimCode" = ?
+                      AND IFNULL(O."Active", 'Y') = 'Y'
+                      AND {OCR_VALID_TODAY_SQL.format(schema=connection.schema)}
                 """,
                 [dim_code],
             )
@@ -834,6 +850,10 @@ class GRPOService:
             for code, name in active_budget_codes.items():
                 if normalized_saved_budget in {code.lower(), name.lower()}:
                     return code
+
+        company_default = self.SERVICE_FREIGHT_DEFAULT_BUDGET.get(self.company_code)
+        if company_default in active_budget_codes:
+            return company_default
 
         location_hint = (
             f"{dispatch_plan.service_location_name} {dispatch_plan.service_location_code or ''}"
@@ -4033,6 +4053,15 @@ class GRPOService:
                 document_line["CostingCode2"] = effective_month_dimension
             if post_budget_as_dimension:
                 document_line["CostingCode3"] = budget_delivery_point
+                if company_code == "JIVO_MART" and budget_delivery_point == "SUPPLY-C":
+                    sub_budget = self._resolve_active_dimension_code(
+                        4,
+                        self.MART_SUPPLY_CHAIN_SUB_BUDGET_BY_BRANCH.get(
+                            int(branch_id), self.MART_SUPPLY_CHAIN_SUB_BUDGET_DEFAULT
+                        ),
+                    )
+                    if sub_budget:
+                        document_line["CostingCode4"] = sub_budget
             if state_dimension:
                 document_line["CostingCode5"] = state_dimension
             if sub_account:

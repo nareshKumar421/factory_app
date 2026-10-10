@@ -8,6 +8,21 @@ from ..exceptions import SAPConnectionError, SAPDataError
 
 logger = logging.getLogger(__name__)
 
+# A distribution rule SAP will take today: OOCR.Active is not enough, because
+# SAP also refuses a rule outside its OCR1 validity window ("Invalid
+# distribution rule"). Expects the OOCR row aliased O; fill in {schema}.
+OCR_VALID_TODAY_SQL = """(
+    NOT EXISTS (
+        SELECT 1 FROM "{schema}"."OCR1" V WHERE V."OcrCode" = O."OcrCode"
+    )
+    OR EXISTS (
+        SELECT 1 FROM "{schema}"."OCR1" V
+        WHERE V."OcrCode" = O."OcrCode"
+          AND IFNULL(V."ValidFrom", CURRENT_DATE) <= CURRENT_DATE
+          AND IFNULL(V."ValidTo", CURRENT_DATE) >= CURRENT_DATE
+    )
+)"""
+
 
 class HanaServiceGRPOOptionsReader:
     """Reads SAP master-data options used by service GRPO posting."""
@@ -175,12 +190,13 @@ class HanaServiceGRPOOptionsReader:
         cursor.execute(
             f"""
                 SELECT
-                    "OcrCode" AS variety_code,
-                    IFNULL("OcrName", '') AS variety_name
-                FROM "{schema}"."OOCR"
-                WHERE "DimCode" = 1
-                  AND IFNULL("Active", 'Y') = 'Y'
-                ORDER BY "OcrName", "OcrCode"
+                    O."OcrCode" AS variety_code,
+                    IFNULL(O."OcrName", '') AS variety_name
+                FROM "{schema}"."OOCR" O
+                WHERE O."DimCode" = 1
+                  AND IFNULL(O."Active", 'Y') = 'Y'
+                  AND {OCR_VALID_TODAY_SQL.format(schema=schema)}
+                ORDER BY O."OcrName", O."OcrCode"
             """
         )
         return [
@@ -196,12 +212,13 @@ class HanaServiceGRPOOptionsReader:
         cursor.execute(
             f"""
                 SELECT
-                    "OcrCode" AS project_code,
-                    IFNULL("OcrName", '') AS project_name
-                FROM "{schema}"."OOCR"
-                WHERE "DimCode" = 3
-                  AND IFNULL("Active", 'Y') = 'Y'
-                ORDER BY "OcrName", "OcrCode"
+                    O."OcrCode" AS project_code,
+                    IFNULL(O."OcrName", '') AS project_name
+                FROM "{schema}"."OOCR" O
+                WHERE O."DimCode" = 3
+                  AND IFNULL(O."Active", 'Y') = 'Y'
+                  AND {OCR_VALID_TODAY_SQL.format(schema=schema)}
+                ORDER BY O."OcrName", O."OcrCode"
             """
         )
         return [

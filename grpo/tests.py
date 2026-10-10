@@ -1120,6 +1120,152 @@ class GRPOServiceTests(TestCase):
         self.assertEqual(line["U_Remarks"], "Y")
         self.assertEqual(line["U_BilltyNumber"], "13454")
 
+    # Mart's live dimension 3 once validity windows are applied: "Del Bkhp",
+    # FACTORY and FACT_COM ended 2025-10-31; "Del Mayp" is still valid but
+    # Mart never books freight under it.
+    MART_VALID_BUDGETS = {
+        "BackOff": "Back Office",
+        "Del Mayp": "Delivery Mayapuri",
+        "SUPPLY-C": "SUPPLY CHAIN",
+        "Sales": "Sales",
+    }
+
+    def test_mart_freight_budget_defaults_to_supply_chain(self):
+        """Mart's Service GRPO form defaulted the budget to "Del Bkhp", which SAP
+        refused: "540000087 - Invalid distribution rule: Del Bkhp". It is Active
+        in Mart's OOCR but its validity ended 2025-10-31; Mart books freight
+        under SUPPLY-C. Oil and Beverages keep "Del Bkhp"."""
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        plan = DispatchPlan.objects.create(
+            company=mart,
+            sap_invoice_doc_entry=41265,
+            sap_invoice_doc_num="610260130",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            budget_delivery_point="Del Bkhp",      # stale, from before the cut-over
+            service_location_name="DELHI ISD MAYAPURI",
+        )
+        with patch.object(
+            GRPOService, "_get_active_budget_codes",
+            return_value=self.MART_VALID_BUDGETS,
+        ):
+            budget = GRPOService(company_code="JIVO_MART")._infer_budget_delivery_point(plan)
+        self.assertEqual(budget, "SUPPLY-C")
+
+        # A budget the plan names that is still valid is kept.
+        plan.budget_delivery_point = "Sales"
+        with patch.object(
+            GRPOService, "_get_active_budget_codes",
+            return_value=self.MART_VALID_BUDGETS,
+        ):
+            budget = GRPOService(company_code="JIVO_MART")._infer_budget_delivery_point(plan)
+        self.assertEqual(budget, "Sales")
+
+        oil_plan = DispatchPlan.objects.create(
+            company=self.company,
+            sap_invoice_doc_entry=626050003,
+            sap_invoice_doc_num="626050003",
+            booking_status=DispatchPlanStatus.BOOKED,
+        )
+        with patch.object(
+            GRPOService, "_get_active_budget_codes",
+            return_value={"Del Bkhp": "Delivery Bhakharpur", "Del Mayp": "Delivery Mayapuri"},
+        ):
+            budget = GRPOService(company_code="TC001")._infer_budget_delivery_point(oil_plan)
+        self.assertEqual(budget, "Del Bkhp")
+
+    @patch.object(GRPOService, "_get_sap_bp_group_code", return_value=None)
+    @patch.object(GRPOService, "find_existing_sap_service_grpo", return_value=None)
+    @patch.object(GRPOService, "_filter_purchase_delivery_note_udfs")
+    @patch.object(GRPOService, "_get_dispatch_bill_snapshot")
+    @patch.object(GRPOService, "_get_active_dimension_codes")
+    @patch.object(GRPOService, "_get_sap_tax_codes")
+    @patch.object(GRPOService, "_get_sap_bp_state")
+    @patch.object(GRPOService, "_get_sap_branch_states")
+    @patch("grpo.services.SAPClient")
+    def test_mart_supply_chain_freight_gets_sub_budget_by_branch(
+        self,
+        mock_sap_client,
+        mock_branch_states,
+        mock_vendor_state,
+        mock_tax_codes,
+        mock_dimension_codes,
+        mock_bill_snapshot,
+        mock_filter_udfs,
+        mock_existing_doc,
+        mock_bp_group,
+    ):
+        """Mart's own freight GRPOs carry dimension 4 under SUPPLY-C: SC-WARH
+        from the Delhi branch (BPL 1), SC-BHKR from Haryana."""
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        mock_branch_states.return_value = {1: "DL", 2: "HR"}
+        mock_vendor_state.return_value = "HR"
+        mock_tax_codes.return_value = {
+            "GST05R": {"code": "GST05R", "name": "RCM", "rate": Decimal("5")},
+        }
+        mock_dimension_codes.side_effect = lambda company_code, dim_code: {
+            3: self.MART_VALID_BUDGETS,
+            4: {"SC-BHKR": "SC-BHKR", "SC-WARH": "SC-WARH"},
+        }.get(dim_code)                            # None = unchecked, take as given
+        mock_bill_snapshot.return_value = {
+            "doc_num": "610260130",
+            "state": "PB",
+            "card_code": "CUST001",
+            "item_summary": "Transport freight",
+            "total_litres": "2160.000",
+            "doc_total": "50000.00",
+        }
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 14900, "DocNum": 2010264900, "DocTotal": 2808.00,
+        }
+        mock_sap_client.return_value = mock_instance
+
+        def post(branch_id, bilty_no, doc_entry, budget):
+            plan = DispatchPlan.objects.create(
+                company=mart,
+                sap_invoice_doc_entry=doc_entry,
+                sap_invoice_doc_num=str(doc_entry),
+                booking_status=DispatchPlanStatus.DISPATCHED,
+                place_of_supply="PB",
+                total_freight=Decimal("2808.00"),
+                bilty_no=bilty_no,
+                bilty_date=date(2026, 10, 8),
+            )
+            GRPOService(company_code="JIVO_MART").post_service_grpo(
+                dispatch_plan_id=plan.id,
+                user=self.user,
+                vendor_code="VENDA001040",
+                branch_id=branch_id,
+                service_description="Transport freight",
+                amount=Decimal("2808.00"),
+                tax_code="GST05R",
+                gl_account="5670001",
+                place_of_supply="PB",
+                effective_month="2026-10",
+                location_code=2,
+                location_name="HARYANA",
+                sac_entry=-426,
+                sac_code="00997136",
+                budget_delivery_point=budget,
+                bilty_no=bilty_no,
+                vendor_ref=bilty_no,
+                include_bilty_attachment=False,
+            )
+            return mock_instance.create_grpo.call_args[0][0]["DocumentLines"][0]
+
+        line = post(2, "13454", 41265, "SUPPLY-C")
+        self.assertEqual(line["CostingCode3"], "SUPPLY-C")
+        self.assertEqual(line["CostingCode4"], "SC-BHKR")
+
+        line = post(1, "13455", 41266, "SUPPLY-C")
+        self.assertEqual(line["CostingCode3"], "SUPPLY-C")
+        self.assertEqual(line["CostingCode4"], "SC-WARH")
+
+        # Any other budget: no guess at a sub budget.
+        line = post(2, "13456", 41267, "Sales")
+        self.assertEqual(line["CostingCode3"], "Sales")
+        self.assertNotIn("CostingCode4", line)
+
     @patch.object(GRPOService, "_get_dispatch_bill_snapshot")
     @patch.object(GRPOService, "_get_active_dimension_codes")
     @patch.object(GRPOService, "_get_sap_bp_state")
