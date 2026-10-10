@@ -4,7 +4,8 @@ The store receives the goods and posts the GRPO; accounts then turns that GRPO
 into an A/P invoice. Until now that second step was done by hand in SAP: copy
 the GRPO to an A/P invoice, attach the scanned bill, save. This module does the
 copy from the warehouse side and, for every bill, runs the audit checklist that
-says whether it is fit to be paid (``checks.py`` holds the rules).
+says whether it is fit to be paid (``checks.py`` holds the rules). The checklist
+is a pre-audit: the draft goes to SAP after it, when someone asks.
 
 What SAP gets is a **draft** (``ODRF``, object 18), never a posted invoice: an
 A/P invoice is a payable, and the person who adds it in SAP is still the one who

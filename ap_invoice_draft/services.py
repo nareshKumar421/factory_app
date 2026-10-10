@@ -1,17 +1,18 @@
-"""A/P invoice drafts: make the entry, put the draft into SAP, read the bill, audit.
+"""A/P invoice drafts: make the entry, read the bill, audit, put the draft into SAP.
 
 The order matters for what the user is left holding when something fails:
 
 1. The entry is saved first, with the bill, so nothing typed or uploaded is lost.
-2. The SAP draft is made in the same request. SAP refusing it, or not answering,
-   leaves the entry FAILED with SAP's reason and a "Create in SAP" retry. A
-   retry, like the first try, looks for an open A/P draft on the GRPO before
-   making one: accounts make them by hand too, and a request that timed out may
-   have been taken.
-3. The bill is read in the same request too, on this server (``invoice_reader``,
+2. The bill is read in the same request, on this server (``invoice_reader``,
    about five seconds a page). A read that fails is kept as FAILED and offered
    again; "Read the bill again" also re-reads after the reader improves.
-4. The checks run after each of those, re-reading the GRPO from SAP.
+3. The checks run next, re-reading the GRPO from SAP. They are the pre-audit:
+   nothing goes to SAP until someone has been through them.
+4. The SAP draft is made when that person presses "Create in SAP", below the
+   checklist. SAP refusing it, or not answering, leaves the entry FAILED with
+   SAP's reason and the same button to try again. Every try looks for an open
+   A/P draft on the GRPO before making one: accounts make them by hand too, and
+   a request that timed out may have been taken.
 """
 
 import json
@@ -172,8 +173,9 @@ class APInvoiceDraftService:
     # ------------------------------------------------------------------
 
     def create(self, grpo_doc_entry: int, invoice_file, user) -> APInvoiceDraft:
-        """Save the entry, make its SAP draft, run the checks. Raises
-        ``ValueError`` for anything the user has to change first."""
+        """Save the entry, read the bill, run the checks; the SAP draft waits
+        for ``send_to_sap``. Raises ``ValueError`` for anything the user has to
+        change first."""
         try:
             mime_type_for(getattr(invoice_file, "name", ""))
         except InvoiceReadError as exc:
@@ -206,7 +208,6 @@ class APInvoiceDraftService:
             # Someone else entered the same GRPO a moment ago.
             raise ValueError(f"GRPO {grpo['doc_num']} already has an entry.") from exc
 
-        self.send_to_sap(entry, user, grpo=grpo)
         self._read(entry)
         self.run_checks(entry, grpo=grpo)
         return entry

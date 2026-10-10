@@ -659,10 +659,27 @@ class ServiceTestCase(TestCase):
     def _checks(self, entry):
         return {c.key: c for c in entry.checks.all()}
 
+    def _sent(self):
+        """An entry made, then put into SAP with "Create in SAP"."""
+        entry = self.service.create(27481, _pdf(), self.user)
+        return self.service.send_to_sap(entry, self.user)
+
 
 class CreateTests(ServiceTestCase):
-    def test_makes_the_sap_draft_as_accounts_copy_would(self):
+    def test_creating_reads_and_checks_but_leaves_sap_for_after(self):
+        # The checklist is the pre-audit: nothing goes to SAP until someone asks,
+        # not even a link to the draft accounts already made.
+        self.reader.drafts = {27481: [58620]}
         entry = self.service.create(27481, _pdf(), self.user)
+
+        self.assertEqual(entry.sap_status, SapDraftStatus.PENDING)
+        self.assertIsNone(entry.sap_draft_entry)
+        self.assertEqual(self.sap.payloads, [])
+        self.assertEqual(entry.invoice_read_status, InvoiceReadStatus.READ)
+        self.assertEqual(list(self._checks(entry)), checks.ORDER)
+
+    def test_makes_the_sap_draft_as_accounts_copy_would(self):
+        entry = self._sent()
 
         self.assertEqual(entry.sap_status, SapDraftStatus.CREATED)
         self.assertEqual(entry.sap_draft_entry, 59001)
@@ -686,7 +703,7 @@ class CreateTests(ServiceTestCase):
         self.assertIn("Based On Goods Receipt PO 2026106506.", payload["Comments"])
 
     def test_puts_the_vendors_tds_on_as_accounts_do(self):
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
 
         payload = self.sap.payloads[0]
         self.assertEqual(payload["WithholdingTaxDataCollection"], [{"WTCode": "1031"}])
@@ -700,7 +717,7 @@ class CreateTests(ServiceTestCase):
 
     def test_no_tds_while_the_vendor_is_under_the_limit(self):
         self.reader.tds_setup = {**FakeReader.tds_setup, "year_to_date": D("1000000")}
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
 
         payload = self.sap.payloads[0]
         self.assertNotIn("WithholdingTaxDataCollection", payload)
@@ -726,12 +743,13 @@ class CreateTests(ServiceTestCase):
         self.assertEqual(found["over_receipt"].status, CheckStatus.PASS)
         self.assertEqual(found["qc"].status, CheckStatus.REVIEW)
 
-    def test_an_unreadable_bill_keeps_the_entry_and_its_draft(self):
+    def test_an_unreadable_bill_keeps_the_entry_and_can_still_go_to_sap(self):
         self.read.side_effect = InvoiceReadError("No text could be read off the bill.")
         entry = self.service.create(27481, _pdf(), self.user)
-        self.assertEqual(entry.sap_status, SapDraftStatus.CREATED)
         self.assertEqual(entry.invoice_read_status, InvoiceReadStatus.FAILED)
         self.assertEqual(self._checks(entry)["invoice_number"].status, CheckStatus.UNKNOWN)
+        self.service.send_to_sap(entry, self.user)
+        self.assertEqual(entry.sap_status, SapDraftStatus.CREATED)
 
     def test_whatever_the_ocr_engine_throws_keeps_the_entry(self):
         self.read.side_effect = RuntimeError("onnxruntime: bad alloc")
@@ -742,7 +760,7 @@ class CreateTests(ServiceTestCase):
     def test_links_the_draft_sap_already_has(self):
         # On 2026-10-08 accounts had already made draft 58620 for this GRPO by hand.
         self.reader.drafts = {27481: [58620]}
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
         self.assertEqual(entry.sap_status, SapDraftStatus.CREATED)
         self.assertEqual(entry.sap_draft_entry, 58620)
         self.assertTrue(entry.sap_draft_adopted)
@@ -752,7 +770,7 @@ class CreateTests(ServiceTestCase):
 
     def test_a_refusal_keeps_the_entry_with_sap_reason(self):
         self.sap.create_error = SAPValidationError("Period is locked")
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
         self.assertEqual(entry.sap_status, SapDraftStatus.FAILED)
         self.assertIn("Period is locked", entry.sap_error)
         self.assertIsNone(entry.sap_draft_entry)
@@ -763,7 +781,7 @@ class CreateTests(ServiceTestCase):
             '{\n "error" : {\n "code" : "-4002", "details" : [], "message" : '
             '"To generate this document, first define the numbering series in the Administration module"\n }\n}'
         )
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
         self.assertEqual(
             entry.sap_error,
             "SAP refused the draft: To generate this document, first define the numbering "
@@ -772,7 +790,7 @@ class CreateTests(ServiceTestCase):
 
     def test_a_lost_answer_is_found_on_retry_not_made_twice(self):
         self.sap.create_error = SAPOutcomeUnknown("timeout")
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
         self.assertEqual(entry.sap_status, SapDraftStatus.FAILED)
         self.assertIn("looks for the draft", entry.sap_error)
 
@@ -785,14 +803,14 @@ class CreateTests(ServiceTestCase):
 
     def test_no_open_series_is_said_before_sap_is_asked(self):
         self.reader.no_series = True
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
         self.assertEqual(entry.sap_status, SapDraftStatus.FAILED)
         self.assertIn("no open A/P invoice series for branch 2", entry.sap_error)
         self.assertEqual(self.sap.payloads, [])
 
     def test_an_attachment_failure_still_makes_the_draft(self):
         self.sap.upload_error = SAPDataError("Attachments folder not defined")
-        entry = self.service.create(27481, _pdf(), self.user)
+        entry = self._sent()
         self.assertEqual(entry.sap_status, SapDraftStatus.CREATED)
         self.assertNotIn("AttachmentEntry", self.sap.payloads[0])
         self.assertIn("Attachments folder", entry.sap_attachment_error)
@@ -897,8 +915,14 @@ class GRPOAPStatusTests(ServiceTestCase):
     def test_the_apps_own_entry_is_named(self):
         entry = self.service.create(27481, _pdf(), self.user)
         status = self.service.grpo_ap_status([27481])[27481]
-        self.assertEqual(status["status"], "DRAFT")
+        # Entered and checked, but not yet in SAP: the GRPO still owes its draft.
+        self.assertEqual(status["status"], "NONE")
         self.assertEqual(status["entry"]["entry_no"], entry.entry_no)
+        self.assertIsNone(status["entry"]["sap_draft_entry"])
+
+        self.service.send_to_sap(entry, self.user)
+        status = self.service.grpo_ap_status([27481])[27481]
+        self.assertEqual(status["status"], "DRAFT")
         self.assertEqual(status["entry"]["sap_draft_entry"], 59001)
 
 
@@ -942,7 +966,8 @@ class APITests(ServiceTestCase):
         response = self._create()
         self.assertEqual(response.status_code, 201, response.content)
         body = response.json()
-        self.assertEqual(body["sap_status"], "CREATED")
+        self.assertEqual(body["sap_status"], "PENDING")
+        self.assertEqual(self.sap.payloads, [])
         self.assertEqual(len(body["checks"]), 10)
         self.assertTrue(body["invoice_file_url"].startswith("http://testserver/"))
 
@@ -958,11 +983,22 @@ class APITests(ServiceTestCase):
         self.assertEqual(row["sap_draft_entries"], [58620])
         self.assertEqual(row["entry_no"], "")
 
-    def test_a_refused_draft_is_tried_again(self):
-        self.sap.create_error = SAPValidationError("Period is locked")
+    def test_after_the_checklist_the_maker_puts_it_in_sap(self):
         entry_id = self._create().json()["id"]
+        url = f"{API}{entry_id}/send-to-sap/"
+        self.assertEqual(self._as(self.auditor).post(url, HTTP_COMPANY_CODE="JIVO_OIL").status_code, 403)
+        response = self._as(self.maker).post(url, HTTP_COMPANY_CODE="JIVO_OIL")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual((response.json()["sap_status"], response.json()["sap_draft_entry"]), ("CREATED", 59001))
+        self.assertEqual(len(response.json()["checks"]), 10)
+
+    def test_a_refused_draft_is_tried_again(self):
+        entry_id = self._create().json()["id"]
+        url = f"{API}{entry_id}/send-to-sap/"
+        self.sap.create_error = SAPValidationError("Period is locked")
+        self.assertEqual(self._as(self.maker).post(url, HTTP_COMPANY_CODE="JIVO_OIL").json()["sap_status"], "FAILED")
         self.sap.create_error = None
-        response = self._as(self.maker).post(f"{API}{entry_id}/send-to-sap/", HTTP_COMPANY_CODE="JIVO_OIL")
+        response = self._as(self.maker).post(url, HTTP_COMPANY_CODE="JIVO_OIL")
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["sap_status"], "CREATED")
 

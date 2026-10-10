@@ -123,8 +123,8 @@ class APInvoiceDraftListCreateAPI(APIView):
         return Response(APInvoiceDraftListSerializer(entries, many=True).data)
 
     def post(self, request):
-        """The bill and its GRPO. 201 whether or not SAP took the draft: the
-        entry says which, and offers the retry."""
+        """The bill and its GRPO: saved, read and checked. The SAP draft is
+        made from the entry afterwards (``send-to-sap``)."""
         serializer = APInvoiceDraftCreateSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(
@@ -167,7 +167,8 @@ class APInvoiceDraftReadInvoiceAPI(APIView):
 
 
 class APInvoiceDraftSendToSapAPI(APIView):
-    """Try the SAP draft again; links the one SAP has if it made it after all."""
+    """Make the SAP draft, after the checklist; or try it again. Links the one
+    SAP already has instead: made by hand, or by a try that timed out."""
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanCreateAPInvoiceDraft]
 
