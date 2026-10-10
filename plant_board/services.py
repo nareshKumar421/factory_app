@@ -1493,13 +1493,15 @@ class PlantBoardService:
         active_days = [row for row in daily if row["qty"] > 0]
         # The SKUs behind the unplanned tonnage, so the drill can name them
         # rather than leave a reader with a single figure to argue with.
+        # Read once and used twice: the unplanned drill and the SKU-wise plan.
+        floor_items = self.reader.floor_production_by_item(window_from, window_to) or []
         unplanned = self._unplanned_items(
-            window_from,
-            window_to,
+            floor_items,
             {line.get("item_code") for line in lines if line.get("item_code")},
         )
 
-        floor = self._floor_stock()
+        occupancy = self.stock.get_warehouse_occupancy(PRODUCTION_FLOOR)
+        floor = self._floor_stock(occupancy)
 
         return {
             "planned_qty": _f(planned_qty),
@@ -1549,6 +1551,7 @@ class PlantBoardService:
             "unplanned_item_count": len(unplanned),
             "unplanned_qty": round(sum(row["pieces"] for row in unplanned), 2),
             "unweighed_lines": unweighed_lines,
+            "by_sku": self._plan_by_sku(lines, floor_items, occupancy.get("data") or []),
             # The average the business defined: output over the days that
             # actually produced, so a Sunday does not drag it down and it reads
             # as typical output on a working day.
@@ -1717,7 +1720,7 @@ class PlantBoardService:
         return by_day
 
     def _unplanned_items(
-        self, window_from: date, window_to: date, plan_codes: set
+        self, floor_items: Sequence[Dict[str, Any]], plan_codes: set
     ) -> List[Dict[str, Any]]:
         """What the floor made this month that the plan never listed, by SKU.
 
@@ -1728,7 +1731,7 @@ class PlantBoardService:
         list opens on the tonnes that make up the tile's "Unplanned" figure.
         """
         out: List[Dict[str, Any]] = []
-        for row in self.reader.floor_production_by_item(window_from, window_to) or []:
+        for row in floor_items:
             code = row.get("ItemCode")
             if not code or code in plan_codes:
                 continue
@@ -1747,6 +1750,121 @@ class PlantBoardService:
                 }
             )
         out.sort(key=lambda row: (-row["tons"], -row["pieces"], row["item_code"]))
+        return out
+
+    def _plan_by_sku(
+        self,
+        lines: Sequence[Dict[str, Any]],
+        floor_items: Sequence[Dict[str, Any]],
+        stock_rows: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """The month's plan SKU by SKU: planned, made, what is left, and BH-PF.
+
+        MADE IS THE FLOOR'S OWN RECEIPT, the same journal the band's headline
+        is summed from, so the rows add up to the strip above them. Every SKU
+        the plan lists or the floor made is a row -- an unplanned SKU reads
+        planned 0 -- and BH-PF stock is attached to those rows only: a SKU
+        sitting on the floor that the month neither planned nor made is the
+        Total stock tile's business, not the plan's.
+
+        Tonnes on the agreed 1000 L rule; a SKU with no litre volume carries
+        its pieces and ``weighed: False`` rather than a confident 0 t.
+        """
+        rows: Dict[str, Dict[str, Any]] = {}
+
+        def row_for(code: str, name: str) -> Dict[str, Any]:
+            held = rows.get(code)
+            if held is None:
+                held = rows[code] = {
+                    "item_code": code,
+                    "item_name": name or "",
+                    "on_plan": False,
+                    "planned_qty": 0.0,
+                    "planned_cases": 0.0,
+                    "planned_litres": 0.0,
+                    "pieces_per_case": None,
+                    "produced_qty": 0.0,
+                    "produced_litres": 0.0,
+                    "stock_qty": 0.0,
+                    "stock_litres": 0.0,
+                    "weighed": False,
+                }
+            elif name and not held["item_name"]:
+                held["item_name"] = name
+            return held
+
+        for line in lines:
+            code = line.get("item_code")
+            if not code:
+                continue
+            held = row_for(code, line.get("item_name") or "")
+            held["on_plan"] = True
+            held["planned_qty"] += _f(line.get("planned_qty"))
+            held["planned_cases"] += _f(line.get("planned_cases"))
+            held["planned_litres"] += _f(line.get("planned_litres"))
+            if _f(line.get("pieces_per_case")) > 0:
+                held["pieces_per_case"] = _f(line.get("pieces_per_case"))
+            if _f(line.get("planned_litres")) > 0 or _f(line.get("litres_per_unit")) > 0:
+                held["weighed"] = True
+
+        for item in floor_items:
+            code = item.get("ItemCode")
+            if not code:
+                continue
+            held = row_for(code, item.get("ItemName") or "")
+            held["produced_qty"] += _f(item.get("Pieces"))
+            held["produced_litres"] += _f(item.get("Litres"))
+            if _f(item.get("Litres")) > 0:
+                held["weighed"] = True
+
+        for stock in stock_rows:
+            held = rows.get(stock.get("item_code"))
+            pieces = _f(stock.get("on_hand"))
+            if held is None or pieces <= 0:
+                continue
+            held["stock_qty"] += pieces
+            held["stock_litres"] += pieces * _f(stock.get("litres_per_piece"))
+            if not held["item_name"]:
+                held["item_name"] = stock.get("item_name") or ""
+
+        out: List[Dict[str, Any]] = []
+        for held in rows.values():
+            planned_qty = held["planned_qty"]
+            produced_qty = held["produced_qty"]
+            per_case = held.pop("pieces_per_case")
+            planned_litres = held.pop("planned_litres")
+            produced_litres = held.pop("produced_litres")
+            stock_litres = held.pop("stock_litres")
+            out.append(
+                {
+                    **held,
+                    "planned_qty": round(planned_qty, 2),
+                    "planned_cases": round(held["planned_cases"], 2),
+                    "planned_tons": _tons(planned_litres),
+                    "produced_qty": round(produced_qty, 2),
+                    # Only where the plan carries a case factor for the SKU.
+                    "produced_cases": (
+                        round(produced_qty / per_case, 2) if per_case else None
+                    ),
+                    "produced_tons": _tons(produced_litres),
+                    # Negative is made over plan, kept signed so it can be shown.
+                    "balance_qty": round(planned_qty - produced_qty, 2),
+                    "balance_tons": round(_tons(planned_litres) - _tons(produced_litres), 3),
+                    "attainment_pct": (
+                        round(produced_qty / planned_qty * 100, 1) if planned_qty > 0 else None
+                    ),
+                    "stock_qty": round(held["stock_qty"], 2),
+                    "stock_tons": _tons(stock_litres),
+                }
+            )
+        out.sort(
+            key=lambda row: (
+                -row["planned_tons"],
+                -row["planned_qty"],
+                -row["produced_tons"],
+                row["item_code"],
+            )
+        )
         return out
 
     def _daily_pieces(
@@ -1768,7 +1886,7 @@ class PlantBoardService:
             day += timedelta(days=1)
         return out
 
-    def _floor_stock(self) -> Dict[str, Any]:
+    def _floor_stock(self, occupancy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """What BH-PF holds, what it is worth, and how long it has stood there.
 
         Value comes from the occupancy endpoint the Production Control board
@@ -1781,7 +1899,8 @@ class PlantBoardService:
         rather than folded into the oldest bucket: "has never left" and "left a
         long time ago" are different problems, and the first is the worse one.
         """
-        occupancy = self.stock.get_warehouse_occupancy(PRODUCTION_FLOOR)
+        if occupancy is None:
+            occupancy = self.stock.get_warehouse_occupancy(PRODUCTION_FLOOR)
         rows = occupancy.get("data") or []
         meta = occupancy.get("meta") or {}
 

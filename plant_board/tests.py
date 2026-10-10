@@ -2320,3 +2320,54 @@ class WasteRegisterTests(TestCase):
             [row["date"] for row in series],
             [f"2026-09-{d:02d}" for d in range(4, 11)],
         )
+
+
+class PlanBySkuTests(SimpleTestCase):
+    """The month's plan SKU by SKU, as the Line Performance drill reads it."""
+
+    def rows(self):
+        lines = [
+            {"item_code": "FG1", "item_name": "Oil 1 L", "planned_qty": 1000,
+             "planned_cases": 50, "planned_litres": 1000, "pieces_per_case": 20},
+            {"item_code": "FG5", "item_name": "Oil 5 L", "planned_qty": 200,
+             "planned_cases": 50, "planned_litres": 1000, "pieces_per_case": 4},
+            {"item_code": "PCONLY", "item_name": "Piece only", "planned_qty": 50,
+             "planned_litres": 0},
+        ]
+        floor = [
+            {"ItemCode": "FG1", "ItemName": "Oil 1 L", "Pieces": 400, "Litres": 400},
+            {"ItemCode": "FG5", "ItemName": "Oil 5 L", "Pieces": 240, "Litres": 1200},
+            {"ItemCode": "CP1", "ItemName": "Cold press", "Pieces": 100, "Litres": 500},
+        ]
+        stock = [
+            {"item_code": "FG1", "on_hand": 300, "litres_per_piece": 1},
+            {"item_code": "CP1", "on_hand": 60, "litres_per_piece": 5},
+            # On the floor, but neither planned nor made this month.
+            {"item_code": "OLD", "on_hand": 999, "litres_per_piece": 1},
+        ]
+        return {row["item_code"]: row for row in service()._plan_by_sku(lines, floor, stock)}
+
+    def test_planned_made_left_and_floor_stock_per_sku(self):
+        fg1 = self.rows()["FG1"]
+        self.assertEqual(fg1["planned_tons"], 1.0)
+        self.assertEqual(fg1["produced_tons"], 0.4)
+        self.assertEqual(fg1["balance_tons"], 0.6)
+        self.assertEqual(fg1["produced_cases"], 20)
+        self.assertEqual(fg1["attainment_pct"], 40.0)
+        self.assertEqual(fg1["stock_tons"], 0.3)
+
+    def test_made_over_plan_reads_as_a_negative_balance(self):
+        self.assertEqual(self.rows()["FG5"]["balance_tons"], -0.2)
+
+    def test_unplanned_output_is_a_row_planned_at_zero(self):
+        cp1 = self.rows()["CP1"]
+        self.assertFalse(cp1["on_plan"])
+        self.assertEqual(cp1["planned_tons"], 0)
+        self.assertIsNone(cp1["attainment_pct"])
+        self.assertEqual(cp1["stock_tons"], 0.3)
+
+    def test_floor_stock_the_month_never_touched_is_left_out(self):
+        self.assertNotIn("OLD", self.rows())
+
+    def test_a_sku_with_no_litre_volume_is_flagged_not_zeroed(self):
+        self.assertFalse(self.rows()["PCONLY"]["weighed"])
