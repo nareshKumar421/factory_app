@@ -1551,7 +1551,7 @@ class PlantBoardService:
             "unplanned_item_count": len(unplanned),
             "unplanned_qty": round(sum(row["pieces"] for row in unplanned), 2),
             "unweighed_lines": unweighed_lines,
-            "by_sku": self._plan_by_sku(lines, floor_items, occupancy.get("data") or []),
+            "by_sku": self._plan_by_sku(lines, floor_items),
             # The average the business defined: output over the days that
             # actually produced, so a Sunday does not drag it down and it reads
             # as typical output on a working day.
@@ -1756,16 +1756,18 @@ class PlantBoardService:
         self,
         lines: Sequence[Dict[str, Any]],
         floor_items: Sequence[Dict[str, Any]],
-        stock_rows: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """The month's plan SKU by SKU: planned, made, what is left, and BH-PF.
+        """The month's plan SKU by SKU: planned, made, what is left, and stock.
 
         MADE IS THE FLOOR'S OWN RECEIPT, the same journal the band's headline
         is summed from, so the rows add up to the strip above them. Every SKU
         the plan lists or the floor made is a row -- an unplanned SKU reads
-        planned 0 -- and BH-PF stock is attached to those rows only: a SKU
-        sitting on the floor that the month neither planned nor made is the
-        Total stock tile's business, not the plan's.
+        planned 0.
+
+        STOCK IS EVERY WAREHOUSE the SKU stands in, totalled, with the split
+        per warehouse carried on the row for the drill; BH-PF is kept apart as
+        well. If that read fails the plan still shows, with ``stock_read``
+        False and the stock figures null rather than a confident zero.
 
         Tonnes on the agreed 1000 L rule; a SKU with no litre volume carries
         its pieces and ``weighed: False`` rather than a confident 0 t.
@@ -1785,8 +1787,6 @@ class PlantBoardService:
                     "pieces_per_case": None,
                     "produced_qty": 0.0,
                     "produced_litres": 0.0,
-                    "stock_qty": 0.0,
-                    "stock_litres": 0.0,
                     "weighed": False,
                 }
             elif name and not held["item_name"]:
@@ -1817,15 +1817,24 @@ class PlantBoardService:
             if _f(item.get("Litres")) > 0:
                 held["weighed"] = True
 
-        for stock in stock_rows:
-            held = rows.get(stock.get("item_code"))
-            pieces = _f(stock.get("on_hand"))
-            if held is None or pieces <= 0:
-                continue
-            held["stock_qty"] += pieces
-            held["stock_litres"] += pieces * _f(stock.get("litres_per_piece"))
-            if not held["item_name"]:
-                held["item_name"] = stock.get("item_name") or ""
+        stock: Dict[str, List[Dict[str, Any]]] = {}
+        stock_read = True
+        try:
+            for item in self.reader.stock_by_warehouse(list(rows)) or []:
+                code = item.get("ItemCode")
+                if code not in rows:
+                    continue
+                stock.setdefault(code, []).append(
+                    {
+                        "code": item.get("Warehouse") or "",
+                        "name": item.get("WarehouseName") or "",
+                        "qty": round(_f(item.get("Pieces")), 2),
+                        "tons": _tons(item.get("Litres")),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - the plan still stands without it
+            logger.warning("plant_board: stock by warehouse could not be read: %s", exc)
+            stock_read = False
 
         out: List[Dict[str, Any]] = []
         for held in rows.values():
@@ -1834,7 +1843,10 @@ class PlantBoardService:
             per_case = held.pop("pieces_per_case")
             planned_litres = held.pop("planned_litres")
             produced_litres = held.pop("produced_litres")
-            stock_litres = held.pop("stock_litres")
+            places = sorted(
+                stock.get(held["item_code"], []), key=lambda w: (-w["qty"], w["code"])
+            )
+            floor = next((w for w in places if w["code"] == PRODUCTION_FLOOR), None)
             out.append(
                 {
                     **held,
@@ -1853,8 +1865,17 @@ class PlantBoardService:
                     "attainment_pct": (
                         round(produced_qty / planned_qty * 100, 1) if planned_qty > 0 else None
                     ),
-                    "stock_qty": round(held["stock_qty"], 2),
-                    "stock_tons": _tons(stock_litres),
+                    "stock_read": stock_read,
+                    # Every warehouse together; null when the read failed.
+                    "stock_qty": (
+                        round(sum(w["qty"] for w in places), 2) if stock_read else None
+                    ),
+                    "stock_tons": (
+                        round(sum(w["tons"] for w in places), 3) if stock_read else None
+                    ),
+                    "pf_qty": (floor["qty"] if floor else 0.0) if stock_read else None,
+                    "pf_tons": (floor["tons"] if floor else 0.0) if stock_read else None,
+                    "warehouses": places,
                 }
             )
         out.sort(

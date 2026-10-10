@@ -87,6 +87,10 @@ class FakeReader:
         """The same receipts by SKU. Empty by default, for the same reason."""
         return getattr(self, "floor_item_rows", [])
 
+    def stock_by_warehouse(self, item_codes):
+        """On hand per SKU and warehouse. Empty by default."""
+        return getattr(self, "stock_rows", [])
+
 
 class FakeStock:
     def __init__(self, occupancy=None, levels=None):
@@ -2339,13 +2343,17 @@ class PlanBySkuTests(SimpleTestCase):
             {"ItemCode": "FG5", "ItemName": "Oil 5 L", "Pieces": 240, "Litres": 1200},
             {"ItemCode": "CP1", "ItemName": "Cold press", "Pieces": 100, "Litres": 500},
         ]
-        stock = [
-            {"item_code": "FG1", "on_hand": 300, "litres_per_piece": 1},
-            {"item_code": "CP1", "on_hand": 60, "litres_per_piece": 5},
-            # On the floor, but neither planned nor made this month.
-            {"item_code": "OLD", "on_hand": 999, "litres_per_piece": 1},
+        board = service()
+        board.reader.stock_rows = [
+            {"ItemCode": "FG1", "Warehouse": "BH-PF", "WarehouseName": "Floor",
+             "Pieces": 300, "Litres": 300},
+            {"ItemCode": "FG1", "Warehouse": "BH-FG", "WarehouseName": "Godown",
+             "Pieces": 500, "Litres": 500},
+            {"ItemCode": "CP1", "Warehouse": "BH-PF", "Pieces": 60, "Litres": 300},
+            # Stock of a SKU the month neither planned nor made.
+            {"ItemCode": "OLD", "Warehouse": "BH-PF", "Pieces": 999, "Litres": 999},
         ]
-        return {row["item_code"]: row for row in service()._plan_by_sku(lines, floor, stock)}
+        return {row["item_code"]: row for row in board._plan_by_sku(lines, floor)}
 
     def test_planned_made_left_and_floor_stock_per_sku(self):
         fg1 = self.rows()["FG1"]
@@ -2354,7 +2362,24 @@ class PlanBySkuTests(SimpleTestCase):
         self.assertEqual(fg1["balance_tons"], 0.6)
         self.assertEqual(fg1["produced_cases"], 20)
         self.assertEqual(fg1["attainment_pct"], 40.0)
-        self.assertEqual(fg1["stock_tons"], 0.3)
+        self.assertEqual(fg1["pf_tons"], 0.3)
+
+    def test_stock_is_every_warehouse_totalled_and_split(self):
+        fg1 = self.rows()["FG1"]
+        self.assertEqual(fg1["stock_tons"], 0.8)
+        self.assertEqual(fg1["stock_qty"], 800)
+        self.assertEqual([w["code"] for w in fg1["warehouses"]], ["BH-FG", "BH-PF"])
+
+    def test_a_failed_stock_read_is_null_not_zero(self):
+        board = service()
+
+        def boom(codes):
+            raise RuntimeError("HANA said no")
+
+        board.reader.stock_by_warehouse = boom
+        row = board._plan_by_sku([{"item_code": "FG1", "planned_qty": 1}], [])[0]
+        self.assertFalse(row["stock_read"])
+        self.assertIsNone(row["stock_tons"])
 
     def test_made_over_plan_reads_as_a_negative_balance(self):
         self.assertEqual(self.rows()["FG5"]["balance_tons"], -0.2)
@@ -2366,7 +2391,7 @@ class PlanBySkuTests(SimpleTestCase):
         self.assertIsNone(cp1["attainment_pct"])
         self.assertEqual(cp1["stock_tons"], 0.3)
 
-    def test_floor_stock_the_month_never_touched_is_left_out(self):
+    def test_stock_the_month_never_touched_is_left_out(self):
         self.assertNotIn("OLD", self.rows())
 
     def test_a_sku_with_no_litre_volume_is_flagged_not_zeroed(self):

@@ -561,6 +561,38 @@ class PlantBoardReader:
                 out[row["ItemCode"]] = float(row.get("Litres") or 0)
         return out
 
+    def stock_by_warehouse(self, item_codes) -> List[Dict[str, Any]]:
+        """On hand per SKU and warehouse, for the month-plan SKU drill.
+
+        Every warehouse the SKU stands in, not just BH-PF, straight off
+        ``OITW``. Litres go through the same ``U_IsLitre`` gate as every other
+        figure on this board, so an item without it reads 0 L, never a guess.
+        """
+        codes = sorted({code for code in (item_codes or []) if code})
+        if not codes:
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for start in range(0, len(codes), 400):
+            chunk = codes[start:start + 400]
+            placeholders = ", ".join(["?"] * len(chunk))
+            query = f"""
+                SELECT
+                    W."ItemCode"                                  AS "ItemCode",
+                    W."WhsCode"                                   AS "Warehouse",
+                    MAX(IFNULL(H."WhsName", ''))                  AS "WarehouseName",
+                    SUM(W."OnHand")                               AS "Pieces",
+                    SUM(W."OnHand" * ({LITRES_PER_UNIT}))         AS "Litres"
+                FROM "{self.schema}"."OITW" W
+                JOIN "{self.schema}"."OITM" M ON M."ItemCode" = W."ItemCode"
+                LEFT JOIN "{self.schema}"."OWHS" H ON H."WhsCode" = W."WhsCode"
+                WHERE W."OnHand" > 0
+                  AND W."ItemCode" IN ({placeholders})
+                GROUP BY W."ItemCode", W."WhsCode"
+            """
+            out.extend(self._rows(query, list(chunk)))
+        return out
+
     def classify_items(self, item_codes) -> Dict[str, str]:
         """RAW / PACKAGING / OTHER per item code, from the SAP item group.
 
