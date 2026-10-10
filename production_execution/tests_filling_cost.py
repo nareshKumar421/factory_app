@@ -530,16 +530,18 @@ class FillingCostDefaultsTests(APITestCase):
         data = self._open('NIGHT')
         self.assertNotIn('Electricity', self._amounts(data))
 
-    def test_the_etp_meter_is_not_filling_electricity(self):
-        # Electricity++ charges Beverages for the ETP too; the sheet leaves it out.
+    def test_the_etp_and_kwh_meters_are_not_filling_electricity(self):
+        # Electricity++ charges Beverages for the ETP and the KWH main too; the
+        # sheet leaves both out.
         from unittest import mock
 
         mock.patch.stopall()  # the stand-in Electricity++ above; read the real split
         party = f'company:{self.company.code}'
         breakdown = {
-            'by_party': {party: {'cost': Decimal('35379')}},
+            'by_party': {party: {'cost': Decimal('62244')}},
             'by_meter': {party: {'Production Floor Beverage': {'cost': Decimal('32787')},
-                                 'etp ': {'cost': Decimal('2592')}}},
+                                 'etp ': {'cost': Decimal('2592')},
+                                 'KWH': {'cost': Decimal('26865')}}},
         }
         with mock.patch('maintenance.electricity.service.company_breakdown',
                         return_value=breakdown), \
@@ -549,10 +551,11 @@ class FillingCostDefaultsTests(APITestCase):
             night = self._open('NIGHT')
         explain = {e['head']: e['explain'] for e in day['entries']}
         self.assertEqual(self._amounts(day)['Electricity'], '32787.00')
-        self.assertIn('less etp', explain['Electricity'].lower())
-        self.assertIn('2,592', explain['Electricity'])
+        left_out = explain['Electricity'].split('Meters:')[0]
+        self.assertIn('(less KWH ₹26,865, etp  ₹2,592)', left_out)
         self.assertIn('Meters: Production Floor Beverage ₹32,787', explain['Electricity'])
         self.assertNotIn('etp ₹', explain['Electricity'].split('Meters:')[1])
+        self.assertNotIn('KWH', explain['Electricity'].split('Meters:')[1])
         # A shift's share is of the filling meters only.
         self.assertLessEqual(Decimal(self._amounts(night)['Electricity']), Decimal('32787'))
 

@@ -7,10 +7,11 @@ rather than typed:
 ========================  ==================================================
 Cases                     the shift's production-run cases
 Electricity               Beverages' Electricity++ cost for the day, less
-                          the ETP meter (effluent treatment, not filling); a
-                          shift takes each meter's part by that meter's own
-                          day and night readings, or by its share of the
-                          day's cases where the meter was read only once
+                          the ETP meter (effluent treatment, not filling)
+                          and the KWH main; a shift takes each meter's part
+                          by that meter's own day and night readings, or by
+                          its share of the day's cases where the meter was
+                          read only once
 Fixed Manpower,           the Cost Master's monthly rate over 26 working days,
 Maintenance, Lab, Misc    by the shift's share of the day's running hours
 Batch Coding              bottles (cases x bottles per case) x rate a bottle
@@ -70,9 +71,9 @@ KG_UOMS = {'KG', 'KGS', 'KILOGRAM', 'KILOGRAMS'}
 #: The heads worked out from production rather than resolved as a rate.
 ELECTRICITY = 'Electricity'
 # Meters Electricity++ charges Beverages for that are not filling cost: the
-# ETP treats the plant's effluent whatever the lines fill. Matched by name,
-# ignoring case.
-NOT_FILLING_METERS = ('ETP',)
+# ETP treats the plant's effluent whatever the lines fill, and KWH is the main
+# supply meter, which the boards leave out too. Matched by name, ignoring case.
+NOT_FILLING_METERS = ('ETP', 'KWH')
 WASTAGE = 'Wastage'
 
 
