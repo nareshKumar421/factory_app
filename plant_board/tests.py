@@ -2329,6 +2329,19 @@ class WasteRegisterTests(TestCase):
 class PlanBySkuTests(SimpleTestCase):
     """The month's plan SKU by SKU, as the Line Performance drill reads it."""
 
+    def setUp(self):
+        # Every warehouse unless a test ticks some; no database here.
+        patcher = mock.patch("plant_board.services.plan_stock_warehouses", return_value=None)
+        self.counted = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_only_the_ticked_warehouses_are_counted(self):
+        self.counted.return_value = {"BH-FG"}
+        fg1 = self.rows()["FG1"]
+        self.assertEqual(fg1["stock_tons"], 0.5)
+        self.assertEqual([w["code"] for w in fg1["warehouses"]], ["BH-FG"])
+        self.assertEqual(fg1["pf_tons"], 0.0)
+
     def rows(self):
         lines = [
             {"item_code": "FG1", "item_name": "Oil 1 L", "planned_qty": 1000,

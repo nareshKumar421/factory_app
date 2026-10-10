@@ -39,6 +39,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from django.db import DatabaseError, transaction
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
@@ -58,6 +59,7 @@ from raw_material_gatein.models import POItemReceipt
 from sap_client.context import CompanyContext
 from sap_client.exceptions import SAPConnectionError
 from stock_dashboard.models import (
+    PlantBoardPlanStock,
     PlantBoardSettings,
     PlantBoardWorkforce,
     WarehouseBoardSettings,
@@ -171,6 +173,25 @@ def _tons(litres) -> float:
     named here so nobody has to go looking for where the conversion happened.
     """
     return round(_f(litres) / LITRES_PER_TON, 3)
+
+
+def plan_stock_warehouses(company_code: str) -> Optional[set]:
+    """The warehouses the month-plan drill counts as stock, or None for all.
+
+    None as well when the table is not there yet -- the shared database gets
+    it only when the migration runs -- so the drill reads every warehouse
+    rather than failing the whole Production band.
+    """
+    try:
+        # A savepoint, so a missing table cannot poison the request's transaction.
+        with transaction.atomic():
+            row = PlantBoardPlanStock.objects.filter(company_code=company_code).first()
+    except DatabaseError as exc:
+        logger.warning("plant_board: plan stock warehouses unreadable: %s", exc)
+        return None
+    if row is None or not row.warehouses:
+        return None
+    return {str(code) for code in row.warehouses}
 
 
 class PlantBoardService:
@@ -1764,8 +1785,9 @@ class PlantBoardService:
         the plan lists or the floor made is a row -- an unplanned SKU reads
         planned 0.
 
-        STOCK IS EVERY WAREHOUSE the SKU stands in, totalled, with the split
-        per warehouse carried on the row for the drill; BH-PF is kept apart as
+        STOCK IS THE WAREHOUSES THE PLANT TICKED (every warehouse until it
+        ticks any -- see ``PlantBoardPlanStock``), totalled, with the split per
+        warehouse carried on the row for the drill; BH-PF is kept apart as
         well. If that read fails the plan still shows, with ``stock_read``
         False and the stock figures null rather than a confident zero.
 
@@ -1819,10 +1841,13 @@ class PlantBoardService:
 
         stock: Dict[str, List[Dict[str, Any]]] = {}
         stock_read = True
+        counted = plan_stock_warehouses(self.company_code)
         try:
             for item in self.reader.stock_by_warehouse(list(rows)) or []:
                 code = item.get("ItemCode")
                 if code not in rows:
+                    continue
+                if counted is not None and (item.get("Warehouse") or "") not in counted:
                     continue
                 stock.setdefault(code, []).append(
                     {

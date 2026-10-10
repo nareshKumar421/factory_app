@@ -426,3 +426,40 @@ class PlantBoardSettings(models.Model):
 
     def __str__(self):
         return f"Plant board settings for {self.company_code}"
+
+
+class PlantBoardPlanStock(models.Model):
+    """Which warehouses count as stock on the month-plan SKU drill.
+
+    The drill shows, per plan SKU, the finished goods on hand. "Every
+    warehouse" takes in C&F agents and return floors, so the plant picks the
+    ones it means. Null is "every warehouse", the state before anybody chose;
+    an empty list is never stored, since it would read as no stock anywhere.
+
+    Its own table rather than a column on :class:`PlantBoardSettings`: the
+    shared database gets the column only when the migration runs, and a column
+    there would break every reader of that row until it did.
+    """
+
+    company_code = models.CharField(max_length=50, unique=True)
+    warehouses = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Warehouse codes counted as stock. Empty means every warehouse.",
+    )
+
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="plant_board_plan_stock_updates",
+    )
+
+    class Meta:
+        verbose_name = "Plant board plan stock warehouses"
+        verbose_name_plural = "Plant board plan stock warehouses"
+
+    def __str__(self):
+        return f"Plan stock warehouses for {self.company_code}"

@@ -593,6 +593,29 @@ class PlantBoardReader:
             out.extend(self._rows(query, list(chunk)))
         return out
 
+    def finished_goods_warehouses(self) -> List[Dict[str, Any]]:
+        """Every warehouse holding finished goods, with what it holds.
+
+        The catalogue the month-plan stock setting is ticked from. Tonnes on
+        the board's own litre basis, so the figure beside a tick is the one the
+        drill will add up once it is ticked.
+        """
+        query = f"""
+            SELECT
+                W."WhsCode"                                   AS "Warehouse",
+                MAX(IFNULL(H."WhsName", ''))                  AS "WarehouseName",
+                COUNT(DISTINCT W."ItemCode")                  AS "Items",
+                SUM(W."OnHand")                               AS "Pieces",
+                SUM(W."OnHand" * ({LITRES_PER_UNIT}))         AS "Litres"
+            FROM "{self.schema}"."OITW" W
+            JOIN "{self.schema}"."OITM" M ON M."ItemCode" = W."ItemCode"
+            LEFT JOIN "{self.schema}"."OWHS" H ON H."WhsCode" = W."WhsCode"
+            WHERE W."OnHand" > 0
+              AND M."ItmsGrpCod" = {FINISHED_ITEM_GROUP}
+            GROUP BY W."WhsCode"
+        """
+        return self._rows(query)
+
     def classify_items(self, item_codes) -> Dict[str, str]:
         """RAW / PACKAGING / OTHER per item code, from the SAP item group.
 
