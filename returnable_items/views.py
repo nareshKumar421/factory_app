@@ -77,6 +77,8 @@ from .serializers import (
     ReturnableGatePassLogSerializer,
     ReturnableGatePassSerializer,
     ReturnableReturnEventSerializer,
+    assert_can_edit,
+    discard_attachments,
 )
 
 logger = logging.getLogger(__name__)
@@ -806,6 +808,20 @@ class ReturnableGatePassAttachmentViewSet(CompanyScopedViewSet):
         if gate_pass:
             queryset = queryset.filter(gate_pass_id=gate_pass)
         return queryset.select_related("gate_pass", "created_by")
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        # The same rule as editing the pass: once it has gone to the gate, the
+        # photo the gate checks against stays.
+        gate_pass = instance.gate_pass
+        is_approver_edit = assert_can_edit(gate_pass, self.request.user)
+        removed = discard_attachments([instance])
+        if is_approver_edit:
+            gate_pass.log(
+                ReturnableLogAction.UPDATED,
+                actor=self.request.user,
+                note=f"Edited by the approver before sign-off. Removed {', '.join(removed)}.",
+            )
 
 
 # ---------------------------------------------------------------------------

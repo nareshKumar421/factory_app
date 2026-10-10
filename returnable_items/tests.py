@@ -812,6 +812,79 @@ class ReturnableGatePassFlowTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_approver_can_take_a_file_off_the_pass_when_saving_it(self, _notify):
+        gate_pass = self._create_pass()
+        self._attach(gate_pass, name="better-photo.jpg")
+        wrong = gate_pass.attachments.get(file__contains="gear-motor")
+        storage, name = wrong.file.storage, wrong.file.name
+        self.client.post(self._action_url(gate_pass, "submit"))
+        self._as(self.approver)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.patch(
+                reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+                {"party_name": "Sharma Motors", "remove_attachments": [wrong.pk]},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            [attachment["id"] for attachment in response.data["attachments"]],
+            [gate_pass.attachments.get().pk],
+        )
+        self.assertFalse(storage.exists(name))
+        # The department finds out from the timeline, so it names the file.
+        self.assertIn(
+            name.rsplit("/", 1)[-1], gate_pass.logs.filter(action="UPDATED").first().note
+        )
+
+    def test_department_can_take_a_file_off_its_own_draft(self, _notify):
+        gate_pass = self._create_pass()
+        attachment = gate_pass.attachments.get()
+
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {"remove_attachments": [attachment.pk]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(gate_pass.attachments.exists())
+        self.assertFalse(gate_pass.logs.filter(action="UPDATED").exists())
+
+    def test_removing_files_leaves_another_pass_alone(self, _notify):
+        gate_pass = self._create_pass()
+        other = self._create_pass()
+        theirs = other.attachments.get()
+
+        response = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {"remove_attachments": [theirs.pk]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(other.attachments.filter(pk=theirs.pk).exists())
+
+    def test_files_stay_on_a_pass_already_sent_to_the_gate(self, _notify):
+        gate_pass = self._create_pass()
+        attachment = gate_pass.attachments.get()
+        self._submit_and_approve(gate_pass)
+        self._as(self.approver)
+
+        through_the_form = self.client.patch(
+            reverse("returnable-gatepass-detail", args=[gate_pass.pk]),
+            {"remove_attachments": [attachment.pk]},
+            format="json",
+        )
+        on_its_own = self.client.delete(
+            reverse("returnable-attachment-detail", args=[attachment.pk])
+        )
+
+        self.assertEqual(through_the_form.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(on_its_own.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(gate_pass.attachments.filter(pk=attachment.pk).exists())
+
     def test_cannot_cancel_once_items_started_returning(self, _notify):
         gate_pass = self._create_pass()
         self._submit_and_approve(gate_pass)

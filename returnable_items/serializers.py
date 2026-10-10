@@ -208,6 +208,56 @@ class ReturnableGatePassLogSerializer(serializers.ModelSerializer):
         fields = ["id", "action", "action_display", "actor", "actor_name", "at", "note", "meta"]
 
 
+def assert_can_edit(gate_pass, user):
+    """Decide whether this user may edit this pass, and in whose capacity.
+
+    A draft belongs to the department that raised it. The moment it is
+    submitted it belongs to the approver instead: rather than bounce a pass
+    back over a wrong party name or the wrong pass type, they correct it and
+    sign it off. Past approval the gate is working off the pass as printed,
+    so nobody edits it — it is cancelled and raised again.
+
+    Returns True when this is the approver's edit.
+    """
+    if gate_pass.status == ReturnableStatus.DRAFT:
+        if not (user and user.has_perm(MANAGE_PERM)):
+            raise PermissionDenied("You cannot edit this gate pass.")
+        return False
+
+    if gate_pass.status == ReturnableStatus.PENDING_APPROVAL:
+        if not (user and user.has_perm(APPROVE_PERM)):
+            raise PermissionDenied(
+                "This pass is waiting for approval — only its approver can edit it now."
+            )
+        return True
+
+    raise serializers.ValidationError(
+        {
+            "status": (
+                "Only a draft, or a pass still waiting for approval, can be edited. "
+                "Cancel this one and raise a new one."
+            )
+        }
+    )
+
+
+def discard_attachments(attachments):
+    """Delete these attachment rows, and their files once the save commits.
+
+    The file waits for the commit so that a save which fails after this point
+    does not leave a row pointing at a file that is already gone. Returns the
+    file names, for the timeline.
+    """
+    names = []
+    for attachment in attachments:
+        file = attachment.file
+        attachment.delete()
+        if file:
+            transaction.on_commit(lambda storage=file.storage, name=file.name: storage.delete(name))
+            names.append(file.name.rsplit("/", 1)[-1])
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Gate pass
 # ---------------------------------------------------------------------------
@@ -273,6 +323,11 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
     attachments = ReturnableGatePassAttachmentSerializer(many=True, read_only=True)
 
     items_input = ReturnableGatePassItemInputSerializer(many=True, write_only=True, required=False)
+    # Ids of files already on the pass to take off it. They go with the save,
+    # not on their own, so a Cancel on the form leaves every file where it was.
+    remove_attachments = serializers.ListField(
+        child=serializers.IntegerField(), write_only=True, required=False
+    )
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     purpose_display = serializers.CharField(source="get_purpose_display", read_only=True)
@@ -377,6 +432,7 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             "is_fully_returned",
             "items",
             "items_input",
+            "remove_attachments",
             "return_events",
             "attachments",
             "created_at",
@@ -566,6 +622,7 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         items_input = validated_data.pop("items_input", [])
+        validated_data.pop("remove_attachments", None)
         gate_pass = super().create(validated_data)
         self._sync_items(gate_pass, items_input)
         return gate_pass
@@ -575,38 +632,7 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
         return getattr(request, "user", None)
 
     def _assert_editable(self, instance):
-        """Decide whether this user may edit this pass, and in whose capacity.
-
-        A draft belongs to the department that raised it. The moment it is
-        submitted it belongs to the approver instead: rather than bounce a pass
-        back over a wrong party name or the wrong pass type, they correct it and
-        sign it off. Past approval the gate is working off the pass as printed,
-        so nobody edits it — it is cancelled and raised again.
-
-        Returns True when this is the approver's edit.
-        """
-        user = self._actor()
-
-        if instance.status == ReturnableStatus.DRAFT:
-            if not (user and user.has_perm(MANAGE_PERM)):
-                raise PermissionDenied("You cannot edit this gate pass.")
-            return False
-
-        if instance.status == ReturnableStatus.PENDING_APPROVAL:
-            if not (user and user.has_perm(APPROVE_PERM)):
-                raise PermissionDenied(
-                    "This pass is waiting for approval — only its approver can edit it now."
-                )
-            return True
-
-        raise serializers.ValidationError(
-            {
-                "status": (
-                    "Only a draft, or a pass still waiting for approval, can be edited. "
-                    "Cancel this one and raise a new one."
-                )
-            }
-        )
+        return assert_can_edit(instance, self._actor())
 
     @staticmethod
     def _clear_other_shape(is_returnable):
@@ -633,6 +659,7 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
     @transaction.atomic
     def update(self, instance, validated_data):
         items_input = validated_data.pop("items_input", None)
+        remove_ids = validated_data.pop("remove_attachments", None) or []
         is_approver_edit = self._assert_editable(instance)
 
         new_type = validated_data.get("is_returnable", instance.is_returnable)
@@ -665,6 +692,9 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
         gate_pass = super().update(instance, validated_data)
         if items_input is not None:
             self._sync_items(gate_pass, items_input)
+        # An id that is not on this pass is ignored: it is either another pass's
+        # file or one a second tab already removed.
+        removed = discard_attachments(gate_pass.attachments.filter(pk__in=remove_ids))
 
         # The department only ever sees the pass again through its timeline, so
         # an approver's edit has to leave a mark there. A draft edit does not:
@@ -673,16 +703,18 @@ class ReturnableGatePassSerializer(CompanyScopedModelSerializer):
             gate_pass.log(
                 ReturnableLogAction.UPDATED,
                 actor=self._actor(),
-                note=self._approver_edit_note(gate_pass, type_changed, previous_pass_no),
+                note=self._approver_edit_note(gate_pass, type_changed, previous_pass_no, removed),
             )
         return gate_pass
 
     @staticmethod
-    def _approver_edit_note(gate_pass, type_changed, previous_pass_no):
+    def _approver_edit_note(gate_pass, type_changed, previous_pass_no, removed=()):
         note = "Edited by the approver before sign-off."
         if type_changed:
             kind = "returnable" if gate_pass.is_returnable else "non-returnable"
             note += f" Switched to {kind} — renumbered {previous_pass_no} → {gate_pass.pass_no}."
+        if removed:
+            note += f" Removed {', '.join(removed)}."
         return note
 
 
