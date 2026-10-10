@@ -1032,6 +1032,94 @@ class GRPOServiceTests(TestCase):
         dispatch_plan.refresh_from_db()
         self.assertEqual(dispatch_plan.bilty_no, "1856")
 
+    # JIVO_MART is a real company code, so unlike TC001 these two would
+    # otherwise reach HANA.
+    @patch.object(GRPOService, "_get_sap_bp_group_code", return_value=None)
+    @patch.object(GRPOService, "find_existing_sap_service_grpo", return_value=None)
+    @patch.object(GRPOService, "_filter_purchase_delivery_note_udfs")
+    @patch.object(GRPOService, "_get_dispatch_bill_snapshot")
+    @patch.object(GRPOService, "_get_active_dimension_codes")
+    @patch.object(GRPOService, "_get_sap_tax_codes")
+    @patch.object(GRPOService, "_get_sap_bp_state")
+    @patch.object(GRPOService, "_get_sap_branch_states")
+    @patch("grpo.services.SAPClient")
+    def test_mart_service_grpo_line_remarks_is_yes_not_the_bilty(
+        self,
+        mock_sap_client,
+        mock_branch_states,
+        mock_vendor_state,
+        mock_tax_codes,
+        mock_dimension_codes,
+        mock_bill_snapshot,
+        mock_filter_udfs,
+        mock_existing_doc,
+        mock_bp_group,
+    ):
+        """Mart's PDN1.U_Remarks is a Y/N dropdown, not free text.
+
+        Every Mart Service GRPO with a bilty was refused with "'BILTY NO 13454'
+        is not a valid value for property 'U_Remarks'. The valid values are:
+        'Y' - 'Yes', 'N' - 'No'". Mart's own hand-posted service GRPOs put "Y"
+        there; the bilty number still travels in U_BilltyNumber.
+        """
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        mock_branch_states.return_value = {2: "HR"}
+        mock_vendor_state.return_value = "HR"
+        mock_tax_codes.return_value = {
+            "GST05R": {"code": "GST05R", "name": "RCM", "rate": Decimal("5")},
+        }
+        mock_dimension_codes.return_value = None
+        mock_bill_snapshot.return_value = {
+            "doc_num": "610260130",
+            "state": "PB",
+            "card_code": "CUST001",
+            "item_summary": "Transport freight",
+            "total_litres": "2160.000",
+            "doc_total": "50000.00",
+        }
+        mock_instance = MagicMock()
+        mock_instance.create_grpo.return_value = {
+            "DocEntry": 14900, "DocNum": 2010264900, "DocTotal": 2808.00,
+        }
+        mock_sap_client.return_value = mock_instance
+
+        dispatch_plan = DispatchPlan.objects.create(
+            company=mart,
+            sap_invoice_doc_entry=41265,
+            sap_invoice_doc_num="610260130",
+            booking_status=DispatchPlanStatus.DISPATCHED,
+            place_of_supply="PB",
+            total_freight=Decimal("2808.00"),
+            bilty_no="13454",
+            bilty_date=date(2026, 10, 8),
+        )
+
+        GRPOService(company_code="JIVO_MART").post_service_grpo(
+            dispatch_plan_id=dispatch_plan.id,
+            user=self.user,
+            vendor_code="VENDA001040",
+            branch_id=2,
+            service_description="Transport freight",
+            amount=Decimal("2808.00"),
+            tax_code="GST05R",
+            gl_account="5670001",
+            place_of_supply="PB",
+            effective_month="2026-10",
+            location_code=2,
+            location_name="HARYANA",
+            sac_entry=-426,
+            sac_code="00997136",
+            bilty_no="13454",
+            vendor_ref="13454",
+            include_bilty_attachment=False,
+        )
+
+        payload = mock_instance.create_grpo.call_args[0][0]
+        self.assertEqual(payload["Comments"], "BILTY NO 13454")
+        line = payload["DocumentLines"][0]
+        self.assertEqual(line["U_Remarks"], "Y")
+        self.assertEqual(line["U_BilltyNumber"], "13454")
+
     @patch.object(GRPOService, "_get_dispatch_bill_snapshot")
     @patch.object(GRPOService, "_get_active_dimension_codes")
     @patch.object(GRPOService, "_get_sap_bp_state")

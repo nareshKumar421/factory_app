@@ -4055,8 +4055,13 @@ class GRPOService:
                 document_line["U_Variety"] = line_data["product_variety"][:50]
 
             # Match SAP convention: line remarks carry only the bilty number,
-            # e.g. "BILTY NO 6805".
-            if dispatch_plan.bilty_no:
+            # e.g. "BILTY NO 6805". Mart's PDN1.U_Remarks is a Y/N dropdown,
+            # so text there fails the whole post ("not a valid value for
+            # property 'U_Remarks'"); Mart's own service GRPOs put "Y" on
+            # every line, and the bilty still goes in U_BilltyNumber.
+            if company_code == "JIVO_MART":
+                document_line["U_Remarks"] = "Y"
+            elif dispatch_plan.bilty_no:
                 document_line["U_Remarks"] = f"BILTY NO {dispatch_plan.bilty_no}"[:254]
             document_lines.append(document_line)
 
