@@ -50,6 +50,8 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
+import logging
+
 from django.utils import timezone
 
 from sap_client.context import CompanyContext
@@ -66,6 +68,8 @@ from .constants import (
     PALLET_LITRES,
 )
 from .hana_reader import DISPATCH, PRODUCTION, ProductionDispatchReader
+
+logger = logging.getLogger(__name__)
 
 FAST = "FAST"
 SLOW = "SLOW"
@@ -160,7 +164,12 @@ class ProductionDispatchService:
             if any(figures.values())
         ]
 
-        seen = {row["item_code"] for row in day_rows} | set(window)
+        plans = self._plans(reader, date_from, date_to)
+        planned = {code for plan in plans or [] for code in plan["items"]}
+
+        # A planned SKU is listed even if it never moved: planned and not sold
+        # is the very thing the plan column is there to show.
+        seen = {row["item_code"] for row in day_rows} | set(window) | planned
         item_rows = [self._item(items[code], window.get(code)) for code in sorted(seen) if code in items]
 
         return {
@@ -177,8 +186,45 @@ class ProductionDispatchService:
             "movement_window": {"from": window_from.isoformat(), "to": date_to.isoformat()},
             "items": item_rows,
             "days": day_rows,
+            "plans": plans,
             "meta": {"read_at": timezone.now().isoformat()},
         }
+
+    @staticmethod
+    def _plans(reader, date_from: date, date_to: date) -> Optional[List[Dict[str, Any]]]:
+        """The production plan for each period the range touches, by item.
+
+        ONE PLAN PER PERIOD, the newest. A revision is a new plan over the same
+        dates (April 2026 has the original and "REVSIED MONTHLY PLANNING"), and
+        adding the two would double the month. Newest is the highest AbsID, the
+        same choice the Plant Control board makes.
+
+        None, not an empty list, when the plan could not be read: the page must
+        not show a confident zero plan.
+        """
+        try:
+            rows = reader.plan_lines(date_from, date_to)
+        except Exception as exc:  # noqa: BLE001 - the report stands without it
+            logger.warning("production_dispatch: plan could not be read: %s", exc)
+            return None
+
+        newest: Dict[tuple, int] = {}
+        for row in rows:
+            period = (_iso(row["StartDate"]), _iso(row["EndDate"]))
+            newest[period] = max(newest.get(period, row["AbsID"]), row["AbsID"])
+
+        plans: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            period = (_iso(row["StartDate"]), _iso(row["EndDate"]))
+            if newest[period] != row["AbsID"]:
+                continue
+            plan = plans.setdefault(
+                row["AbsID"],
+                {"name": row["Name"], "from": period[0], "to": period[1], "items": {}},
+            )
+            code = row["ItemCode"]
+            plan["items"][code] = round(plan["items"].get(code, 0.0) + _num(row["Qty"]), 3)
+        return sorted(plans.values(), key=lambda plan: plan["from"])
 
     def _item(self, row: Dict[str, Any], window: Optional[Dict[str, float]]) -> Dict[str, Any]:
         totals = window or {"production": 0.0, "dispatch": 0.0}

@@ -60,6 +60,9 @@ class FakeReader:
         self.calls.append(("documents", date_from, date_to, item_code))
         return self._documents
 
+    def plan_lines(self, date_from, date_to):
+        return getattr(self, "plan_rows", [])
+
 
 def build(reader, date_from, date_to):
     service = ProductionDispatchService(reader_factory=lambda: reader, today=date(2026, 10, 9))
@@ -208,6 +211,34 @@ class ReportTests(SimpleTestCase):
         self.assertTrue(payload["lines"][0]["is_group"])
         self.assertEqual(payload["lines"][0]["date"], "2026-09-30")
         self.assertEqual(payload["lines"][0]["quantity"], 40.0)
+
+
+class PlanTests(SimpleTestCase):
+    def setUp(self):
+        self.reader = FakeReader(items=[item_row("FG1"), item_row("FG2")])
+
+    def plan(self, abs_id, item, qty, start=date(2026, 9, 1), end=date(2026, 9, 30)):
+        return {"AbsID": abs_id, "Name": f"Plan {abs_id}", "StartDate": start,
+                "EndDate": end, "ItemCode": item, "Qty": qty}
+
+    def test_a_revised_plan_replaces_the_one_it_revises(self):
+        self.reader.plan_rows = [self.plan(20, "FG1", 100), self.plan(21, "FG1", 150)]
+        report = build(self.reader, date(2026, 9, 1), date(2026, 9, 30))
+        self.assertEqual(report["plans"], [
+            {"name": "Plan 21", "from": "2026-09-01", "to": "2026-09-30", "items": {"FG1": 150.0}},
+        ])
+
+    def test_a_planned_sku_that_never_moved_is_still_listed(self):
+        self.reader.plan_rows = [self.plan(21, "FG2", 40)]
+        report = build(self.reader, date(2026, 9, 1), date(2026, 9, 30))
+        self.assertEqual([item["item_code"] for item in report["items"]], ["FG2"])
+
+    def test_a_failed_plan_read_is_none_not_an_empty_plan(self):
+        def boom(*args):
+            raise RuntimeError("HANA said no")
+
+        self.reader.plan_lines = boom
+        self.assertIsNone(build(self.reader, date(2026, 9, 1), date(2026, 9, 30))["plans"])
 
 
 class ApiTests(TestCase):

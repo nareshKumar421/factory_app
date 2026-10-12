@@ -233,6 +233,33 @@ class ProductionDispatchReader:
         return self._rows(query, params)
 
     # ------------------------------------------------------------------
+    # The production plan
+    # ------------------------------------------------------------------
+
+    def plan_lines(self, date_from: date, date_to: date) -> List[Dict[str, Any]]:
+        """Planned quantity per plan and item, for every plan overlapping the range.
+
+        The plan is SAP's sales forecast (``OFCT``/``FCT1``), the same one the
+        Production Planning page and the Plant Control board read. Every
+        overlapping plan is returned with its period; the caller picks one per
+        period, since a revised plan sits beside the one it revises.
+        """
+        query = f"""
+            SELECT
+                H."AbsID" AS "AbsID",
+                IFNULL(H."Name", '') AS "Name",
+                H."StartDate" AS "StartDate",
+                H."EndDate" AS "EndDate",
+                L."ItemCode" AS "ItemCode",
+                SUM(L."Quantity") AS "Qty"
+            FROM "{self.schema}"."OFCT" H
+            JOIN "{self.schema}"."FCT1" L ON L."AbsID" = H."AbsID"
+            WHERE H."StartDate" <= ? AND H."EndDate" >= ?
+            GROUP BY H."AbsID", H."Name", H."StartDate", H."EndDate", L."ItemCode"
+        """
+        return self._rows(query, [date_to, date_from])
+
+    # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
 
