@@ -91,6 +91,10 @@ class FakeReader:
         """On hand per SKU and warehouse. Empty by default."""
         return getattr(self, "stock_rows", [])
 
+    def dispatch_by_item(self, date_from, date_to, group_card_codes):
+        """Dispatch per SKU, group companies flagged. Empty by default."""
+        return getattr(self, "dispatch_rows", [])
+
 
 class FakeStock:
     def __init__(self, occupancy=None, levels=None):
@@ -2410,3 +2414,47 @@ class PlanBySkuTests(SimpleTestCase):
 
     def test_a_sku_with_no_litre_volume_is_flagged_not_zeroed(self):
         self.assertFalse(self.rows()["PCONLY"]["weighed"])
+
+    def dispatch_rows(self):
+        board = service()
+        board.reader.dispatch_rows = [
+            {"ItemCode": "FG1", "IsGroup": 0, "Pieces": 600, "Litres": 600},
+            {"ItemCode": "FG1", "IsGroup": 1, "Pieces": 100, "Litres": 100},
+            # Dispatched but neither planned nor made: not a row.
+            {"ItemCode": "OLD", "IsGroup": 0, "Pieces": 5, "Litres": 5},
+        ]
+        lines = [
+            {"item_code": "FG1", "planned_qty": 1000, "planned_litres": 1000},
+            {"item_code": "FG5", "planned_qty": 200, "planned_litres": 1000},
+        ]
+        rows = board._plan_by_sku(lines, [], date(2026, 10, 1), date(2026, 10, 12))
+        return {row["item_code"]: row for row in rows}
+
+    def test_dispatch_leaves_group_companies_out_and_says_how_much(self):
+        fg1 = self.dispatch_rows()["FG1"]
+        self.assertEqual(fg1["dispatch_qty"], 600)
+        self.assertEqual(fg1["dispatch_tons"], 0.6)
+        self.assertEqual(fg1["group_dispatch_qty"], 100)
+        self.assertEqual(fg1["group_dispatch_tons"], 0.1)
+        self.assertEqual(fg1["dispatch_balance_tons"], 0.4)
+        self.assertEqual(fg1["dispatch_pct"], 60.0)
+
+    def test_a_planned_sku_nobody_bought_reads_zero_dispatched(self):
+        rows = self.dispatch_rows()
+        self.assertNotIn("OLD", rows)
+        self.assertTrue(rows["FG5"]["dispatch_read"])
+        self.assertEqual(rows["FG5"]["dispatch_qty"], 0)
+        self.assertEqual(rows["FG5"]["dispatch_pct"], 0.0)
+
+    def test_a_failed_dispatch_read_is_null_not_zero(self):
+        board = service()
+
+        def boom(*args):
+            raise RuntimeError("HANA said no")
+
+        board.reader.dispatch_by_item = boom
+        row = board._plan_by_sku(
+            [{"item_code": "FG1", "planned_qty": 1}], [], date(2026, 10, 1), date(2026, 10, 12)
+        )[0]
+        self.assertFalse(row["dispatch_read"])
+        self.assertIsNone(row["dispatch_qty"])

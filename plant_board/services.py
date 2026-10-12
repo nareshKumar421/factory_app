@@ -43,6 +43,7 @@ from django.db import DatabaseError, transaction
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
+from admin_board.constants import INTERCOMPANY_CARD_CODES
 from blowing.models import BlowingRun
 from packing_material.constants import consumption_warehouses
 from packing_material.services import PackingMaterialService
@@ -1572,7 +1573,7 @@ class PlantBoardService:
             "unplanned_item_count": len(unplanned),
             "unplanned_qty": round(sum(row["pieces"] for row in unplanned), 2),
             "unweighed_lines": unweighed_lines,
-            "by_sku": self._plan_by_sku(lines, floor_items),
+            "by_sku": self._plan_by_sku(lines, floor_items, window_from, window_to),
             # The average the business defined: output over the days that
             # actually produced, so a Sunday does not drag it down and it reads
             # as typical output on a working day.
@@ -1777,8 +1778,10 @@ class PlantBoardService:
         self,
         lines: Sequence[Dict[str, Any]],
         floor_items: Sequence[Dict[str, Any]],
+        window_from: Optional[date] = None,
+        window_to: Optional[date] = None,
     ) -> List[Dict[str, Any]]:
-        """The month's plan SKU by SKU: planned, made, what is left, and stock.
+        """The month's plan SKU by SKU: planned, made, dispatched, and stock.
 
         MADE IS THE FLOOR'S OWN RECEIPT, the same journal the band's headline
         is summed from, so the rows add up to the strip above them. Every SKU
@@ -1790,6 +1793,13 @@ class PlantBoardService:
         warehouse carried on the row for the drill; BH-PF is kept apart as
         well. If that read fails the plan still shows, with ``stock_read``
         False and the stock figures null rather than a confident zero.
+
+        DISPATCH is the Production & Dispatch report's own definition over the
+        same window as made, group companies left out (and carried apart as
+        ``group_dispatch_qty``) -- what lets the plan be set against what was
+        actually sold. Only SKUs the plan lists or the floor made are rows. A
+        failed read is ``dispatch_read`` False and null figures, never zero:
+        "nothing dispatched" is the very thing this column is read for.
 
         Tonnes on the agreed 1000 L rule; a SKU with no litre volume carries
         its pieces and ``weighed: False`` rather than a confident 0 t.
@@ -1861,6 +1871,32 @@ class PlantBoardService:
             logger.warning("plant_board: stock by warehouse could not be read: %s", exc)
             stock_read = False
 
+        dispatched: Dict[str, Dict[str, float]] = {}
+        dispatch_read = window_from is not None and window_to is not None
+        if dispatch_read:
+            try:
+                for item in self.reader.dispatch_by_item(
+                    window_from,
+                    window_to,
+                    INTERCOMPANY_CARD_CODES.get(self.company_code, []),
+                ) or []:
+                    code = item.get("ItemCode")
+                    if code not in rows:
+                        continue
+                    held = dispatched.setdefault(
+                        code,
+                        {"qty": 0.0, "litres": 0.0, "group_qty": 0.0, "group_litres": 0.0},
+                    )
+                    if item.get("IsGroup"):
+                        held["group_qty"] += _f(item.get("Pieces"))
+                        held["group_litres"] += _f(item.get("Litres"))
+                    else:
+                        held["qty"] += _f(item.get("Pieces"))
+                        held["litres"] += _f(item.get("Litres"))
+            except Exception as exc:  # noqa: BLE001 - the plan still stands without it
+                logger.warning("plant_board: dispatch by item could not be read: %s", exc)
+                dispatch_read = False
+
         out: List[Dict[str, Any]] = []
         for held in rows.values():
             planned_qty = held["planned_qty"]
@@ -1904,6 +1940,12 @@ class PlantBoardService:
                     "pf_qty": (floor["qty"] if floor else 0.0) if stock_read else None,
                     "pf_tons": (floor["tons"] if floor else 0.0) if stock_read else None,
                     "warehouses": places,
+                    **self._dispatch_figures(
+                        dispatched.get(held["item_code"]),
+                        dispatch_read,
+                        planned_qty,
+                        planned_litres,
+                    ),
                 }
             )
         out.sort(
@@ -1915,6 +1957,39 @@ class PlantBoardService:
             )
         )
         return out
+
+    @staticmethod
+    def _dispatch_figures(
+        sold: Optional[Dict[str, float]],
+        read: bool,
+        planned_qty: float,
+        planned_litres: float,
+    ) -> Dict[str, Any]:
+        """One plan row's dispatch, against its plan. Null throughout when unread."""
+        if not read:
+            return {
+                "dispatch_read": False,
+                "dispatch_qty": None,
+                "dispatch_tons": None,
+                "group_dispatch_qty": None,
+                "group_dispatch_tons": None,
+                "dispatch_balance_qty": None,
+                "dispatch_balance_tons": None,
+                "dispatch_pct": None,
+            }
+        qty = (sold or {}).get("qty", 0.0)
+        litres = (sold or {}).get("litres", 0.0)
+        return {
+            "dispatch_read": True,
+            "dispatch_qty": round(qty, 2),
+            "dispatch_tons": _tons(litres),
+            "group_dispatch_qty": round((sold or {}).get("group_qty", 0.0), 2),
+            "group_dispatch_tons": _tons((sold or {}).get("group_litres", 0.0)),
+            # Negative is dispatched over plan, kept signed like balance_qty.
+            "dispatch_balance_qty": round(planned_qty - qty, 2),
+            "dispatch_balance_tons": round(_tons(planned_litres) - _tons(litres), 3),
+            "dispatch_pct": round(qty / planned_qty * 100, 1) if planned_qty > 0 else None,
+        }
 
     def _daily_pieces(
         self, by_day: Dict[date, Dict[str, float]], window_from: date, window_to: date

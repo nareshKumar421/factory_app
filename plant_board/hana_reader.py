@@ -593,6 +593,56 @@ class PlantBoardReader:
             out.extend(self._rows(query, list(chunk)))
         return out
 
+    def dispatch_by_item(
+        self, date_from, date_to, group_card_codes
+    ) -> List[Dict[str, Any]]:
+        """What left the company per SKU, for the month plan's dispatch view.
+
+        The Production & Dispatch report's definition, line for line (see
+        ``production_dispatch/hana_reader.py``): every delivery, and every A/R
+        invoice line NOT copied from a delivery, so a delivered-then-billed
+        line counts once. Item documents only, no reserve invoices, nothing
+        cancelled. Stock transfers to own depots are not dispatch.
+
+        Sales to group companies are flagged rather than dropped, so the board
+        can leave them out and still say how much it left out.
+        """
+        codes = list(group_card_codes or [])
+        in_list = ", ".join(["?"] * len(codes)) or "''"
+        group = f"""CASE WHEN H."CardCode" IN ({in_list}) THEN 1 ELSE 0 END"""
+        query = f"""
+            SELECT
+                "ItemCode"                                    AS "ItemCode",
+                "IsGroup"                                     AS "IsGroup",
+                SUM("Qty")                                    AS "Pieces",
+                SUM("Qty" * "PerUnit")                        AS "Litres"
+            FROM (
+                SELECT L."ItemCode", {group} AS "IsGroup", L."Quantity" AS "Qty",
+                       ({LITRES_PER_UNIT}) AS "PerUnit"
+                FROM "{self.schema}"."ODLN" H
+                JOIN "{self.schema}"."DLN1" L ON L."DocEntry" = H."DocEntry"
+                JOIN "{self.schema}"."OITM" M ON M."ItemCode" = L."ItemCode"
+                WHERE H."DocDate" BETWEEN ? AND ?
+                  AND H."CANCELED" = 'N'
+                  AND H."DocType" = 'I'
+
+                UNION ALL
+
+                SELECT L."ItemCode", {group}, L."Quantity", ({LITRES_PER_UNIT})
+                FROM "{self.schema}"."OINV" H
+                JOIN "{self.schema}"."INV1" L ON L."DocEntry" = H."DocEntry"
+                JOIN "{self.schema}"."OITM" M ON M."ItemCode" = L."ItemCode"
+                WHERE H."DocDate" BETWEEN ? AND ?
+                  AND H."CANCELED" = 'N'
+                  AND H."DocType" = 'I'
+                  AND H."isIns" = 'N'
+                  AND IFNULL(L."BaseType", -1) <> 15
+            )
+            GROUP BY "ItemCode", "IsGroup"
+        """
+        span = [date_from, date_to]
+        return self._rows(query, [*codes, *span, *codes, *span])
+
     def finished_goods_warehouses(self) -> List[Dict[str, Any]]:
         """Every warehouse holding finished goods, with what it holds.
 
