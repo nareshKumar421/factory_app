@@ -32,6 +32,7 @@ from .views import (
 )
 
 from .views_service_pending_summary import ServicePendingSummaryAPI
+from .views_sap_edit import GRPOSapEditAPI, GRPOSapEditFindAPI
 
 urlpatterns = [
     # Material GRPO dashboard insight totals
@@ -122,6 +123,10 @@ urlpatterns = [
         ServiceGRPOPostingDetailAPI.as_view(),
         name="service-grpo-detail",
     ),
+
+    # Any GRPO already in SAP, changed after posting (grpo.sap_edit)
+    path("sap-edit/find/", GRPOSapEditFindAPI.as_view(), name="grpo-sap-edit-find"),
+    path("sap-edit/<int:doc_entry>/", GRPOSapEditAPI.as_view(), name="grpo-sap-edit"),
 
     # SAP's own Goods Receipt Note, as data, for one posted GRPO
     path("<int:posting_id>/print/", GRPOPrintAPI.as_view(), name="grpo-print"),

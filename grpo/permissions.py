@@ -78,3 +78,19 @@ class CanManagePOPrintSettings(BasePermission):
 
     def has_permission(self, request, view):
         return request.user.has_perm("grpo.can_manage_po_print_settings")
+
+
+class CanEditGRPOInSap(BasePermission):
+    """Either right to change a posted GRPO in SAP: material or service.
+
+    Opening the edit screen needs one of them; the save then checks the one for
+    the GRPO's own type (``grpo.sap_edit.PERMISSION_BY_TYPE``).
+    """
+
+    PERMISSIONS = (
+        "grpo.can_edit_grpo_in_sap",
+        "grpo.can_edit_service_grpo_in_sap",
+    )
+
+    def has_permission(self, request, view):
+        return any(request.user.has_perm(perm) for perm in self.PERMISSIONS)

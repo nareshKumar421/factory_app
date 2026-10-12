@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 HANDLERS = {
     "goods_return.receive": "goods_return.sap_posting.ReceiveHandler",
     "grpo.material": "grpo.sap_posting.MaterialGRPOHandler",
+    "grpo.edit": "grpo.sap_edit.GRPOEditHandler",
     "short_dispatch.post": "short_dispatch.sap_posting.ShortDispatchHandler",
     "bill_summary.stamp": "dispatch_plans.sap_posting.BillSummaryStampHandler",
     "dispatch_tracking.receive": "gate_core.services.dispatch_tracking_sap.SapReceiveHandler",
@@ -55,6 +56,7 @@ HANDLERS = {
 KIND_LABELS = {
     "goods_return.receive": "Goods return (A/R Return)",
     "grpo.material": "Material GRPO",
+    "grpo.edit": "GRPO edit (after posting)",
     "short_dispatch.post": "Short dispatch (A/R Return)",
     "bill_summary.stamp": "Bill summary (invoice dispatch stamp)",
     "dispatch_tracking.receive": "Delivery (invoice received stamp)",
@@ -70,6 +72,7 @@ KIND_LABELS = {
 #: kind -> what the "SAP is down" banner calls it, in a list of what waits.
 KIND_SHORT = {
     "grpo.material": "GRPOs",
+    "grpo.edit": "GRPO edits",
     "goods_return.receive": "goods returns",
     "short_dispatch.post": "short dispatches",
     "bill_summary.stamp": "bill summary stamps",

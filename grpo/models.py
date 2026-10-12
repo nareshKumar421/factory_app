@@ -405,3 +405,91 @@ class POPrintSettings(models.Model):
         if self.approver_source == POApproverSource.MANUAL:
             return f"{self.company_id}: approver '{self.approver_name}'"
         return f"{self.company_id}: approver from SAP"
+
+
+class GRPOSapEditStatus(models.TextChoices):
+    WAITING = "WAITING", "Waiting for SAP"
+    POSTED = "POSTED", "Saved in SAP"
+    REFUSED = "REFUSED", "Refused"
+
+
+class GRPOSapEdit(models.Model):
+    """One change to a GRPO already in SAP, made from the app.
+
+    Any GRPO in the company, not only the ones the app posted: most are still
+    posted by hand in SAP. ``changes`` holds what the person saw and what they
+    asked for, field by field, so the posting queue can tell, when it sends,
+    whether SAP still holds what they saw (send it), already holds what they
+    asked for (an earlier try landed), or has been changed by someone else
+    since (refuse, and say so). See ``grpo.sap_edit``.
+    """
+
+    company = models.ForeignKey(
+        "company.Company",
+        on_delete=models.PROTECT,
+        related_name="grpo_sap_edits",
+    )
+    doc_entry = models.IntegerField(help_text="SAP DocEntry of the GRPO")
+    doc_num = models.BigIntegerField(help_text="SAP DocNum of the GRPO")
+    # SAP's OPDN.DocType: I = items (material), S = service.
+    doc_type = models.CharField(max_length=1)
+    card_code = models.CharField(max_length=50, blank=True, default="")
+    card_name = models.CharField(max_length=150, blank=True, default="")
+    changes = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=10,
+        choices=GRPOSapEditStatus.choices,
+        default=GRPOSapEditStatus.WAITING,
+    )
+    message = models.TextField(blank=True, default="")
+    # Kept the moment SAP gives it, so a retry links the same attachment entry
+    # instead of uploading the files again.
+    sap_attachment_entry = models.IntegerField(null=True, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="grpo_sap_edits",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    posted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "grpo_sap_edit"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["company", "doc_entry"])]
+        default_permissions = ()
+        permissions = [
+            ("can_edit_grpo_in_sap", "Can edit a material GRPO in SAP"),
+            ("can_edit_service_grpo_in_sap", "Can edit a service GRPO in SAP"),
+        ]
+
+    def __str__(self):
+        return f"Edit of GRPO {self.doc_num} ({self.get_status_display()})"
+
+
+class GRPOSapEditAttachment(ControlledDocumentMixin, models.Model):
+    """A file an edit adds to the GRPO's attachments in SAP."""
+
+    DOCUMENT_MODULE = "GRPO"
+
+    edit = models.ForeignKey(
+        GRPOSapEdit,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to="grpo_sap_edit_attachments/")
+    original_filename = models.CharField(max_length=255)
+    # The SAP attachment entry this file became a line of; set once uploaded,
+    # so a retry never uploads it twice.
+    sap_absolute_entry = models.IntegerField(null=True, blank=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "grpo_sap_edit_attachment"
+        ordering = ["id"]
+
+    def __str__(self):
+        return f"{self.original_filename} for {self.edit}"
