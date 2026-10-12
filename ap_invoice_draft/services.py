@@ -414,7 +414,9 @@ class APInvoiceDraftService:
         try:
             with entry.invoice_file.open("rb") as handle:
                 content = handle.read()
-            data, model = read_invoice(content, entry.invoice_filename or entry.invoice_file.name)
+            data, model = read_invoice(
+                content, entry.invoice_filename or entry.invoice_file.name, signer=checks.RATE_CHECKER,
+            )
         except (InvoiceReadError, OSError) as exc:
             entry.invoice_read_status = InvoiceReadStatus.FAILED
             entry.invoice_read_error = str(exc)

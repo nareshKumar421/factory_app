@@ -21,7 +21,7 @@ from rest_framework.test import APIClient
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPDataError, SAPOutcomeUnknown, SAPValidationError
 
-from . import checks, tds
+from . import checks, stamp_signature, tds
 from .invoice_reader import (
     InvoiceReadError,
     fill_rate_blanks,
@@ -71,7 +71,7 @@ SSY_GRPO = {
     ],
 }
 
-def _bill(rows, *, lines=None, rate_check=None, gate_stamp_date="", po_numbers=()):
+def _bill(rows, *, lines=None, rate_check=None, stamp_signature=None, gate_stamp_date="", po_numbers=()):
     """A bill as ``invoice_reader.read_invoice`` returns it: one box per row
     unless the test lays the boxes out itself."""
     return {
@@ -84,6 +84,7 @@ def _bill(rows, *, lines=None, rate_check=None, gate_stamp_date="", po_numbers=(
         "po_numbers": list(po_numbers),
         "gate_stamp_date": gate_stamp_date,
         "rate_check": rate_check or {"found": True, "ink": 0.0, "signed": False, "text": ""},
+        "stamp_signature": stamp_signature or {"found": True, "signed": False, "signer": "Kulbeer", "match": None},
     }
 
 
@@ -323,30 +324,36 @@ class GRPOTimingCheckTests(SimpleTestCase):
 
 
 class RateCheckSignatureTests(SimpleTestCase):
-    def _with(self, **marks):
-        return {**SSY_INVOICE, "rate_check": {"found": True, "ink": 0.0, "signed": False, "text": "", **marks}}
+    def _with(self, **mark):
+        return {**SSY_INVOICE, "stamp_signature": {"found": True, "signed": True, "signer": "Kulbeer", **mark}}
 
-    def test_a_blank_rate_check_line_fails(self):
-        # All four bills downloaded on 2026-10-08 were like this.
+    def test_kulbeers_mark_passes(self):
+        finding = checks.check_rate_check_signature(self._with(match=0.74))
+        self.assertEqual(finding.status, CheckStatus.PASS)
+        self.assertIn("signed with Kulbeer's mark (likeness 0.74)", finding.detail)
+
+    def test_another_mark_needs_a_look(self):
+        finding = checks.check_rate_check_signature(self._with(match=0.46))
+        self.assertEqual(finding.status, CheckStatus.REVIEW)
+        self.assertIn("not like Kulbeer's mark (likeness 0.46)", finding.detail)
+
+    def test_a_blank_signature_box_fails(self):
         self.assertEqual(_status(checks.check_rate_check_signature(SSY_INVOICE)), CheckStatus.FAIL)
 
-    def test_signed_and_named_kulbeer_passes(self):
-        invoice = self._with(ink=1.1, signed=True, text="Kulbeer")
-        self.assertEqual(_status(checks.check_rate_check_signature(invoice)), CheckStatus.PASS)
-
-    def test_a_signature_needs_a_look_to_say_whose(self):
-        invoice = self._with(ink=1.1, signed=True)
-        finding = checks.check_rate_check_signature(invoice)
+    def test_no_kept_marks_to_hold_it_to_needs_a_look(self):
+        finding = checks.check_rate_check_signature(self._with(match=None))
         self.assertEqual(finding.status, CheckStatus.REVIEW)
         self.assertIn("Confirm it is Kulbeer's", finding.detail)
 
-    def test_faint_marks_need_a_look(self):
-        invoice = self._with(ink=0.4, signed=None)
+    def test_no_stamp_found_needs_a_look(self):
+        invoice = {**SSY_INVOICE, "stamp_signature": {"found": False}}
         self.assertEqual(_status(checks.check_rate_check_signature(invoice)), CheckStatus.REVIEW)
 
-    def test_no_stamp_found_needs_a_look(self):
-        invoice = {**SSY_INVOICE, "rate_check": {"found": False}}
-        self.assertEqual(_status(checks.check_rate_check_signature(invoice)), CheckStatus.REVIEW)
+    def test_a_bill_read_before_this_asks_to_be_read_again(self):
+        invoice = {key: value for key, value in SSY_INVOICE.items() if key != "stamp_signature"}
+        finding = checks.check_rate_check_signature(invoice)
+        self.assertEqual(finding.status, CheckStatus.REVIEW)
+        self.assertIn("Read the bill again", finding.detail)
 
 
 class POApproverCheckTests(SimpleTestCase):
@@ -844,7 +851,7 @@ class CreateTests(ServiceTestCase):
 class ReadInvoiceTests(ServiceTestCase):
     def test_reading_again_replaces_what_was_read_and_rechecks(self):
         entry = self.service.create(27481, _pdf(), self.user)
-        signed = {**SSY_INVOICE, "rate_check": {"found": True, "ink": 1.2, "signed": True, "text": "Kulbeer"}}
+        signed = {**SSY_INVOICE, "stamp_signature": {"found": True, "signed": True, "signer": "Kulbeer", "match": 0.74}}
         self.read.return_value = (signed, "RapidOCR test 2")
         self.service.read_invoice(entry)
         entry.refresh_from_db()
@@ -1101,6 +1108,100 @@ class RateCheckMarksTests(SimpleTestCase):
 
     def test_no_label_no_finding(self):
         self.assertEqual(rate_check_marks(_page(), []), {"found": False})
+
+
+def _drawn_stamp(mark=None, text="", angle=0.0):
+    """The gate's stamp as it lands on a bill: border, heading, the printed
+    "Signature" and its dotted line, signed with ``mark`` (a kept mark's
+    image) or ``text``; and the heading and village lines as OCR finds them."""
+    import cv2
+    w, x0, y0 = 410, 300, 200
+    page = _page(1100, 900)
+    blue = (150, 40, 30)
+    right, bottom = x0 + int(1.01 * w), y0 + int(0.71 * w)
+    cv2.rectangle(page, (x0 - int(0.05 * w), y0 - int(0.08 * w)), (right, bottom), blue, 4)
+    cv2.line(page, (x0 + int(0.47 * w), y0 + int(0.2 * w)), (x0 + int(0.47 * w), bottom), blue, 3)
+    cv2.putText(page, "JIVO WELLNESS PVT. LTD.", (x0, y0 + 30), cv2.FONT_HERSHEY_TRIPLEX, 1.05, blue, 2)
+    word = cv2.imread(str(stamp_signature.WORD_TEMPLATE), cv2.IMREAD_GRAYSCALE)
+    word = cv2.resize(word, None, fx=w / 409, fy=w / 409, interpolation=cv2.INTER_NEAREST)
+    wx, wy = x0 + int(0.80 * w) - word.shape[1], bottom - int(0.02 * w) - word.shape[0]
+    page[wy: wy + word.shape[0], wx: wx + word.shape[1]][word < 128] = blue
+    for x in range(wx + word.shape[1] + 2, right - 6, 9):
+        cv2.rectangle(page, (x, bottom - 12), (x + 3, bottom - 9), blue, -1)
+    if mark is not None:
+        h, mw = mark.shape
+        mx, my = x0 + int(0.82 * w), bottom - int(0.02 * w) - h
+        page[my: my + h, mx: mx + mw][mark < 128] = (110, 30, 20)
+    if text:
+        cv2.putText(page, text, (x0 + int(0.82 * w), bottom - int(0.04 * w)),
+                    cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.3, (110, 30, 20), 3)
+    if angle:
+        turn = cv2.getRotationMatrix2D((550, 450), angle, 1.0)
+        page = cv2.warpAffine(page, turn, (1100, 900), borderValue=(255, 255, 255))
+    lines = [
+        {"page": 1, "text": "JIVO WELLNESS PVT. LTD.", "score": 0.9, "box": [x0, y0, x0 + w, y0 + 40]},
+        {"page": 1, "text": "Village Bhakharpur, Ganaur", "score": 0.9, "box": [x0 + 15, y0 + 38, x0 + w - 15, y0 + 70]},
+    ]
+    return page, lines
+
+
+def _kept_marks(leave_out=""):
+    import cv2
+    return {
+        path.stem: cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        for path in sorted(stamp_signature.REFERENCES.glob("kulbeer_*.png"))
+        if not leave_out or leave_out not in path.stem
+    }
+
+
+@skipUnless(_HAS_OCR, "the OCR packages are not installed")
+class StampSignatureTests(SimpleTestCase):
+    """Kulbeer's mark in the gate stamp's Signature box, matched by its shape."""
+
+    def _read(self, leave_out="raj-969", **drawn):
+        page, lines = _drawn_stamp(**drawn)
+        others = [stamp_signature.mark_shape(255 - m) for m in _kept_marks(leave_out).values()]
+        with mock.patch.object(stamp_signature, "reference_shapes", return_value=others):
+            return stamp_signature.read_stamp_signature(page, lines, "Kulbeer")
+
+    def test_each_kept_mark_matches_the_other_four(self):
+        marks = {name: stamp_signature.mark_shape(255 - m) for name, m in _kept_marks().items()}
+        self.assertEqual(len(marks), 5)
+        for name, shape in marks.items():
+            with self.subTest(mark=name):
+                best = max(stamp_signature.likeness(shape, other) for o, other in marks.items() if o != name)
+                self.assertGreaterEqual(best, checks.SIGNATURE_MATCH_MIN)
+
+    def test_his_mark_on_the_stamp_is_his(self):
+        raj = _kept_marks()["kulbeer_raj-969"]
+        for angle in (0.0, 2.0):  # stamps go on by hand, at an angle
+            with self.subTest(angle=angle):
+                mark = self._read(mark=raj, angle=angle)
+                self.assertEqual((mark["found"], mark["signed"]), (True, True))
+                self.assertGreaterEqual(mark["match"], checks.SIGNATURE_MATCH_MIN)
+
+    def test_someone_elses_signature_is_not(self):
+        for text in ("Raj", "Amit"):
+            with self.subTest(text=text):
+                self.assertLess(self._read(text=text)["match"], checks.SIGNATURE_MATCH_MIN)
+
+    def test_a_blank_box_is_unsigned(self):
+        self.assertEqual(self._read(), {"found": True, "signed": False, "signer": "Kulbeer", "match": None})
+
+    def test_no_stamp_on_the_page(self):
+        page, lines = _drawn_stamp()
+        self.assertEqual(stamp_signature.read_stamp_signature(page, lines[:1], "Kulbeer"), {"found": False})
+
+    def test_the_buyers_name_is_not_the_stamp(self):
+        lines = [
+            {"page": 1, "text": "JIVO WELLNESS PVT. LTD - GANNUR", "score": 0.9, "box": [93, 572, 585, 602]},
+            {"page": 1, "text": "20/9/2 & 10/1/2, VILLAGE BAKHARPUR", "score": 0.9, "box": [93, 600, 500, 625]},
+        ]
+        self.assertIsNone(stamp_signature.find_stamp(lines))
+
+    def test_his_kept_marks_are_found_by_name(self):
+        self.assertEqual(len(stamp_signature.reference_shapes("Kulbeer")), 5)
+        self.assertEqual(stamp_signature.reference_shapes("Someone"), [])
 
 
 class RowsTests(SimpleTestCase):

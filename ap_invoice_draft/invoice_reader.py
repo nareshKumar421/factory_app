@@ -31,6 +31,8 @@ import threading
 from importlib import metadata
 from typing import Any
 
+from .stamp_signature import read_stamp_signature
+
 logger = logging.getLogger(__name__)
 
 #: What the bill may be, by extension.
@@ -92,16 +94,22 @@ def engine_name() -> str:
         return "RapidOCR"
 
 
-def read_invoice(content: bytes, filename: str) -> tuple[dict[str, Any], str]:
-    """``(what is printed where, the engine that read it)``. Raises ``InvoiceReadError``."""
+def read_invoice(content: bytes, filename: str, signer: str = "") -> tuple[dict[str, Any], str]:
+    """``(what is printed where, the engine that read it)``. Raises ``InvoiceReadError``.
+
+    ``signer``: whose kept marks the gate stamp's signature is held to.
+    """
     images = _page_images(content, filename)
     lines: list[dict] = []
     rate_check: dict = {"found": False}
+    stamp_signature: dict = {"found": False}
     for page, image in enumerate(images, start=1):
         page_lines = mend_slash_dashes(fill_rate_blanks(image, _ocr(image, page)))
         lines.extend(page_lines)
         if not rate_check["found"]:
             rate_check = rate_check_marks(image, page_lines)
+        if not stamp_signature["found"]:
+            stamp_signature = read_stamp_signature(image, page_lines, signer)
     if not lines:
         raise InvoiceReadError("No text could be read off the bill. Is the scan blank or upside down?")
     return {
@@ -111,6 +119,7 @@ def read_invoice(content: bytes, filename: str) -> tuple[dict[str, Any], str]:
         "po_numbers": list(dict.fromkeys(m for line in lines for m in PO_NUMBER.findall(line["text"]))),
         "gate_stamp_date": gate_stamp_date(lines),
         "rate_check": rate_check,
+        "stamp_signature": stamp_signature,
     }, engine_name()
 
 
