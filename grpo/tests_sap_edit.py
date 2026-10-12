@@ -66,6 +66,7 @@ class FakeSap:
     def __init__(self, doc):
         self.doc = doc
         self.patches = []
+        self.removed = []
         self.saves = True
 
     # reader
@@ -77,6 +78,26 @@ class FakeSap:
 
     def month_codes(self):
         return MONTHS
+
+    shared = ()
+
+    def attachments(self, entry):
+        return copy.deepcopy(self.doc["attachments"]) if entry == self.doc["attachment_entry"] else []
+
+    def attachment_shared_with(self, entry, doc_entry):
+        return list(self.shared)
+
+    def remove_lines(self, company_code, entry, filenames):
+        self.removed.append(list(filenames))
+        if self.saves:
+            self.doc["attachments"] = [
+                a for a in self.doc["attachments"]
+                if not any(a["filename"].lower() == f.lower() for f in filenames)
+            ]
+
+    def add_line(self, absolute_entry, file_path, filename, **kwargs):
+        self.doc["attachments"].append(
+            {"line": len(self.doc["attachments"]) + 1, "filename": filename, "date": None})
 
     def contact_persons(self, card_code):
         return [{"code": 7, "name": "AMIT", "active": True}]
@@ -202,6 +223,36 @@ class RuleTests(SimpleTestCase):
             "U_VehicleNoM": {"before": "HR55X1", "after": ""}}})
         self.assertEqual(sap_edit.payload_for(changes, doc, fields), {"U_VehicleNoM": None})
 
+    def test_the_last_attachment_stays_unless_a_new_one_replaces_it(self):
+        doc = _doc(attachment_entry=555, attachments=[{"line": 1, "filename": "7320.pdf", "date": None}])
+        data = {"remove_attachments": [{"filename": "7320.pdf"}]}
+        with self.assertRaises(sap_edit.EditError) as caught:
+            sap_edit.build_changes(doc, UDFS, data)
+        self.assertIn("Please Attach its Receiving", str(caught.exception))
+        changes = sap_edit.build_changes(doc, UDFS, data, new_file_names=["7320-corrected.pdf"])
+        self.assertEqual(changes["attachments_removed"],
+                         [{"filename": "7320.pdf", "label": "Removed 7320.pdf"}])
+
+    def test_removals_are_checked_against_sap(self):
+        doc = _doc(attachment_entry=555, attachments=[
+            {"line": 1, "filename": "bill.pdf", "date": None},
+            {"line": 2, "filename": "LR.pdf", "date": None},
+        ])
+        with self.assertRaises(sap_edit.EditConflict):
+            sap_edit.build_changes(doc, UDFS, {"remove_attachments": [{"filename": "gone.pdf"}]})
+        with self.assertRaises(sap_edit.EditError) as caught:
+            sap_edit.build_changes(doc, UDFS, {"remove_attachments": [{"filename": "lr.pdf"}]},
+                                   new_file_names=["LR.PDF"])
+        self.assertIn("Rename it", str(caught.exception))
+        with self.assertRaises(sap_edit.EditError) as caught:
+            sap_edit.build_changes(doc, UDFS, {"remove_attachments": [{"filename": "lr.pdf"}]},
+                                   shared_with=[{"document": "GRPO", "doc_num": 2026096650, "cancelled": True}])
+        self.assertIn("cancelled GRPO 2026096650", str(caught.exception))
+        doc["attachments"].append({"line": 3, "filename": "lr.pdf", "date": None})
+        with self.assertRaises(sap_edit.EditError) as caught:
+            sap_edit.build_changes(doc, UDFS, {"remove_attachments": [{"filename": "LR.pdf"}]})
+        self.assertIn("more than once", str(caught.exception))
+
     def test_a_back_date_refusal_says_what_to_do(self):
         message = sap_edit.explain_refusal(
             "(2011) 20!Back Date Entry not allowed for Goods Receipt PO on 2026-08-10 by user B1i",
@@ -227,10 +278,10 @@ class _EditFixtures(TestCase):
         self.sap = FakeSap(_doc())
         reader = patch("grpo.sap_edit.reader_for", return_value=self.sap)
         writer = patch("grpo.sap_edit.patch_grpo", side_effect=self.sap.patch)
-        reader.start()
-        writer.start()
-        self.addCleanup(reader.stop)
-        self.addCleanup(writer.stop)
+        remover = patch("grpo.sap_edit.remove_attachment_lines", side_effect=self.sap.remove_lines)
+        for patcher in (reader, writer, remover):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def submit(self, data, files=()):
         return sap_edit.submit(
@@ -348,6 +399,58 @@ class AttachmentTests(_EditFixtures):
             self.client_sap.add_line_to_existing_attachment.call_args.kwargs["absolute_entry"], 555
         )
         self.assertEqual(self.sap.patches, [])
+
+    def _two_files(self):
+        self.sap.doc["attachment_entry"] = 555
+        self.sap.doc["attachments"] = [
+            {"line": 1, "filename": "bill.pdf", "date": None},
+            {"line": 2, "filename": "wrong.pdf", "date": None},
+        ]
+
+    def test_one_file_of_several_is_removed(self):
+        self._two_files()
+        edit, outcome = self.submit({"remove_attachments": [{"filename": "wrong.pdf"}]})
+        self.assertEqual(outcome.kind, "POSTED")
+        self.assertEqual(self.sap.removed, [["wrong.pdf"]])
+        self.assertEqual(self.sap.patches, [])
+        self.assertIn("Removed wrong.pdf", edit.message)
+
+    def test_the_only_file_is_replaced_by_adding_first(self):
+        self.sap.doc["attachment_entry"] = 555
+        self.sap.doc["attachments"] = [{"line": 1, "filename": "7320.pdf", "date": None}]
+        self.client_sap.add_line_to_existing_attachment.side_effect = self.sap.add_line
+        edit, outcome = self.submit(
+            {"remove_attachments": [{"filename": "7320.pdf"}]},
+            files=[self._file("7320-corrected.pdf")],
+        )
+        self.assertEqual(outcome.kind, "POSTED", outcome.message)
+        self.assertEqual(self.sap.removed, [["7320.pdf"]])
+        self.assertEqual([a["filename"] for a in self.sap.doc["attachments"]], ["7320-corrected.pdf"])
+
+    def test_a_removal_sap_does_not_save_is_refused(self):
+        self._two_files()
+        self.sap.saves = False
+        edit, outcome = self.submit({"remove_attachments": [{"filename": "wrong.pdf"}]})
+        self.assertEqual(outcome.kind, "REJECTED")
+        self.assertIn("the removal of wrong.pdf", outcome.message)
+
+    def test_a_retry_finding_the_file_gone_removes_nothing(self):
+        self._two_files()
+        edit = GRPOSapEdit.objects.create(
+            company=self.company, doc_entry=501, doc_num=2026106504, doc_type="S",
+            changes={"header": {}, "lines": [], "attachments_removed": [
+                {"filename": "gone.pdf", "label": "Removed gone.pdf"}]},
+        )
+        outcome = sap_edit.GRPOEditHandler().send(MagicMock(source_id=edit.pk))
+        self.assertEqual(outcome.kind, "POSTED")
+        self.assertEqual(self.sap.removed, [])
+
+    def test_a_shared_set_is_not_touched(self):
+        self._two_files()
+        self.sap.shared = [{"document": "GRPO", "doc_num": 2026096650, "cancelled": True}]
+        with self.assertRaises(sap_edit.EditError):
+            self.submit({"remove_attachments": [{"filename": "wrong.pdf"}]})
+        self.assertEqual(self.sap.removed, [])
 
     def test_a_retry_does_not_upload_a_file_twice(self):
         with patch("grpo.sap_edit.patch_grpo", side_effect=SAPUnavailable("down")):

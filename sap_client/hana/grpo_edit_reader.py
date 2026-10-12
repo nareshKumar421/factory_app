@@ -221,6 +221,40 @@ class HanaGRPOEditReader:
             for row in rows
         ]
 
+    def attachments(self, absolute_entry: int) -> list:
+        """The files of one SAP attachment entry, in line order."""
+        return self._attachments(absolute_entry)
+
+    def attachment_shared_with(self, absolute_entry: int, doc_entry: int) -> list:
+        """Other documents that point at the same attachment entry.
+
+        A GRPO re-entered from a cancelled one ("Based On Goods Receipt PO ...")
+        keeps the original's entry, so a file removed from it would vanish from
+        the cancelled original too. No two live GRPOs share one (Oct 2026).
+        """
+        rows = self._query(
+            """
+            SELECT 'GRPO', H."DocNum", H."CANCELED" FROM "{schema}"."OPDN" H
+             WHERE H."AtcEntry" = ? AND H."DocEntry" <> ?
+            UNION ALL
+            SELECT 'Draft', H."DocEntry", 'N' FROM "{schema}"."ODRF" H WHERE H."AtcEntry" = ?
+            UNION ALL
+            SELECT 'Purchase order', H."DocNum", H."CANCELED" FROM "{schema}"."OPOR" H
+             WHERE H."AtcEntry" = ?
+            UNION ALL
+            SELECT 'A/P invoice', H."DocNum", H."CANCELED" FROM "{schema}"."OPCH" H
+             WHERE H."AtcEntry" = ?
+            UNION ALL
+            SELECT 'Goods return', H."DocNum", H."CANCELED" FROM "{schema}"."ORPD" H
+             WHERE H."AtcEntry" = ?
+            """,
+            (int(absolute_entry), int(doc_entry), int(absolute_entry), int(absolute_entry),
+             int(absolute_entry), int(absolute_entry)),
+        )
+        return [
+            {"document": row[0], "doc_num": row[1], "cancelled": row[2] != "N"} for row in rows
+        ]
+
     def _attachments(self, absolute_entry: int) -> list:
         rows = self._query(
             """

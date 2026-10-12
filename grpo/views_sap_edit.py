@@ -93,6 +93,10 @@ def document_payload(request, company, reader, document, udfs) -> dict:
         }
 
     contacts = reader.contact_persons(document["card_code"]) if document["card_code"] else []
+    shared_with = (
+        reader.attachment_shared_with(document["attachment_entry"], document["doc_entry"])
+        if document["attachment_entry"] else []
+    )
     header = []
     for field in sap_edit.header_fields(udfs):
         entry = {
@@ -194,6 +198,9 @@ def document_payload(request, company, reader, document, udfs) -> dict:
             {"line": a["line"], "filename": a["filename"], "date": _iso(a["date"])}
             for a in document["attachments"]
         ],
+        # Files can be removed unless the entry is shared with another document;
+        # the last one only goes when a new one comes in the same save.
+        "attachments_shared_message": sap_edit.shared_message(shared_with) if shared_with else "",
         "edits": [edit_payload(edit) for edit in edits],
         "material_posting_id": material_posting,
         "service_posting_id": service_posting,

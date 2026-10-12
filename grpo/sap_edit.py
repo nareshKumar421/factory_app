@@ -8,7 +8,9 @@ on the TEST companies:
 * **Any GRPO, header only:** vendor ref (``NumAtCard``), document date
   (``TaxDate``), delivery date (``DocDueDate``), remarks (``Comments``),
   contact person, the header's user-defined fields the company has (vehicle,
-  bilty, transporter, bill of entry, receive date, city), and attachments.
+  bilty, transporter, bill of entry, receive date, city), and attachments:
+  files added, and files removed (so a file is replaced by adding the new one
+  and removing the old one in the same edit).
   The posting date, vendor, items, quantities, prices, warehouses, tax codes
   and accounts are fixed: the Service Layer answers "Field cannot be updated
   (ODBC -1029)" for those.
@@ -31,6 +33,14 @@ refuses B1i's updates to a GRPO dated before the open back-date window
 Only ``manager`` and Gurcharan (and user 48 in Mart) are exempt, and there are
 no back-date grants (``BKDT``) for B1i. The screen warns up front
 (:func:`back_date_floor`); SAP's own answer is what decides.
+
+Another rule, in all three companies: a GRPO that is not cancelled must have an
+attachment ("(200019) Please Attach its Receiving"; tried on TEST: taking the
+link off a GRPO is refused). So removing files never leaves a GRPO with none:
+the last file goes only when a new one comes in the same edit. Removing one file
+of several is the Service Layer's ``B1S-ReplaceCollectionsOnPatch`` on the
+attachment entry; it could not be tried on TEST, whose Service Layer has no
+attachments folder (-5002), so SAP's answer and the read-back decide.
 """
 
 import logging
@@ -80,6 +90,28 @@ AMOUNT_TOLERANCE = Decimal("0.005")
 #: drafts find the GRPO's gate entry by it (``ap_invoice_draft.services``), so
 #: an edit may rewrite the remarks around it but not drop it.
 GATE_ENTRY_STAMP = re.compile(r"Gate Entry:\s*\S+")
+
+
+LAST_FILE_MESSAGE = (
+    "A GRPO must keep at least one attachment: SAP refuses a GRPO without one "
+    "(\"Please Attach its Receiving\"). To replace the last file, add the new one "
+    "in the same save."
+)
+
+
+def same_file(a: str, b: str) -> bool:
+    return (a or "").strip().lower() == (b or "").strip().lower()
+
+
+def shared_message(shared_with: list) -> str:
+    others = ", ".join(
+        f"{'cancelled ' if other['cancelled'] else ''}{other['document']} {other['doc_num']}"
+        for other in shared_with[:3]
+    )
+    return (
+        f"This GRPO's attachments are shared with {others}: a file removed here would "
+        "disappear there too. Remove it in SAP itself."
+    )
 
 
 class EditError(Exception):
@@ -227,7 +259,15 @@ def line_closed_reason(line: dict) -> str:
     return "Closed in SAP."
 
 
-def build_changes(document: dict, udfs: list, data: dict, *, month_codes=None) -> dict:
+def build_changes(
+    document: dict,
+    udfs: list,
+    data: dict,
+    *,
+    month_codes=None,
+    new_file_names=(),
+    shared_with=(),
+) -> dict:
     """The changes the person asked for, checked against SAP's current values.
 
     ``data`` is ``{"header": {key: {"before", "after"}}, "lines": [{"line_num",
@@ -235,6 +275,10 @@ def build_changes(document: dict, udfs: list, data: dict, *, month_codes=None) -
     A field whose ``after`` equals SAP's value is dropped; one whose ``before``
     no longer equals it means someone changed the GRPO since, and the whole edit
     is refused rather than overwriting that.
+
+    ``data["remove_attachments"]`` names files of the GRPO's attachment entry to
+    remove (``[{"filename"}]``). ``new_file_names`` are the files added in the
+    same edit; ``shared_with`` the other documents on the same attachment entry.
     """
     reason = editable_reason(document)
     if reason:
@@ -313,18 +357,60 @@ def build_changes(document: dict, udfs: list, data: dict, *, month_codes=None) -
             }
         )
 
-    return {"header": header, "lines": lines}
+    removals = build_removals(document, data.get("remove_attachments") or [], new_file_names)
+    if removals and shared_with:
+        raise EditError(shared_message(list(shared_with)))
+
+    return {"header": header, "lines": lines, "attachments_removed": removals}
+
+
+def build_removals(document: dict, requested: list, new_file_names=()) -> list:
+    """The files to take off the GRPO, checked against its attachments in SAP."""
+    removals = []
+    for item in requested:
+        name = str((item or {}).get("filename") or "").strip()
+        if not name or any(same_file(r["filename"], name) for r in removals):
+            continue
+        if not document["attachment_entry"]:
+            raise EditError("This GRPO has no attachments in SAP to remove.")
+        matches = [a for a in document["attachments"] if same_file(a["filename"], name)]
+        if not matches:
+            raise EditConflict(
+                f"{name} is no longer attached to this GRPO in SAP. Reload the GRPO."
+            )
+        if len(matches) > 1:
+            raise EditError(
+                f"SAP holds {name} on this GRPO more than once, so the app cannot tell "
+                "which to remove. Remove it in SAP itself."
+            )
+        if any(same_file(new, name) for new in new_file_names):
+            raise EditError(
+                f"A new file is also called {name}. Rename it before adding it, so it "
+                "cannot be mistaken for the one being removed."
+            )
+        removals.append({"filename": matches[0]["filename"],
+                         "label": f"Removed {matches[0]['filename']}"})
+    if removals:
+        remaining = len(document["attachments"]) - len(removals) + len(list(new_file_names))
+        if remaining < 1:
+            raise EditError(LAST_FILE_MESSAGE)
+    return removals
 
 
 def has_changes(changes: dict) -> bool:
-    return bool(changes.get("header") or changes.get("lines"))
+    return bool(
+        changes.get("header") or changes.get("lines") or changes.get("attachments_removed")
+    )
 
 
 def summary(changes: dict, attachment_count: int = 0) -> str:
     labels = [change["label"] for change in changes.get("header", {}).values()]
     labels += [change["label"] for change in changes.get("lines", [])]
     if attachment_count:
-        labels.append(f"{attachment_count} attachment{'s' if attachment_count > 1 else ''}")
+        labels.append(
+            f"added {attachment_count} attachment{'s' if attachment_count > 1 else ''}"
+        )
+    labels += [change["label"] for change in changes.get("attachments_removed", [])]
     return ", ".join(labels)
 
 
@@ -411,6 +497,13 @@ def check_still_applies(changes: dict, document: dict, fields: dict) -> None:
                 f"{change['label']} was changed in SAP to {_display(current)} after this "
                 "edit was made, so nothing was sent. Open the GRPO again and redo the edit."
             )
+    for removal in changes.get("attachments_removed", []):
+        held = [a for a in document["attachments"] if same_file(a["filename"], removal["filename"])]
+        if len(held) > 1:
+            raise EditError(
+                f"SAP now holds {removal['filename']} on this GRPO more than once, so "
+                "nothing was sent. Remove it in SAP itself."
+            )
     lines_by_num = {line["line_num"]: line for line in document["lines"]}
     line_fields = {field.key: field for field in LINE_FIELDS}
     for change in changes.get("lines", []):
@@ -481,8 +574,8 @@ def _sap_message(response):
         return f"HTTP {response.status_code}: {response.text[:300]}"
 
 
-def patch_grpo(company_code, doc_entry, payload):
-    """The PATCH, with SAP not answering told apart from SAP refusing."""
+def _sl_call(company_code, method, path, payload=None, headers=None):
+    """One Service Layer call, with SAP not answering told apart from SAP refusing."""
     from sap_client import health
     from sap_client.context import CompanyContext
     from sap_client.service_layer.auth import ServiceLayerSession
@@ -494,9 +587,11 @@ def patch_grpo(company_code, doc_entry, payload):
     except requests.RequestException as exc:
         raise SAPUnavailable(f"SAP Service Layer did not answer the login: {exc}") from exc
     try:
-        response = requests.patch(
-            f"{sl['base_url']}/b1s/v2/PurchaseDeliveryNotes({int(doc_entry)})",
+        response = requests.request(
+            method,
+            f"{sl['base_url']}/b1s/v2/{path}",
             json=payload,
+            headers=headers,
             cookies=cookies,
             timeout=(10, 180),
             verify=False,
@@ -510,8 +605,41 @@ def patch_grpo(company_code, doc_entry, payload):
         ) from exc
     if response.status_code in (502, 503, 504):
         raise SAPUnavailable(f"SAP Service Layer is not available ({response.status_code}).")
-    if response.status_code not in (200, 204):
+    if response.status_code not in (200, 201, 204):
         raise SAPValidationError(_sap_message(response))
+    return response.json() if response.content else {}
+
+
+def patch_grpo(company_code, doc_entry, payload):
+    _sl_call(company_code, "PATCH", f"PurchaseDeliveryNotes({int(doc_entry)})", payload)
+
+
+def _line_filename(line: dict) -> str:
+    name, extension = line.get("FileName") or "", line.get("FileExtension") or ""
+    return f"{name}.{extension}" if extension else name
+
+
+def remove_attachment_lines(company_code, absolute_entry, filenames):
+    """Take files off an attachment entry: its other lines, sent back as SAP
+    gave them, replace the collection. The file itself stays in SAP's folder."""
+    entry = _sl_call(company_code, "GET", f"Attachments2({int(absolute_entry)})")
+    lines = entry.get("Attachments2_Lines") or []
+    keep = [
+        {key: value for key, value in line.items() if not key.startswith(("odata", "@"))}
+        for line in lines
+        if not any(same_file(_line_filename(line), name) for name in filenames)
+    ]
+    if len(keep) == len(lines):
+        return
+    if not keep:
+        raise EditError(LAST_FILE_MESSAGE)
+    _sl_call(
+        company_code,
+        "PATCH",
+        f"Attachments2({int(absolute_entry)})",
+        {"Attachments2_Lines": keep},
+        headers={"B1S-ReplaceCollectionsOnPatch": "true"},
+    )
 
 
 def attach_files(edit, document):
@@ -614,17 +742,39 @@ class GRPOEditHandler:
             raise EditError(f"GRPO {edit.doc_num} is not in SAP for {edit.company.name}.")
 
         check_still_applies(edit.changes, document, fields)
+        removals = [r["filename"] for r in edit.changes.get("attachments_removed", [])]
+        to_remove = [
+            name for name in removals
+            if any(same_file(a["filename"], name) for a in document["attachments"])
+        ]
+        if to_remove:
+            shared = reader.attachment_shared_with(document["attachment_entry"], edit.doc_entry)
+            if shared:
+                raise EditError(shared_message(shared))
         payload = payload_for(edit.changes, document, fields)
+        # New files first, so a GRPO replacing its only file is never left with none.
         link_entry = attach_files(edit, document)
+        if to_remove:
+            held = reader.attachments(document["attachment_entry"])
+            if len(held) - len(to_remove) < 1:
+                raise EditError(LAST_FILE_MESSAGE)
+            remove_attachment_lines(edit.company.code, document["attachment_entry"], to_remove)
         if link_entry:
             payload["AttachmentEntry"] = link_entry
         if payload:
             patch_grpo(edit.company.code, edit.doc_entry, payload)
+        if payload or to_remove:
             document = reader.document(edit.doc_entry, udfs)
 
         missing = not_saved(edit.changes, document, fields)
         if link_entry and document.get("attachment_entry") != link_entry:
             missing.append("Attachments")
+        still_attached = [
+            name for name in removals
+            if any(same_file(a["filename"], name) for a in document["attachments"])
+        ]
+        if still_attached:
+            missing.append(f"the removal of {', '.join(still_attached)}")
         if missing:
             raise EditError(
                 "SAP took the update but did not save "
@@ -659,8 +809,20 @@ def submit(*, company, document, udfs, data, files, user, month_codes=None):
     from sap_postings import services as sap_postings
     from .services import _allocate_grpo_document
 
-    changes = build_changes(document, udfs, data, month_codes=month_codes)
     files = list(files or [])
+    shared_with = ()
+    if (data.get("remove_attachments") or []) and document["attachment_entry"]:
+        shared_with = reader_for(company.code).attachment_shared_with(
+            document["attachment_entry"], document["doc_entry"]
+        )
+    changes = build_changes(
+        document,
+        udfs,
+        data,
+        month_codes=month_codes,
+        new_file_names=[upload.name for upload in files],
+        shared_with=shared_with,
+    )
     if not has_changes(changes) and not files:
         raise EditError("Nothing was changed.")
     earlier = pending_edit(company, document["doc_entry"])
