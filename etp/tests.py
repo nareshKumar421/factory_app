@@ -559,6 +559,124 @@ class BackwashTests(EtpTestBase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class BackwashBulkTests(EtpTestBase):
+    """The day's steps are filed from one form, each with its own clock."""
+
+    URL = "/api/v1/etp/backwash-entries/bulk/"
+
+    def setUp(self):
+        super().setUp()
+        self.backwash = BackwashEquipment.objects.create(
+            plant=self.plant, name="Sand Filter Backwash", sequence=1
+        )
+        self.rinse = BackwashEquipment.objects.create(
+            plant=self.plant, name="Sand Filter Rinse", sequence=2
+        )
+        self.stp_step = BackwashEquipment.objects.create(
+            plant=self.stp, name="Carbon Filter Rinse", sequence=1
+        )
+
+    def _sheet(self, *steps):
+        return self.client.post(
+            self.URL,
+            {
+                "plant": self.plant.id,
+                "date": str(self.today),
+                "operator": self.operator.id,
+                "chemist": self.chemist.id,
+                "steps": list(steps),
+            },
+            format="json",
+        )
+
+    def test_every_step_is_filed_with_its_own_times(self):
+        response = self._sheet(
+            {"equipment": self.backwash.id, "start_time": "08:20", "stop_time": "08:30"},
+            {
+                "equipment": self.rinse.id,
+                "start_time": "08:30",
+                "stop_time": "08:35",
+                "remarks": "Rinsed twice",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual([row["contact_minutes"] for row in response.data], [10, 5])
+        entries = BackwashEntry.objects.order_by("start_time")
+        self.assertEqual(entries.count(), 2)
+        # Plant, date and the two signatures are filled once for the sheet.
+        for entry in entries:
+            self.assertEqual(entry.plant, self.plant)
+            self.assertEqual(entry.date, self.today)
+            self.assertEqual(entry.operator, self.operator)
+            self.assertEqual(entry.chemist, self.chemist)
+        self.assertEqual(entries[1].remarks, "Rinsed twice")
+        trail = self.client.get("/api/v1/etp/change-log/", {"register": "BACKWASH"})
+        self.assertEqual(len(trail.data), 2)
+
+    def test_one_bad_step_files_none_and_names_the_step(self):
+        BackwashEntry.objects.create(
+            plant=self.plant, date=self.today, equipment=self.rinse, start_time="08:30"
+        )
+        response = self._sheet(
+            {"equipment": self.backwash.id, "start_time": "08:20"},
+            {"equipment": self.rinse.id, "start_time": "08:30"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Sand Filter Rinse.start_time", response.data)
+        self.assertEqual(BackwashEntry.objects.count(), 1)
+
+    def test_a_step_of_another_plant_is_refused(self):
+        response = self._sheet(
+            {"equipment": self.backwash.id, "start_time": "08:20"},
+            {"equipment": self.stp_step.id, "start_time": "08:40"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Carbon Filter Rinse.equipment", response.data)
+        self.assertFalse(BackwashEntry.objects.exists())
+
+    def test_a_missing_date_is_reported_once(self):
+        response = self.client.post(
+            self.URL,
+            {
+                "plant": self.plant.id,
+                "steps": [
+                    {"equipment": self.backwash.id, "start_time": "08:20"},
+                    {"equipment": self.rinse.id, "start_time": "08:30"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(list(response.data), ["date"])
+
+    def test_the_same_step_twice_in_one_sheet_is_refused(self):
+        response = self._sheet(
+            {"equipment": self.backwash.id, "start_time": "08:20"},
+            {"equipment": self.backwash.id, "start_time": "08:20"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Sand Filter Backwash.start_time", response.data)
+        self.assertFalse(BackwashEntry.objects.exists())
+
+    def test_an_empty_sheet_is_refused(self):
+        response = self._sheet()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("steps", response.data)
+
+    def test_filing_needs_the_manage_right(self):
+        viewer = _client(self.company, perms=["can_view_etp_backwash"])
+        response = viewer.post(
+            self.URL,
+            {
+                "plant": self.plant.id,
+                "date": str(self.today),
+                "steps": [{"equipment": self.backwash.id, "start_time": "08:20"}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
 class CalibrationTests(EtpTestBase):
     URL = "/api/v1/etp/calibration-records/"
 

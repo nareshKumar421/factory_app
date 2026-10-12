@@ -16,10 +16,12 @@ Two read-only endpoints sit on top of the registers:
 from datetime import date as date_cls
 from decimal import Decimal
 
+from django.db import transaction
 from django.db.models import Count, OuterRef, ProtectedError, Q, Subquery, Sum
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -649,6 +651,75 @@ class BackwashEntryViewSet(
         if equipment:
             qs = qs.filter(equipment_id=equipment)
         return self.filter_register(qs).order_by("-date", "start_time")
+
+    #: Filled once for the whole sheet; every step row inherits them.
+    BULK_SHARED_FIELDS = ("plant", "date", "operator", "chemist")
+
+    @action(detail=False, methods=["post"], url_path="bulk")
+    def bulk(self, request):
+        """File a day's steps in one go — the form lays out every step of the plant.
+
+        Body: ``plant``, ``date``, ``operator``, ``chemist`` once, plus ``steps``:
+        one ``{equipment, start_time, stop_time, chemical, chemical_quantity,
+        remarks}`` per step performed (the form leaves out the steps it did not
+        get a start time for). All or nothing: one bad step files none, and its
+        error is keyed by the step's name so the operator knows which row.
+        """
+        steps = request.data.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ValidationError(
+                {"steps": ["Fill the start time of at least one step."]}
+            )
+        if not all(isinstance(row, dict) for row in steps):
+            raise ValidationError({"steps": ["Each step must be an object."]})
+
+        shared = {
+            field: request.data.get(field) for field in self.BULK_SHARED_FIELDS
+        }
+        equipment_ids = [
+            int(row["equipment"]) if str(row.get("equipment", "")).isdigit() else None
+            for row in steps
+        ]
+        step_names = dict(
+            BackwashEquipment.objects.filter(pk__in=equipment_ids).values_list(
+                "id", "name"
+            )
+        )
+
+        errors = {}
+        valid = []
+        seen = set()
+        for position, (row, equipment_id) in enumerate(
+            zip(steps, equipment_ids), start=1
+        ):
+            serializer = self.get_serializer(data={**row, **shared})
+            label = step_names.get(equipment_id, f"Step {position}")
+            if not serializer.is_valid():
+                for field, messages in serializer.errors.items():
+                    # A bad plant / date is wrong once, not once per step.
+                    key = field if field in shared else f"{label}.{field}"
+                    errors[key] = messages
+                continue
+            slot = (
+                serializer.validated_data["equipment"].pk,
+                serializer.validated_data["start_time"],
+            )
+            if slot in seen:
+                errors[f"{label}.start_time"] = [
+                    "The same step is in the sheet twice at this start time."
+                ]
+                continue
+            seen.add(slot)
+            valid.append(serializer)
+        if errors:
+            raise ValidationError(errors)
+
+        with transaction.atomic():
+            for serializer in valid:
+                self.perform_create(serializer)
+        return Response(
+            [serializer.data for serializer in valid], status=status.HTTP_201_CREATED
+        )
 
 
 # ---------------------------------------------------------------------------
