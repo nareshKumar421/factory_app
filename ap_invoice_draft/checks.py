@@ -28,7 +28,7 @@ GRPO_DAYS_AFTER_ARRIVAL = 3
 RATE_CHECKER = "Kulbeer"
 #: How alike the mark in the gate stamp's Signature box must be to his kept
 #: marks (``stamp_signature.likeness``, 0..1) to be his. His own score
-#: 0.67-0.75 against each other, other handwriting on the bills at most 0.57.
+#: 0.69-0.75 against each other, other handwriting on the bills at most 0.57.
 SIGNATURE_MATCH_MIN = 0.62
 #: Who the printed Purchase Order must name as its approver.
 PO_APPROVER = "Gagandeep Singh"

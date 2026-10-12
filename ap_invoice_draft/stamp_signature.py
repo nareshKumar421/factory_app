@@ -8,28 +8,31 @@ to OCR). It is a mark, not letters, so it is matched by its shape against
 marks of his kept in ``signatures/`` rather than read.
 
 The stamp is found by its heading, straightened (it goes on by hand, at an
-angle), and the mark is cut from the corner its right and bottom borders
-make, after the printed word "Signature".
+angle), and the mark is cut from just after its printed word "Signature",
+which is found by its shape. The stamp's borders are no guide: where it
+lands on the bill's table they break up.
 """
 
 import re
 from pathlib import Path
-from typing import Optional
 
 #: The stamp's heading, and the village line printed under it, which tells
 #: it from the buyer's name printed on the bill.
 STAMP_HEADING = re.compile(r"jiv\w*\s*wel", re.I)
-STAMP_VILLAGE = re.compile(r"^\W*vill?ag", re.I)
+STAMP_VILLAGE = re.compile(r"\bvill?ag", re.I)
 
 #: Kulbeer's marks, and the stamp's printed word "Signature".
 REFERENCES = Path(__file__).resolve().parent / "signatures"
 WORD_TEMPLATE = REFERENCES / "stamp_word_signature.png"
 
-#: Where things sit on the straightened stamp, in widths of its heading (W)
-#: from the heading's top left. Measured on five stamps, 2026-10-12.
-RIGHT_BORDER_AT = 1.01
-BOTTOM_BORDER_AT = 0.71
-#: The mark: up to this far above the bottom border.
+#: Where the printed "Signature" is looked for on the straightened stamp, in
+#: widths of its heading (W) from the heading's top left, (across, down). On
+#: six stamps it sat 0.52-0.82 across and 0.60-0.72 down.
+WORD_AREA = ((0.35, 1.05), (0.45, 0.85))
+#: The mark, from the word: starting this far before the word's end (a mark
+#: may start over its last letters), this wide, and this high above its foot.
+MARK_FROM_WORD_END = 0.04
+MARK_WIDTH = 0.24
 MARK_HEIGHT = 0.17
 #: Ink wholly in the window's bottom strip is the dotted line or the bill's own
 #: print showing under the stamp, not the mark, which is written above it.
@@ -40,12 +43,12 @@ def read_stamp_signature(image, page_lines: list[dict], signer: str) -> dict:
     """The stamp's Signature box on this page: ``found`` (the stamp and its
     borders), ``signed`` (anything written in it), and ``match``, how alike
     the mark is to ``signer``'s kept marks, 0..1 (None with none kept)."""
-    heading = find_stamp(page_lines)
-    if heading is None:
-        return {"found": False}
-    stamp, w, heading_at = straightened_stamp(image, heading)
-    window = mark_window(stamp, w, heading_at)
-    if window is None:
+    for heading in stamp_headings(page_lines):
+        stamp, w, heading_at = straightened_stamp(image, heading)
+        window = mark_window(stamp, w, heading_at)
+        if window is not None:
+            break
+    else:
         return {"found": False}
     mark = signature_mark(window[0], w)
     if mark is None:
@@ -71,21 +74,30 @@ def reference_shapes(signer: str) -> list:
     return shapes
 
 
-def find_stamp(page_lines: list[dict]) -> Optional[dict]:
-    """The stamp's heading line, as OCR read it, or None."""
+def stamp_headings(page_lines: list[dict]) -> list[dict]:
+    """The lines that may be the stamp's heading, as OCR read them.
+
+    The heading has the stamp's village line just under it, starting under
+    its left edge. OCR may read the bill's own print into that line where the
+    stamp lands on it ("IGST Village Bhakharpur..."); a buyer's address has the
+    word further along ("20/9/2 & 10/1/2, VILLAGE BAKHARPUR").
+    """
+    headings = []
     for line in page_lines:
         if not STAMP_HEADING.search(line["text"]):
             continue
         x0, y0, x1, y1 = line["box"]
         h = y1 - y0
-        if any(
-            STAMP_VILLAGE.search(other["text"])
-            and y0 + 0.3 * h <= other["box"][1] <= y1 + 1.5 * h
-            and other["box"][0] < x1 and other["box"][2] > x0
-            for other in page_lines
-        ):
-            return line
-    return None
+        for other in page_lines:
+            village = STAMP_VILLAGE.search(other["text"])
+            if village is None or not y0 + 0.3 * h <= other["box"][1] <= y1 + 1.5 * h:
+                continue
+            ox0, _, ox1, _ = other["box"]
+            starts_at = ox0 + (ox1 - ox0) * village.start() / max(1, len(other["text"]))
+            if abs(starts_at - x0) <= 0.15 * (x1 - x0):
+                headings.append(line)
+                break
+    return headings
 
 
 def _ink(image, threshold: int = 150):
@@ -119,58 +131,27 @@ def straightened_stamp(image, heading: dict):
     return level, w, (int(hx), int(hy))
 
 
-def _long_lines(ink, horizontal: bool, length: int) -> list:
-    import cv2
-    import numpy as np
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (length, 1) if horizontal else (1, length))
-    opened = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
-    _, _, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(opened, np.ones((3, 3), np.uint8)))
-    return list(stats[1:])
-
-
 def mark_window(stamp, w: int, heading_at: tuple[int, int]):
-    """The stamp's Signature box after the printed word: ``(image, (x, y))``,
-    or None when the stamp's borders are not there to go by."""
+    """The Signature box from just before the printed word's end, with the
+    word painted out: ``(image, (x, y))``, or None if the word is not found."""
     import cv2
     import numpy as np
 
-    hx, hy = heading_at
-    ink = _ink(stamp)
-    # Right border: the vertical line nearest where it should be.
-    vertical = [s for s in _long_lines(ink, False, int(0.25 * w))
-                if hy + 0.2 * w < s[1] + s[3] and s[1] < hy + 0.8 * w]
-    if not vertical:
+    found = _printed_word(_ink(stamp), w, heading_at)
+    if found is None:
         return None
-    right = min(vertical, key=lambda s: abs(s[0] + s[2] / 2 - (hx + RIGHT_BORDER_AT * w)))
-    rx = int(right[0])
-    if abs(rx - (hx + RIGHT_BORDER_AT * w)) > 0.12 * w:
-        return None
-    # Bottom border: the horizontal line nearest where it should be that
-    # reaches the right border.
-    horizontal = [s for s in _long_lines(ink, True, int(0.3 * w)) if s[0] + s[2] >= rx - 0.1 * w]
-    if not horizontal:
-        return None
-    bottom = min(horizontal, key=lambda s: abs(s[1] + s[3] / 2 - (hy + BOTTOM_BORDER_AT * w)))
-    by = int(bottom[1])
-    if abs(by - (hy + BOTTOM_BORDER_AT * w)) > 0.1 * w:
-        return None
-
-    # The printed word "Signature": painted out, and the mark taken from a
-    # little before its end, as a mark may start over its last letters.
-    top = max(0, by - int(MARK_HEIGHT * w))
-    start = rx - int(0.22 * w)
+    (wx, wy), word = found
     stamp = stamp.copy()
-    found = _printed_word(ink, w, rx, by)
-    if found is not None:
-        (wx, wy), word = found
-        printed = cv2.dilate(word, np.ones((3, 3), np.uint8)) > 0
-        stamp[wy: wy + word.shape[0], wx: wx + word.shape[1]][printed] = 255
-        start = wx + word.shape[1] - int(0.04 * w)
-    return stamp[top: by, start: rx], (start, top)
+    printed = cv2.dilate(word, np.ones((3, 3), np.uint8)) > 0
+    stamp[wy: wy + word.shape[0], wx: wx + word.shape[1]][printed] = 255
+    end, foot = wx + word.shape[1], min(stamp.shape[0], wy + word.shape[0] + max(2, int(0.005 * w)))
+    left = max(0, end - int(MARK_FROM_WORD_END * w))
+    right = min(stamp.shape[1], end + int((MARK_WIDTH - MARK_FROM_WORD_END) * w))
+    top = max(0, foot - int(MARK_HEIGHT * w))
+    return stamp[top: foot, left: right], (left, top)
 
 
-def _printed_word(ink, w: int, rx: int, by: int):
+def _printed_word(ink, w: int, heading_at: tuple[int, int]):
     """Where the stamp's printed "Signature" is: ``((x, y), its ink at that
     size)``, or None if the template does not find it."""
     import cv2
@@ -179,8 +160,11 @@ def _printed_word(ink, w: int, rx: int, by: int):
     template = cv2.imread(str(WORD_TEMPLATE), cv2.IMREAD_GRAYSCALE)
     if template is None:
         return None
-    left, top = max(0, rx - int(0.65 * w)), max(0, by - int(0.2 * w))
-    search = cv2.GaussianBlur(ink[top: by, left: rx], (5, 5), 0).astype(np.float32)
+    hx, hy = heading_at
+    (across_from, across_to), (down_from, down_to) = WORD_AREA
+    left, top = max(0, hx + int(across_from * w)), max(0, hy + int(down_from * w))
+    right, bottom = min(ink.shape[1], hx + int(across_to * w)), min(ink.shape[0], hy + int(down_to * w))
+    search = cv2.GaussianBlur(ink[top: bottom, left: right], (5, 5), 0).astype(np.float32)
     word = (template < 128).astype(np.uint8) * 255
     best = (0.3, None)
     for scale in np.linspace(0.85, 1.15, 13):
@@ -299,7 +283,7 @@ def stroke_directions(a, b) -> float:
 
 def likeness(a, b) -> float:
     """How alike two marks are, 0..1: where the strokes lie and which way they
-    run, averaged. Kulbeer's five marks of 2026-10 score 0.67-0.75 against
-    each other; 56 other pieces of handwriting on the same bills (dates, qty,
+    run, averaged. Kulbeer's six marks of 2026-10 score 0.69-0.75 against
+    each other; 65 other pieces of handwriting on the same bills (dates, qty,
     vehicle and gate numbers) at most 0.57."""
     return (stroke_overlap(a, b) + stroke_directions(a, b)) / 2

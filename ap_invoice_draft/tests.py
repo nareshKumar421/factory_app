@@ -1110,7 +1110,7 @@ class RateCheckMarksTests(SimpleTestCase):
         self.assertEqual(rate_check_marks(_page(), []), {"found": False})
 
 
-def _drawn_stamp(mark=None, text="", angle=0.0):
+def _drawn_stamp(mark=None, text="", angle=0.0, borders=True):
     """The gate's stamp as it lands on a bill: border, heading, the printed
     "Signature" and its dotted line, signed with ``mark`` (a kept mark's
     image) or ``text``; and the heading and village lines as OCR finds them."""
@@ -1119,7 +1119,8 @@ def _drawn_stamp(mark=None, text="", angle=0.0):
     page = _page(1100, 900)
     blue = (150, 40, 30)
     right, bottom = x0 + int(1.01 * w), y0 + int(0.71 * w)
-    cv2.rectangle(page, (x0 - int(0.05 * w), y0 - int(0.08 * w)), (right, bottom), blue, 4)
+    if borders:
+        cv2.rectangle(page, (x0 - int(0.05 * w), y0 - int(0.08 * w)), (right, bottom), blue, 4)
     cv2.line(page, (x0 + int(0.47 * w), y0 + int(0.2 * w)), (x0 + int(0.47 * w), bottom), blue, 3)
     cv2.putText(page, "JIVO WELLNESS PVT. LTD.", (x0, y0 + 30), cv2.FONT_HERSHEY_TRIPLEX, 1.05, blue, 2)
     word = cv2.imread(str(stamp_signature.WORD_TEMPLATE), cv2.IMREAD_GRAYSCALE)
@@ -1164,9 +1165,9 @@ class StampSignatureTests(SimpleTestCase):
         with mock.patch.object(stamp_signature, "reference_shapes", return_value=others):
             return stamp_signature.read_stamp_signature(page, lines, "Kulbeer")
 
-    def test_each_kept_mark_matches_the_other_four(self):
+    def test_each_kept_mark_matches_the_others(self):
         marks = {name: stamp_signature.mark_shape(255 - m) for name, m in _kept_marks().items()}
-        self.assertEqual(len(marks), 5)
+        self.assertEqual(len(marks), 6)
         for name, shape in marks.items():
             with self.subTest(mark=name):
                 best = max(stamp_signature.likeness(shape, other) for o, other in marks.items() if o != name)
@@ -1179,6 +1180,11 @@ class StampSignatureTests(SimpleTestCase):
                 mark = self._read(mark=raj, angle=angle)
                 self.assertEqual((mark["found"], mark["signed"]), (True, True))
                 self.assertGreaterEqual(mark["match"], checks.SIGNATURE_MATCH_MIN)
+
+    def test_found_by_its_printed_word_when_its_borders_break_up(self):
+        # Landed on the bill's table (Pioneer PP/R/26-27/1627): no long border lines.
+        mark = self._read(mark=_kept_marks()["kulbeer_raj-969"], borders=False)
+        self.assertGreaterEqual(mark["match"], checks.SIGNATURE_MATCH_MIN)
 
     def test_someone_elses_signature_is_not(self):
         for text in ("Raj", "Amit"):
@@ -1197,10 +1203,17 @@ class StampSignatureTests(SimpleTestCase):
             {"page": 1, "text": "JIVO WELLNESS PVT. LTD - GANNUR", "score": 0.9, "box": [93, 572, 585, 602]},
             {"page": 1, "text": "20/9/2 & 10/1/2, VILLAGE BAKHARPUR", "score": 0.9, "box": [93, 600, 500, 625]},
         ]
-        self.assertIsNone(stamp_signature.find_stamp(lines))
+        self.assertEqual(stamp_signature.stamp_headings(lines), [])
+
+    def test_the_village_line_read_together_with_the_bills_print(self):
+        # Pioneer PP/R/26-27/1627: the stamp sits over the bill's "IGST".
+        heading = {"page": 1, "text": "JIVO WELLNESS PVT. LTD.", "score": 0.9, "box": [927, 1220, 1360, 1267]}
+        village = {"page": 1, "text": "IGST Village Bhakharpur C naur, Sonipat I ryana", "score": 0.9,
+                   "box": [874, 1254, 1351, 1303]}
+        self.assertEqual(stamp_signature.stamp_headings([heading, village]), [heading])
 
     def test_his_kept_marks_are_found_by_name(self):
-        self.assertEqual(len(stamp_signature.reference_shapes("Kulbeer")), 5)
+        self.assertEqual(len(stamp_signature.reference_shapes("Kulbeer")), 6)
         self.assertEqual(stamp_signature.reference_shapes("Someone"), [])
 
 
