@@ -7,6 +7,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Count, Prefetch
+from django.utils.timezone import localdate
 
 from company.models import Company
 from driver_management.models import Driver, VehicleEntry
@@ -80,6 +81,53 @@ def record_bilty_attachment_audit(
         reason=(reason or "").strip(),
         performed_by=user if getattr(user, "pk", None) else None,
     )
+
+
+def schedule_booked_plan(plan: DispatchPlan, *, newly_booked: bool) -> bool:
+    """Give a bill going onto a truck a dispatch date the gate will see.
+
+    The empty-vehicle-in board expects a truck by its bills' dispatch dates, so
+    a bill put on a truck with no date -- or with one already gone by -- never
+    shows there as expected. A blank becomes today. A past date becomes today
+    only when this save is what puts the bill on the truck: a truck linked
+    today cannot arrive yesterday, but re-saving an existing link (a bilty
+    fix) is not a new arrival. A future date is the desk booking the truck
+    ahead, and stays.
+
+    Sets the field only; the caller saves. Returns whether it changed.
+    """
+    today = localdate()
+    if plan.dispatch_date is not None and (
+        plan.dispatch_date >= today or not newly_booked
+    ):
+        return False
+    plan.dispatch_date = today
+    return True
+
+
+def select_for_planning(plan: DispatchPlan, user) -> None:
+    """Tick a bill going onto a truck on Bill Selection, if it is not already.
+
+    Linking lists bills by invoice date, not by selection, so a bill can be put
+    on a truck without ever being chosen for planning -- and the Plan page,
+    which shows only selected bills, then has no sight of a bill that is
+    leaving. Booked, it cannot be unticked again (``reconcile_selection``
+    refuses), so this only ever adds.
+    """
+    selection, created = SelectedDispatchBill.objects.get_or_create(
+        company_id=plan.company_id,
+        sap_invoice_doc_entry=plan.sap_invoice_doc_entry,
+        defaults={
+            "sap_invoice_doc_num": plan.sap_invoice_doc_num,
+            "created_by": user,
+            "updated_by": user,
+        },
+    )
+    if not created and not selection.is_active:
+        selection.is_active = True
+        selection.updated_by = user
+        selection.save(update_fields=["is_active", "updated_by", "updated_at"])
+
 
 # Ceiling on one dispatch-date window when the caller doesn't ask for a row count.
 # The window is resolved to doc-entries first and fetched by key, so this bounds
@@ -1143,6 +1191,13 @@ class DispatchPlansService:
         self._assert_bill_not_added_to_inside_vehicle(sap_invoice_doc_entry, data)
         self._validate_links(data)
         self._apply_master_data(data)
+        linking = self._is_vehicle_link(data)
+        if linking:
+            # A link carries the sheet's primary bill's date, and shared across
+            # the truck it would overwrite every other bill's date with it --
+            # or wipe them all when that bill had none. Each bill keeps its
+            # own; ``schedule_booked_plan`` fills the ones that need it.
+            data.pop("dispatch_date", None)
         plan, created = DispatchPlan.objects.get_or_create(
             company=self.company,
             sap_invoice_doc_entry=sap_invoice_doc_entry,
@@ -1151,6 +1206,13 @@ class DispatchPlansService:
                 "created_by": user,
                 "updated_by": user,
             },
+        )
+        # Read before the payload lands on the plan: is this save what puts the
+        # bill on this truck, or a re-save of a link it already has?
+        newly_booked = linking and (
+            created
+            or plan.booking_status != DispatchPlanStatus.BOOKED
+            or plan.vehicle_id != data["vehicle_id"]
         )
 
         if doc_num:
@@ -1173,10 +1235,27 @@ class DispatchPlansService:
                 plan.bilty_attachment_name,
             )
 
+        if linking:
+            schedule_booked_plan(plan, newly_booked=newly_booked)
+
         plan.updated_by = user
         plan.save()
+        if linking:
+            select_for_planning(plan, user)
         self._link_completed_empty_in(plan)
         return plan
+
+    @staticmethod
+    def _is_vehicle_link(data: Dict[str, Any]) -> bool:
+        """Whether this save books the bill onto a truck.
+
+        Only the linking screens send a vehicle with BOOKED. The Plan page's
+        edit sends neither, and an unlink sends PENDING with the vehicle
+        cleared, so neither is mistaken for one.
+        """
+        return data.get("booking_status") == DispatchPlanStatus.BOOKED and bool(
+            data.get("vehicle_id")
+        )
 
     #: What a plan must not be saved without, and the SAP bill field it is copied
     #: from when the caller did not supply it.

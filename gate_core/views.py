@@ -17,6 +17,7 @@ from dispatch_plans.freight_approval_service import (
     truck_plans as truck_freight_plans,
 )
 from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
+from dispatch_plans.services import schedule_booked_plan, select_for_planning
 from dispatch_plans.permissions import (
     CanAddBillInsideVehicle,
     CanMoveBillInsideVehicle,
@@ -3241,8 +3242,12 @@ def _put_plan_on_inside_truck(plan, *, vehicle, driver_id, bilty_no, bilty_date,
     one the truck is registered to. That last part is the rule linking applies
     (``DispatchPlansService._apply_master_data``). Before it was here, a bill
     added to an inside truck carried no transporter, and neither did its bill
-    summary.
+    summary. Linking's dispatch date and Bill Selection rules apply too.
     """
+    newly_booked = (
+        plan.booking_status != DispatchPlanStatus.BOOKED
+        or plan.vehicle_id != vehicle.id
+    )
     plan.vehicle_id = vehicle.id
     plan.driver_id = driver_id
     plan.bilty_no = bilty_no
@@ -3261,8 +3266,11 @@ def _put_plan_on_inside_truck(plan, *, vehicle, driver_id, bilty_no, bilty_date,
         update_fields.append("transporter")
     if plan.booking_status != DispatchPlanStatus.BOOKED:
         plan.booking_status = DispatchPlanStatus.BOOKED
+    if schedule_booked_plan(plan, newly_booked=newly_booked):
+        update_fields.append("dispatch_date")
     plan.updated_by = user
     plan.save(update_fields=update_fields)
+    select_for_planning(plan, user)
 
 
 class InsideVehicleAddBillView(APIView):
@@ -3655,20 +3663,23 @@ class InsideVehicleMoveBillView(APIView):
                 return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
 
             if plan is not None:
+                newly_booked = plan.vehicle_id != to_vehicle_id
                 plan.vehicle_id = to_vehicle_id
                 plan.driver_id = target.vehicle_entry.driver_id
                 if plan.booking_status != DispatchPlanStatus.BOOKED:
                     plan.booking_status = DispatchPlanStatus.BOOKED
+                update_fields = [
+                    "vehicle",
+                    "driver",
+                    "booking_status",
+                    "updated_by",
+                    "updated_at",
+                ]
+                if schedule_booked_plan(plan, newly_booked=newly_booked):
+                    update_fields.append("dispatch_date")
                 plan.updated_by = request.user
-                plan.save(
-                    update_fields=[
-                        "vehicle",
-                        "driver",
-                        "booking_status",
-                        "updated_by",
-                        "updated_at",
-                    ]
-                )
+                plan.save(update_fields=update_fields)
+                select_for_planning(plan, request.user)
                 attached = attach_bill_to_inside_vehicle(plan, request.user)
             else:
                 attached = False

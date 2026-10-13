@@ -9,7 +9,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from company.models import Company, UserCompany, UserRole
-from dispatch_plans.models import DispatchPlan, DispatchPlanStatus
+from dispatch_plans.models import DispatchPlan, DispatchPlanStatus, SelectedDispatchBill
 from driver_management.models import Driver
 from gate_core.models import (
     EmptyVehicleGateInCover,
@@ -178,6 +178,28 @@ class InsideVehicleFlowTests(TestCase):
         late.refresh_from_db()
         self.assertEqual(late.bilty_no, "NCR-4494")
         self.assertEqual(late.bilty_date, date(2026, 10, 5))
+
+    def test_add_bill_dates_and_selects_a_bill_planning_never_touched(self):
+        """Linking's rule: the bill is leaving today, so it says so, and the
+        Plan page can see it."""
+        self._booked(self.beverages, 80001)
+        gate_in = self._arrival().gate_ins.get(company=self.beverages)
+        late = DispatchPlan.objects.create(
+            company=self.beverages,
+            sap_invoice_doc_entry=80009,
+            sap_invoice_doc_num="80009",
+        )
+
+        resp = self._add_bill(gate_in, 80009, bilty_no="2124", bilty_date="2026-10-06")
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        late.refresh_from_db()
+        self.assertEqual(late.dispatch_date, timezone.localdate())
+        self.assertTrue(
+            SelectedDispatchBill.objects.filter(
+                company=self.beverages, sap_invoice_doc_entry=80009, is_active=True
+            ).exists()
+        )
 
     def test_a_sent_bilty_comes_whole_never_with_the_plan_s_old_date(self):
         self._booked(self.beverages, 80001)
