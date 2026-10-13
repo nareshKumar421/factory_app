@@ -427,7 +427,9 @@ class FillingCostDefaultsTests(APITestCase):
 
     def _night_of_the_28th(self):
         run = self._run(1, [('2026-09-28 20:00', '2026-09-29 06:00', '5655')])
-        self._waste(run, '412.1')        # 412.1 kg at ₹10 = ₹4,121
+        # The store's transfer for the night: 412.1 kg, at SAP's ₹4,121.
+        self.sap.return_value = [self._posted(
+            926678136, 'wastage 28-09-2026 Night', ('PF-500', 'KGS', '412.1', '4121'))]
         return run
 
     def _open(self, shift='', **params):
@@ -473,8 +475,7 @@ class FillingCostDefaultsTests(APITestCase):
         self.assertEqual(explain['Batch Coding'], '1,35,720 bottles × ₹0.03')
         self.assertIn('32,787', explain['Electricity'])
         self.assertIn('Preform 412.100 kg × ₹7.5', explain['Scrap Recurring'])
-        # SAP has not had the day posted, so the waste logs stand in, and say so.
-        self.assertIn('SAP has no wastage transfer for 28 Sep Night yet', explain['Wastage'])
+        self.assertIn('926678136 (wastage 28-09-2026 Night) ₹4,121', explain['Wastage'])
 
     def test_the_day_shift_of_a_night_only_day_takes_nothing(self):
         self._night_of_the_28th()
@@ -552,12 +553,15 @@ class FillingCostDefaultsTests(APITestCase):
         self.assertEqual(self._amounts(data)['Batch Coding'], '0.00')
         self.assertIn('No bottles per case on run #8', data['warnings'][0])
 
-    def test_waste_without_a_price_is_named_not_guessed(self):
-        run = self._run(9, [('2026-09-28 20:00', '2026-09-29 06:00', '100')])
-        self._waste(run, '5', price=None)
+    def test_the_apps_waste_logs_never_stand_in_for_sap(self):
+        run = self._night_of_the_28th()
+        self._waste(run, '412.1')        # logged in the app, priced on the run
+        self.sap.return_value = []       # but the store has not posted the night
         data = self._open('NIGHT')
-        self.assertEqual(self._amounts(data)['Wastage'], '0.00')
-        self.assertTrue(any('No SAP price for PREFORM 500 ML' in w for w in data['warnings']))
+        self.assertNotIn('Wastage', self._amounts(data))
+        self.assertNotIn('Scrap Recurring', self._amounts(data))
+        self.assertIn('SAP has no wastage transfer for 28 Sep Night yet: Wastage and Scrap '
+                      'Recurring are left blank until the store posts it.', data['warnings'])
 
     def test_no_scrap_price_leaves_scrap_to_be_typed(self):
         self.preform.prices.all().delete()
@@ -618,7 +622,7 @@ class FillingCostDefaultsTests(APITestCase):
     # -- wastage from SAP ---------------------------------------------------------
 
     def test_wastage_is_what_sap_moved_for_the_shift(self):
-        self._night_of_the_28th()                       # logs say ₹4,121
+        self._night_of_the_28th()
         self.sap.return_value = [
             self._posted(926678136, 'wastage 28-09-2026  Night', ('PF-500', 'KGS', '100', '1500')),
             self._posted(1026678005, 'wasatge 28/9/26 night', ('PF-500', 'KGS', '20', '300.50')),
@@ -663,20 +667,22 @@ class FillingCostDefaultsTests(APITestCase):
                       ['Wastage']['explain'])
         self.assertEqual(self._amounts(data)['Scrap Recurring'], '-424.13')  # 56.55 kg x 7.5
 
-    def test_sap_unreachable_falls_back_to_the_logs_and_says_so(self):
-        self._night_of_the_28th()
+    def test_sap_unreachable_leaves_wastage_blank_and_says_so(self):
+        run = self._night_of_the_28th()
+        self._waste(run, '412.1')
         self.sap.side_effect = RuntimeError('HANA down')
         data = self._open('NIGHT')
-        self.assertEqual(self._amounts(data)['Wastage'], '4121.00')
-        self.assertIn("SAP could not be read: Wastage and Scrap Recurring are from the "
-                      "app's waste logs.", data['warnings'])
+        self.assertNotIn('Wastage', self._amounts(data))
+        self.assertNotIn('Scrap Recurring', self._amounts(data))
+        self.assertIn('SAP could not be read: Wastage and Scrap Recurring are left blank.',
+                      data['warnings'])
 
     def test_a_transfer_whose_remarks_name_no_day_is_named(self):
         self._night_of_the_28th()
         self.sap.return_value = [self._posted(926678116, 'App transfer request TR-20260924-0009',
                                               ('PF-500', 'KGS', '1', '10'))]
         data = self._open('NIGHT')
-        self.assertEqual(self._amounts(data)['Wastage'], '4121.00')
+        self.assertNotIn('Wastage', self._amounts(data))
         self.assertIn('SAP wastage transfer 926678116 name no day in their remarks, so are '
                       'not counted on any sheet.', data['warnings'])
 

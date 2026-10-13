@@ -20,9 +20,9 @@ Batch Coding              bottles (cases x bottles per case) x rate a bottle
 Lubrication               litres (bottles x litres a bottle) x rate a litre
 Wastage                   what SAP's books moved into BH-WST for the day: the
                           store's stock transfers from BH-PP, matched to the
-                          day and shift by their remarks; until the store has
-                          posted them, the waste logged on the runs x the
-                          material's SAP price
+                          day and shift by their remarks. SAP's records only:
+                          until the store has posted the day, the head is left
+                          blank and the sheet says so
 Scrap Recurring           minus the same wastage in kilos x each kind of
                           scrap's latest price a kg (``ScrapKind``)
 ========================  ==================================================
@@ -71,8 +71,7 @@ from cost_master.services import resolve_rates_bulk
 from maintenance.electricity.run_hours import MAX_SEGMENT_HOURS, capped, merge
 
 from ..models import (
-    FillingCostShift, ProductionMaterialUsage, ProductionRun, ProductionSegment,
-    RunStatus, ScrapKind, WasteLog,
+    FillingCostShift, ProductionRun, ProductionSegment, RunStatus, ScrapKind,
 )
 
 ZERO = Decimal('0')
@@ -186,10 +185,6 @@ class Production:
     litres: Decimal = ZERO
     hours: Decimal = ZERO
     day_hours: Decimal = ZERO          # the company's, every line
-    wastage: Decimal = ZERO            # rupees
-    wastage_logs: int = 0
-    #: material code -> {'name', 'uom', 'qty'}: the waste logged, item by item.
-    waste_items: Dict[str, dict] = field(default_factory=dict)
     #: (product, bottles a case, litres a bottle) -> cases: what was filled, SKU by SKU.
     skus: Dict[tuple, Decimal] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
@@ -209,12 +204,6 @@ class Production:
         return ONE
 
 
-def _add_waste(result, log, qty):
-    item = result.waste_items.setdefault(log.material_code or log.material_name, {
-        'name': log.material_name, 'uom': (log.uom or '').strip().upper(), 'qty': ZERO})
-    item['qty'] += qty
-
-
 def _runs(company, day, now):
     """Every live, started run of the company that ran in ``day``'s 24 hours."""
     whole = shift_window(day)
@@ -231,7 +220,7 @@ def _runs(company, day, now):
         .exclude(status=RunStatus.DRAFT)
         .filter(Q(id__in=touching) | Q(date=day))
         .select_related('line')
-        .prefetch_related('segments', 'material_usages', 'waste_logs')
+        .prefetch_related('segments')
     )
 
 
@@ -289,7 +278,7 @@ def production(company, day, shift='', line=None, now=None):
         if line is None or line_id == line.id:
             result.hours += _hours(spans, window)
 
-    no_bottles, no_litres, no_price = [], [], set()
+    no_bottles, no_litres = [], []
     for part in shift_runs:
         run = part.run
         cases = part.total * part.fraction
@@ -307,37 +296,6 @@ def production(company, day, shift='', line=None, now=None):
         else:
             no_bottles.append(run)
 
-        prices = {u.material_code: u.unit_price for u in run.material_usages.all()
-                  if u.material_code and u.unit_price is not None}
-        for log in run.waste_logs.all():
-            qty = log.wastage_qty * part.fraction
-            result.wastage_logs += 1
-            _add_waste(result, log, qty)
-            price = prices.get(log.material_code)
-            if price is None:
-                no_price.add(log.material_name)
-            else:
-                result.wastage += qty * price
-
-    # Waste logged on its own, not against a run, belongs to the floor as a
-    # whole and to the shift it was logged in.
-    if line is None:
-        standalone = WasteLog.objects.filter(
-            company=company, production_run__isnull=True,
-            created_at__gte=window[0], created_at__lt=window[1])
-        for log in standalone:
-            result.wastage_logs += 1
-            _add_waste(result, log, log.wastage_qty)
-            price = (ProductionMaterialUsage.objects
-                     .filter(production_run__company=company,
-                             material_code=log.material_code, unit_price__isnull=False)
-                     .exclude(material_code='')
-                     .order_by('-created_at').values_list('unit_price', flat=True).first())
-            if price is None:
-                no_price.add(log.material_name)
-            else:
-                result.wastage += log.wastage_qty * price
-
     def names(runs):
         return ', '.join(f"#{r.run_number} {r.product or r.line.name}".strip() for r in runs)
 
@@ -349,10 +307,6 @@ def production(company, day, shift='', line=None, now=None):
         result.warnings.append(
             f"No litres per bottle on run {names(no_litres)}: its bottles are "
             f"left out of Lubrication.")
-    if no_price:
-        result.warnings.append(
-            "No SAP price for " + ', '.join(sorted(no_price)) +
-            ": that waste is left out of Wastage.")
     return result
 
 
@@ -542,8 +496,12 @@ def _scrap(company, day, items, warnings):
 
 
 def _wastage_and_scrap(company, day, shift, line, now, made, add):
-    """Wastage and Scrap Recurring: off SAP's wastage transfers where the store
-    has posted the day, off the app's waste logs until it has."""
+    """Wastage and Scrap Recurring, off SAP's wastage transfers and nothing else.
+
+    The app's own waste logs never stand in: until the store has posted the
+    day, or while SAP cannot be read, both heads are left blank and the sheet
+    says why. A saved sheet is offered SAP's figure once it is there.
+    """
     scopes = {(shift, line.id if line else None): made}
 
     def made_in(window, of_line):
@@ -568,57 +526,52 @@ def _wastage_and_scrap(company, day, shift, line, now, made, add):
 
     on_day = f"{day:%d %b}" + (f" {FillingCostShift(shift).name.title()}" if shift else '')
     sap = _sap_wastage(company, day)
-    used, items, value = [], {}, ZERO
     if sap is None:
         made.warnings.append(
-            "SAP could not be read: Wastage and Scrap Recurring are from the app's waste logs.")
-    else:
-        transfers, unread = sap
-        for transfer in transfers:
-            share = share_of(transfer['shift'])
-            if share <= 0:
-                continue
-            amount = sum((Decimal(str(moved['value'])) for moved in transfer['lines']), ZERO) * share
-            used.append((transfer, share, amount))
-            value += amount
-            for moved in transfer['lines']:
-                item = items.setdefault(moved['item_code'], {
-                    'name': moved['item_name'], 'uom': moved['uom'], 'qty': ZERO})
-                item['qty'] += Decimal(str(moved['qty'])) * share
-        if unread:
-            made.warnings.append(
-                "SAP wastage " + ('transfer ' if len(unread) == 1 else 'transfers ')
-                + ', '.join(str(t['doc_num']) for t in unread)
-                + " name no day in their remarks, so are not counted on any sheet.")
-        if used and not shift:
-            # A day posted for one shift only, while the other ran.
-            posted = {t['shift'] for t, _, _ in used}
-            if '' not in posted:
-                for missing in {FillingCostShift.DAY, FillingCostShift.NIGHT} - posted:
-                    if made_in(missing, line).cases > 0:
-                        made.warnings.append(
-                            f"SAP has no wastage transfer for {day:%d %b} "
-                            f"{FillingCostShift(missing).name.title()} yet, though it ran: "
-                            f"Wastage counts only what is posted.")
-
-    if used:
-        source = 'sap'
-        said = ', '.join(
-            f"{t['doc_num']} ({t['remarks']}) ₹{_figure(amount)}"
-            + (f" = {_pct(share)} of ₹{_figure(amount / share)}" if share != ONE else '')
-            for t, share, amount in used)
-        add(WASTAGE, value,
-            f"SAP: what the store moved from {WASTAGE_FROM_WAREHOUSE} to {WASTAGE_WAREHOUSE} "
-            f"for {on_day}, at SAP's value — {said}", source)
-    elif made.wastage_logs:
-        source, items = 'waste_logs', made.waste_items
-        add(WASTAGE, made.wastage,
-            f"{made.wastage_logs} waste log {'entry' if made.wastage_logs == 1 else 'entries'}"
-            f" × the material's SAP price on the run"
-            + ('' if sap is None else
-               f" — SAP has no wastage transfer for {on_day} yet"), source)
-    else:
+            "SAP could not be read: Wastage and Scrap Recurring are left blank.")
         return
+    transfers, unread = sap
+    if unread:
+        made.warnings.append(
+            "SAP wastage " + ('transfer ' if len(unread) == 1 else 'transfers ')
+            + ', '.join(str(t['doc_num']) for t in unread)
+            + " name no day in their remarks, so are not counted on any sheet.")
+
+    used, items, value = [], {}, ZERO
+    for transfer in transfers:
+        share = share_of(transfer['shift'])
+        if share <= 0:
+            continue
+        amount = sum((Decimal(str(moved['value'])) for moved in transfer['lines']), ZERO) * share
+        used.append((transfer, share, amount))
+        value += amount
+        for moved in transfer['lines']:
+            item = items.setdefault(moved['item_code'], {
+                'name': moved['item_name'], 'uom': moved['uom'], 'qty': ZERO})
+            item['qty'] += Decimal(str(moved['qty'])) * share
+    if not used:
+        made.warnings.append(
+            f"SAP has no wastage transfer for {on_day} yet: Wastage and Scrap Recurring "
+            f"are left blank until the store posts it.")
+        return
+    if not shift:
+        # A day posted for one shift only, while the other ran.
+        posted = {t['shift'] for t, _, _ in used}
+        if '' not in posted:
+            for missing in {FillingCostShift.DAY, FillingCostShift.NIGHT} - posted:
+                if made_in(missing, line).cases > 0:
+                    made.warnings.append(
+                        f"SAP has no wastage transfer for {day:%d %b} "
+                        f"{FillingCostShift(missing).name.title()} yet, though it ran: "
+                        f"Wastage counts only what is posted.")
+
+    said = ', '.join(
+        f"{t['doc_num']} ({t['remarks']}) ₹{_figure(amount)}"
+        + (f" = {_pct(share)} of ₹{_figure(amount / share)}" if share != ONE else '')
+        for t, share, amount in used)
+    add(WASTAGE, value,
+        f"SAP: what the store moved from {WASTAGE_FROM_WAREHOUSE} to {WASTAGE_WAREHOUSE} "
+        f"for {on_day}, at SAP's value — {said}", 'sap')
 
     scrap = _scrap(company, day, items, made.warnings)
     if scrap is None:
@@ -633,7 +586,7 @@ def _wastage_and_scrap(company, day, shift, line, now, made, add):
         f"{_figure(kg, 3)} kg of the wastage sold as scrap at the latest scrap rates, "
         f"deducted: {said}"
         + (f". Not scrap: {', '.join(not_scrap)}" if not_scrap else ''),
-        source)
+        'sap')
 
 
 def defaults(company, day, shift='', line=None, now=None):
