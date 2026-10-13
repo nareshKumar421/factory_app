@@ -15,6 +15,7 @@ class FuelEntryAdmin(admin.ModelAdmin):
     list_display = (
         "vehicle",
         "entry_date",
+        "entry_time",
         "fuel_type",
         "odometer",
         "quantity",
@@ -29,7 +30,14 @@ class FuelEntryAdmin(admin.ModelAdmin):
 
 @admin.register(ServiceEntry)
 class ServiceEntryAdmin(admin.ModelAdmin):
-    list_display = ("vehicle", "entry_date", "kind", "total_amount", "approval_status")
+    list_display = (
+        "vehicle",
+        "entry_date",
+        "entry_time",
+        "kind",
+        "total_amount",
+        "approval_status",
+    )
     list_filter = ("approval_status", "kind")
     search_fields = ("vehicle__vehicle_number", "bill_number", "workshop_name")
     date_hierarchy = "entry_date"
@@ -44,7 +52,7 @@ class VehicleDocumentAdmin(admin.ModelAdmin):
 
 @admin.register(DailyReading)
 class DailyReadingAdmin(admin.ModelAdmin):
-    list_display = ("vehicle", "reading_date", "odometer")
+    list_display = ("vehicle", "reading_date", "reading_time", "odometer")
     list_filter = ("vehicle",)
     search_fields = ("vehicle__vehicle_number",)
     date_hierarchy = "reading_date"

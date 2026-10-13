@@ -229,6 +229,9 @@ class DailyReading(BaseModel):
         FleetVehicle, on_delete=models.CASCADE, related_name="daily_readings"
     )
     reading_date = models.DateField(db_index=True)
+    #: When on that day the dial was read. Null only on readings logged before
+    #: the time was asked for.
+    reading_time = models.TimeField(null=True, blank=True)
     odometer = models.PositiveIntegerField(help_text="Meter reading in km, as it read that day.")
     remarks = models.CharField(max_length=255, blank=True, default="")
 
@@ -249,8 +252,8 @@ class FuelEntry(BaseModel):
     """One filling at a pump.
 
     The screen a driver or clerk uses every day, so it asks for as little as it
-    can: vehicle, date, meter reading, quantity and amount, plus who filled it
-    and a photo of the slip. Rate is derived when it is left out, because a
+    can: vehicle, date and time, meter reading, quantity and amount, plus who
+    filled it and a photo of the slip. Rate is derived when it is left out, because a
     pump slip prints the amount and the litres.
 
     No approval, unlike :class:`ServiceEntry`: a filling counts as spend the
@@ -267,6 +270,9 @@ class FuelEntry(BaseModel):
         FleetVehicle, on_delete=models.CASCADE, related_name="fuel_entries"
     )
     entry_date = models.DateField(db_index=True)
+    #: When on that day it was filled. Null only on fillings entered before the
+    #: time was asked for.
+    entry_time = models.TimeField(null=True, blank=True)
     fuel_type = models.CharField(
         max_length=12,
         choices=FuelType.choices,
@@ -312,7 +318,14 @@ class FuelEntry(BaseModel):
     )
 
     class Meta:
-        ordering = ["-entry_date", "-odometer", "-id"]
+        # Time before the meter: across the whole fleet, two vehicles' meters
+        # on the same day say nothing about which was filled first.
+        ordering = [
+            "-entry_date",
+            models.F("entry_time").desc(nulls_last=True),
+            "-odometer",
+            "-id",
+        ]
         verbose_name_plural = "Fuel entries"
         indexes = [
             models.Index(fields=["vehicle", "entry_date"]),
@@ -336,6 +349,9 @@ class ServiceEntry(ApprovableEntry):
         FleetVehicle, on_delete=models.CASCADE, related_name="service_entries"
     )
     entry_date = models.DateField(db_index=True)
+    #: When on that day the work was done. Null only on bills entered before
+    #: the time was asked for.
+    entry_time = models.TimeField(null=True, blank=True)
     odometer = models.PositiveIntegerField(null=True, blank=True)
     kind = models.CharField(max_length=10, choices=ServiceKind.choices, default=ServiceKind.ROUTINE)
     workshop_name = models.CharField(max_length=120, blank=True, default="")
@@ -366,7 +382,7 @@ class ServiceEntry(ApprovableEntry):
     remarks = models.TextField(blank=True, default="")
 
     class Meta:
-        ordering = ["-entry_date", "-id"]
+        ordering = ["-entry_date", models.F("entry_time").desc(nulls_last=True), "-id"]
         verbose_name_plural = "Service entries"
         indexes = [models.Index(fields=["vehicle", "entry_date"])]
 

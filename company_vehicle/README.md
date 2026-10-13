@@ -38,6 +38,18 @@ back. A fuel entry, having no approval, stays editable. Entering
 (`can_add_fleet_expense`) and approving (`can_approve_fleet_expense`) are
 separate rights on purpose.
 
+## Date and time
+
+Every entry — a filling, a workshop bill, a daily reading — carries a time
+beside its date (`entry_time`, `reading_time`). It is a separate column rather
+than a datetime, so everything that groups or filters by day (the running log,
+the monthly totals, one reading per vehicle per day) is untouched.
+
+The time is required on a new entry and may not be later than now, give or
+take ten minutes for a phone whose clock runs fast. Entries made before the
+time was asked for have none, and can still be corrected without inventing
+one; a time once given cannot be cleared.
+
 ## Mileage
 
 The one number here nobody can check by eye, so it is computed rather than

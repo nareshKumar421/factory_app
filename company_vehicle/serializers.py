@@ -7,7 +7,7 @@ accept what a pump slip actually shows and to work the rest out itself.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from django.utils import timezone
@@ -41,6 +41,37 @@ def _user_name(user):
     if not user:
         return None
     return getattr(user, "full_name", None) or user.get_username()
+
+
+#: How far past the server's clock an entry's time may run before it counts as
+#: the future. The form fills in the phone's own time, and a phone's clock
+#: drifts a few minutes either way.
+CLOCK_SLACK = timedelta(minutes=10)
+
+
+def _check_time(instance, attrs, date_field: str, time_field: str, missing: str, future: str):
+    """The time that goes with an entry's date.
+
+    Asked for on every new entry, and never later than now. An entry saved
+    before the time was asked for can still be corrected without one -- nobody
+    remembers when last month's filling was -- but a time once given is never
+    taken away. The same rule as the bill photo on a filling.
+    """
+
+    def value(name):
+        if name in attrs:
+            return attrs[name]
+        return getattr(instance, name, None) if instance else None
+
+    at = value(time_field)
+    if at is None:
+        if instance is None or getattr(instance, time_field) is not None:
+            raise serializers.ValidationError({time_field: missing})
+        return
+    on = value(date_field)
+    latest = timezone.localtime() + CLOCK_SLACK
+    if on and datetime.combine(on, at) > latest.replace(tzinfo=None):
+        raise serializers.ValidationError({time_field: future})
 
 
 class ApprovalActionSerializer(serializers.Serializer):
@@ -329,6 +360,7 @@ class DailyReadingSerializer(serializers.ModelSerializer):
             "vehicle_number",
             "vehicle_nickname",
             "reading_date",
+            "reading_time",
             "odometer",
             "remarks",
             "entered_by_name",
@@ -351,6 +383,15 @@ class DailyReadingSerializer(serializers.ModelSerializer):
         replaced and do break, so this is a question rather than a wall --
         answer it in the remarks and it saves.
         """
+        _check_time(
+            self.instance,
+            attrs,
+            "reading_date",
+            "reading_time",
+            missing="What time was the meter read?",
+            future="A reading cannot be timed in the future.",
+        )
+
         vehicle = attrs.get("vehicle") or getattr(self.instance, "vehicle", None)
         on = attrs.get("reading_date") or getattr(self.instance, "reading_date", None)
         odometer = attrs.get("odometer", getattr(self.instance, "odometer", None))
@@ -396,6 +437,7 @@ class FuelEntrySerializer(serializers.ModelSerializer):
             "vehicle_number",
             "vehicle_nickname",
             "entry_date",
+            "entry_time",
             "fuel_type",
             "fuel_type_label",
             "unit",
@@ -455,6 +497,7 @@ class FuelEntryWriteSerializer(serializers.ModelSerializer):
         fields = [
             "vehicle",
             "entry_date",
+            "entry_time",
             "fuel_type",
             "odometer",
             "quantity",
@@ -526,6 +569,16 @@ class FuelEntryWriteSerializer(serializers.ModelSerializer):
         if (attrs.get("amount") or amount) <= 0:
             raise serializers.ValidationError({"amount": "Amount must be more than zero."})
 
+        # --- when -----------------------------------------------------------
+        _check_time(
+            self.instance,
+            attrs,
+            "entry_date",
+            "entry_time",
+            missing="What time was it filled?",
+            future="A filling cannot be timed in the future.",
+        )
+
         # --- who filled it, and the slip -----------------------------------
         if not (self._field(attrs, "filled_by") or "").strip():
             raise serializers.ValidationError({"filled_by": "Who filled it? Enter the driver's name."})
@@ -591,6 +644,7 @@ class ServiceEntrySerializer(ApprovalFieldsMixin, serializers.ModelSerializer):
             "vehicle_number",
             "vehicle_nickname",
             "entry_date",
+            "entry_time",
             "odometer",
             "kind",
             "kind_label",
@@ -644,6 +698,7 @@ class ServiceEntryWriteSerializer(serializers.ModelSerializer):
         fields = [
             "vehicle",
             "entry_date",
+            "entry_time",
             "odometer",
             "kind",
             "workshop_name",
@@ -675,6 +730,14 @@ class ServiceEntryWriteSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
+        _check_time(
+            self.instance,
+            attrs,
+            "entry_date",
+            "entry_time",
+            missing="What time was the work done?",
+            future="A service cannot be timed in the future.",
+        )
         parts = self._field(attrs, "parts_amount") or Decimal("0")
         labour = self._field(attrs, "labour_amount") or Decimal("0")
         total = self._field(attrs, "total_amount")

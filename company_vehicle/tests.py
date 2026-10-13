@@ -6,19 +6,22 @@ one until somebody acts on it.
 """
 
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
+from django.utils import timezone
 
 from .constants import ApprovalStatus, FuelType, VehicleCategory, VehicleStatus
 from .models import DailyReading, FleetVehicle, FuelEntry, ServiceEntry, VehicleDocument
 from .serializers import (
     DailyReadingSerializer,
     FuelEntryWriteSerializer,
+    ServiceEntryWriteSerializer,
     VehicleDocumentSerializer,
 )
 from .services import (
@@ -137,6 +140,7 @@ class FuelFormTests(TestCase):
         data = {
             "vehicle": self.vehicle.id,
             "entry_date": TODAY.isoformat(),
+            "entry_time": "09:30",
             "odometer": 10_500,
             "quantity": "50",
             "amount": "4500",
@@ -231,6 +235,104 @@ class FuelFormTests(TestCase):
         form = FuelEntryWriteSerializer(entry, data={"bill_photo": None}, partial=True)
         self.assertFalse(form.is_valid())
         self.assertIn("bill_photo", form.errors)
+
+    def test_a_new_filling_needs_the_time(self):
+        data = self.payload()
+        del data["entry_time"]
+        form = FuelEntryWriteSerializer(data=data)
+        self.assertFalse(form.is_valid())
+        self.assertIn("entry_time", form.errors)
+
+    def test_the_time_is_kept(self):
+        form = FuelEntryWriteSerializer(data=self.payload(entry_time="17:45"))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.validated_data["entry_time"], time(17, 45))
+
+    def test_an_old_filling_without_a_time_can_still_be_corrected(self):
+        entry = fill(self.vehicle, TODAY, 10_400, 50)
+        entry.filled_by = "Gurpreet"
+        entry.save(update_fields=["filled_by"])
+        form = FuelEntryWriteSerializer(entry, data={"odometer": 10_450}, partial=True)
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_a_given_time_cannot_be_taken_away(self):
+        entry = fill(self.vehicle, TODAY, 10_400, 50)
+        entry.filled_by = "Gurpreet"
+        entry.entry_time = time(9, 30)
+        entry.save(update_fields=["filled_by", "entry_time"])
+        form = FuelEntryWriteSerializer(entry, data={"entry_time": None}, partial=True)
+        self.assertFalse(form.is_valid())
+        self.assertIn("entry_time", form.errors)
+
+
+class EntryTimeTests(TestCase):
+    """A time later today than now is the future, like a date after today.
+
+    The clock is pinned so "now" is 14:00 on TODAY, in the server's zone.
+    """
+
+    NOW = datetime(2026, 9, 1, 14, 0)
+
+    def setUp(self):
+        self.vehicle = make_vehicle(opening_odometer=10_000)
+        patcher = mock.patch(
+            "company_vehicle.serializers.timezone.localtime",
+            return_value=timezone.make_aware(self.NOW),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fuel(self, at):
+        return FuelEntryWriteSerializer(
+            data={
+                "vehicle": self.vehicle.id,
+                "entry_date": TODAY.isoformat(),
+                "entry_time": at,
+                "odometer": 10_500,
+                "quantity": "50",
+                "amount": "4500",
+                "filled_by": "Gurpreet",
+                "bill_photo": SimpleUploadedFile("slip.jpg", b"jpeg", content_type="image/jpeg"),
+            }
+        )
+
+    def test_a_filling_later_today_is_refused(self):
+        form = self.fuel("21:00")
+        self.assertFalse(form.is_valid())
+        self.assertIn("entry_time", form.errors)
+
+    def test_a_phone_clock_a_few_minutes_fast_is_let_through(self):
+        form = self.fuel("14:05")
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_any_time_on_an_earlier_day_is_fine(self):
+        form = self.fuel("23:59")
+        form.initial_data["entry_date"] = (TODAY - timedelta(days=1)).isoformat()
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_a_reading_later_today_is_refused(self):
+        form = DailyReadingSerializer(
+            data={
+                "vehicle": self.vehicle.id,
+                "reading_date": TODAY.isoformat(),
+                "reading_time": "21:00",
+                "odometer": 10_000,
+            }
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("reading_time", form.errors)
+
+    def test_a_service_later_today_is_refused(self):
+        form = ServiceEntryWriteSerializer(
+            data={
+                "vehicle": self.vehicle.id,
+                "entry_date": TODAY.isoformat(),
+                "entry_time": "21:00",
+                "total_amount": "1500",
+            }
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("entry_time", form.errors)
 
 
 class SpendTests(TestCase):
@@ -504,6 +606,7 @@ class DailyReadingTests(TestCase):
             data={
                 "vehicle": self.vehicle.id,
                 "reading_date": (TODAY + timedelta(days=1)).isoformat(),
+                "reading_time": "08:15",
                 "odometer": 900,
             }
         )
@@ -514,10 +617,24 @@ class DailyReadingTests(TestCase):
             data={
                 "vehicle": self.vehicle.id,
                 "reading_date": (TODAY + timedelta(days=1)).isoformat(),
+                "reading_time": "08:15",
                 "odometer": 900,
                 "remarks": "Meter replaced",
             }
         )
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_a_reading_needs_the_time(self):
+        form = DailyReadingSerializer(
+            data={"vehicle": self.vehicle.id, "reading_date": TODAY.isoformat(), "odometer": 10_000}
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("reading_time", form.errors)
+
+    def test_re_entering_an_old_day_without_a_time_still_saves(self):
+        # The upsert lands on a reading logged before the time was asked for.
+        existing = read(self.vehicle, TODAY, 10_000)
+        form = DailyReadingSerializer(existing, data={"odometer": 10_020}, partial=True)
         self.assertTrue(form.is_valid(), form.errors)
 
     def test_a_reading_cannot_be_dated_in_the_future(self):
@@ -525,6 +642,7 @@ class DailyReadingTests(TestCase):
             data={
                 "vehicle": self.vehicle.id,
                 "reading_date": date(2099, 1, 1).isoformat(),
+                "reading_time": "08:15",
                 "odometer": 10_000,
             }
         )
