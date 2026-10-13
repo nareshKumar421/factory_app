@@ -83,6 +83,11 @@ from .views import (
     SAPStockTransferDetailView,
     SAPStockTransferListView,
 )
+from .views_cash_sale_out import (
+    CashSaleGateOutCancelView,
+    CashSaleGateOutListCreateView,
+    CashSaleGateOutPendingBillsView,
+)
 from .views_sales_dispatch import (
     SalesDispatchAttachmentDetailView,
     SalesDispatchAttachmentListCreateView,
@@ -186,6 +191,10 @@ urlpatterns = [
     path('bst-outs/<int:entry_id>/', BSTGateOutDetailView.as_view(), name='bst_gate_out_detail'),
 
     # Docking / sales dispatch gate-out URLs
+    # Cash sale out: counter bills leaving with the buyer, no docking
+    path('sales-dispatch/cash-sales/', CashSaleGateOutListCreateView.as_view(), name='cash_sale_gate_out_list_create'),
+    path('sales-dispatch/cash-sales/pending-bills/', CashSaleGateOutPendingBillsView.as_view(), name='cash_sale_gate_out_pending_bills'),
+    path('sales-dispatch/cash-sales/<int:entry_id>/cancel/', CashSaleGateOutCancelView.as_view(), name='cash_sale_gate_out_cancel'),
     path('sales-dispatch/documents/', SalesDispatchDocumentListView.as_view(), name='sales_dispatch_documents'),
     path('sales-dispatch/documents/<str:document_type>/<int:doc_entry>/', SalesDispatchDocumentDetailView.as_view(), name='sales_dispatch_document_detail'),
     path('sales-dispatch/lock/', SalesDispatchLockView.as_view(), name='sales_dispatch_lock'),

@@ -363,6 +363,7 @@ class SAPClient:
         date_to: str | None = None,
         search: str | None = None,
         limit: int = 500,
+        doc_entries: list[int] | None = None,
     ) -> list[dict]:
         """Posted A/R invoices of the counter/cash-sale customers, with lines."""
         reader = HanaARInvoiceReader(self.context)
@@ -372,6 +373,7 @@ class SAPClient:
             date_to=date_to,
             search=search,
             limit=limit,
+            doc_entries=list(doc_entries or []),
         )
 
     def ar_cash_sale_state(

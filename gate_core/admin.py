@@ -4,6 +4,8 @@ from .models import (
     BSTGateOut,
     BSTGateOutItem,
     BSTGateReturn,
+    CashSaleGateOut,
+    CashSaleGateOutBill,
     EmptyVehicleGateIn,
     EmptyVehicleGateOut,
     JobWorkGateIn,
@@ -92,6 +94,30 @@ class SalesDispatchGatepassPrintLogInline(admin.TabularInline):
 
     def has_add_permission(self, request, obj=None):
         return False
+
+
+class CashSaleGateOutBillInline(admin.TabularInline):
+    model = CashSaleGateOutBill
+    extra = 0
+    readonly_fields = (
+        "sap_doc_entry", "sap_doc_num", "doc_date", "customer_name",
+        "customer_ref", "doc_total", "item_summary", "is_active",
+    )
+    exclude = ("company", "customer_code", "total_quantity")
+
+
+@admin.register(CashSaleGateOut)
+class CashSaleGateOutAdmin(admin.ModelAdmin):
+    list_display = (
+        "entry_no", "company", "taken_by_name", "vehicle_no", "out_at", "status",
+    )
+    list_filter = ("company", "status", "out_at")
+    search_fields = (
+        "entry_no", "taken_by_name", "taken_by_mobile", "vehicle_no",
+        "bills__sap_doc_num",
+    )
+    readonly_fields = ("entry_no", "created_at", "updated_at")
+    inlines = [CashSaleGateOutBillInline]
 
 
 @admin.register(SalesDispatchGateOut)

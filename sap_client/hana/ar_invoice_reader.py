@@ -360,6 +360,7 @@ class HanaARInvoiceReader:
         date_to: Optional[str] = None,
         search: Optional[str] = None,
         limit: int = 500,
+        doc_entries: Optional[list[int]] = None,
     ) -> list[dict]:
         """The counter/cash-sale book as SAP holds it, newest first, with lines.
 
@@ -370,6 +371,10 @@ class HanaARInvoiceReader:
 
         Cancelled invoices are included and flagged — a voided cash sale is part
         of the counter's day, and hiding it reads as a bill that never existed.
+
+        ``doc_entries`` narrows the book to those bills, for a caller that already
+        knows which it wants (the gate marking a picked bill out); the cash-sale
+        test still applies, so an ordinary customer's invoice never comes back.
         """
         safe_limit = max(1, min(int(limit or 500), 1000))
         codes = [str(c).strip() for c in (card_codes or []) if str(c).strip()]
@@ -385,6 +390,10 @@ class HanaARInvoiceReader:
             # selects which customers to show, not any billed value.
             where.append("""UPPER(IFNULL(C."CardName", '')) LIKE ?""")
             params.append(self.CASH_SALE_NAME_PATTERN)
+        if doc_entries:
+            entries = [int(e) for e in doc_entries]
+            where.append(f"""H."DocEntry" IN ({", ".join(["?"] * len(entries))})""")
+            params.extend(entries)
         if date_from:
             where.append("""H."DocDate" >= TO_DATE(?, 'YYYY-MM-DD')""")
             params.append(str(date_from))

@@ -30,6 +30,11 @@ from .dispatch_tracking import (
     TruckDispatchUpdate,
 )
 from .bst_gate_out import BSTGateOut, BSTGateOutItem
+from .cash_sale_gate_out import (
+    CashSaleGateOut,
+    CashSaleGateOutBill,
+    CashSaleGateOutStatus,
+)
 from .bst_gate_in import BSTGateIn, BSTGateInItem
 from .bst_gate_return import BSTGateReturn
 from .job_work_gate_in import JobWorkGateIn, JobWorkGateInItem
