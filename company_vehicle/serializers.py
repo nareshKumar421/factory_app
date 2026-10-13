@@ -435,7 +435,8 @@ class FuelEntrySerializer(serializers.ModelSerializer):
 class FuelEntryWriteSerializer(serializers.ModelSerializer):
     """Record one filling.
 
-    Three conveniences, all of them because of what a pump slip looks like:
+    Who filled it and a photo of the slip are always asked for. Beyond that,
+    three conveniences, all of them because of what a pump slip looks like:
 
     * **Any two of quantity, rate and amount.** The slip prints the amount and
       the litres; the rate is arithmetic, so it is not asked for.
@@ -524,6 +525,17 @@ class FuelEntryWriteSerializer(serializers.ModelSerializer):
             attrs["rate"] = (amount / quantity).quantize(TWO_PLACES)
         if (attrs.get("amount") or amount) <= 0:
             raise serializers.ValidationError({"amount": "Amount must be more than zero."})
+
+        # --- who filled it, and the slip -----------------------------------
+        if not (self._field(attrs, "filled_by") or "").strip():
+            raise serializers.ValidationError({"filled_by": "Who filled it? Enter the driver's name."})
+        # Every new filling brings its slip. Fillings saved before the photo
+        # was asked for can still be corrected without one, but a photo once
+        # attached is never taken away.
+        if not self._field(attrs, "bill_photo") and (
+            self.instance is None or self.instance.bill_photo
+        ):
+            raise serializers.ValidationError({"bill_photo": "Attach a photo of the bill."})
 
         # --- the meter -----------------------------------------------------
         odometer = self._field(attrs, "odometer")

@@ -249,8 +249,9 @@ class FuelEntry(BaseModel):
     """One filling at a pump.
 
     The screen a driver or clerk uses every day, so it asks for as little as it
-    can: vehicle, date, meter reading, quantity and amount. Rate is derived
-    when it is left out, because a pump slip prints the amount and the litres.
+    can: vehicle, date, meter reading, quantity and amount, plus who filled it
+    and a photo of the slip. Rate is derived when it is left out, because a
+    pump slip prints the amount and the litres.
 
     No approval, unlike :class:`ServiceEntry`: a filling counts as spend the
     moment it is recorded. ``created_by`` says who entered it, which is the

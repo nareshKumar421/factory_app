@@ -11,6 +11,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 
 from .constants import ApprovalStatus, FuelType, VehicleCategory, VehicleStatus
@@ -139,6 +140,8 @@ class FuelFormTests(TestCase):
             "odometer": 10_500,
             "quantity": "50",
             "amount": "4500",
+            "filled_by": "Gurpreet",
+            "bill_photo": SimpleUploadedFile("slip.jpg", b"jpeg", content_type="image/jpeg"),
         }
         data.update(overrides)
         return data
@@ -192,6 +195,42 @@ class FuelFormTests(TestCase):
         form = FuelEntryWriteSerializer(data=self.payload(entry_date=date(2099, 1, 1).isoformat()))
         self.assertFalse(form.is_valid())
         self.assertIn("entry_date", form.errors)
+
+    def test_who_filled_it_is_asked_for(self):
+        for blank in (None, "", "   "):
+            data = self.payload(filled_by=blank)
+            if blank is None:
+                del data["filled_by"]
+            form = FuelEntryWriteSerializer(data=data)
+            self.assertFalse(form.is_valid())
+            self.assertIn("filled_by", form.errors)
+
+    def test_a_new_filling_needs_the_bill_photo(self):
+        data = self.payload()
+        del data["bill_photo"]
+        form = FuelEntryWriteSerializer(data=data)
+        self.assertFalse(form.is_valid())
+        self.assertIn("bill_photo", form.errors)
+
+    def test_an_old_filling_without_a_photo_can_still_be_corrected(self):
+        entry = fill(self.vehicle, TODAY, 10_400, 50)
+        entry.filled_by = "Gurpreet"
+        entry.save(update_fields=["filled_by"])
+        form = FuelEntryWriteSerializer(entry, data={"odometer": 10_450}, partial=True)
+        self.assertTrue(form.is_valid(), form.errors)
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_an_attached_photo_cannot_be_taken_away(self):
+        entry = fill(self.vehicle, TODAY, 10_400, 50)
+        entry.filled_by = "Gurpreet"
+        entry.bill_photo.save("slip.jpg", ContentFile(b"jpeg"), save=True)
+
+        form = FuelEntryWriteSerializer(entry, data={"odometer": 10_450}, partial=True)
+        self.assertTrue(form.is_valid(), form.errors)
+
+        form = FuelEntryWriteSerializer(entry, data={"bill_photo": None}, partial=True)
+        self.assertFalse(form.is_valid())
+        self.assertIn("bill_photo", form.errors)
 
 
 class SpendTests(TestCase):
