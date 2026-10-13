@@ -1487,6 +1487,94 @@ class FillingCostSheetEntry(models.Model):
         return filling_cost_per_case(self.amount, self.sheet.cases)
 
 
+class ScrapKind(models.Model):
+    """One kind of scrap the factory sells — 'Preform 10.5 GM' — and the SAP
+    items it is made of.
+
+    The factory's scrap table, row by row. The filling cost sheet's Scrap
+    Recurring is each kind's kilos of the day's wastage at its latest price a
+    kg (``ScrapPrice``). Wastage counted in pieces needs the grams a piece to
+    become kilos; wastage in grams or kilos does not.
+    """
+    company = models.ForeignKey(
+        'company.Company', on_delete=models.PROTECT, related_name='scrap_kinds'
+    )
+    name = models.CharField(max_length=100)
+    items = models.JSONField(
+        default=list, blank=True,
+        help_text="The SAP items this scrap is: [{'code': 'PM0000659', "
+                  "'name': 'PREFORM 10/10.5 GMS'}]. An item belongs to one kind."
+    )
+    grams_per_piece = models.DecimalField(
+        max_digits=10, decimal_places=3, null=True, blank=True,
+        help_text="Weight of one piece, for wastage counted in pieces."
+    )
+    pieces_per_box = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="As the factory's scrap table has it. Shown, not used in the figure."
+    )
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='scrap_kinds_created'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+        verbose_name = 'Scrap Kind'
+        verbose_name_plural = 'Scrap Kinds'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'name'], condition=models.Q(is_active=True),
+                name='uniq_active_scrap_kind_name',
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def item_codes(self):
+        return [item['code'] for item in self.items or [] if item.get('code')]
+
+    def price_on(self, day):
+        """The price a kg in force on ``day``: the newest from then or before,
+        else the first ever entered. ``None`` while it has none."""
+        prices = sorted(self.prices.all(), key=lambda p: p.effective_from)
+        if not prices:
+            return None
+        before = [p for p in prices if p.effective_from <= day]
+        return before[-1] if before else prices[0]
+
+
+class ScrapPrice(models.Model):
+    """What a kg of one kind of scrap fetches, from a date on.
+
+    A new price is a new row; the sheet takes the newest one on or before its
+    day, so a day already gone keeps the price it had.
+    """
+    kind = models.ForeignKey(ScrapKind, on_delete=models.CASCADE, related_name='prices')
+    price_per_kg = models.DecimalField(max_digits=10, decimal_places=2)
+    effective_from = models.DateField()
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='scrap_prices_created'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['kind', '-effective_from']
+        unique_together = ('kind', 'effective_from')
+        verbose_name = 'Scrap Price'
+        verbose_name_plural = 'Scrap Prices'
+
+    def __str__(self):
+        return f"{self.kind} — ₹{self.price_per_kg}/kg from {self.effective_from}"
+
+
 # ---------------------------------------------------------------------------
 # QC Check Models
 # ---------------------------------------------------------------------------

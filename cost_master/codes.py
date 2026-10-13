@@ -86,9 +86,20 @@ FILLING_COST_TYPES = {
                     'Rs. 0.2 per 15 litres.'),
     'Lab': ('beverage-lab', 'Beverage — Lab', 'PER_MONTH', ''),
     'Miscellaneous': ('beverage-miscellaneous', 'Beverage — Miscellaneous', 'PER_MONTH', ''),
-    # A credit: waste sold as scrap comes off the sheet's total.
-    'Scrap Recovering': ('beverage-scrap-recovery', 'Beverage — Scrap Recovery', 'PER_KG',
-                         'Credit: rupees per kg of logged waste sold as scrap.'),
+    # The fixed bills the factory spreads over the month's working days.
+    'Ground Water Extraction': ('beverage-ground-water', 'Beverage — Ground Water Extraction',
+                                'PER_MONTH', 'The ground water extraction bill.'),
+    'AMC': ('beverage-amc', 'Beverage — AMC', 'PER_MONTH',
+            'Annual maintenance contracts, by the month.'),
+    'Servicing Cost': ('beverage-servicing', 'Beverage — Servicing Cost', 'PER_MONTH', ''),
 }
-# Older sheets name a head differently; a new day renames the carried-over row.
-FILLING_COST_HEAD_ALIASES = {'Fixed Manpower': ('Salary',)}
+# Older sheets name a head differently; a new day renames the carried-over row,
+# and the board adds the old name into the new. The fixed bills were typed with
+# their sums in the name before the Cost Master held them.
+FILLING_COST_HEAD_ALIASES = {
+    'Fixed Manpower': ('Salary',),
+    'Ground Water Extraction': ('Ground Water Extraction Bill',),
+    'AMC': ('AMC - Rs. 21510/26',),
+    'Servicing Cost': ('Servicing Cost - Rs. 74353/26',),
+    'Scrap Recurring': ('Scrap Recovering',),
+}

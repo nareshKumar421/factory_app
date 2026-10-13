@@ -108,6 +108,15 @@ class FillingCostBoardTests(APITestCase):
         # Lab was only spent on the 26th, which had no runs to count bottles from.
         self.assertIsNone(heads['Lab']['per_bottle'])
 
+    def test_bills_typed_with_their_sums_add_into_todays_names(self):
+        self._sheet('2026-09-24', '', '100', [('AMC - Rs. 21510/26', '827'),
+                                              ('Scrap Recovering', '-50')])
+        self._sheet('2026-09-25', '', '100', [('AMC', '827.31'), ('Scrap Recurring', '-100')])
+        heads = {h['head']: h for h in self._board()['heads']}
+        self.assertEqual(heads['AMC']['amount'], '1654.31')
+        self.assertEqual(heads['Scrap Recurring']['amount'], '-150.00')
+        self.assertNotIn('AMC - Rs. 21510/26', heads)
+
     def test_the_month_before_is_there_to_compare(self):
         self.assertEqual(self._board()['previous'],
                          {'month': '2026-08', 'per_case': '2.50', 'days_entered': 1})

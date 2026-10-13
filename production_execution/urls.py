@@ -74,7 +74,7 @@ from .views import (
     LineSkuConfigAutoFillAPI,
     # Filling Cost Sheet
     FillingCostSheetListCreateAPI, FillingCostSheetDetailAPI,
-    FillingCostDefaultsAPI, FillingCostBoardAPI,
+    FillingCostDefaultsAPI, FillingCostBoardAPI, ScrapKindListCreateAPI, ScrapKindDetailAPI,
     # Cost Master
 )
 from .views_settings import ProductionSettingsAPI
@@ -323,6 +323,10 @@ urlpatterns = [
     path('filling-costs/', FillingCostSheetListCreateAPI.as_view(), name='pe-filling-cost-list-create'),
     path('filling-costs/<int:sheet_id>/', FillingCostSheetDetailAPI.as_view(), name='pe-filling-cost-detail'),
     path('filling-costs/defaults/', FillingCostDefaultsAPI.as_view(), name='pe-filling-cost-defaults'),
+    path('filling-costs/scrap-rates/', ScrapKindListCreateAPI.as_view(),
+         name='pe-scrap-rate-list-create'),
+    path('filling-costs/scrap-rates/<int:kind_id>/', ScrapKindDetailAPI.as_view(),
+         name='pe-scrap-rate-detail'),
     path('filling-costs/board/', FillingCostBoardAPI.as_view(), name='pe-filling-cost-board'),
 
     # ------------------------------------------------------------------

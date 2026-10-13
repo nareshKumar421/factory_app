@@ -6,7 +6,7 @@ from .models import (
     ProductionMaterialUsage, MachineRuntime, ProductionManpower,
     LineClearance, LineClearanceItem,
     MachineChecklistEntry, WasteLog,
-    FillingCostSheet, FillingCostSheetEntry,
+    FillingCostSheet, FillingCostSheetEntry, ScrapKind, ScrapPrice,
     ProductionSettings,
 )
 
@@ -212,6 +212,20 @@ class FillingCostSheetAdmin(admin.ModelAdmin):
     list_filter = ['company', 'line']
     date_hierarchy = 'date'
     inlines = [FillingCostSheetEntryInline]
+
+
+class ScrapPriceInline(admin.TabularInline):
+    model = ScrapPrice
+    extra = 0
+    fields = ['effective_from', 'price_per_kg', 'created_by']
+    readonly_fields = ['created_by']
+
+
+@admin.register(ScrapKind)
+class ScrapKindAdmin(admin.ModelAdmin):
+    list_display = ['id', 'name', 'company', 'grams_per_piece', 'pieces_per_box', 'is_active']
+    list_filter = ['company', 'is_active']
+    inlines = [ScrapPriceInline]
 
 
 @admin.register(ProductionSettings)

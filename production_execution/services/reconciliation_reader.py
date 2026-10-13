@@ -54,6 +54,62 @@ class ReconciliationReader:
     def wastage_by_item(self, warehouse, date_from, date_to) -> List[Dict[str, Any]]:
         return self._by_item(date_from, date_to, WASTE_TRANS_TYPES, "in", warehouse)
 
+    # Wastage transfers, document by document --------------------------
+    def wastage_transfers(
+        self, date_from, date_to, to_warehouse, from_warehouse
+    ) -> List[Dict[str, Any]]:
+        """Each stock transfer from ``from_warehouse`` into the wastage
+        warehouse posted in the window, with what it moved, item by item.
+
+        ``value`` is what SAP's books moved (``OINM.TransValue``), not the
+        transfer line's own total: a line can carry a price where the stock
+        moved at nothing. The remarks travel with it because that is where
+        the store writes the production day and shift the waste belongs to —
+        SAP's own date is only when the transfer was posted.
+        """
+        schema = self.connection.schema
+        query = f"""
+SELECT
+    H."DocEntry",
+    H."DocNum",
+    H."DocDate",
+    COALESCE(H."Comments", '') AS "Remarks",
+    O."ItemCode",
+    COALESCE(I."ItemName", '') AS "ItemName",
+    COALESCE(I."InvntryUom", '') AS "Uom",
+    ROUND(SUM(O."InQty"), 3) AS "Qty",
+    ROUND(SUM(O."TransValue"), 2) AS "Value"
+FROM "{schema}"."OWTR" H
+JOIN "{schema}"."OINM" O
+    ON O."TransType" = 67 AND O."CreatedBy" = H."DocEntry"
+   AND O."Warehouse" = ? AND O."InQty" > 0
+LEFT JOIN "{schema}"."OITM" I
+    ON I."ItemCode" = O."ItemCode"
+WHERE H."DocDate" >= ? AND H."DocDate" <= ?
+  AND H."Filler" = ?
+  AND H."CANCELED" = 'N'
+GROUP BY H."DocEntry", H."DocNum", H."DocDate", H."Comments",
+         O."ItemCode", I."ItemName", I."InvntryUom"
+ORDER BY H."DocDate", H."DocNum", O."ItemCode"
+"""
+        docs: Dict[int, Dict[str, Any]] = {}
+        for row in self._execute(query, [to_warehouse, date_from, date_to, from_warehouse]):
+            doc = docs.setdefault(row[0], {
+                "doc_entry": row[0],
+                "doc_num": row[1],
+                "doc_date": row[2].date() if hasattr(row[2], "date") else row[2],
+                "remarks": (row[3] or "").strip(),
+                "lines": [],
+            })
+            doc["lines"].append({
+                "item_code": row[4] or "",
+                "item_name": row[5] or "",
+                "uom": (row[6] or "").strip(),
+                "qty": row[7] or 0,
+                "value": row[8] or 0,
+            })
+        return list(docs.values())
+
     # Litres per piece, from the item master ---------------------------
     def litre_items(self) -> List[Dict[str, Any]]:
         """Every item SAP holds a volume for: ``{item_code, item_name, litres}``.

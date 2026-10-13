@@ -3,6 +3,7 @@ from collections import defaultdict, deque
 
 from django.db import IntegrityError, transaction
 from django.db.models import Prefetch, Q, Sum
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 
 from rest_framework.views import APIView
@@ -22,7 +23,7 @@ from .models import (
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, InProcessQCCheck, FinalQCCheck,
-    FillingCostSheet, FillingCostSheetEntry, FillingCostShift,
+    FillingCostSheet, FillingCostSheetEntry, FillingCostShift, ScrapKind, ScrapPrice,
 )
 from .serializers import (
     # Master Data
@@ -74,7 +75,7 @@ from .serializers import (
     ProductionMovementReportSerializer,
     # Filling Cost Sheet
     FillingCostSheetSerializer, FillingCostSheetWriteSerializer,
-    FillingCostSheetUpdateSerializer,
+    FillingCostSheetUpdateSerializer, ScrapKindSerializer, ScrapKindWriteSerializer,
 )
 from .permissions import (
     CanManageProductionLines, CanManageMachines, CanManageChecklistTemplates,
@@ -2827,3 +2828,112 @@ class FillingCostDefaultsAPI(APIView):
             return Response({'detail': 'shift must be DAY or NIGHT.'},
                             status=status.HTTP_400_BAD_REQUEST)
         return Response(filling_cost.defaults(company, day, shift, line))
+
+
+def _scrap_kinds(request):
+    return (ScrapKind.objects.filter(company=request.company.company, is_active=True)
+            .prefetch_related('prices'))
+
+
+def _scrap_items_taken(company, items, kind=None):
+    """Refuse an item another kind already counts: it would be sold twice."""
+    codes = {item['code'] for item in items}
+    others = ScrapKind.objects.filter(company=company, is_active=True)
+    if kind is not None:
+        others = others.exclude(pk=kind.pk)
+    for other in others:
+        taken = codes & set(other.item_codes)
+        if taken:
+            return f"{', '.join(sorted(taken))} already counts as {other.name}."
+    return None
+
+
+def _save_scrap_kind(request, data, kind=None):
+    """Create or change a kind, and its price if one was sent."""
+    company = request.company.company
+    if 'items' in data:
+        error = _scrap_items_taken(company, data['items'], kind)
+        if error:
+            return None, error
+    try:
+        with transaction.atomic():
+            if kind is None:
+                kind = ScrapKind(company=company, created_by=request.user,
+                                 sort_order=(_scrap_kinds(request).count()))
+            for field in ('name', 'items', 'grams_per_piece', 'pieces_per_box'):
+                if field in data:
+                    setattr(kind, field, data[field])
+            kind.save()
+            if 'price_per_kg' in data:
+                ScrapPrice.objects.update_or_create(
+                    kind=kind,
+                    effective_from=data.get('effective_from') or timezone.localdate(),
+                    defaults={'price_per_kg': data['price_per_kg'],
+                              'created_by': request.user})
+    except IntegrityError:
+        return None, f"There is already a scrap called {data['name']}."
+    return kind, None
+
+
+class ScrapKindListCreateAPI(APIView):
+    """``GET [?date=YYYY-MM-DD]`` the scrap rates — each kind at its price on
+    ``date`` (today unless given) — or ``POST`` a new kind."""
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                    CanViewFillingCost()]
+        return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                CanManageFillingCost()]
+
+    def get(self, request):
+        day = timezone.localdate()
+        if request.GET.get('date'):
+            day = parse_date(request.GET['date'])
+            if day is None:
+                return Response({'detail': 'date must be a date (YYYY-MM-DD).'},
+                                status=status.HTTP_400_BAD_REQUEST)
+        return Response(ScrapKindSerializer(
+            _scrap_kinds(request), many=True, context={'day': day}).data)
+
+    def post(self, request):
+        serializer = ScrapKindWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({'detail': 'Invalid data.', 'errors': serializer.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+        kind, error = _save_scrap_kind(request, serializer.validated_data)
+        if error:
+            return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+        kind = _scrap_kinds(request).get(pk=kind.pk)
+        return Response(ScrapKindSerializer(kind, context={'day': timezone.localdate()}).data,
+                        status=status.HTTP_201_CREATED)
+
+
+class ScrapKindDetailAPI(APIView):
+    """``PATCH`` a kind of scrap — its items, weight, or a new price — or
+    ``DELETE`` it from the rates. A deleted kind keeps its prices on record."""
+
+    def get_permissions(self):
+        return [IsAuthenticated(), HasCompanyContext(), InFillingCostCompany(),
+                CanManageFillingCost()]
+
+    def patch(self, request, kind_id):
+        kind = _scrap_kinds(request).filter(pk=kind_id).first()
+        if kind is None:
+            return Response({'detail': 'Scrap not found.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ScrapKindWriteSerializer(data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response({'detail': 'Invalid data.', 'errors': serializer.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+        kind, error = _save_scrap_kind(request, serializer.validated_data, kind)
+        if error:
+            return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+        kind = _scrap_kinds(request).get(pk=kind.pk)
+        return Response(ScrapKindSerializer(kind, context={'day': timezone.localdate()}).data)
+
+    def delete(self, request, kind_id):
+        updated = _scrap_kinds(request).filter(pk=kind_id).update(is_active=False)
+        if not updated:
+            return Response({'detail': 'Scrap not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+

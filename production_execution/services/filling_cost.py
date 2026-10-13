@@ -13,12 +13,28 @@ Electricity               Beverages' Electricity++ cost for the day, less
                           its share of the day's cases where the meter was
                           read only once
 Fixed Manpower,           the Cost Master's monthly rate over 26 working days,
-Maintenance, Lab, Misc    by the shift's share of the day's running hours
+Maintenance, Lab, Misc,   by the shift's share of the day's running hours
+Ground Water Extraction,
+AMC, Servicing Cost
 Batch Coding              bottles (cases x bottles per case) x rate a bottle
 Lubrication               litres (bottles x litres a bottle) x rate a litre
-Wastage                   waste logged on the runs x the material's SAP price
-Scrap Recovering          minus the kg of waste logged x the scrap rate a kg
+Wastage                   what SAP's books moved into BH-WST for the day: the
+                          store's stock transfers from BH-PP, matched to the
+                          day and shift by their remarks; until the store has
+                          posted them, the waste logged on the runs x the
+                          material's SAP price
+Scrap Recurring           minus the same wastage in kilos x each kind of
+                          scrap's latest price a kg (``ScrapKind``)
 ========================  ==================================================
+
+**Wastage in SAP.** The floor's waste is moved in SAP from the production
+floor (BH-PP) into the wastage warehouse (BH-WST), one transfer per line and
+shift, posted days later. SAP's own date is therefore the posting, not the
+production: the store writes the day and shift in the remarks — "wasatge
+28-09-2026 Day" — and that is what a transfer is matched on. A transfer whose
+remarks name no shift is the whole day's. A shift's sheet takes its shift's
+transfers and its share of the day's cases of an untagged one; a line's sheet
+takes its share of the cases, as SAP does not say which line a transfer is.
 
 **Which shift.** Day is 07:00-19:00 and Night 19:00-07:00, a night belonging
 to the date it starts (as ``labour_count``'s shifts are). A run's cases go to
@@ -37,9 +53,10 @@ sheets add up with every other line's to one day.
 Nothing here is saved: the page shows these as a new sheet's starting values,
 and what is saved is what the person entering it confirms.
 """
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Dict, List, Optional
 
@@ -55,7 +72,7 @@ from maintenance.electricity.run_hours import MAX_SEGMENT_HOURS, capped, merge
 
 from ..models import (
     FillingCostShift, ProductionMaterialUsage, ProductionRun, ProductionSegment,
-    RunStatus, WasteLog,
+    RunStatus, ScrapKind, WasteLog,
 )
 
 ZERO = Decimal('0')
@@ -65,8 +82,9 @@ PAISE = Decimal('0.01')
 DAY_STARTS = time(7)
 NIGHT_STARTS = time(19)
 
-#: Units a waste log's quantity is in kilograms under.
+#: Units a quantity is in kilograms, or in grams, under.
 KG_UOMS = {'KG', 'KGS', 'KILOGRAM', 'KILOGRAMS'}
+GRAM_UOMS = {'G', 'GM', 'GMS', 'GRAM', 'GRAMS'}
 
 #: The heads worked out from production rather than resolved as a rate.
 ELECTRICITY = 'Electricity'
@@ -75,6 +93,20 @@ ELECTRICITY = 'Electricity'
 # supply meter, which the boards leave out too. Matched by name, ignoring case.
 NOT_FILLING_METERS = ('ETP', 'KWH')
 WASTAGE = 'Wastage'
+SCRAP = 'Scrap Recurring'
+
+#: Where the store moves the floor's waste in SAP, and from where.
+WASTAGE_WAREHOUSE = 'BH-WST'
+WASTAGE_FROM_WAREHOUSE = 'BH-PP'
+#: How long after the day its waste may still be posted. The store has taken
+#: up to eleven days; a month leaves room.
+WASTAGE_POSTING_DAYS = 30
+
+# 'wasatge 28-09-2026 Day', 'wastge 4/9/26', 'wastage 26.8.26': day first,
+# any of - / . between, then a year — which is not trusted (see below).
+_REMARK_DATE = re.compile(r'(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{2,5})(?!\d)')
+_REMARK_DAY = re.compile(r'\bday\b', re.IGNORECASE)
+_REMARK_NIGHT = re.compile(r'\bnight\b', re.IGNORECASE)
 
 
 def shift_window(day, shift=''):
@@ -156,7 +188,8 @@ class Production:
     day_hours: Decimal = ZERO          # the company's, every line
     wastage: Decimal = ZERO            # rupees
     wastage_logs: int = 0
-    scrap_kg: Decimal = ZERO
+    #: material code -> {'name', 'uom', 'qty'}: the waste logged, item by item.
+    waste_items: Dict[str, dict] = field(default_factory=dict)
     #: (product, bottles a case, litres a bottle) -> cases: what was filled, SKU by SKU.
     skus: Dict[tuple, Decimal] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
@@ -174,6 +207,12 @@ class Production:
         if self.day_hours > 0:
             return self.hours / self.day_hours
         return ONE
+
+
+def _add_waste(result, log, qty):
+    item = result.waste_items.setdefault(log.material_code or log.material_name, {
+        'name': log.material_name, 'uom': (log.uom or '').strip().upper(), 'qty': ZERO})
+    item['qty'] += qty
 
 
 def _runs(company, day, now):
@@ -273,8 +312,7 @@ def production(company, day, shift='', line=None, now=None):
         for log in run.waste_logs.all():
             qty = log.wastage_qty * part.fraction
             result.wastage_logs += 1
-            if (log.uom or '').strip().upper() in KG_UOMS:
-                result.scrap_kg += qty
+            _add_waste(result, log, qty)
             price = prices.get(log.material_code)
             if price is None:
                 no_price.add(log.material_name)
@@ -289,8 +327,7 @@ def production(company, day, shift='', line=None, now=None):
             created_at__gte=window[0], created_at__lt=window[1])
         for log in standalone:
             result.wastage_logs += 1
-            if (log.uom or '').strip().upper() in KG_UOMS:
-                result.scrap_kg += log.wastage_qty
+            _add_waste(result, log, log.wastage_qty)
             price = (ProductionMaterialUsage.objects
                      .filter(production_run__company=company,
                              material_code=log.material_code, unit_price__isnull=False)
@@ -392,6 +429,213 @@ def _shift_electricity(by_meter, rounds, shift, case_share):
     return amount, by_readings, by_cases
 
 
+def wastage_remarks(remarks, posted=None):
+    """``(day, shift)`` a wastage transfer's remarks name, or ``None``.
+
+    The store writes them by hand — 'wasatge 28-09-2026 Day', 'wastge 4/9/26',
+    'Wastage 26.8.26 NIght' — so the date is read day first whatever separates
+    it, and the shift is 'DAY', 'NIGHT', or '' for the whole day (named
+    neither, or both: 'Day night').
+
+    The year is the one thing the store gets wrong ('23/7/24', '07-05-20226'
+    on transfers posted in 2026). Waste is posted after the day it is from,
+    so given the date it was ``posted`` the day is the latest one on or
+    before it with that day and month, whatever year is written.
+    """
+    match = _REMARK_DATE.search(remarks or '')
+    if match is None:
+        return None
+    dd, mm, yy = (int(part) for part in match.groups())
+    years = ([posted.year, posted.year - 1] if posted is not None
+             else [yy + 2000 if yy < 100 else yy])
+    for year in years:
+        try:
+            named = date(year, mm, dd)
+        except ValueError:
+            continue
+        if posted is None or named <= posted:
+            break
+    else:
+        return None
+    by_day, by_night = _REMARK_DAY.search(remarks), _REMARK_NIGHT.search(remarks)
+    shift = '' if bool(by_day) == bool(by_night) else ('DAY' if by_day else 'NIGHT')
+    return named, shift
+
+
+def _sap_wastage(company, day):
+    """The store's wastage transfers for ``day``: ``(transfers, unread)``.
+
+    ``transfers`` are those whose remarks name ``day``, each with the
+    ``shift`` they name; ``unread`` are transfers posted in the window whose
+    remarks name no day at all, so cannot be placed. ``None`` when SAP cannot
+    be read.
+    """
+    from sap_client.context import CompanyContext
+
+    from .reconciliation_reader import ReconciliationReader
+
+    try:
+        posted = ReconciliationReader(CompanyContext(company.code)).wastage_transfers(
+            day, day + timedelta(days=WASTAGE_POSTING_DAYS),
+            WASTAGE_WAREHOUSE, WASTAGE_FROM_WAREHOUSE)
+    except Exception:  # noqa: BLE001 - the sheet still opens on the waste logs
+        return None
+    transfers, unread = [], []
+    for transfer in posted:
+        named = wastage_remarks(transfer['remarks'], transfer['doc_date'])
+        if named is None:
+            unread.append(transfer)
+        elif named[0] == day:
+            transfers.append({**transfer, 'shift': named[1]})
+    return transfers, unread
+
+
+def _scrap(company, day, items, warnings):
+    """Scrap Recurring off ``items`` (code -> {'name', 'uom', 'qty'}):
+    ``(rupees, [(kind, kg, price a kg)], not scrap)``, or ``None`` when the
+    company keeps no scrap rates.
+
+    An item counts under the scrap kind that lists it, in kilos: as they are,
+    from grams, or from pieces by the kind's weight a piece. A kind with no
+    weight or no price is named in ``warnings`` and left out, not guessed.
+    """
+    kinds = list(ScrapKind.objects.filter(company=company, is_active=True)
+                 .prefetch_related('prices'))
+    if not kinds:
+        return None
+    by_code = {code: kind for kind in kinds for code in kind.item_codes}
+    sold, not_scrap = {}, []
+    no_weight, no_price = defaultdict(lambda: ZERO), defaultdict(lambda: ZERO)
+    for code, item in items.items():
+        kind = by_code.get(code)
+        if kind is None:
+            not_scrap.append(item['name'])
+            continue
+        uom = (item['uom'] or '').upper()
+        if uom in KG_UOMS:
+            kg = item['qty']
+        elif uom in GRAM_UOMS:
+            kg = item['qty'] / 1000
+        elif kind.grams_per_piece:
+            kg = item['qty'] * kind.grams_per_piece / 1000
+        else:
+            no_weight[kind] += item['qty']
+            continue
+        price = kind.price_on(day)
+        if price is None:
+            no_price[kind] += kg
+            continue
+        part = sold.setdefault(kind, [ZERO, price.price_per_kg])
+        part[0] += kg
+    for kind, pieces in no_weight.items():
+        warnings.append(
+            f"{kind.name} has no weight a piece in the scrap rates: its "
+            f"{_figure(pieces)} pieces are left out of {SCRAP}.")
+    for kind, kg in no_price.items():
+        warnings.append(
+            f"{kind.name} has no price a kg in the scrap rates: its "
+            f"{_figure(kg, 3)} kg are left out of {SCRAP}.")
+    rupees = sum((kg * price for kg, price in sold.values()), ZERO)
+    lines = [(kind, kg, price) for kind, (kg, price) in
+             sorted(sold.items(), key=lambda kv: kv[0].sort_order)]
+    return rupees, lines, sorted(set(not_scrap))
+
+
+def _wastage_and_scrap(company, day, shift, line, now, made, add):
+    """Wastage and Scrap Recurring: off SAP's wastage transfers where the store
+    has posted the day, off the app's waste logs until it has."""
+    scopes = {(shift, line.id if line else None): made}
+
+    def made_in(window, of_line):
+        key = (window, of_line.id if of_line else None)
+        if key not in scopes:
+            scopes[key] = production(company, day, window, of_line, now)
+        return scopes[key]
+
+    def share_of(posted_for):
+        """This sheet's part of a transfer for ``posted_for`` ('' = the whole day)."""
+        if shift and posted_for and posted_for != shift:
+            return ZERO
+        window = shift or posted_for
+        if line is None and window == posted_for:
+            return ONE
+        part, whole = made_in(window, line), made_in(posted_for, None)
+        if whole.cases > 0:
+            return part.cases / whole.cases
+        if whole.hours > 0:
+            return part.hours / whole.hours
+        return ONE if line is None else ZERO
+
+    on_day = f"{day:%d %b}" + (f" {FillingCostShift(shift).name.title()}" if shift else '')
+    sap = _sap_wastage(company, day)
+    used, items, value = [], {}, ZERO
+    if sap is None:
+        made.warnings.append(
+            "SAP could not be read: Wastage and Scrap Recurring are from the app's waste logs.")
+    else:
+        transfers, unread = sap
+        for transfer in transfers:
+            share = share_of(transfer['shift'])
+            if share <= 0:
+                continue
+            amount = sum((Decimal(str(moved['value'])) for moved in transfer['lines']), ZERO) * share
+            used.append((transfer, share, amount))
+            value += amount
+            for moved in transfer['lines']:
+                item = items.setdefault(moved['item_code'], {
+                    'name': moved['item_name'], 'uom': moved['uom'], 'qty': ZERO})
+                item['qty'] += Decimal(str(moved['qty'])) * share
+        if unread:
+            made.warnings.append(
+                "SAP wastage " + ('transfer ' if len(unread) == 1 else 'transfers ')
+                + ', '.join(str(t['doc_num']) for t in unread)
+                + " name no day in their remarks, so are not counted on any sheet.")
+        if used and not shift:
+            # A day posted for one shift only, while the other ran.
+            posted = {t['shift'] for t, _, _ in used}
+            if '' not in posted:
+                for missing in {FillingCostShift.DAY, FillingCostShift.NIGHT} - posted:
+                    if made_in(missing, line).cases > 0:
+                        made.warnings.append(
+                            f"SAP has no wastage transfer for {day:%d %b} "
+                            f"{FillingCostShift(missing).name.title()} yet, though it ran: "
+                            f"Wastage counts only what is posted.")
+
+    if used:
+        source = 'sap'
+        said = ', '.join(
+            f"{t['doc_num']} ({t['remarks']}) ₹{_figure(amount)}"
+            + (f" = {_pct(share)} of ₹{_figure(amount / share)}" if share != ONE else '')
+            for t, share, amount in used)
+        add(WASTAGE, value,
+            f"SAP: what the store moved from {WASTAGE_FROM_WAREHOUSE} to {WASTAGE_WAREHOUSE} "
+            f"for {on_day}, at SAP's value — {said}", source)
+    elif made.wastage_logs:
+        source, items = 'waste_logs', made.waste_items
+        add(WASTAGE, made.wastage,
+            f"{made.wastage_logs} waste log {'entry' if made.wastage_logs == 1 else 'entries'}"
+            f" × the material's SAP price on the run"
+            + ('' if sap is None else
+               f" — SAP has no wastage transfer for {on_day} yet"), source)
+    else:
+        return
+
+    scrap = _scrap(company, day, items, made.warnings)
+    if scrap is None:
+        return
+    rupees, sold, not_scrap = scrap
+    if not sold:
+        return
+    kg = sum((part for _, part, _ in sold), ZERO)
+    said = ', '.join(f"{kind.name} {_figure(part, 3)} kg × ₹{_rate(price)}"
+                     for kind, part, price in sold)
+    add(SCRAP, -rupees,
+        f"{_figure(kg, 3)} kg of the wastage sold as scrap at the latest scrap rates, "
+        f"deducted: {said}"
+        + (f". Not scrap: {', '.join(not_scrap)}" if not_scrap else ''),
+        source)
+
+
 def defaults(company, day, shift='', line=None, now=None):
     """A new sheet's starting values: its cases, and an amount for each head."""
     made = production(company, day, shift, line, now)
@@ -477,20 +721,8 @@ def defaults(company, day, shift='', line=None, now=None):
         elif rate.basis == CostBasis.PER_CASE:
             add(head, sign * made.cases * value,
                 f"{_figure(made.cases)} cases × ₹{_rate(value)}", 'cost_master')
-        elif rate.basis == CostBasis.PER_KG:
-            if value > 0:
-                add(head, sign * made.scrap_kg * value,
-                    f"{_figure(made.scrap_kg, 3)} kg of logged waste × ₹{_rate(value)} a kg"
-                    + (', deducted' if credit else ''), 'cost_master')
-            else:
-                made.warnings.append(
-                    f"{head}: no rate a kg in the Cost Master yet "
-                    f"({_figure(made.scrap_kg, 3)} kg of waste logged).")
 
-    if made.wastage_logs:
-        add(WASTAGE, made.wastage,
-            f"{made.wastage_logs} waste log {'entry' if made.wastage_logs == 1 else 'entries'}"
-            f" × the material's SAP price on the run", 'waste_logs')
+    _wastage_and_scrap(company, day, shift, line, now, made, add)
 
     return {
         'date': day.isoformat(),

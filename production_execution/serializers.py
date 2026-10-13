@@ -16,7 +16,7 @@ from .models import (
     ResourceElectricity, ResourceWater, ResourceGas, ResourceCompressedAir,
     ResourceLabour, ResourceMachineCost, ResourceOverhead,
     ProductionRunCost, ProductionRunCostLine, InProcessQCCheck, FinalQCCheck,
-    FillingCostSheet, FillingCostSheetEntry, FillingCostShift,
+    FillingCostSheet, FillingCostSheetEntry, FillingCostShift, ScrapKind, ScrapPrice,
 )
 from .services.production_service import bom_request_required, start_checks_are_optional
 
@@ -1454,3 +1454,87 @@ class FillingCostSheetUpdateSerializer(FillingCostSheetWriteSerializer):
     cases = serializers.DecimalField(
         max_digits=15, decimal_places=2, min_value=Decimal('0.01'), required=False)
     entries = FillingCostEntryWriteSerializer(many=True, required=False)
+
+
+# ---------------------------------------------------------------------------
+# Scrap rates — what the filling cost sheet's Scrap Recurring is priced at
+# ---------------------------------------------------------------------------
+
+class ScrapPriceSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(
+        source='created_by.full_name', read_only=True, default='')
+
+    class Meta:
+        model = ScrapPrice
+        fields = ['id', 'price_per_kg', 'effective_from', 'created_by_name', 'created_at']
+        read_only_fields = fields
+
+
+class ScrapKindSerializer(serializers.ModelSerializer):
+    """A kind of scrap with the price a kg in force on the ``day`` in context,
+    and every price it has had, newest first."""
+    price_per_kg = serializers.SerializerMethodField()
+    price_from = serializers.SerializerMethodField()
+    prices = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ScrapKind
+        fields = ['id', 'name', 'items', 'grams_per_piece', 'pieces_per_box', 'sort_order',
+                  'price_per_kg', 'price_from', 'prices']
+        read_only_fields = fields
+
+    def _price(self, obj):
+        return obj.price_on(self.context['day'])
+
+    def get_price_per_kg(self, obj):
+        price = self._price(obj)
+        return str(price.price_per_kg) if price else None
+
+    def get_price_from(self, obj):
+        price = self._price(obj)
+        return price.effective_from.isoformat() if price else None
+
+    def get_prices(self, obj):
+        prices = sorted(obj.prices.all(), key=lambda p: p.effective_from, reverse=True)
+        return ScrapPriceSerializer(prices, many=True).data
+
+
+class ScrapItemSerializer(serializers.Serializer):
+    code = serializers.CharField(max_length=50)
+    name = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+
+    def validate_code(self, value):
+        code = value.strip().upper()
+        if not code:
+            raise serializers.ValidationError('An item needs its SAP code.')
+        return code
+
+
+class ScrapKindWriteSerializer(serializers.Serializer):
+    """A kind of scrap, and optionally a price a kg from ``effective_from``
+    (today unless given). A price for a date that already has one replaces it;
+    any other date adds a row, so the days before keep their price."""
+    name = serializers.CharField(max_length=100)
+    items = ScrapItemSerializer(many=True, required=False)
+    grams_per_piece = serializers.DecimalField(
+        max_digits=10, decimal_places=3, min_value=Decimal('0.001'),
+        required=False, allow_null=True)
+    pieces_per_box = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    price_per_kg = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal('0'), required=False)
+    effective_from = serializers.DateField(required=False)
+
+    def validate_name(self, value):
+        name = value.strip()
+        if not name:
+            raise serializers.ValidationError('Name the scrap.')
+        return name
+
+    def validate_items(self, value):
+        seen = set()
+        for item in value:
+            if item['code'] in seen:
+                raise serializers.ValidationError(f"{item['code']} is listed twice.")
+            seen.add(item['code'])
+        return value
+
