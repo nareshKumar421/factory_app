@@ -633,8 +633,13 @@ class AccountsBoardService(SectionBuilder):
             ),
         )
 
+        # A handover's "given" half is cash passed between two people, not
+        # cash issued from the box, so it is not an issue.
         handouts = AdvanceEntry.objects.filter(
-            company=self.company, is_active=True, direction=AdvanceDirection.GIVEN
+            company=self.company,
+            is_active=True,
+            direction=AdvanceDirection.GIVEN,
+            counterpart__isnull=True,
         )
         if self.period:
             handouts = handouts.filter(

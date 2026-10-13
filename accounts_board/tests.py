@@ -29,6 +29,7 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
+from cash_book import services as cash_book_services
 from cash_book.models import (
     AdvanceDirection,
     AdvanceEntry,
@@ -266,6 +267,25 @@ class CashIssuedTests(AccountsBoardTestCase):
             board["imprest"]["card_balance"],
             board["headline"]["imprest_issued"] - board["headline"]["cash_issued"],
         )
+
+
+class HandoverIsNotAnIssueTests(AccountsBoardTestCase):
+    """Cash passed from one person to another never left the box."""
+
+    def test_only_cash_from_the_box_counts_as_handed_out(self):
+        self.advance(self.bunty, 5000)
+        cash_book_services.record_handover(
+            user=None,
+            company=self.oil,
+            to_person=self.jas,
+            entry_date=TODAY,
+            sources=[(self.bunty, Decimal("2000"))],
+        )
+
+        handouts = self.board()["cash_issued"]["handouts"]
+        self.assertEqual(handouts["total"], 5000.0)
+        self.assertEqual(handouts["count"], 1)
+        self.assertEqual(handouts["people"], 1)
 
 
 class ReconciliationTests(AccountsBoardTestCase):

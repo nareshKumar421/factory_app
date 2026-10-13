@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     AdvanceEntryDetailAPI,
     AdvanceEntryListCreateAPI,
+    AdvanceHandoverCreateAPI,
     AdvanceHolderListAPI,
     AdvanceStatementAPI,
     AtmAccountDetailAPI,
@@ -64,6 +65,12 @@ urlpatterns = [
     ),
     # Cash handed to somebody who has not yet said what it went on.
     path("advances/", AdvanceEntryListCreateAPI.as_view(), name="cash-book-advances"),
+    # Cash passed between two people without going through the box.
+    path(
+        "advances/handovers/",
+        AdvanceHandoverCreateAPI.as_view(),
+        name="cash-book-advance-handovers",
+    ),
     path(
         "advances/<int:pk>/",
         AdvanceEntryDetailAPI.as_view(),

@@ -79,6 +79,7 @@ from .serializers import (
     SetApproverSerializer,
     PersonSerializer,
     RecordAdvanceSerializer,
+    RecordHandoverSerializer,
     RecordAtmReceiptSerializer,
     RecordEntrySerializer,
     UpdateEntrySerializer,
@@ -933,7 +934,7 @@ class AdvanceEntryListCreateAPI(APIView):
     def get(self, request):
         queryset = AdvanceEntry.objects.filter(
             company=_company(request)
-        ).select_related("person")
+        ).select_related("person", "counterpart")
         person = _parse_positive_int(request.query_params.get("person"), None)
         if person:
             queryset = queryset.filter(person_id=person)
@@ -960,8 +961,39 @@ class AdvanceEntryListCreateAPI(APIView):
         )
 
 
+class AdvanceHandoverCreateAPI(APIView):
+    """POST cash passed from one or more people straight to another.
+
+    Answers with every half it wrote -- a return on each giver and a handout
+    to the receiver for each of them.
+    """
+
+    permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
+
+    def post(self, request):
+        serializer = RecordHandoverSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        legs = services.record_handover(
+            user=request.user,
+            company=_company(request),
+            to_person=data["to_person"],
+            entry_date=data["entry_date"],
+            sources=[(row["person"], row["amount"]) for row in data["sources"]],
+            detail=data.get("detail", ""),
+        )
+        return Response(
+            AdvanceEntrySerializer(legs, many=True).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class AdvanceEntryDetailAPI(APIView):
-    """DELETE to take a handout or a return back out of the ledger."""
+    """DELETE to take a handout or a return back out of the ledger.
+
+    Either half of a handover takes the other with it.
+    """
 
     permission_classes = [IsAuthenticated, HasCompanyContext, CanManageCashBook]
 

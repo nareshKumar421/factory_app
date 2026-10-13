@@ -356,6 +356,14 @@ class AdvanceEntry(BaseModel):
     to Bunty's pocket. The money reaches the cash book later, as the expenses he
     eventually explains (:attr:`CashEntry.advance_holder`), which is why none of
     the sheet's advance handouts appear in its cash register.
+
+    **A handover is two of these.** When Kamal passes 6,300 of his float to
+    Manoj, it never goes near the box. It is written as a return on Kamal and
+    a handout to Manoj, each naming the other in :attr:`counterpart`, so every
+    balance and total keeps reading the two directions it always has. They are
+    made together and taken out together (:func:`cash_book.services.
+    record_handover`), because half of one is a lie in either direction: a
+    return on its own says the box got cash it never did.
     """
 
     company = models.ForeignKey(
@@ -376,6 +384,17 @@ class AdvanceEntry(BaseModel):
         help_text="Always positive; ``direction`` says which way it moved.",
     )
     detail = models.TextField(blank=True, default="")
+
+    counterpart = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="On a handover: the other half of it. Set on both halves, "
+        "each pointing at the other. Blank when the cash moved between this "
+        "person and the box.",
+    )
 
     class Meta:
         ordering = ["-entry_date", "-id"]

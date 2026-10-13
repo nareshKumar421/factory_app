@@ -467,6 +467,10 @@ class MovementSerializer(serializers.Serializer):
     #: False for a row somebody has taken out. It is shown, struck through,
     #: and contributes nothing to the running balance beside it.
     is_active = serializers.BooleanField(default=True)
+    #: On half of a handover: the person on the other side of it. Null on
+    #: everything else, card statements included.
+    counterpart_person_id = serializers.IntegerField(allow_null=True, default=None)
+    counterpart_person_name = serializers.CharField(allow_null=True, default=None)
 
 
 class SetApproverSerializer(serializers.Serializer):
@@ -498,6 +502,9 @@ class AdvanceEntrySerializer(serializers.ModelSerializer):
     direction_label = serializers.CharField(
         source="get_direction_display", read_only=True
     )
+    counterpart_person = serializers.IntegerField(
+        source="counterpart.person_id", read_only=True, allow_null=True, default=None
+    )
 
     class Meta:
         model = AdvanceEntry
@@ -511,6 +518,8 @@ class AdvanceEntrySerializer(serializers.ModelSerializer):
             "amount",
             "detail",
             "is_active",
+            "counterpart",
+            "counterpart_person",
         ]
         read_only_fields = fields
 
@@ -524,6 +533,26 @@ class RecordAdvanceSerializer(serializers.Serializer):
     amount = serializers.DecimalField(
         max_digits=14, decimal_places=2, min_value=Decimal("0.01")
     )
+    detail = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class HandoverSourceSerializer(serializers.Serializer):
+    """One person a handover's cash came from, and how much. Input only."""
+
+    person = serializers.PrimaryKeyRelatedField(queryset=get_user_model().objects.all())
+    amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.01")
+    )
+
+
+class RecordHandoverSerializer(serializers.Serializer):
+    """Input for cash passed from one or more people straight to another."""
+
+    to_person = serializers.PrimaryKeyRelatedField(
+        queryset=get_user_model().objects.all()
+    )
+    entry_date = serializers.DateField()
+    sources = HandoverSourceSerializer(many=True, allow_empty=False)
     detail = serializers.CharField(required=False, allow_blank=True, default="")
 
 
@@ -706,6 +735,7 @@ __all__ = [
     "MovementSerializer",
     "PersonSerializer",
     "RecordAdvanceSerializer",
+    "RecordHandoverSerializer",
     "RecordAtmReceiptSerializer",
     "CashBunchDetailSerializer",
     "CashBunchSerializer",

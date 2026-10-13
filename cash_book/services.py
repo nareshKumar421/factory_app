@@ -949,7 +949,9 @@ def advance_statement(company, person, *, include_cancelled=False):
     is out of the book must not move the figure beside it, or every balance
     below it becomes a number nobody can reproduce.
     """
-    entries = AdvanceEntry.objects.filter(company=company, person=person)
+    entries = AdvanceEntry.objects.filter(
+        company=company, person=person
+    ).select_related("counterpart__person")
     if not include_cancelled:
         entries = entries.filter(is_active=True)
 
@@ -964,6 +966,15 @@ def advance_statement(company, person, *, include_cancelled=False):
             "detail": entry.detail,
             "cash_entry_id": None,
             "is_active": entry.is_active,
+            # Who the cash went to or came from, when it was a handover.
+            "counterpart_person_id": (
+                entry.counterpart.person_id if entry.counterpart else None
+            ),
+            "counterpart_person_name": (
+                entry.counterpart.person.full_name or entry.counterpart.person.email
+                if entry.counterpart
+                else None
+            ),
         }
         for entry in entries
     ] + [
@@ -1152,13 +1163,161 @@ def record_advance(
 
 
 @transaction.atomic
+def record_handover(
+    *, user, company, to_person, entry_date, sources, detail=""
+) -> list[AdvanceEntry]:
+    """Cash passed from one or more people straight to another.
+
+    ``sources`` is ``[(person, amount), ...]``: Kamal 6,300 and Sukhmeet 500,
+    both to Manoj. Each becomes its own pair -- a return on the giver and a
+    handout to ``to_person``, naming each other -- so Manoj's ledger says
+    where each part came from, and one wrong line can be taken out without
+    the rest.
+
+    The box is not involved and nothing here touches it. That was already
+    true of the "take it back, give it out" pair the custodian used to type;
+    what this adds is that the two halves exist together or not at all.
+
+    Giving more than somebody holds is allowed. It leaves them owed, which is
+    what happened if they made up the difference from their own pocket.
+    """
+    detail = (detail or "").strip()
+    if not sources:
+        raise ValidationError({"sources": "Say who the cash came from."})
+
+    seen = set()
+    for person, amount in sources:
+        name = person.full_name or person.email
+        if person.pk == to_person.pk:
+            raise ValidationError(
+                {"sources": f"{name} cannot hand cash over to themselves."}
+            )
+        if person.pk in seen:
+            raise ValidationError(
+                {"sources": f"{name} is listed twice. Put it on one line."}
+            )
+        seen.add(person.pk)
+        if amount is None or amount <= ZERO:
+            raise ValidationError({"sources": "Every amount must be above zero."})
+
+    legs = []
+    for person, amount in sources:
+        common = {
+            "company": company,
+            "entry_date": entry_date,
+            "amount": amount,
+            "detail": detail,
+            "created_by": user,
+            "updated_by": user,
+        }
+        out_of = AdvanceEntry.objects.create(
+            person=person, direction=AdvanceDirection.RETURNED, **common
+        )
+        into = AdvanceEntry.objects.create(
+            person=to_person,
+            direction=AdvanceDirection.GIVEN,
+            counterpart=out_of,
+            **common,
+        )
+        out_of.counterpart = into
+        out_of.save(update_fields=["counterpart"])
+        legs += [out_of, into]
+    return legs
+
+
+def handover_candidates(company):
+    """Pairs typed the old way that look like one handover.
+
+    Before handovers existed, passing cash from Kamal to Manoj was typed as
+    "cash taken back" off Kamal and "cash given" to Manoj. This finds those:
+    on one day, a return and a handout of the same amount, by two different
+    people, neither already a handover. A pair is offered only when it is the
+    one match on both sides -- two returns of 500 on a day when somebody was
+    given 500 could be either, and guessing would link the wrong person.
+
+    Only suggestions. Same-day same-amount is also what a real return to the
+    box followed by a real handout from it looks like, so somebody reads the
+    details before :func:`link_handover` is run on any of them.
+    """
+    loose = AdvanceEntry.objects.filter(
+        company=company, is_active=True, counterpart__isnull=True
+    ).select_related("person")
+    returns = [e for e in loose if e.direction == AdvanceDirection.RETURNED]
+    handouts = [e for e in loose if e.direction == AdvanceDirection.GIVEN]
+
+    def same(a, b):
+        return (
+            a.entry_date == b.entry_date
+            and a.amount == b.amount
+            and a.person_id != b.person_id
+        )
+
+    pairs = []
+    for out_of in returns:
+        matches = [into for into in handouts if same(out_of, into)]
+        if len(matches) != 1:
+            continue
+        into = matches[0]
+        if sum(1 for other in returns if same(other, into)) != 1:
+            continue
+        pairs.append((out_of, into))
+    pairs.sort(key=lambda pair: (pair[0].entry_date, pair[0].id))
+    return pairs
+
+
+@transaction.atomic
+def link_handover(*, user, out_of: AdvanceEntry, into: AdvanceEntry):
+    """Make an old "taken back" and "given" pair into one handover.
+
+    Neither amount, date nor balance changes -- the two rows already moved the
+    cash correctly. What changes is that each now names the other, so the
+    ledger says who the cash went to, and taking one out takes both.
+    """
+    problems = []
+    if out_of.company_id != into.company_id:
+        problems.append("they are in different companies")
+    if out_of.direction != AdvanceDirection.RETURNED:
+        problems.append(f"#{out_of.id} is not cash taken back")
+    if into.direction != AdvanceDirection.GIVEN:
+        problems.append(f"#{into.id} is not cash given")
+    if not (out_of.is_active and into.is_active):
+        problems.append("one of them has been taken out")
+    if out_of.counterpart_id or into.counterpart_id:
+        problems.append("one of them is already a handover")
+    if out_of.person_id == into.person_id:
+        problems.append("they are the same person")
+    if out_of.amount != into.amount:
+        problems.append(f"the amounts differ ({out_of.amount} and {into.amount})")
+    if out_of.entry_date != into.entry_date:
+        problems.append("they are on different days")
+    if problems:
+        raise ValidationError(
+            {"handover": f"#{out_of.id} and #{into.id}: " + "; ".join(problems)}
+        )
+
+    for half, other in ((out_of, into), (into, out_of)):
+        half.counterpart = other
+        half.updated_by = user
+        half.save(update_fields=["counterpart", "updated_by", "updated_at"])
+
+
+@transaction.atomic
 def cancel_advance(*, user, entry: AdvanceEntry) -> AdvanceEntry:
-    """Take a handout or a return back out of the ledger, keeping the row."""
+    """Take a handout or a return back out of the ledger, keeping the row.
+
+    Half of a handover takes the other half with it. Leaving one behind would
+    have the box receiving cash nobody gave it, or paying out cash it never
+    held -- the very mistake handovers exist to make impossible.
+    """
     if not entry.is_active:
         return entry
-    entry.is_active = False
-    entry.updated_by = user
-    entry.save(update_fields=["is_active", "updated_by", "updated_at"])
+    halves = [entry]
+    if entry.counterpart_id is not None:
+        halves.append(entry.counterpart)
+    for half in halves:
+        half.is_active = False
+        half.updated_by = user
+        half.save(update_fields=["is_active", "updated_by", "updated_at"])
     return entry
 
 
