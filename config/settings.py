@@ -331,6 +331,14 @@ INSTALLED_APPS = [
     # bodies of writes and failures. Written by its middleware (last in
     # MIDDLEWARE); `manage.py api_usage` says what is used most.
     'api_log.apps.ApiLogConfig',
+    # Cash book to SAP: the imprest PO per bunch, a GRPO per voucher and the
+    # A/P drafts, posted from approved vouchers through sap_postings. Its own
+    # tables only; cash_book is read, never changed.
+    'cash_sap.apps.CashSapConfig',
+    # Fixed Asset GRPO: the PO linked late to a fixed-asset gate entry, then
+    # the GRPO into the FA warehouses through grpo's engine. Own tables plus
+    # proxies over raw_material_gatein's receipts.
+    'fixed_asset_grpo.apps.FixedAssetGrpoConfig',
 ]
 
 MIDDLEWARE = [

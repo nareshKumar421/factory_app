@@ -174,6 +174,10 @@ urlpatterns = [
     path("api/v1/construction/", include("construction_projects.urls")),
     # Import / Export: EXIM's screens, brought across one module at a time.
     path("api/v1/exim/", include("exim.urls")),
+    # Cash book to SAP: plan, post and follow a bunch's imprest documents.
+    path("api/v1/cash-sap/", include("cash_sap.urls")),
+    # Fixed Asset GRPO: link the PO to a fixed-asset gate entry, then post.
+    path("api/v1/fixed-asset-grpo/", include("fixed_asset_grpo.urls")),
 
 ]
 
