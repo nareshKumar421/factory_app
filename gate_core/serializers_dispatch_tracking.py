@@ -10,6 +10,11 @@ from gate_core.models import (
     TruckDispatchStatus,
     TruckDispatchUpdate,
 )
+from gate_core.services.dispatch_tracking_status import (
+    delivered_on,
+    delivery_progress,
+    ship_to_groups,
+)
 
 # Statuses that carry a hand-over date the operator can back-date.
 DELIVERY_STATUSES = (
@@ -34,16 +39,39 @@ class TruckDispatchBillItemSerializer(serializers.Serializer):
 
 
 class TruckDispatchBillSerializer(serializers.Serializer):
-    """A bill on the truck, with its items, for the partial-delivery form."""
+    """A bill on the truck, with its items, for the delivery form.
+
+    Carries the bill's ship-to so the form can offer the truck's stops, and
+    where its delivery stands (``context["progress"]``) so stops already made
+    are shown as such and not offered again by default.
+    """
 
     id = serializers.IntegerField()
     sap_doc_num = serializers.CharField()
     sap_doc_entry = serializers.IntegerField()
     customer_name = serializers.CharField()
+    ship_to_code = serializers.CharField(default="")
+    ship_to_address = serializers.CharField(default="")
+    place_of_supply = serializers.CharField(default="")
     company = serializers.CharField(source="company.name", default="")
     total_quantity = serializers.DecimalField(max_digits=18, decimal_places=3, allow_null=True)
     sap_doc_total = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    # DELIVERED / PARTIALLY_DELIVERED once a delivery update covered this bill,
+    # else null; and the date it was delivered on.
+    delivery_status = serializers.SerializerMethodField()
+    delivered_date = serializers.SerializerMethodField()
     items = serializers.SerializerMethodField()
+
+    def _progress(self):
+        return self.context.get("progress")
+
+    def get_delivery_status(self, document):
+        progress = self._progress()
+        return progress.bill_status(document.id) if progress else None
+
+    def get_delivered_date(self, document):
+        progress = self._progress()
+        return progress.bill_delivered_on(document.id) if progress else None
 
     def get_items(self, document):
         items = [item for item in document.items.all() if item.is_active]
@@ -140,10 +168,20 @@ class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
     partial_lines = TruckDispatchPartialLineSerializer(many=True, read_only=True)
     # A delivery, bill by bill, as SAP has it. Empty for every other status.
     sap_receipts = serializers.SerializerMethodField()
+    # The bills a delivery at one stop covered, and that stop as the customer
+    # locations name it. Both empty for an update that speaks for the truck.
+    documents = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
+    locations = serializers.SerializerMethodField()
 
     def get_sap_receipts(self, update):
         receipts = [receipt for receipt in update.sap_receipts.all() if receipt.is_active]
         return TruckDispatchSapReceiptSerializer(receipts, many=True).data
+
+    def get_locations(self, update):
+        return [
+            {key: value for key, value in group.items() if key != "bill_ids"}
+            for group in ship_to_groups(update.documents.all())
+        ]
 
     class Meta:
         model = TruckDispatchUpdate
@@ -158,6 +196,8 @@ class TruckDispatchUpdateSerializer(serializers.ModelSerializer):
             "remarks",
             "proof",
             "return_note",
+            "documents",
+            "locations",
             "partial_lines",
             "sap_receipts",
             "created_by_name",
@@ -224,10 +264,32 @@ class TruckDispatchUpdateCreateSerializer(serializers.Serializer):
     # afterwards via the return-note endpoint.
     return_note = serializers.FileField(required=False, allow_null=True)
     partial_lines = TruckDispatchPartialLineInputSerializer(many=True, required=False)
+    # The bills this delivery covers -- one stop of a multi-drop truck. Left out
+    # (or empty), the update speaks for the whole truck.
+    documents = serializers.ListField(child=serializers.IntegerField(), required=False)
 
     def validate(self, attrs):
         status = attrs.get("status")
         lines = attrs.get("partial_lines") or []
+        documents = attrs.get("documents") or []
+
+        if documents and status not in DELIVERY_STATUSES:
+            raise serializers.ValidationError(
+                {"documents": "Bills apply only to a Delivered or Partially Delivered update."}
+            )
+        if len(set(documents)) != len(documents):
+            raise serializers.ValidationError(
+                {"documents": "A bill is listed more than once."}
+            )
+        covered = set(documents)
+        for line in lines:
+            if covered and line["document"] not in covered:
+                raise serializers.ValidationError({
+                    "partial_lines": (
+                        f"Bill {line['document']} is not among the bills this update "
+                        "covers."
+                    )
+                })
 
         if status == TruckDispatchStatus.PARTIALLY_DELIVERED and not lines:
             raise serializers.ValidationError(
@@ -312,6 +374,15 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
             if docking.is_active and docking.status == "DISPATCHED"
         ]
 
+    def _progress(self, arrival):
+        """The truck's delivery progress, worked out once per truck per request --
+        the status, the lateness flags and the locations all read it."""
+        cache = self.__dict__.setdefault("_progress_cache", {})
+        progress = cache.get(arrival.id)
+        if progress is None:
+            progress = cache[arrival.id] = delivery_progress(arrival)
+        return progress
+
     def get_vehicle_number(self, arrival):
         return getattr(arrival.vehicle, "vehicle_number", "") if arrival.vehicle_id else ""
 
@@ -385,7 +456,8 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
         return names
 
     def get_customer_locations(self, arrival):
-        """Where the truck's goods are going: each customer's ship-to address.
+        """Where the truck's goods are going: each customer's ship-to address,
+        and whether the truck has delivered there yet.
 
         Read off the bills the same way ``get_customers`` is — the header of a
         legacy single-document docking standing in for its bill — using the
@@ -394,40 +466,40 @@ class DispatchTrackingTruckSerializer(serializers.Serializer):
 
         One entry per distinct customer + ship-to, carrying the bills going
         there: a truck with four bills for one warehouse shows it once, while a
-        customer taking deliveries at two addresses shows both.
+        customer taking deliveries at two addresses shows both. Each carries
+        ``delivery_status`` (DELIVERED / PARTIALLY_DELIVERED / null) and
+        ``delivered_date`` from the delivery updates that covered its bills.
         """
-        locations = {}
+        progress = self._progress(arrival)
+        sources = []
         for docking in self._dispatched_dockings(arrival):
-            sources = [d for d in docking.documents.all() if d.is_active] or [docking]
-            for source in sources:
-                if not (source.customer_name or source.ship_to_code or source.ship_to_address):
-                    continue
-                key = (source.customer_name, source.ship_to_code, source.ship_to_address)
-                entry = locations.get(key)
-                if entry is None:
-                    entry = locations[key] = {
-                        "customer_name": source.customer_name,
-                        "ship_to_code": source.ship_to_code,
-                        "ship_to_address": source.ship_to_address,
-                        "place_of_supply": source.place_of_supply,
-                        "documents": [],
-                    }
-                if source.sap_doc_num and source.sap_doc_num not in entry["documents"]:
-                    entry["documents"].append(source.sap_doc_num)
-        return list(locations.values())
+            sources.extend([d for d in docking.documents.all() if d.is_active] or [docking])
+
+        locations = []
+        for group in ship_to_groups(sources):
+            bill_ids = group.pop("bill_ids")
+            if bill_ids:
+                status, delivered_date = progress.group_status(bill_ids)
+            elif progress.whole_truck is not None:
+                # A legacy docking has no bill rows to scope a delivery to, so
+                # only a whole-truck delivery can have reached it.
+                status = progress.whole_truck.status
+                delivered_date = delivered_on(progress.whole_truck)
+            else:
+                status, delivered_date = None, None
+            group["delivery_status"] = status
+            group["delivered_date"] = delivered_date
+            locations.append(group)
+        return locations
 
     def _latest_update(self, arrival):
-        # dispatch_updates is prefetched and ordered -occurred_at, so [0] is newest.
-        updates = list(arrival.dispatch_updates.all())
-        return updates[0] if updates else None
+        return self._progress(arrival).latest
 
     def get_current_status(self, arrival):
-        latest = self._latest_update(arrival)
-        return latest.status if latest else "DISPATCHED"
+        return self._progress(arrival).current_status
 
     def get_current_status_display(self, arrival):
-        latest = self._latest_update(arrival)
-        return latest.get_status_display() if latest else "Dispatched"
+        return self._progress(arrival).current_status_display
 
     def get_last_update_at(self, arrival):
         latest = self._latest_update(arrival)

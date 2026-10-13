@@ -379,7 +379,20 @@ class CustomerLocationOnTrackingTests(DispatchTrackingTests):
             "ship_to_address": "C-26 HAZARA PARK\rDELHI-110051\rIN",
             "place_of_supply": "DL",
             "documents": ["INV-1001"],
+            "delivery_status": None,
+            "delivered_date": None,
         }])
+
+    def test_a_whole_truck_delivery_reaches_a_legacy_docking(self):
+        """A legacy docking has no bill rows to scope a delivery to, so only a
+        delivery of the whole truck can mark its location delivered."""
+        self.client.post(
+            f"/api/v1/gate-core/dispatch-tracking/{self.arrival.id}/updates/",
+            {"status": "DELIVERED", "delivered_date": "2026-10-11"}, **self.hdr,
+        )
+        location = self._locations()[0]
+        self.assertEqual(location["delivery_status"], "DELIVERED")
+        self.assertEqual(str(location["delivered_date"]), "2026-10-11")
 
     def test_bills_to_one_address_show_it_once_with_all_their_bills(self):
         sohna = "ESR SOHNA LOGISTICS PARK\rGURUGRAM-122103\rIN"
@@ -803,3 +816,246 @@ class PartialDeliveryTests(TestCase):
         )
         resp = self.client.post(self.updates_url, self._partial(), format="json", **self.hdr)
         self.assertEqual(resp.status_code, 403, resp.content)
+
+
+class StopByStopDeliveryTests(TestCase):
+    """One bilty, goods for several customer locations, delivered one stop at a
+    time. Each Delivered update names its stop's bills; the truck is Delivered
+    only once every stop is made, and each location says where it stands.
+    """
+
+    AGRA = ("CSD AGRA", "STATION ROAD\rAGRA-282001\rIN", "UP")
+    HISAR = ("CSD HISAR", "OPP POLICE CHECK POST\rHISAR-125004\rIN", "HR")
+    CUSTOMER = "THE AREA MANAGER CANTEEN STORE DEPARTMENT"
+
+    def setUp(self):
+        PartialDeliveryTests.setUp(self)
+        for bill, (code, address, state) in ((self.bill_a, self.AGRA), (self.bill_b, self.HISAR)):
+            bill.customer_name = self.CUSTOMER
+            bill.ship_to_code, bill.ship_to_address, bill.place_of_supply = code, address, state
+            bill.save()
+        # A second bill for Hisar: a stop is a ship-to, not a bill.
+        self.bill_c = SalesDispatchGateOutDocument.objects.create(
+            sales_dispatch=self.docking, company=self.company,
+            document_type=SalesDispatchDocumentType.INVOICE,
+            sap_doc_entry=2003, sap_doc_num="INV-2003", customer_name=self.CUSTOMER,
+            ship_to_code=self.HISAR[0], ship_to_address=self.HISAR[1],
+            place_of_supply=self.HISAR[2],
+            total_boxes=0, total_quantity=50, created_by=self.user, updated_by=self.user,
+        )
+        self.item_c1 = SalesDispatchGateOutItem.objects.create(
+            sales_dispatch=self.docking, document=self.bill_c, line_num=4,
+            item_code="FG0000600", item_name="SOYA 1L", quantity=50, uom="PCS",
+            total_boxes=0, created_by=self.user, updated_by=self.user,
+        )
+        self.list_url = "/api/v1/gate-core/dispatch-tracking/"
+        self.summary_url = "/api/v1/gate-core/dispatch-tracking/summary/"
+
+    def _post(self, payload, fmt="json", expect=201):
+        resp = self.client.post(self.updates_url, payload, format=fmt, **self.hdr)
+        self.assertEqual(resp.status_code, expect, resp.content)
+        return resp
+
+    def _row(self):
+        resp = self.client.get(self.list_url, **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data["results"][0]
+
+    def _locations(self):
+        return {loc["ship_to_code"]: loc for loc in self._row()["customer_locations"]}
+
+    def _bills(self):
+        resp = self.client.get(self.bills_url, **self.hdr)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {bill["sap_doc_num"]: bill for bill in resp.data}
+
+    def _hisar(self):
+        return {"status": "DELIVERED", "documents": [self.bill_b.id, self.bill_c.id]}
+
+    def test_delivering_one_stop_leaves_the_rest_on_the_road(self):
+        resp = self._post({
+            "status": "DELIVERED", "delivered_date": "2026-10-11",
+            "documents": [self.bill_a.id],
+        })
+        self.assertEqual(resp.data["documents"], [self.bill_a.id])
+        self.assertEqual(resp.data["locations"], [{
+            "customer_name": self.CUSTOMER,
+            "ship_to_code": "CSD AGRA",
+            "ship_to_address": self.AGRA[1],
+            "place_of_supply": "UP",
+            "documents": ["INV-2001"],
+        }])
+
+        row = self._row()
+        self.assertEqual(row["current_status"], "PARTIALLY_DELIVERED")
+        self.assertEqual(row["current_status_display"], "Partially Delivered")
+
+        locations = self._locations()
+        self.assertEqual(locations["CSD AGRA"]["delivery_status"], "DELIVERED")
+        self.assertEqual(str(locations["CSD AGRA"]["delivered_date"]), "2026-10-11")
+        self.assertIsNone(locations["CSD HISAR"]["delivery_status"])
+        self.assertIsNone(locations["CSD HISAR"]["delivered_date"])
+
+        bills = self._bills()
+        self.assertEqual(bills["INV-2001"]["delivery_status"], "DELIVERED")
+        self.assertEqual(str(bills["INV-2001"]["delivered_date"]), "2026-10-11")
+        self.assertEqual(bills["INV-2001"]["ship_to_code"], "CSD AGRA")
+        self.assertEqual(bills["INV-2001"]["place_of_supply"], "UP")
+        self.assertIsNone(bills["INV-2002"]["delivery_status"])
+        self.assertIsNone(bills["INV-2003"]["delivery_status"])
+
+    def test_the_last_stop_delivers_the_truck(self):
+        self._post({"status": "DELIVERED", "documents": [self.bill_a.id]})
+        self._post(self._hisar())
+
+        row = self._row()
+        self.assertEqual(row["current_status"], "DELIVERED")
+        self.assertEqual(row["update_count"], 2)
+        self.assertEqual(
+            {code: loc["delivery_status"] for code, loc in self._locations().items()},
+            {"CSD AGRA": "DELIVERED", "CSD HISAR": "DELIVERED"},
+        )
+
+    def test_a_truck_level_event_between_stops_keeps_the_stops_made(self):
+        from datetime import timedelta
+        self._post({"status": "DELIVERED", "documents": [self.bill_a.id]})
+        past = (timezone.localdate() - timedelta(days=1)).isoformat()
+        self._post({"status": "IN_TRANSIT", "expected_reach_date": past, "location": "NH-9"})
+
+        row = self._row()
+        self.assertEqual(row["current_status"], "IN_TRANSIT")
+        self.assertTrue(row["is_late"])
+        self.assertEqual(self._locations()["CSD AGRA"]["delivery_status"], "DELIVERED")
+
+        self._post(self._hisar())
+        row = self._row()
+        self.assertEqual(row["current_status"], "DELIVERED")
+        self.assertFalse(row["is_late"])
+
+    def test_a_short_stop_leaves_the_truck_partially_delivered_at_the_end(self):
+        self._post({
+            "status": "PARTIALLY_DELIVERED",
+            "documents": [self.bill_a.id],
+            "partial_lines": [{
+                "document": self.bill_a.id,
+                "items": [{"item": self.item_a1.id, "qty_delivered": "500", "qty_returned": "100"}],
+            }],
+        })
+        self._post(self._hisar())
+
+        self.assertEqual(self._row()["current_status"], "PARTIALLY_DELIVERED")
+        self.assertEqual(
+            {code: loc["delivery_status"] for code, loc in self._locations().items()},
+            {"CSD AGRA": "PARTIALLY_DELIVERED", "CSD HISAR": "DELIVERED"},
+        )
+
+    def test_half_a_stop_delivered_shows_the_stop_partially_delivered(self):
+        self._post({"status": "DELIVERED", "documents": [self.bill_b.id]})
+        self.assertEqual(self._locations()["CSD HISAR"]["delivery_status"], "PARTIALLY_DELIVERED")
+
+    def test_a_whole_truck_delivery_still_covers_every_stop(self):
+        resp = self._post({"status": "DELIVERED", "delivered_date": "2026-10-12"})
+        self.assertEqual(resp.data["documents"], [])
+        self.assertEqual(resp.data["locations"], [])
+        self.assertEqual(self._row()["current_status"], "DELIVERED")
+        self.assertEqual(
+            {code: (loc["delivery_status"], str(loc["delivered_date"]))
+             for code, loc in self._locations().items()},
+            {"CSD AGRA": ("DELIVERED", "2026-10-12"), "CSD HISAR": ("DELIVERED", "2026-10-12")},
+        )
+
+    def test_the_newest_delivery_to_reach_a_bill_is_the_one_that_counts(self):
+        self._post({"status": "DELIVERED", "delivered_date": "2026-10-10"})
+        self._post({
+            "status": "PARTIALLY_DELIVERED", "delivered_date": "2026-10-11",
+            "documents": [self.bill_a.id],
+            "partial_lines": [{
+                "document": self.bill_a.id,
+                "items": [{"item": self.item_a1.id, "qty_delivered": "500", "qty_returned": "100"}],
+            }],
+        })
+        locations = self._locations()
+        self.assertEqual(locations["CSD AGRA"]["delivery_status"], "PARTIALLY_DELIVERED")
+        self.assertEqual(str(locations["CSD AGRA"]["delivered_date"]), "2026-10-11")
+        self.assertEqual(locations["CSD HISAR"]["delivery_status"], "DELIVERED")
+        self.assertEqual(str(locations["CSD HISAR"]["delivered_date"]), "2026-10-10")
+
+    # --- what is refused ----------------------------------------------------
+
+    def test_a_short_bill_must_be_among_the_bills_covered(self):
+        resp = self._post({
+            "status": "PARTIALLY_DELIVERED",
+            "documents": [self.bill_a.id],
+            "partial_lines": [{
+                "document": self.bill_b.id,
+                "items": [{"item": self.item_b1.id, "qty_returned": "5"}],
+            }],
+        }, expect=400)
+        self.assertIn("partial_lines", resp.data)
+        self.assertEqual(TruckDispatchPartialDeliveryLine.objects.count(), 0)
+
+    def test_bills_apply_only_to_a_delivery(self):
+        resp = self._post({"status": "IN_TRANSIT", "documents": [self.bill_a.id]}, expect=400)
+        self.assertIn("documents", resp.data)
+
+    def test_covered_bills_must_be_on_this_truck(self):
+        resp = self._post({"status": "DELIVERED", "documents": [self.bill_a.id, 999999]}, expect=400)
+        self.assertIn("not on this truck", str(resp.data))
+        self.assertEqual(self.arrival.dispatch_updates.count(), 0)
+
+    def test_a_bill_listed_twice_is_refused(self):
+        resp = self._post(
+            {"status": "DELIVERED", "documents": [self.bill_a.id, self.bill_a.id]}, expect=400
+        )
+        self.assertIn("documents", resp.data)
+
+    # --- the dashboard and the wire -----------------------------------------
+
+    def test_the_summary_counts_the_truck_as_delivered_only_at_the_last_stop(self):
+        self._post({"status": "DELIVERED", "documents": [self.bill_a.id]})
+        d = self.client.get(self.summary_url, **self.hdr).data
+        self.assertEqual(d["status_counts"]["PARTIALLY_DELIVERED"], 1)
+        self.assertEqual(d["status_counts"]["DELIVERED"], 0)
+        self.assertEqual((d["active"], d["completed"]), (1, 0))
+
+        self._post(self._hisar())
+        d = self.client.get(self.summary_url, **self.hdr).data
+        self.assertEqual(d["status_counts"]["DELIVERED"], 1)
+        self.assertEqual((d["active"], d["completed"]), (0, 1))
+
+    def test_multipart_carries_the_covered_bills_as_json(self):
+        import json as _json
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        proof = SimpleUploadedFile("proof.jpg", b"\xff\xd8\xff\xd9", content_type="image/jpeg")
+        resp = self._post({
+            "status": "DELIVERED",
+            "proof": proof,
+            "documents": _json.dumps([self.bill_a.id]),
+        }, fmt="multipart")
+        self.assertEqual(resp.data["documents"], [self.bill_a.id])
+        self.assertEqual(self._row()["current_status"], "PARTIALLY_DELIVERED")
+
+    def test_bad_json_for_the_covered_bills_is_a_400(self):
+        resp = self._post({"status": "DELIVERED", "documents": "[1,"}, fmt="multipart", expect=400)
+        self.assertIn("documents", resp.data)
+
+    def test_the_board_does_not_scale_queries_with_stops(self):
+        """Each update's covered bills are prefetched: a truck delivered in
+        three stops must not cost three more queries than one delivered in one."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def count_queries():
+            with CaptureQueriesContext(connection) as ctx:
+                resp = self.client.get(self.list_url, **self.hdr)
+                self.assertEqual(resp.status_code, 200, resp.content)
+            return len(ctx)
+
+        self._post({"status": "DELIVERED", "documents": [self.bill_a.id]})
+        count_queries()  # warm the permission cache
+        before = count_queries()
+        self._post({"status": "DELIVERED", "documents": [self.bill_b.id]})
+        self._post({"status": "DELIVERED", "documents": [self.bill_c.id]})
+        after = count_queries()
+        self.assertEqual(before, after, f"board N+1: {before} queries for 1 stop, {after} for 3")

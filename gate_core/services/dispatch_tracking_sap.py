@@ -5,7 +5,8 @@ SAP keeps a delivery on the invoice, not on the truck: ``OINV.U_Recv_Date``
 proof as the invoice's attachment. Until this, one person typed those in by hand
 from scanned bills, weeks after the truck came back. A Delivered or Partially
 Delivered tracking update now opens a :class:`TruckDispatchSapReceipt` for every
-A/R invoice on the truck, and the SAP posting queue writes each one.
+A/R invoice on the truck -- or, for a delivery logged at one stop of a multi-drop
+truck, for that stop's invoices only -- and the SAP posting queue writes each one.
 
 What ``SBO_SP_TRANSACTIONNOTIFICATION`` demands of that write (read from the
 procedure itself; the app posts as ``B1i``, whom none of the rules exempt):
@@ -149,7 +150,10 @@ NEEDS_PROOF_MESSAGE = "Attach the proof of delivery to send this to SAP."
 
 
 def open_receipts(update, user):
-    """One receipt per invoice on the truck, for a delivery update just logged.
+    """One receipt per invoice the delivery covers, for an update just logged:
+    every invoice on the truck, or only the named stop's when the update covers
+    a subset (``update.documents``). A bill still on the road for another stop
+    is not received in SAP ahead of its own delivery.
 
     Runs inside the update's own transaction; nothing here talks to SAP.
     """
@@ -162,8 +166,11 @@ def open_receipts(update, user):
         for item in line.items.all()
     }
     received_date = received_date_for(update)
+    covered = {document.id for document in update.documents.all()}
     opened = []
     for document in truck_invoices(update.arrival):
+        if covered and document.id not in covered:
+            continue
         earlier = TruckDispatchSapReceipt.objects.filter(
             document=document, is_active=True
         ).exclude(update=update)

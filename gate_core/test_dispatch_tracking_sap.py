@@ -1,4 +1,5 @@
 """A delivery logged on Dispatch Tracking, written to each bill's SAP invoice."""
+import json
 import shutil
 import tempfile
 from datetime import date
@@ -377,6 +378,53 @@ class DeliverySapReceiptTests(TestCase):
         second = self._post({"status": "DELIVERED", "proof": self._proof()})
         self.assertEqual(second.data["sap_receipts"], [])
         self.assertEqual(self.patch.call_count, 2)
+
+    # --- a delivery at one stop of a multi-drop truck -----------------------
+
+    def test_a_delivery_at_one_stop_receives_only_that_stops_bills(self):
+        self._sap()
+        resp = self._post({
+            "status": "DELIVERED", "delivered_date": "2026-10-05", "proof": self._proof(),
+            "documents": json.dumps([self.bill_a.id]),
+        })
+        self.assertEqual(
+            [(r["sap_doc_num"], r["status"]) for r in self._receipts(resp.data["id"])],
+            [("INV-2001", "POSTED")],
+        )
+        self.assertEqual(self.patch.call_count, 1)
+        self.assertEqual(self._payload(2001)["U_Recv_Date"], "2026-10-05")
+        # Bill B is still on the road for its own stop: SAP hears nothing of it.
+        self.assertFalse(TruckDispatchSapReceipt.objects.filter(document=self.bill_b).exists())
+
+    def test_each_stop_receives_its_own_bills(self):
+        self._sap()
+        self._post({
+            "status": "DELIVERED", "delivered_date": "2026-10-05", "proof": self._proof(),
+            "documents": json.dumps([self.bill_a.id]),
+        })
+        second = self._post({
+            "status": "DELIVERED", "delivered_date": "2026-10-06", "proof": self._proof(),
+            "documents": json.dumps([self.bill_b.id]),
+        })
+        self.assertEqual(
+            [(r["sap_doc_num"], r["status"]) for r in self._receipts(second.data["id"])],
+            [("INV-2002", "POSTED")],
+        )
+        self.assertEqual(self._payload(2002)["U_Recv_Date"], "2026-10-06")
+        self.assertEqual(self.patch.call_count, 2)
+        # The first stop's receipt stands: the second delivery did not touch it.
+        self.assertEqual(self._receipt(self.bill_a).status, Status.POSTED)
+
+    def test_a_stop_delivered_again_replaces_only_its_own_waiting_receipt(self):
+        self._sap()
+        first = self._post({"status": "DELIVERED", "documents": json.dumps([self.bill_a.id])})
+        self._post({"status": "DELIVERED", "proof": self._proof(),
+                    "documents": json.dumps([self.bill_a.id])})
+        self.assertEqual(
+            TruckDispatchSapReceipt.objects.get(update_id=first.data["id"]).status,
+            Status.SUPERSEDED,
+        )
+        self.assertEqual(self.patch.call_count, 1)
 
     def test_timeline_carries_each_bills_sap_status(self):
         self._sap()

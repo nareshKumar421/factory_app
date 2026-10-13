@@ -4,8 +4,15 @@ Once a physical truck leaves the gate (its ``VehicleArrival`` is DEPARTED and it
 dockings DISPATCHED), operators track what happens next -- in transit, reached,
 delivered, returned, etc. Each event is one ``TruckDispatchUpdate`` on the truck's
 arrival, so a multi-company truck has a single shared timeline (the trip is the
-truck, not the per-company docking). The truck's *current* post-dispatch status is
-the latest update.
+truck, not the per-company docking).
+
+A truck-level event speaks for the whole truck. A delivery may instead name the
+bills it covers (``TruckDispatchUpdate.documents``): one bilty often carries goods
+for several customers' locations, dropped one after another, and each stop is
+then logged as its own Delivered update. The truck's *current* status is derived
+from the timeline by ``gate_core.services.dispatch_tracking_status`` -- the latest
+update, except that a truck delivered stop by stop is Delivered only once every
+bill on it has been.
 """
 from decimal import Decimal
 
@@ -73,6 +80,18 @@ class TruckDispatchUpdate(BaseModel):
     # the return note.
     return_note = models.FileField(
         upload_to="dispatch_tracking/return_note/", null=True, blank=True
+    )
+
+    # The bills this update covers, when a delivery is logged one stop at a time:
+    # a truck dropping at Agra, then Hisar, then Bikaner gets one Delivered update
+    # per stop, each naming that stop's bills, and SAP is told about those bills
+    # only. Empty means the whole truck -- every truck-level event (in transit,
+    # reached, delayed, returned, closed), a delivery made in one go, and every
+    # delivery logged before stops were tracked.
+    documents = models.ManyToManyField(
+        "gate_core.SalesDispatchGateOutDocument",
+        related_name="delivery_updates",
+        blank=True,
     )
 
     class Meta:

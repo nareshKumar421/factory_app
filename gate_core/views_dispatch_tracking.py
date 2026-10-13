@@ -40,6 +40,7 @@ from gate_core.serializers_dispatch_tracking import (
     TruckDispatchUpdateSerializer,
 )
 from gate_core.services import dispatch_tracking_sap
+from gate_core.services.dispatch_tracking_status import delivery_progress
 from gate_core.services.user_scope import user_company_ids
 
 
@@ -127,6 +128,9 @@ class DispatchTrackingListView(APIView):
                 "gate_outs__transporter",
                 "gate_outs__documents",
                 "dispatch_updates",
+                # The bills each delivery covered: the truck's status, and each
+                # location's, are derived from them.
+                "dispatch_updates__documents",
             )
         )
 
@@ -200,11 +204,18 @@ class DispatchTrackingBillsView(APIView):
                 "gate_outs__company",
                 "gate_outs__documents__company",
                 "gate_outs__documents__items",
+                # Where each bill's delivery stands, so the form can tell the
+                # stops already made from the ones still to come.
+                "dispatch_updates__documents",
             ),
             id=arrival_id,
         )
         bills = _arrival_bills(arrival, set(user_company_ids(request)))
-        return Response(TruckDispatchBillSerializer(bills, many=True).data)
+        return Response(
+            TruckDispatchBillSerializer(
+                bills, many=True, context={"progress": delivery_progress(arrival)}
+            ).data
+        )
 
 
 class DispatchTrackingUpdatesView(APIView):
@@ -231,6 +242,7 @@ class DispatchTrackingUpdatesView(APIView):
             arrival.dispatch_updates.filter(is_active=True)
             .select_related("created_by")
             .prefetch_related(
+                "documents",
                 "partial_lines__document",
                 "partial_lines__items__item",
                 "sap_receipts__document__company",
@@ -242,25 +254,29 @@ class DispatchTrackingUpdatesView(APIView):
             ).data
         )
 
-    def _payload(self, request):
-        """Request data with ``partial_lines`` decoded.
+    # The list-valued fields multipart cannot carry as such.
+    JSON_FIELDS = ("partial_lines", "documents")
 
-        Multipart carries the return note and proof as files, so the per-bill rows
-        arrive as a JSON string in the same form; JSON requests already have a list.
+    def _payload(self, request):
+        """Request data with ``partial_lines`` and ``documents`` decoded.
+
+        Multipart carries the return note and proof as files, so the per-bill
+        rows and the covered bills arrive as JSON strings in the same form; JSON
+        requests already have lists.
         """
         data = request.data
-        raw = data.get("partial_lines")
-        if not isinstance(raw, str):
+        raw = {name: data.get(name) for name in self.JSON_FIELDS}
+        if not any(isinstance(value, str) for value in raw.values()):
             return data
 
-        try:
-            parsed = json.loads(raw or "[]")
-        except json.JSONDecodeError:
-            raise ValidationError(
-                {"partial_lines": "Invalid JSON in 'partial_lines'."}
-            )
         payload = data.dict() if hasattr(data, "dict") else dict(data)
-        payload["partial_lines"] = parsed
+        for name, value in raw.items():
+            if not isinstance(value, str):
+                continue
+            try:
+                payload[name] = json.loads(value or "[]")
+            except json.JSONDecodeError:
+                raise ValidationError({name: f"Invalid JSON in '{name}'."})
         return payload
 
     def post(self, request, arrival_id):
@@ -270,9 +286,15 @@ class DispatchTrackingUpdatesView(APIView):
         data = serializer.validated_data
 
         lines = data.get("partial_lines") or []
+        covered = data.get("documents") or []
         bills_by_id = {
             bill.id: bill for bill in _arrival_bills(arrival, set(user_company_ids(request)))
         }
+        for document_id in covered:
+            if document_id not in bills_by_id:
+                raise ValidationError(
+                    {"documents": f"Bill {document_id} is not on this truck."}
+                )
         for line in lines:
             bill = bills_by_id.get(line["document"])
             if bill is None:
@@ -317,6 +339,10 @@ class DispatchTrackingUpdatesView(APIView):
                 created_by=request.user,
                 updated_by=request.user,
             )
+            # A delivery at one stop names that stop's bills; the status
+            # derivation and the SAP receipts both read the scope from here.
+            if covered:
+                update.documents.set(covered)
             for line in lines:
                 bill = bills_by_id[line["document"]]
                 parent = TruckDispatchPartialDeliveryLine.objects.create(
@@ -516,7 +542,12 @@ class DispatchTrackingSummaryView(APIView):
         qs = (
             _dispatched_trucks_qs(request)
             .select_related("vehicle", "driver")
-            .prefetch_related("gate_outs__transporter", "dispatch_updates")
+            .prefetch_related(
+                "gate_outs__transporter",
+                "gate_outs__documents",
+                "dispatch_updates",
+                "dispatch_updates__documents",
+            )
             .filter(
                 Q(departed_at__date__gte=from_date, departed_at__date__lte=to_date)
                 | Q(
@@ -542,7 +573,9 @@ class DispatchTrackingSummaryView(APIView):
                 key=lambda u: (u.occurred_at, u.id),
                 reverse=True,
             )
-            current = updates[0].status if updates else "DISPATCHED"
+            # Derived the same way the board derives it, so a truck delivered
+            # stop by stop counts as Partially Delivered until its last stop.
+            current = delivery_progress(arrival).current_status
             counts[current] = counts.get(current, 0) + 1
             if not updates:
                 no_update_yet += 1
