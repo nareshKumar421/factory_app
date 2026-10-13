@@ -1748,7 +1748,8 @@ class MaterialIndent(BaseModel):
     purchase_remarks = models.TextField(blank=True, default="")
 
     # Gate-in of the purchased goods (vehicle recorded by the gate; invoice/bill
-    # go on MaterialIndentAttachment).
+    # go on MaterialIndentAttachment). A purchase may come in several vehicles;
+    # each is a MaterialIndentArrival, and these fields hold the latest one.
     gatein_vehicle_number = models.CharField(max_length=30, blank=True, default="")
     gatein_driver_name = models.CharField(max_length=200, blank=True, default="")
     gatein_driver_mobile = models.CharField(max_length=20, blank=True, default="")
@@ -1770,6 +1771,18 @@ class MaterialIndent(BaseModel):
         related_name="maintenance_material_indents_received",
     )
     received_at = models.DateTimeField(null=True, blank=True)
+
+    #: Part of the purchase came and the rest never will (the vendor is short,
+    #: the order was cut). Stops the gate expecting the remainder.
+    short_closed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indents_short_closed",
+    )
+    short_closed_at = models.DateTimeField(null=True, blank=True)
+    short_close_reason = models.TextField(blank=True, default="")
 
     #: Legacy link (unused in the store/purchase flow) — kept for old records.
     generated_gate_pass = models.ForeignKey(
@@ -1808,6 +1821,28 @@ class MaterialIndent(BaseModel):
                 next_number = int(suffix) + 1
         return f"{prefix}-{next_number:04d}"
 
+    def refresh_arrival_status(self):
+        """Derive PURCHASED / PARTIALLY_ARRIVED / GATE_IN / RECEIVED from the arrivals.
+
+        The gate still expects goods while any bought line has some left to
+        come, unless the indent was short closed. Once nothing more is
+        expected, the indent waits at GATE_IN until the store has received
+        every arrival, then it is RECEIVED.
+        """
+        items = list(self.items.all())
+        arrivals = list(self.arrivals.all())
+        expecting_more = not self.short_closed_at and any(
+            item.pending_arrival_quantity > 0 for item in items
+        )
+        if expecting_more:
+            self.status = (
+                MaterialIndentStatus.PARTIALLY_ARRIVED if arrivals else MaterialIndentStatus.PURCHASED
+            )
+        elif any(arrival.received_at is None for arrival in arrivals):
+            self.status = MaterialIndentStatus.GATE_IN
+        else:
+            self.status = MaterialIndentStatus.RECEIVED
+
 
 class MaterialIndentItem(BaseModel):
     """One line of a material indent (a requested item)."""
@@ -1834,6 +1869,14 @@ class MaterialIndentItem(BaseModel):
     )
     #: How much the store could issue from stock; the rest is the purchase shortfall.
     issued_quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        validators=[MinValueValidator(Decimal("0.000"))],
+    )
+    #: How much of the purchased shortfall came through the gate, over every
+    #: arrival. The running sum of this line's MaterialIndentArrivalLine rows.
+    arrived_quantity = models.DecimalField(
         max_digits=14,
         decimal_places=3,
         default=Decimal("0.000"),
@@ -1867,6 +1910,103 @@ class MaterialIndentItem(BaseModel):
     def shortfall_quantity(self):
         short = self.quantity - self.issued_quantity
         return short if short > Decimal("0.000") else Decimal("0.000")
+
+    @property
+    def pending_arrival_quantity(self):
+        """What was bought and has not come through the gate yet."""
+        pending = self.shortfall_quantity - self.arrived_quantity
+        return pending if pending > Decimal("0.000") else Decimal("0.000")
+
+    @property
+    def awaiting_receipt_quantity(self):
+        """What came through the gate and the store has not received yet."""
+        return sum(
+            (
+                line.quantity
+                for line in self.arrival_lines.all()
+                if line.arrival.received_at is None
+            ),
+            Decimal("0.000"),
+        )
+
+
+class MaterialIndentArrival(BaseModel):
+    """One vehicle bringing some or all of a purchased indent through the gate.
+
+    A purchase often comes in pieces — five of fifteen lines today, the rest
+    next week — so the gate records what each vehicle brought, and the store
+    receives each arrival into stock.
+    """
+
+    indent = models.ForeignKey(
+        MaterialIndent,
+        on_delete=models.CASCADE,
+        related_name="arrivals",
+    )
+    arrival_no = models.PositiveIntegerField(default=1)
+    vehicle_number = models.CharField(max_length=30, blank=True, default="")
+    driver_name = models.CharField(max_length=200, blank=True, default="")
+    driver_mobile = models.CharField(max_length=20, blank=True, default="")
+    remarks = models.TextField(blank=True, default="")
+    gate_in_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indent_arrivals",
+    )
+    gate_in_at = models.DateTimeField(default=timezone.now)
+    #: Set when the store has received this arrival into stock.
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maintenance_material_indent_arrivals_received",
+    )
+    received_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["arrival_no", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["indent", "arrival_no"],
+                name="uniq_material_indent_arrival_no",
+            )
+        ]
+        verbose_name = "Material Indent Arrival"
+        verbose_name_plural = "Material Indent Arrivals"
+
+    def __str__(self):
+        return f"{self.indent} arrival {self.arrival_no}"
+
+
+class MaterialIndentArrivalLine(BaseModel):
+    """How much of one indent line came on one arrival."""
+
+    arrival = models.ForeignKey(
+        MaterialIndentArrival,
+        on_delete=models.CASCADE,
+        related_name="lines",
+    )
+    item = models.ForeignKey(
+        MaterialIndentItem,
+        on_delete=models.CASCADE,
+        related_name="arrival_lines",
+    )
+    quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+
+    class Meta:
+        ordering = ["id"]
+        verbose_name = "Material Indent Arrival Line"
+        verbose_name_plural = "Material Indent Arrival Lines"
+
+    def __str__(self):
+        return f"{self.item_id} +{self.quantity}"
 
 
 class MaterialIndentQuotation(BaseModel):

@@ -263,6 +263,9 @@ class MaterialIndentStatus(models.TextChoices):
     #: Approver picked a company; the purchaser now buys and closes the indent.
     QUOTATION_SELECTED = "QUOTATION_SELECTED", "Company Selected"
     PURCHASED = "PURCHASED", "Purchased"
+    #: Some of the purchase came through the gate; the rest is still expected.
+    #: The gate can let the next vehicle in, and the store can receive what came.
+    PARTIALLY_ARRIVED = "PARTIALLY_ARRIVED", "Part Arrived"
     GATE_IN = "GATE_IN", "Arrived at Gate"
     RECEIVED = "RECEIVED", "Received into Store"
     REJECTED = "REJECTED", "Rejected"

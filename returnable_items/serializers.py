@@ -271,6 +271,8 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
     department_name = serializers.CharField(source="department.name", read_only=True, default="")
     item_count = serializers.IntegerField(read_only=True)
     item_names = serializers.SerializerMethodField()
+    #: How many lines are fully back, so a queue can say "1 of 3 back".
+    items_back = serializers.SerializerMethodField()
     days_overdue = serializers.IntegerField(read_only=True)
     pending_return_qty = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
     destination = serializers.CharField(read_only=True)
@@ -282,6 +284,9 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
         # Comma-joined item names for the list view. `items` is prefetched by the
         # viewset, so this adds no extra query.
         return ", ".join(item.item_name for item in obj.items.all())
+
+    def get_items_back(self, obj):
+        return sum(1 for item in obj.items.all() if item.is_fully_returned)
 
     def get_material_indent_no(self, obj):
         indents = list(obj.source_material_indents.all())
@@ -309,6 +314,7 @@ class ReturnableGatePassListSerializer(CompanyScopedModelSerializer):
             "is_overdue",
             "days_overdue",
             "item_count",
+            "items_back",
             "pending_return_qty",
             "gate_out_at",
             "last_return_at",

@@ -377,6 +377,15 @@ class CanReceiveMaterialIndent(DjangoPermission):
     permission = "maintenance.can_receive_material_indent"
 
 
+class CanShortCloseMaterialIndent(AnyDjangoPermission):
+    """Purchaser (knows the vendor is short) or store (knows what came) may say the rest is not coming."""
+
+    permissions = [
+        "maintenance.can_purchase_material_indent",
+        "maintenance.can_receive_material_indent",
+    ]
+
+
 class CanViewWorkPermit(AnyDjangoPermission):
     permissions = [
         "maintenance.can_view_work_permit",

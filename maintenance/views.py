@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Count, F, OuterRef, ProtectedError, Q, Subquery, Sum
+from django.db.models import Count, F, Max, OuterRef, ProtectedError, Q, Subquery, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -75,6 +75,8 @@ from .models import (
     MaintenanceWorkOrderLog,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
+    MaterialIndentArrival,
+    MaterialIndentArrivalLine,
     MaterialIndentAttachment,
     MaterialIndentItem,
     MaterialIndentQuotation,
@@ -141,6 +143,7 @@ from .permissions import (
     CanPurchaseMaterialIndent,
     CanReceiveMaterialIndent,
     CanReviewMaterialIndent,
+    CanShortCloseMaterialIndent,
     CanSubmitMaterialIndent,
     CanViewMaterialIndent,
     CanAddDailyElectricity,
@@ -210,6 +213,7 @@ from .serializers import (
     MaterialIndentReceiveSerializer,
     MaterialIndentReviewSerializer,
     MaterialIndentSerializer,
+    MaterialIndentShortCloseSerializer,
     DailyElectricityReadingSerializer,
     DailyWastageLogSerializer,
     ElectricityConsumerSerializer,
@@ -4301,6 +4305,8 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             permissions.append(CanGateInMaterialIndent())
         elif self.action == "receive":
             permissions.append(CanReceiveMaterialIndent())
+        elif self.action == "short_close":
+            permissions.append(CanShortCloseMaterialIndent())
         else:
             permissions.append(CanViewMaterialIndent())
         return permissions
@@ -4313,7 +4319,14 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
                 "purchased_by", "created_by", "updated_by",
                 "selected_quotation", "quotations_submitted_by", "quotation_selected_by",
             )
-            .prefetch_related("items", "quotations__lines__item", "quotations__attachments")
+            .prefetch_related(
+                "items__arrival_lines__arrival",
+                "quotations__lines__item",
+                "quotations__attachments",
+                "arrivals__lines__item",
+                "arrivals__gate_in_by",
+                "arrivals__received_by",
+            )
         )
         params = self.request.query_params
         search = params.get("search")
@@ -4326,7 +4339,8 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
             ).distinct()
         status_param = params.get("status")
         if status_param:
-            qs = qs.filter(status=status_param)
+            # One status, or several comma-separated ("PARTIALLY_ARRIVED,GATE_IN").
+            qs = qs.filter(status__in=[value for value in status_param.split(",") if value])
         department = params.get("department")
         if department:
             qs = qs.filter(department_id=department)
@@ -4709,60 +4723,171 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
 
     @action(detail=True, methods=["post"], url_path="gate-in")
     def gate_in(self, request, pk=None):
-        """Gate records the vehicle when the purchased goods arrive (invoice/bill via attachments)."""
+        """Gate records one vehicle bringing some or all of the purchase.
+
+        ``items`` is how much of each bought line this vehicle brought; omitted,
+        everything still expected came at once. Anything still to come keeps
+        the indent PARTIALLY_ARRIVED, back in the gate's Material In queue for
+        the next vehicle. Invoice/bill files go on as attachments.
+        """
         indent = self.get_object()
-        if indent.status != MaterialIndentStatus.PURCHASED:
-            return Response(
-                {"detail": "Only a purchased indent can be gated in."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         payload = MaterialIndentGateInSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-        indent.status = MaterialIndentStatus.GATE_IN
-        indent.gatein_vehicle_number = payload.validated_data.get("vehicle_number", "")
-        indent.gatein_driver_name = payload.validated_data.get("driver_name", "")
-        indent.gatein_driver_mobile = payload.validated_data.get("driver_mobile", "")
-        indent.gate_in_by = request.user
-        indent.gate_in_at = timezone.now()
-        indent.updated_by = request.user
-        indent.save(
-            update_fields=[
-                "status", "gatein_vehicle_number", "gatein_driver_name", "gatein_driver_mobile",
-                "gate_in_by", "gate_in_at", "updated_by", "updated_at",
-            ]
-        )
+        data = payload.validated_data
+
+        with transaction.atomic():
+            # Locked so two gate-ins at once neither share an arrival number
+            # nor both let in the last of the same line.
+            indent = MaterialIndent.objects.select_for_update().get(pk=indent.pk)
+            if indent.status not in (
+                MaterialIndentStatus.PURCHASED,
+                MaterialIndentStatus.PARTIALLY_ARRIVED,
+            ):
+                return Response(
+                    {"detail": "Only a purchased indent can be gated in."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            items = {item.id: item for item in indent.items.all()}
+
+            if "items" in data:
+                counts = {}
+                for row in data["items"]:
+                    if row["id"] not in items:
+                        return Response(
+                            {"detail": "That item is not on this indent."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    counts[row["id"]] = counts.get(row["id"], Decimal("0")) + row["quantity"]
+            else:
+                counts = {item.id: item.pending_arrival_quantity for item in items.values()}
+            counts = {item_id: qty for item_id, qty in counts.items() if qty > 0}
+
+            if not counts:
+                return Response(
+                    {"detail": "Nothing came. Enter how much of each item arrived."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            for item_id, qty in counts.items():
+                item = items[item_id]
+                if qty > item.pending_arrival_quantity:
+                    return Response(
+                        {
+                            "detail": (
+                                f"Only {item.pending_arrival_quantity.normalize():f} {item.unit} "
+                                f"of {item.particulars} is still expected."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            now = timezone.now()
+            last_no = indent.arrivals.aggregate(last=Max("arrival_no"))["last"] or 0
+            arrival = MaterialIndentArrival.objects.create(
+                indent=indent,
+                arrival_no=last_no + 1,
+                vehicle_number=data.get("vehicle_number", ""),
+                driver_name=data.get("driver_name", ""),
+                driver_mobile=data.get("driver_mobile", ""),
+                remarks=data.get("remarks", ""),
+                gate_in_by=request.user,
+                gate_in_at=now,
+                created_by=request.user,
+                updated_by=request.user,
+            )
+            for item_id, qty in counts.items():
+                item = items[item_id]
+                MaterialIndentArrivalLine.objects.create(
+                    arrival=arrival,
+                    item=item,
+                    quantity=qty,
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
+                item.arrived_quantity += qty
+                item.updated_by = request.user
+                item.save(update_fields=["arrived_quantity", "updated_by", "updated_at"])
+
+            indent.gatein_vehicle_number = arrival.vehicle_number
+            indent.gatein_driver_name = arrival.driver_name
+            indent.gatein_driver_mobile = arrival.driver_mobile
+            indent.gate_in_by = request.user
+            indent.gate_in_at = now
+            indent.updated_by = request.user
+            indent.refresh_arrival_status()
+            indent.save(
+                update_fields=[
+                    "status", "gatein_vehicle_number", "gatein_driver_name", "gatein_driver_mobile",
+                    "gate_in_by", "gate_in_at", "updated_by", "updated_at",
+                ]
+            )
+
+        if indent.status == MaterialIndentStatus.PARTIALLY_ARRIVED:
+            body = (
+                f"Indent {indent.indent_no}: part of the purchase arrived at the gate, "
+                "the rest is still expected. Collect what came into store stock."
+            )
+        else:
+            body = (
+                f"Indent {indent.indent_no} has arrived at the gate. Collect it into store stock."
+            )
         self._notify_perm(
             indent,
             "maintenance.can_receive_material_indent",
             NotificationType.MATERIAL_INDENT_GATE_IN,
             "Material arrived — ready to receive into store",
-            f"Indent {indent.indent_no} has arrived at the gate. Collect it into store stock.",
+            body,
             request.user,
         )
         return Response(self._fresh(indent))
 
     @action(detail=True, methods=["post"])
     def receive(self, request, pk=None):
-        """Store collects the arrival: each purchased item is added to Store/Spares stock."""
+        """Store receives what the gate let in: each line's count goes into Store/Spares stock.
+
+        Each count starts at what the gate recorded on the arrivals the store
+        has not received yet; the store sends a different number when it counts
+        one. Receiving settles those arrivals. The indent is RECEIVED once
+        nothing more is expected at the gate, and stays PARTIALLY_ARRIVED until then.
+        """
         indent = self.get_object()
-        if indent.status != MaterialIndentStatus.GATE_IN:
-            return Response(
-                {"detail": "Only a gated-in indent can be received into store."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         payload = MaterialIndentReceiveSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
         overrides = {row["id"]: row["received_quantity"] for row in payload.validated_data.get("items", [])}
-        counts = [(item, overrides.get(item.id, item.shortfall_quantity)) for item in indent.items.all()]
-        if not any(qty and qty > 0 for _, qty in counts):
-            return Response(
-                {"detail": "Nothing was counted. Enter how many of each item came."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         with transaction.atomic():
+            indent = MaterialIndent.objects.select_for_update().get(pk=indent.pk)
+            arrivals = list(indent.arrivals.filter(received_at__isnull=True).prefetch_related("lines"))
+            if not arrivals:
+                return Response(
+                    {"detail": "Nothing has come through the gate for the store to receive."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            awaiting = {}
+            for arrival in arrivals:
+                for line in arrival.lines.all():
+                    awaiting[line.item_id] = awaiting.get(line.item_id, Decimal("0")) + line.quantity
+
+            items = {item.id: item for item in indent.items.all()}
+            for item_id, qty in overrides.items():
+                if item_id not in items:
+                    return Response(
+                        {"detail": "That item is not on this indent."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if item_id not in awaiting and qty > 0:
+                    return Response(
+                        {"detail": f"{items[item_id].particulars} has not come through the gate yet."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            counts = [(items[item_id], overrides.get(item_id, qty)) for item_id, qty in awaiting.items()]
+            if not any(qty > 0 for _, qty in counts):
+                return Response(
+                    {"detail": "Nothing was counted. Enter how many of each item came."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             for item, qty in counts:
-                if qty is None or qty <= 0:
+                if qty <= 0:
                     continue
                 spare = self._match_or_create_spare(indent, item, request.user)
                 spare.current_stock = spare.current_stock + qty
@@ -4779,23 +4904,74 @@ class MaterialIndentViewSet(CompanyScopedViewSet):
                     created_by=request.user,
                     updated_by=request.user,
                 )
-                item.received_quantity = qty
+                item.received_quantity += qty
                 item.received_spare = spare
                 item.updated_by = request.user
                 item.save(update_fields=["received_quantity", "received_spare", "updated_by", "updated_at"])
 
-            indent.status = MaterialIndentStatus.RECEIVED
+            now = timezone.now()
+            for arrival in arrivals:
+                arrival.received_by = request.user
+                arrival.received_at = now
+                arrival.updated_by = request.user
+                arrival.save(update_fields=["received_by", "received_at", "updated_by", "updated_at"])
+
             indent.received_by = request.user
-            indent.received_at = timezone.now()
+            indent.received_at = now
             indent.updated_by = request.user
+            indent.refresh_arrival_status()
             indent.save(
                 update_fields=["status", "received_by", "received_at", "updated_by", "updated_at"]
             )
 
+        if indent.status == MaterialIndentStatus.RECEIVED:
+            title = "Your material request was received into store"
+            body = f"Indent {indent.indent_no}: purchased items are now in Store / Spares stock."
+        else:
+            title = "Part of your material request was received into store"
+            body = (
+                f"Indent {indent.indent_no}: what has arrived so far is in Store / Spares stock. "
+                "The rest is still expected at the gate."
+            )
+        self._notify_user(
+            indent, indent.created_by, NotificationType.MATERIAL_INDENT_RECEIVED, title, body,
+            request.user,
+        )
+        return Response(self._fresh(indent))
+
+    @action(detail=True, methods=["post"], url_path="short-close")
+    def short_close(self, request, pk=None):
+        """Part of the purchase came and the rest never will: stop the gate expecting it.
+
+        What already arrived still goes through the store as usual, so the
+        indent moves to GATE_IN when the store has something left to receive,
+        and to RECEIVED otherwise.
+        """
+        indent = self.get_object()
+        payload = MaterialIndentShortCloseSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        with transaction.atomic():
+            indent = MaterialIndent.objects.select_for_update().get(pk=indent.pk)
+            if indent.status != MaterialIndentStatus.PARTIALLY_ARRIVED:
+                return Response(
+                    {"detail": "Only an indent whose goods have partly arrived can be short closed."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            indent.short_closed_by = request.user
+            indent.short_closed_at = timezone.now()
+            indent.short_close_reason = payload.validated_data["reason"]
+            indent.updated_by = request.user
+            indent.refresh_arrival_status()
+            indent.save(
+                update_fields=[
+                    "status", "short_closed_by", "short_closed_at", "short_close_reason",
+                    "updated_by", "updated_at",
+                ]
+            )
         self._notify_user(
             indent, indent.created_by, NotificationType.MATERIAL_INDENT_RECEIVED,
-            "Your material request was received into store",
-            f"Indent {indent.indent_no}: purchased items are now in Store / Spares stock.",
+            "The rest of your material request is not coming",
+            f"Indent {indent.indent_no} was closed short: {indent.short_close_reason}",
             request.user,
         )
         return Response(self._fresh(indent))

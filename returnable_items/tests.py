@@ -263,6 +263,24 @@ class ReturnableGatePassFlowTests(APITestCase):
         self.assertEqual(gate_pass.return_events.count(), 2)
         self.assertEqual(gate_pass.pending_return_qty, Decimal("0.000"))
 
+    def test_gate_queue_counts_the_lines_already_back(self, _notify):
+        gate_pass = self._create_pass()
+        self._submit_and_approve(gate_pass)
+        self._gate_out(gate_pass)
+        motor = gate_pass.items.get(item_name="Gear Motor 3HP")
+
+        self._record_return(
+            gate_pass,
+            {"lines": [{"pass_item": motor.id, "quantity_returned": "2.000"}]},
+        )
+
+        listed = self.client.get(
+            reverse("returnable-gatepass-list"), {"status": "PARTIALLY_RETURNED"}
+        )
+        self.assertEqual(listed.status_code, status.HTTP_200_OK)
+        row = next(row for row in listed.data if row["id"] == gate_pass.id)
+        self.assertEqual((row["items_back"], row["item_count"]), (1, 2))
+
     def test_over_return_is_rejected(self, _notify):
         gate_pass = self._create_pass()
         self._submit_and_approve(gate_pass)

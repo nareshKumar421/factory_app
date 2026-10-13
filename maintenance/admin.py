@@ -38,6 +38,7 @@ from .models import (
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     MaterialIndent,
+    MaterialIndentArrival,
     MaterialIndentAttachment,
     MaterialIndentItem,
     SafetyFine,
@@ -348,6 +349,12 @@ class MaterialIndentAttachmentInline(admin.TabularInline):
     extra = 0
 
 
+class MaterialIndentArrivalInline(admin.TabularInline):
+    model = MaterialIndentArrival
+    extra = 0
+    raw_id_fields = ("gate_in_by", "received_by")
+
+
 @admin.register(MaterialIndent)
 class MaterialIndentAdmin(admin.ModelAdmin):
     list_display = (
@@ -362,9 +369,9 @@ class MaterialIndentAdmin(admin.ModelAdmin):
     search_fields = ("indent_no", "purpose", "requested_by_name", "items__particulars")
     raw_id_fields = (
         "department", "submitted_by", "reviewed_by", "approved_by",
-        "purchased_by", "gate_in_by", "received_by", "generated_gate_pass",
+        "purchased_by", "gate_in_by", "received_by", "short_closed_by", "generated_gate_pass",
     )
-    inlines = [MaterialIndentItemInline, MaterialIndentAttachmentInline]
+    inlines = [MaterialIndentItemInline, MaterialIndentArrivalInline, MaterialIndentAttachmentInline]
 
 
 @admin.register(SafetyViolationType)

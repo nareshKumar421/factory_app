@@ -1,9 +1,11 @@
+import importlib
 import shutil
 import tempfile
 from decimal import Decimal
 from datetime import date, timedelta
 from unittest.mock import patch
 
+from django.apps import apps as django_apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -48,6 +50,7 @@ from .models import (
     MaintenanceWorkOrderAttachment,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
+    MaterialIndentArrival,
     PreventiveMaintenanceExecution,
     PreventiveMaintenancePlan,
     SpareCategory,
@@ -3001,6 +3004,200 @@ class MaterialIndentAPITests(APITestCase):
             self.client.get(f"/api/v1/maintenance/material-indents/{indent_id}/").data["status"],
             "GATE_IN",
         )
+
+
+    # ---- A purchase arriving in pieces ----
+
+    def _purchased_indent(self):
+        """A4 Paper box 30 + Pen 40, nothing issued, so both are bought in full."""
+        data = self._create_indent()
+        indent_id = self._submit(data)
+        for step in ("approve", "purchase"):
+            done = self.client.post(
+                f"/api/v1/maintenance/material-indents/{indent_id}/{step}/", {}, format="json"
+            )
+            self.assertEqual(done.status_code, status.HTTP_200_OK, (step, done.data))
+        paper, pen = data["items"]
+        return indent_id, paper["id"], pen["id"]
+
+    def _gate_in(self, indent_id, counts, vehicle="HR55-1234"):
+        return self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/gate-in/",
+            {
+                "vehicle_number": vehicle,
+                "items": [{"id": item_id, "quantity": qty} for item_id, qty in counts.items()],
+            },
+            format="json",
+        )
+
+    def _receive(self, indent_id, body=None):
+        return self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/receive/", body or {}, format="json"
+        )
+
+    @staticmethod
+    def _line(data, item_id):
+        return next(item for item in data["items"] if item["id"] == item_id)
+
+    def test_a_purchase_can_come_in_three_vehicles(self):
+        indent_id, paper, pen = self._purchased_indent()
+
+        # Vehicle 1 brings all the paper and none of the pens.
+        first = self._gate_in(indent_id, {paper: "30", pen: "0"})
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+        self.assertEqual(first.data["status"], "PARTIALLY_ARRIVED")
+        self.assertEqual(Decimal(self._line(first.data, pen)["pending_arrival_quantity"]), 40)
+        self.assertEqual(Decimal(self._line(first.data, paper)["awaiting_receipt_quantity"]), 30)
+        self.assertEqual([len(a["lines"]) for a in first.data["arrivals"]], [1])
+
+        # The store takes in what came; the pens are still on their way.
+        received = self._receive(indent_id)
+        self.assertEqual(received.status_code, status.HTTP_200_OK, received.data)
+        self.assertEqual(received.data["status"], "PARTIALLY_ARRIVED")
+        self.assertEqual(
+            MaintenanceSpare.objects.get(company=self.company, name__iexact="A4 Paper box").current_stock,
+            Decimal("30.000"),
+        )
+        self.assertFalse(MaintenanceSpare.objects.filter(name__iexact="Pen (Blue)").exists())
+
+        # Vehicle 2 brings 25 pens, vehicle 3 the last 15 before the store counts again.
+        self.assertEqual(self._gate_in(indent_id, {pen: "25"}, "PB10-1").data["status"], "PARTIALLY_ARRIVED")
+        third = self._gate_in(indent_id, {pen: "15"}, "PB10-2")
+        self.assertEqual(third.data["status"], "GATE_IN")
+        self.assertEqual(third.data["gatein_vehicle_number"], "PB10-2")
+        self.assertEqual([a["arrival_no"] for a in third.data["arrivals"]], [1, 2, 3])
+        self.assertEqual(Decimal(self._line(third.data, pen)["awaiting_receipt_quantity"]), 40)
+
+        done = self._receive(indent_id)
+        self.assertEqual(done.status_code, status.HTTP_200_OK, done.data)
+        self.assertEqual(done.data["status"], "RECEIVED")
+        pen_spare = MaintenanceSpare.objects.get(company=self.company, name__iexact="Pen (Blue)")
+        self.assertEqual(pen_spare.current_stock, Decimal("40.000"))
+        self.assertEqual(Decimal(self._line(done.data, pen)["received_quantity"]), 40)
+        self.assertTrue(all(a["received_at"] for a in done.data["arrivals"]))
+
+    def test_gate_in_without_items_lets_in_everything_still_expected(self):
+        indent_id, paper, pen = self._purchased_indent()
+        self._gate_in(indent_id, {paper: "10"})
+
+        rest = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/gate-in/", {}, format="json"
+        )
+        self.assertEqual(rest.status_code, status.HTTP_200_OK, rest.data)
+        self.assertEqual(rest.data["status"], "GATE_IN")
+        last = rest.data["arrivals"][-1]["lines"]
+        self.assertEqual(
+            {line["item"]: Decimal(line["quantity"]) for line in last}, {paper: 20, pen: 40}
+        )
+
+    def test_gate_in_refuses_more_than_is_still_expected(self):
+        indent_id, paper, _ = self._purchased_indent()
+        self._gate_in(indent_id, {paper: "25"})
+
+        response = self._gate_in(indent_id, {paper: "6"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Only 5 NOS of A4 Paper box", response.data["detail"])
+        self.assertEqual(MaterialIndentArrival.objects.filter(indent_id=indent_id).count(), 1)
+
+    def test_gate_in_refuses_a_vehicle_that_brought_nothing(self):
+        indent_id, paper, pen = self._purchased_indent()
+        response = self._gate_in(indent_id, {paper: "0", pen: "0"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(MaterialIndent.objects.get(pk=indent_id).status, "PURCHASED")
+
+    def test_receive_refuses_a_line_the_gate_has_not_let_in(self):
+        indent_id, paper, pen = self._purchased_indent()
+        self._gate_in(indent_id, {paper: "30"})
+
+        response = self._receive(
+            indent_id,
+            {"items": [{"id": paper, "received_quantity": "30"},
+                       {"id": pen, "received_quantity": "40"}]},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Pen has not come through the gate", response.data["detail"])
+
+    def test_receive_counts_less_than_the_gate_and_settles_the_arrival(self):
+        indent_id, paper, pen = self._purchased_indent()
+        self._gate_in(indent_id, {paper: "30", pen: "40"})
+
+        response = self._receive(
+            indent_id,
+            {"items": [{"id": paper, "received_quantity": "28"},
+                       {"id": pen, "received_quantity": "40"}]},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["status"], "RECEIVED")
+        paper_line = self._line(response.data, paper)
+        self.assertEqual(Decimal(paper_line["arrived_quantity"]), 30)
+        self.assertEqual(Decimal(paper_line["received_quantity"]), 28)
+        self.assertEqual(Decimal(paper_line["awaiting_receipt_quantity"]), 0)
+
+    def test_short_close_ends_a_purchase_whose_rest_is_not_coming(self):
+        indent_id, paper, pen = self._purchased_indent()
+        self._gate_in(indent_id, {paper: "30", pen: "10"})
+
+        # Before the store has received the 40 that came: it still owes them.
+        closed = self.client.post(
+            f"/api/v1/maintenance/material-indents/{indent_id}/short-close/",
+            {"reason": "Vendor has no more pens"},
+            format="json",
+        )
+        self.assertEqual(closed.status_code, status.HTTP_200_OK, closed.data)
+        self.assertEqual(closed.data["status"], "GATE_IN")
+        self.assertEqual(closed.data["short_close_reason"], "Vendor has no more pens")
+
+        # Nothing more can come in, and receiving what did ends it.
+        self.assertEqual(self._gate_in(indent_id, {pen: "5"}).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._receive(indent_id).data["status"], "RECEIVED")
+
+    def test_short_close_needs_a_part_arrived_indent_and_a_reason(self):
+        indent_id, paper, _ = self._purchased_indent()
+        url = f"/api/v1/maintenance/material-indents/{indent_id}/short-close/"
+
+        nothing_came = self.client.post(url, {"reason": "Cancelled"}, format="json")
+        self.assertEqual(nothing_came.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self._gate_in(indent_id, {paper: "30"})
+        no_reason = self.client.post(url, {"reason": "  "}, format="json")
+        self.assertEqual(no_reason.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self._as(self._reviewer("can_gatein_material_indent"))
+        gate = self.client.post(url, {"reason": "Not coming"}, format="json")
+        self.assertEqual(gate.status_code, status.HTTP_403_FORBIDDEN)
+
+        self._as(self._reviewer("can_purchase_material_indent"))
+        purchaser = self.client.post(url, {"reason": "Not coming"}, format="json")
+        self.assertEqual(purchaser.status_code, status.HTTP_200_OK, purchaser.data)
+        self.assertEqual(purchaser.data["status"], "GATE_IN")
+
+    def test_status_filter_takes_several_statuses(self):
+        waiting, paper, _ = self._purchased_indent()
+        part, part_paper, _ = self._purchased_indent()
+        self._gate_in(part, {part_paper: "1"})
+        self._create_indent()  # a draft, filtered out
+
+        response = self.client.get(
+            "/api/v1/maintenance/material-indents/?status=PURCHASED,PARTIALLY_ARRIVED"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual({row["id"] for row in response.data}, {waiting, part})
+
+    def test_an_indent_gated_in_before_arrivals_existed_gets_its_one_arrival(self):
+        migration = importlib.import_module("maintenance.migrations.0039_material_indent_arrivals")
+        indent_id, paper, pen = self._purchased_indent()
+        MaterialIndent.objects.filter(pk=indent_id).update(
+            status="GATE_IN", gatein_vehicle_number="OLD-1", gate_in_at=timezone.now()
+        )
+
+        migration.record_past_gate_ins(django_apps, None)
+
+        arrival = MaterialIndentArrival.objects.get(indent_id=indent_id)
+        self.assertEqual(arrival.vehicle_number, "OLD-1")
+        self.assertIsNone(arrival.received_at)
+        received = self._receive(indent_id)
+        self.assertEqual(received.data["status"], "RECEIVED")
+        self.assertEqual(Decimal(self._line(received.data, pen)["received_quantity"]), 40)
 
 
 class StoreSpareAPITests(APITestCase):

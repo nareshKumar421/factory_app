@@ -72,6 +72,8 @@ from .models import (
     MaintenanceWorkOrderLog,
     MaintenanceWorkOrderPhoto,
     MaterialIndent,
+    MaterialIndentArrival,
+    MaterialIndentArrivalLine,
     MaterialIndentAttachment,
     MaterialIndentItem,
     MaterialIndentQuotation,
@@ -2038,6 +2040,12 @@ class WorkPermitCompleteInputSerializer(serializers.Serializer):
 
 class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
     shortfall_quantity = serializers.DecimalField(max_digits=14, decimal_places=3, read_only=True)
+    pending_arrival_quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, read_only=True
+    )
+    awaiting_receipt_quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, read_only=True
+    )
     received_spare_name = serializers.CharField(source="received_spare.name", read_only=True, default="")
 
     class Meta:
@@ -2053,6 +2061,9 @@ class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
             "priority",
             "issued_quantity",
             "shortfall_quantity",
+            "arrived_quantity",
+            "pending_arrival_quantity",
+            "awaiting_receipt_quantity",
             "received_quantity",
             "received_spare",
             "received_spare_name",
@@ -2066,6 +2077,7 @@ class MaterialIndentItemSerializer(CompanyScopedModelSerializer):
         read_only_fields = [
             "indent",
             "issued_quantity",
+            "arrived_quantity",
             "received_quantity",
             "received_spare",
             "created_by",
@@ -2272,6 +2284,42 @@ class MaterialIndentQuotationReturnSerializer(serializers.Serializer):
     quotation_remarks = serializers.CharField()
 
 
+class MaterialIndentArrivalLineSerializer(serializers.ModelSerializer):
+    item_particulars = serializers.CharField(source="item.particulars", read_only=True)
+    item_specification = serializers.CharField(source="item.specification", read_only=True)
+    item_unit = serializers.CharField(source="item.unit", read_only=True)
+
+    class Meta:
+        model = MaterialIndentArrivalLine
+        fields = ["id", "item", "item_particulars", "item_specification", "item_unit", "quantity"]
+
+
+class MaterialIndentArrivalSerializer(serializers.ModelSerializer):
+    """One vehicle's worth of a purchase, as the gate let it in."""
+
+    gate_in_by_name = serializers.CharField(source="gate_in_by.full_name", read_only=True, default="")
+    received_by_name = serializers.CharField(source="received_by.full_name", read_only=True, default="")
+    lines = MaterialIndentArrivalLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = MaterialIndentArrival
+        fields = [
+            "id",
+            "arrival_no",
+            "vehicle_number",
+            "driver_name",
+            "driver_mobile",
+            "remarks",
+            "gate_in_by",
+            "gate_in_by_name",
+            "gate_in_at",
+            "received_by",
+            "received_by_name",
+            "received_at",
+            "lines",
+        ]
+
+
 class MaterialIndentSerializer(CompanyScopedModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     department_name = serializers.CharField(source="department.name", read_only=True, default="")
@@ -2281,6 +2329,9 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
     purchased_by_name = serializers.CharField(source="purchased_by.full_name", read_only=True, default="")
     gate_in_by_name = serializers.CharField(source="gate_in_by.full_name", read_only=True, default="")
     received_by_name = serializers.CharField(source="received_by.full_name", read_only=True, default="")
+    short_closed_by_name = serializers.CharField(
+        source="short_closed_by.full_name", read_only=True, default=""
+    )
     quotations_submitted_by_name = serializers.CharField(
         source="quotations_submitted_by.full_name", read_only=True, default=""
     )
@@ -2294,6 +2345,7 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
     items_input = MaterialIndentItemInputSerializer(many=True, write_only=True, required=False)
     attachments = MaterialIndentAttachmentSerializer(many=True, read_only=True)
     quotations = MaterialIndentQuotationSerializer(many=True, read_only=True)
+    arrivals = MaterialIndentArrivalSerializer(many=True, read_only=True)
     total_items = serializers.SerializerMethodField()
     has_shortfall = serializers.SerializerMethodField()
 
@@ -2345,10 +2397,15 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "received_by",
             "received_by_name",
             "received_at",
+            "short_closed_by",
+            "short_closed_by_name",
+            "short_closed_at",
+            "short_close_reason",
             "items",
             "items_input",
             "attachments",
             "quotations",
+            "arrivals",
             "total_items",
             "has_shortfall",
             "is_active",
@@ -2386,6 +2443,9 @@ class MaterialIndentSerializer(CompanyScopedModelSerializer):
             "gate_in_at",
             "received_by",
             "received_at",
+            "short_closed_by",
+            "short_closed_at",
+            "short_close_reason",
             "created_by",
             "updated_by",
             "created_at",
@@ -2456,12 +2516,23 @@ class MaterialIndentPurchaseSerializer(serializers.Serializer):
     purchase_remarks = serializers.CharField(required=False, allow_blank=True)
 
 
-class MaterialIndentGateInSerializer(serializers.Serializer):
-    """Gate records the vehicle when purchased goods arrive (invoice/bill via attachments)."""
+class MaterialIndentGateInItemSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=3, min_value=Decimal("0.000"))
 
-    vehicle_number = serializers.CharField(required=False, allow_blank=True)
-    driver_name = serializers.CharField(required=False, allow_blank=True)
-    driver_mobile = serializers.CharField(required=False, allow_blank=True)
+
+class MaterialIndentGateInSerializer(serializers.Serializer):
+    """Gate records the vehicle when purchased goods arrive (invoice/bill via attachments).
+
+    ``items`` says how much of each line this vehicle brought. Omit it when
+    everything still expected came at once.
+    """
+
+    vehicle_number = serializers.CharField(required=False, allow_blank=True, max_length=30)
+    driver_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
+    driver_mobile = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    remarks = serializers.CharField(required=False, allow_blank=True)
+    items = MaterialIndentGateInItemSerializer(many=True, required=False)
 
 
 class MaterialIndentReceiveItemSerializer(serializers.Serializer):
@@ -2472,9 +2543,15 @@ class MaterialIndentReceiveItemSerializer(serializers.Serializer):
 
 
 class MaterialIndentReceiveSerializer(serializers.Serializer):
-    """Store collects the arrival into stock. Omit items to receive each full shortfall."""
+    """Store collects what the gate let in. Omit items to receive each line as the gate counted it."""
 
     items = MaterialIndentReceiveItemSerializer(many=True, required=False)
+
+
+class MaterialIndentShortCloseSerializer(serializers.Serializer):
+    """Why the rest of a part-arrived purchase will never come."""
+
+    reason = serializers.CharField(allow_blank=False, trim_whitespace=True)
 
 
 # ---------------------------------------------------------------------------
