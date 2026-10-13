@@ -32,7 +32,14 @@ from maintenance.electricity.engine import (
     Share,
     fixed_split,
 )
-from maintenance.electricity.run_hours import MAX_SEGMENT_HOURS, capped, hours_by_day, merge
+from maintenance.electricity.run_hours import (
+    MAX_SEGMENT_HOURS,
+    SourceIntervals,
+    capped,
+    hours_by_day,
+    merge,
+    shift_hours,
+)
 from maintenance.models import (
     DailyElectricityReading,
     ElectricityMeter,
@@ -40,7 +47,12 @@ from maintenance.models import (
 )
 from maintenance.models_manager import UserElectricityMeter
 from maintenance.tests_meter_scope import client_for, make_user
-from production_execution.models import ProductionLine, ProductionRun, ProductionSegment
+from production_execution.models import (
+    MachineBreakdown,
+    ProductionLine,
+    ProductionRun,
+    ProductionSegment,
+)
 
 METERS_URL = "/api/v1/maintenance/electricity-tree-meters/"
 OLD_READINGS_URL = "/api/v1/maintenance/daily-electricity-readings/"
@@ -381,6 +393,31 @@ class EngineProportionalTests(SimpleTestCase):
         )
         self.assertEqual(result.nodes[0].split, {OIL: Decimal("600"), BEV: Decimal("300")})
 
+    def test_a_shift_counting_setup_reads_each_companys_shift_hours(self):
+        setup = Setup(
+            self.LP,
+            D1,
+            basis=Basis.RUN_HOURS,
+            drivers=(Driver("line:1", OIL), Driver("line:3", OIL, Decimal("2")), Driver("line:2", BEV)),
+            short_stop_hours=Decimal("4"),
+        )
+        result = self.allocate(
+            [setup],
+            [reading(self.LP, D1, 0, 900)],
+            {
+                # Each line's own hours are not what a shift setup reads...
+                ("line:1", D1): Decimal("10"),
+                ("line:3", D1): Decimal("10"),
+                ("line:2", D1): Decimal("10"),
+                # ...but its companies' shift hours, the heaviest line's weight on them.
+                (engine.shift_source(setup, OIL), D1): Decimal("12"),
+                (engine.shift_source(setup, BEV), D1): Decimal("12"),
+            },
+        )
+        node = result.nodes[0]
+        self.assertEqual(node.drivers, {OIL: Decimal("24"), BEV: Decimal("12")})
+        self.assertEqual(node.split, {OIL: Decimal("600"), BEV: Decimal("300")})
+
     def test_nothing_ran_so_the_fixed_split_is_used_and_said_to_be(self):
         result = self.allocate(
             [self.run_hours_setup(fallback=shares((OIL, 50), (BEV, 50)))],
@@ -465,6 +502,72 @@ class RunHoursArithmeticTests(SimpleTestCase):
         start = self.at(D1, 9)
         interval = capped(start, start + timedelta(days=40), start + timedelta(days=90))
         self.assertEqual(interval[1] - interval[0], timedelta(hours=MAX_SEGMENT_HOURS))
+
+
+class ShiftHoursTests(SimpleTestCase):
+    """A company's shift hours: stops count as running, breakdowns always do."""
+
+    tz = ZoneInfo("Asia/Kolkata")
+    FOUR = timedelta(hours=4)
+
+    def at(self, on, hour, minute=0):
+        return datetime.combine(on, time(hour, minute), tzinfo=self.tz)
+
+    def hours(self, *found, short_stop=FOUR, days=(D1,)):
+        return shift_hours(found, short_stop, list(days), self.tz)
+
+    def test_a_short_stop_nobody_logged_counts_as_running(self):
+        line = SourceIntervals(running=[(self.at(D1, 8), self.at(D1, 13)), (self.at(D1, 14), self.at(D1, 20))])
+        self.assertEqual(self.hours(line), {D1: Decimal("12")})
+
+    def test_a_logged_breakdown_counts_however_long(self):
+        line = SourceIntervals(
+            running=[(self.at(D1, 8), self.at(D1, 10)), (self.at(D1, 16), self.at(D1, 20))],
+            stopped=[(self.at(D1, 10), self.at(D1, 16))],
+        )
+        self.assertEqual(self.hours(line), {D1: Decimal("12")})
+
+    def test_a_long_idle_is_the_line_switched_off_but_its_breakdowns_still_count(self):
+        # Ran 08-20, a one-hour breakdown, then nothing till the next morning.
+        line = SourceIntervals(
+            running=[(self.at(D1, 8), self.at(D1, 20)), (self.at(day(2), 8), self.at(day(2), 12))],
+            stopped=[(self.at(D1, 20), self.at(D1, 21))],
+        )
+        self.assertEqual(self.hours(line, days=(D1, day(2))), {D1: Decimal("13"), day(2): Decimal("4")})
+
+    def test_a_breakdown_after_the_last_stop_does_not_count(self):
+        # Left open after the line stopped for good: capped at a day, and ignored.
+        line = SourceIntervals(
+            running=[(self.at(D1, 8), self.at(D1, 11))],
+            stopped=[(self.at(D1, 11), self.at(day(2), 11))],
+        )
+        self.assertEqual(self.hours(line, days=(D1, day(2))), {D1: Decimal("3")})
+
+    def test_two_lines_running_side_by_side_count_once(self):
+        sidel = SourceIntervals(running=[(self.at(D1, 8), self.at(D1, 20))])
+        filler = SourceIntervals(running=[(self.at(D1, 9), self.at(D1, 19))])
+        self.assertEqual(self.hours(sidel, filler), {D1: Decimal("12")})
+
+    def test_a_changeover_between_two_runs_counts(self):
+        first = SourceIntervals(running=[(self.at(D1, 7), self.at(D1, 12))])
+        second = SourceIntervals(running=[(self.at(D1, 12, 40), self.at(D1, 19))])
+        self.assertEqual(self.hours(first, second), {D1: Decimal("12")})
+
+    def test_a_cut_off_of_zero_counts_only_logged_breakdowns(self):
+        line = SourceIntervals(
+            running=[(self.at(D1, 8), self.at(D1, 10)), (self.at(D1, 11), self.at(D1, 13)),
+                     (self.at(D1, 14), self.at(D1, 16))],
+            stopped=[(self.at(D1, 10), self.at(D1, 11))],
+        )
+        self.assertEqual(self.hours(line, short_stop=timedelta(0)), {D1: Decimal("7")})
+
+    def test_a_stop_mostly_logged_counts_when_the_rest_is_short(self):
+        # Five hours down, four and a half of them logged.
+        line = SourceIntervals(
+            running=[(self.at(D1, 6), self.at(D1, 8)), (self.at(D1, 13), self.at(D1, 15))],
+            stopped=[(self.at(D1, 8), self.at(D1, 12, 30))],
+        )
+        self.assertEqual(self.hours(line), {D1: Decimal("9")})
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +802,32 @@ class SetupVersionTests(TreeFixture):
         self.assertEqual(good.status_code, 201, good.data)
         self.assertEqual(good.data["drivers"][0]["company"], "JIVO_OIL")
         self.assertEqual(good.data["summary"], "By run hours of 10 Head (Jivo Oil); otherwise Jivo Oil 50% · Jivo Beverages 50%")
+
+    def test_a_run_hours_split_can_count_stops_as_running(self):
+        line = ProductionLine.objects.create(company=self.oil, name="10 Head")
+        response = self.new_version(
+            self.lab, day(5), parent=self.ground.id, basis="RUN_HOURS",
+            drivers=[{"production_line": line.id}], short_stop_hours="4",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["short_stop_hours"], "4")
+        self.assertEqual(
+            response.data["summary"],
+            "By run hours of 10 Head (Jivo Oil), stops under 4 h counted as running",
+        )
+        # A day is the most a stop can be.
+        too_long = self.client.patch(
+            f"{SETUPS_URL}{response.data['id']}/", {"short_stop_hours": "30"}, format="json"
+        )
+        self.assertEqual(too_long.status_code, 400)
+        # Only run hours have stops to count.
+        fixed = self.client.patch(
+            f"{SETUPS_URL}{response.data['id']}/",
+            {"basis": "FIXED", "drivers": [], "shares": [{"company": "JIVO_OIL", "percent": "100"}]},
+            format="json",
+        )
+        self.assertEqual(fixed.status_code, 200, fixed.data)
+        self.assertIsNone(fixed.data["short_stop_hours"])
 
     def test_a_meter_cannot_leave_the_tree_while_sub_meters_hang_off_it(self):
         response = self.new_version(self.ground, day(10), in_service=False)
@@ -1230,6 +1359,56 @@ class SplitReportTests(TreeFixture):
         split = {item["party"]: item["units"] for item in row["split"]}
         self.assertEqual(split, {OIL: "600.00", BEV: "300.00"})
         self.assertEqual({d["party"]: d["amount"] for d in row["drivers"]}, {OIL: "24.0", BEV: "12.0"})
+
+    def test_a_version_from_a_date_counts_stops_while_earlier_days_keep_segments(self):
+        oil_line = ProductionLine.objects.create(company=self.oil, name="10 Head")
+        bev_line = ProductionLine.objects.create(company=self.bev, name="Sidel")
+        tz = timezone.get_current_timezone()
+
+        def at(on, hour):
+            return datetime.combine(on, time(hour), tzinfo=tz)
+
+        # Each day: Oil runs 08-20 straight. Sidel runs 08-11, breaks down
+        # (logged) till 14, pauses unlogged from 17 to 18, and stops at 20.
+        number = 0
+        for on in (D1, day(2)):
+            number += 1
+            oil_run = ProductionRun.objects.create(company=self.oil, run_number=number, date=on, line=oil_line)
+            ProductionSegment.objects.create(production_run=oil_run, start_time=at(on, 8), end_time=at(on, 20), is_active=False)
+            bev_run = ProductionRun.objects.create(company=self.bev, run_number=number, date=on, line=bev_line)
+            for start, end in ((8, 11), (14, 17), (18, 20)):
+                ProductionSegment.objects.create(
+                    production_run=bev_run, start_time=at(on, start), end_time=at(on, end), is_active=False
+                )
+            MachineBreakdown.objects.create(
+                production_run=bev_run, start_time=at(on, 11), end_time=at(on, 14), is_active=False
+            )
+
+        chiller = self.make_meter("TR 125", parent=self.kwh)
+        drivers = [{"production_line": oil_line.id}, {"production_line": bev_line.id}]
+        self.assertEqual(
+            self.client.patch(
+                f"{SETUPS_URL}{chiller.setups.get().id}/", {"basis": "RUN_HOURS", "drivers": drivers}, format="json"
+            ).status_code,
+            200,
+        )
+        response = self.new_version(chiller, day(2), parent=self.kwh.id, basis="RUN_HOURS",
+                                    drivers=drivers, short_stop_hours="4")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.read(chiller, D1, 0, 340)
+        self.read(chiller, day(2), 340, 820)
+
+        def chiller_row(on):
+            return next(row for row in self.split(on, on)["meters"] if row["name"] == "TR 125")
+
+        # Before the change: Sidel's running segments only, 3 + 3 + 2 hours.
+        before = chiller_row(D1)
+        self.assertEqual({d["party"]: d["amount"] for d in before["drivers"]}, {OIL: "12.0", BEV: "8.0"})
+        self.assertEqual({s["party"]: s["units"] for s in before["split"]}, {OIL: "204.00", BEV: "136.00"})
+        # From it: the breakdown and the pause count, so Sidel was on 12 hours.
+        after = chiller_row(day(2))
+        self.assertEqual({d["party"]: d["amount"] for d in after["drivers"]}, {OIL: "12.0", BEV: "12.0"})
+        self.assertEqual({s["party"]: s["units"] for s in after["split"]}, {OIL: "240.00", BEV: "240.00"})
 
     def test_blowing_machines_can_drive_a_split(self):
         machine = BlowingMachine.objects.create(company=self.oil, name="Synergy 1/4")

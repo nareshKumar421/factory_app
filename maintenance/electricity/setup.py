@@ -241,7 +241,8 @@ def save_setup(
     """Create a version, or correct ``instance``, with its shares and drivers.
 
     ``data`` is the setup serializer's validated data: ``effective_from``,
-    ``in_service``, ``parent``, ``basis``, ``note``, ``shares`` and ``drivers``.
+    ``in_service``, ``parent``, ``basis``, ``short_stop_hours``, ``note``,
+    ``shares`` and ``drivers``.
     Omitted keys keep the instance's values.
     """
     def current(key, default=None):
@@ -257,6 +258,8 @@ def save_setup(
     basis = current("basis", Basis.UNASSIGNED)
     if not in_service:
         parent, basis = None, Basis.UNASSIGNED
+    # Only run hours have stops to count.
+    short_stop_hours = current("short_stop_hours") if basis == Basis.RUN_HOURS else None
 
     if "shares" in data:
         shares = data["shares"]
@@ -306,6 +309,7 @@ def save_setup(
     setup.in_service = in_service
     setup.parent = parent
     setup.basis = basis
+    setup.short_stop_hours = short_stop_hours
     setup.note = current("note", "") or ""
     setup.updated_by = user
     setup.save()

@@ -244,14 +244,19 @@ def describe_setup(setup_row, snapshot: Optional[sources.Snapshot] = None) -> di
         "parent_name": setup_row.parent.name if setup_row.parent_id else None,
         "basis": setup_row.basis,
         "basis_label": ElectricityAllocationBasis(setup_row.basis).label,
+        "short_stop_hours": (
+            _plain(setup_row.short_stop_hours) if setup_row.short_stop_hours is not None else None
+        ),
         "shares": shares,
         "drivers": drivers,
-        "summary": summarise_rule(setup_row.basis, shares, drivers),
+        "summary": summarise_rule(setup_row.basis, shares, drivers, setup_row.short_stop_hours),
         "note": setup_row.note,
     }
 
 
-def summarise_rule(basis: str, shares: List[dict], drivers: List[dict]) -> str:
+def summarise_rule(
+    basis: str, shares: List[dict], drivers: List[dict], short_stop_hours: Optional[Decimal] = None
+) -> str:
     """One line a person can check at a glance: "Oil 50% · Beverages 50%"."""
     def share_text(items):
         return " · ".join(f"{item['party_name']} {item['percent']}%" for item in items)
@@ -264,6 +269,8 @@ def summarise_rule(basis: str, shares: List[dict], drivers: List[dict]) -> str:
             f"{item['name']} ({item['company_name'] or '—'})" for item in drivers
         ) or "nothing yet"
         text = f"By {what} {followed}"
+        if basis == engine.Basis.RUN_HOURS and short_stop_hours is not None:
+            text += f", stops under {_plain(short_stop_hours)} h counted as running"
         if shares:
             text += f"; otherwise {share_text(shares)}"
         return text

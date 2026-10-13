@@ -20,7 +20,8 @@ Three ways a meter's own units can be split (:class:`Basis`):
 * ``FIXED``       — fixed percentages.
 * ``RUN_HOURS``   — in proportion to the hours the chosen production lines and
   blowing machines ran that day. Oil ran 24 h and Beverages 12 h, so Oil takes
-  two thirds.
+  two thirds. A version with ``short_stop_hours`` counts each company's shift
+  hours instead — stops and breakdowns included, see ``run_hours``.
 * ``METER_RATIO`` — in proportion to what other meters read that day: the
   chillers split the way the two Sidels drew power.
 
@@ -147,6 +148,23 @@ class Setup:
     shares: Tuple[Share, ...] = ()
     drivers: Tuple[Driver, ...] = ()
     id: Optional[int] = None
+    #: RUN_HOURS only. Set: each company counts its shift hours on this meter,
+    #: with stops shorter than this many hours counted as running. None: each
+    #: line's running segments, added up.
+    short_stop_hours: Optional[Decimal] = None
+
+    @property
+    def counts_shifts(self) -> bool:
+        return self.basis == Basis.RUN_HOURS and self.short_stop_hours is not None
+
+
+def shift_source(setup: Setup, party: str) -> str:
+    """The run-hours key of a company's shift hours under one setup version.
+
+    Shift hours depend on which lines the version follows and its cut-off, so
+    they are worked out per version, not per line.
+    """
+    return f"shift:{setup.meter_id}:{setup.effective_from.isoformat()}:{party}"
 
 
 @dataclass(frozen=True)
@@ -588,7 +606,16 @@ class Allocator:
 
         if basis in Basis.PROPORTIONAL:
             weights: Dict[str, Decimal] = defaultdict(lambda: ZERO)
-            for driver in setup.drivers:
+            if setup.counts_shifts:
+                # A company is on while any of its lines is, so its lines are
+                # not added up; the heaviest one's weight stands for them.
+                heaviest: Dict[str, Decimal] = {}
+                for driver in setup.drivers:
+                    heaviest[driver.party] = max(heaviest.get(driver.party, ZERO), driver.weight)
+                for party, weight in heaviest.items():
+                    hours = self.run_hours.get((shift_source(setup, party), node.day), ZERO)
+                    weights[party] = hours * weight
+            for driver in () if setup.counts_shifts else setup.drivers:
                 if basis == Basis.RUN_HOURS:
                     amount = self.run_hours.get((driver.source, node.day), ZERO)
                 else:

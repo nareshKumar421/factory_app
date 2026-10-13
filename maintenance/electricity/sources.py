@@ -2,19 +2,23 @@
 
 One call, a handful of queries, whatever the span: meters, every setup
 version, the readings around the span, and the run hours of whatever the
-proportional rules follow. The engine itself never touches the ORM.
+proportional rules follow — each line's running hours, and each company's
+shift hours where a version counts shifts. The engine itself never touches the
+ORM.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 from django.db.models import Min
+from django.utils import timezone
 
 from . import engine
-from .run_hours import run_hours
+from .run_hours import days_between, load_intervals, segment_hours, shift_hours
 
 #: How far either side of a span readings are loaded. A reading after the span
 #: can cover skipped days inside it, and the reading before the span's first
@@ -97,6 +101,7 @@ def _setup_to_engine(setup, snapshot: Snapshot) -> engine.Setup:
         shares=tuple(shares),
         drivers=tuple(drivers),
         id=setup.id,
+        short_stop_hours=setup.short_stop_hours,
     )
 
 
@@ -200,11 +205,37 @@ def load(
         )
     ]
 
-    sources = {
-        driver.source
-        for setup in setups
-        if setup.basis == engine.Basis.RUN_HOURS
-        for driver in setup.drivers
-    }
-    hours = run_hours(sources, date_from, date_to, now=now) if sources else {}
+    hours = run_hours_for(setups, date_from, date_to, now=now)
     return engine.Allocator(meters, setups, readings, hours), snapshot
+
+
+def run_hours_for(
+    setups: List[engine.Setup], date_from: date, date_to: date, *, now=None
+) -> Dict[Tuple[str, date], Decimal]:
+    """Every hour a run-hours setup could ask for over the span.
+
+    A version without a cut-off reads each line's own running hours; one with
+    a cut-off reads its companies' shift hours, under :func:`engine.shift_source`.
+    """
+    followed = [setup for setup in setups if setup.basis == engine.Basis.RUN_HOURS]
+    sources = {driver.source for setup in followed for driver in setup.drivers}
+    if not sources:
+        return {}
+    intervals = load_intervals(sources, date_from, date_to, now=now)
+    days = days_between(date_from, date_to)
+    tz = timezone.get_current_timezone()
+
+    hours = segment_hours(intervals, days, tz)
+    for setup in followed:
+        if not setup.counts_shifts:
+            continue
+        by_party: Dict[str, List[str]] = {}
+        for driver in setup.drivers:
+            by_party.setdefault(driver.party, []).append(driver.source)
+        short_stop = timedelta(hours=float(setup.short_stop_hours))
+        for party, party_sources in by_party.items():
+            found = [intervals[source] for source in party_sources if source in intervals]
+            key = engine.shift_source(setup, party)
+            for day, amount in shift_hours(found, short_stop, days, tz).items():
+                hours[(key, day)] = amount
+    return hours

@@ -134,6 +134,7 @@ class ElectricityMeterSetupSerializer(serializers.ModelSerializer):
             "in_service",
             "parent",
             "basis",
+            "short_stop_hours",
             "note",
             "shares",
             "drivers",
@@ -199,6 +200,14 @@ class ElectricityMeterPlacementSerializer(serializers.Serializer):
     )
     basis = serializers.ChoiceField(
         choices=ElectricityAllocationBasis.choices, required=False
+    )
+    short_stop_hours = serializers.DecimalField(
+        max_digits=4,
+        decimal_places=2,
+        min_value=Decimal("0"),
+        max_value=Decimal("24"),
+        required=False,
+        allow_null=True,
     )
     shares = ElectricityMeterShareSerializer(many=True, required=False)
     drivers = ElectricityMeterDriverSerializer(many=True, required=False)

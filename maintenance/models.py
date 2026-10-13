@@ -3,7 +3,7 @@ import datetime as dt
 from decimal import Decimal
 
 from django.conf import settings
-from django.core.validators import MinValueValidator
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils import timezone
 
@@ -2801,6 +2801,18 @@ class ElectricityMeterSetup(BaseModel):
         max_length=20,
         choices=ElectricityAllocationBasis.choices,
         default=ElectricityAllocationBasis.UNASSIGNED,
+    )
+    short_stop_hours = models.DecimalField(
+        max_digits=4,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("24"))],
+        help_text=(
+            "Run hours only. Set: each company counts its shift hours — a stop shorter "
+            "than this, and any logged breakdown, counts as running. Blank: only the "
+            "running segments count, each line on its own."
+        ),
     )
     note = models.TextField(
         blank=True,

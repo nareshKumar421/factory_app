@@ -23,14 +23,40 @@ Three rules keep bad rows from swamping a meter:
   "closed" segments span weeks, and one left open since July would otherwise
   count as running every day since.
 * An open segment runs until now, and never past the cap above.
+
+Shift hours
+-----------
+The meters on the Terrace — the chillers and what they serve — run for the
+shift, not for the minutes a line was actually filling. A stop on the line
+does not stop the chiller. So from 1 Oct 2026 a setup can say how long a stop
+may be and still count as running (``short_stop_hours`` on the version). A
+setup with it set counts a company's **shift hours** on the meter
+(:func:`shift_hours`):
+
+* every running segment of the company's lines and machines on that meter,
+  merged — the company is on while any of them runs, so two lines running side
+  by side count once;
+* every stop between two running stretches shorter than the cut-off — an
+  unlogged pause, lunch, the changeover to the next run;
+* every **logged** breakdown between two running stretches, however long.
+  Breakdowns are never subtracted.
+
+A stop longer than the cut-off that nobody logged is the line switched off —
+overnight, or a run left paused for days — and does not count. Nor does a
+breakdown after the company's last stop: one left open with nobody restarting
+the line would otherwise count as running for a day.
+
+A setup without a cut-off keeps the rule above: running segments only, each
+line on its own. September 2026's versions are left that way.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from django.db.models import Q
 from django.utils import timezone
@@ -42,6 +68,14 @@ MAX_SEGMENT_HOURS = 24
 SECONDS_PER_HOUR = Decimal("3600")
 
 Interval = Tuple[datetime, datetime]
+
+
+@dataclass
+class SourceIntervals:
+    """What one line or machine did: when it ran, and its logged breakdowns."""
+
+    running: List[Interval] = field(default_factory=list)
+    stopped: List[Interval] = field(default_factory=list)
 
 
 def day_bounds(day: date, tz) -> Interval:
@@ -90,19 +124,25 @@ def hours_by_day(
     return hours
 
 
-def run_hours(
+def days_between(date_from: date, date_to: date) -> List[date]:
+    return [date_from + timedelta(days=n) for n in range((date_to - date_from).days + 1)]
+
+
+def load_intervals(
     sources: Iterable[str],
     date_from: date,
     date_to: date,
     *,
     now: Optional[datetime] = None,
-) -> Dict[Tuple[str, date], Decimal]:
-    """``{(source, day): hours}`` for ``"line:<id>"`` and ``"blowing:<id>"`` sources.
+) -> Dict[str, SourceIntervals]:
+    """Running segments and logged breakdowns of ``"line:<id>"`` and
+    ``"blowing:<id>"`` sources, for whatever could touch the span.
 
-    Days a source did not run are absent rather than zero.
+    Reaches a day past the span's end as well, so a stop on its last evening
+    can be bridged to the restart the next morning.
     """
-    from blowing.models import BlowingSegment
-    from production_execution.models import ProductionSegment
+    from blowing.models import BlowingBreakdown, BlowingSegment
+    from production_execution.models import MachineBreakdown, ProductionSegment
 
     line_ids, machine_ids = set(), set()
     for source in sources:
@@ -123,45 +163,113 @@ def run_hours(
     # A segment that started more than the cap before the window cannot reach
     # into it, whatever its end says.
     earliest = window_start - timedelta(hours=MAX_SEGMENT_HOURS)
-    overlaps = Q(end_time__gt=window_start) | Q(end_time__isnull=True)
+    latest = window_end + timedelta(hours=MAX_SEGMENT_HOURS)
+    overlaps = Q(end_time__gt=earliest) | Q(end_time__isnull=True)
 
-    segments: Dict[str, List[Interval]] = defaultdict(list)
+    found: Dict[str, SourceIntervals] = defaultdict(SourceIntervals)
+
+    def add(prefix, rows, attr):
+        for source_id, start, end in rows:
+            interval = capped(start, end, now)
+            if interval:
+                getattr(found[f"{prefix}:{source_id}"], attr).append(interval)
+
     if line_ids:
-        rows = (
-            ProductionSegment.objects.filter(
-                production_run__line_id__in=line_ids,
-                # The join bypasses the run's live-only manager, so deleted
-                # runs are dropped here by hand.
-                production_run__is_deleted=False,
-                start_time__gte=earliest,
-                start_time__lt=window_end,
-            )
-            .filter(overlaps)
-            .values_list("production_run__line_id", "start_time", "end_time")
+        # The join bypasses the run's live-only manager, so deleted runs are
+        # dropped here by hand.
+        in_window = dict(
+            production_run__line_id__in=line_ids,
+            production_run__is_deleted=False,
+            start_time__gte=earliest,
+            start_time__lt=latest,
         )
-        for line_id, start, end in rows:
-            interval = capped(start, end, now)
-            if interval:
-                segments[f"line:{line_id}"].append(interval)
+        add(
+            "line",
+            ProductionSegment.objects.filter(**in_window)
+            .filter(overlaps)
+            .values_list("production_run__line_id", "start_time", "end_time"),
+            "running",
+        )
+        add(
+            "line",
+            MachineBreakdown.objects.filter(**in_window)
+            .filter(overlaps)
+            .values_list("production_run__line_id", "start_time", "end_time"),
+            "stopped",
+        )
     if machine_ids:
-        rows = (
-            BlowingSegment.objects.filter(
-                blowing_run__machine_id__in=machine_ids,
-                blowing_run__is_active=True,
-                start_time__gte=earliest,
-                start_time__lt=window_end,
-            )
-            .filter(overlaps)
-            .values_list("blowing_run__machine_id", "start_time", "end_time")
+        in_window = dict(
+            blowing_run__machine_id__in=machine_ids,
+            blowing_run__is_active=True,
+            start_time__gte=earliest,
+            start_time__lt=latest,
         )
-        for machine_id, start, end in rows:
-            interval = capped(start, end, now)
-            if interval:
-                segments[f"blowing:{machine_id}"].append(interval)
+        add(
+            "blowing",
+            BlowingSegment.objects.filter(**in_window)
+            .filter(overlaps)
+            .values_list("blowing_run__machine_id", "start_time", "end_time"),
+            "running",
+        )
+        add(
+            "blowing",
+            BlowingBreakdown.objects.filter(**in_window)
+            .filter(overlaps)
+            .values_list("blowing_run__machine_id", "start_time", "end_time"),
+            "stopped",
+        )
+    return dict(found)
 
-    days = [date_from + timedelta(days=n) for n in range((date_to - date_from).days + 1)]
+
+def segment_hours(
+    intervals: Mapping[str, SourceIntervals], days: Sequence[date], tz
+) -> Dict[Tuple[str, date], Decimal]:
+    """``{(source, day): hours}`` of running segments only, each source on its own."""
     result: Dict[Tuple[str, date], Decimal] = {}
-    for source, intervals in segments.items():
-        for day, hours in hours_by_day(intervals, days, tz).items():
+    for source, found in intervals.items():
+        for day, hours in hours_by_day(found.running, days, tz).items():
             result[(source, day)] = hours
     return result
+
+
+def overlap_seconds(gap: Interval, intervals: Iterable[Interval]) -> float:
+    """How much of ``gap`` the (merged) ``intervals`` cover."""
+    seconds = 0.0
+    for start, end in intervals:
+        low, high = max(start, gap[0]), min(end, gap[1])
+        if high > low:
+            seconds += (high - low).total_seconds()
+    return seconds
+
+
+def on_intervals(found: Iterable[SourceIntervals], short_stop: timedelta) -> List[Interval]:
+    """When a group of lines and machines was on, counting stops as running.
+
+    See *Shift hours* above. A stop between two running stretches counts in
+    full when what nobody logged of it is shorter than ``short_stop``;
+    otherwise only its logged breakdowns count.
+    """
+    found = list(found)
+    running = merge(interval for item in found for interval in item.running)
+    stopped = merge(interval for item in found for interval in item.stopped)
+    counted: List[Interval] = list(running)
+    for (_, gap_start), (gap_end, _) in zip(running, running[1:]):
+        gap = (gap_start, gap_end)
+        logged = overlap_seconds(gap, stopped)
+        unlogged = (gap_end - gap_start).total_seconds() - logged
+        if unlogged < short_stop.total_seconds():
+            counted.append(gap)
+            continue
+        for start, end in stopped:
+            low, high = max(start, gap_start), min(end, gap_end)
+            if high > low:
+                counted.append((low, high))
+    return merge(counted)
+
+
+def shift_hours(
+    found: Iterable[SourceIntervals], short_stop: timedelta, days: Sequence[date], tz
+) -> Dict[date, Decimal]:
+    """Hours on each of ``days`` a group of lines and machines was on."""
+    return hours_by_day(on_intervals(found, short_stop), days, tz)
+
