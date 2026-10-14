@@ -3,14 +3,22 @@ amounts_board/hana_reader.py
 
 The board's SAP reads, for one company schema.
 
-STOCK VALUE IS SAP'S OWN
-------------------------
-``OITW."StockValue"`` -- the per-warehouse value SAP's inventory valuation keeps,
-the same column the stock dashboard and the admin board's PM tile sum. Rows with
-nothing on hand are left out, as the stock dashboard leaves them out: on live
-(2026-10-06) Oil carried Rs 1.05 Cr of NEGATIVE value on packing-material rows
-whose quantity was zero -- valuation leftovers, not stock anybody can count. So
-this board ties to what is in the godowns, not to the inventory G/L account.
+STOCK IS VALUED AT THE LAST PURCHASE PRICE
+------------------------------------------
+Quantity on hand (``OITW."OnHand"``) times the item's ``OITM."LastPurPrc"`` --
+the price SAP's own Price Report shows (Inventory > Inventory Reports > Price
+Report, with "Last Purchase Price" picked), which is the price the business
+values stock at. The price is per item, not per godown. A price kept in a
+foreign currency (``LastPurCur``) is turned into rupees at that currency's
+latest rate in ORTT; with no rate on file it is taken as it stands.
+
+It used to be ``OITW."StockValue"``, SAP's stored per-warehouse value. On live
+(2026-10-14) that column had drifted away from SAP's own stock journal (OIVL)
+and from the ledger -- Beverages raw material summed to Rs -28 L against
+Rs 1.11 Cr in the G/L, and BH-FG showed items with stock on hand at a NEGATIVE
+value -- so it could not be shown as the value of what is in the godowns.
+
+Rows with nothing on hand are still left out: there is nothing to price.
 
 DEBTORS ARE THE LEDGER BALANCE, NOT THE OPEN BILLS
 --------------------------------------------------
@@ -60,22 +68,51 @@ class AmountsReader:
     # Stock
     # ------------------------------------------------------------------
 
+    def _stock_on_hand(self) -> str:
+        """Every godown row with stock on hand, its item, and the item's price.
+
+        ``Price`` is the last purchase price in rupees, as the module docstring
+        explains. Used as a derived table by the two stock reads below.
+        """
+        return f"""
+            SELECT
+                W."WhsCode",
+                W."ItemCode",
+                W."OnHand",
+                M."ItemName",
+                M."InvntryUom",
+                M."ItmsGrpCod",
+                IFNULL(M."LastPurPrc", 0) * CASE
+                    WHEN IFNULL(M."LastPurCur", '') IN ('', A."MainCurncy") THEN 1
+                    ELSE IFNULL(R."Rate", 1)
+                END AS "Price"
+            FROM "{self.schema}"."OITW" W
+            JOIN "{self.schema}"."OITM" M ON M."ItemCode" = W."ItemCode"
+            CROSS JOIN (SELECT "MainCurncy" FROM "{self.schema}"."OADM") A
+            LEFT JOIN (
+                SELECT
+                    "Currency",
+                    "Rate",
+                    ROW_NUMBER() OVER (PARTITION BY "Currency" ORDER BY "RateDate" DESC) AS "Latest"
+                FROM "{self.schema}"."ORTT"
+            ) R ON R."Currency" = M."LastPurCur" AND R."Latest" = 1
+            WHERE W."OnHand" <> 0
+        """
+
     def stock_by_godown(self, item_groups: Sequence[int]) -> List[Dict[str, Any]]:
         """Value and item count per godown per item group, stock on hand only."""
         groups = list(item_groups)
         query = f"""
             SELECT
-                W."WhsCode" AS "Warehouse",
+                S."WhsCode" AS "Warehouse",
                 IFNULL(O."WhsName", '') AS "WarehouseName",
-                M."ItmsGrpCod" AS "ItemGroup",
+                S."ItmsGrpCod" AS "ItemGroup",
                 COUNT(*) AS "Items",
-                SUM(W."StockValue") AS "Value"
-            FROM "{self.schema}"."OITW" W
-            JOIN "{self.schema}"."OITM" M ON M."ItemCode" = W."ItemCode"
-            LEFT JOIN "{self.schema}"."OWHS" O ON O."WhsCode" = W."WhsCode"
-            WHERE W."OnHand" <> 0
-              AND M."ItmsGrpCod" IN ({_placeholders(groups)})
-            GROUP BY W."WhsCode", O."WhsName", M."ItmsGrpCod"
+                SUM(S."OnHand" * S."Price") AS "Value"
+            FROM ({self._stock_on_hand()}) S
+            LEFT JOIN "{self.schema}"."OWHS" O ON O."WhsCode" = S."WhsCode"
+            WHERE S."ItmsGrpCod" IN ({_placeholders(groups)})
+            GROUP BY S."WhsCode", O."WhsName", S."ItmsGrpCod"
         """
         return self._rows(query, groups)
 
@@ -83,17 +120,16 @@ class AmountsReader:
         """What one godown holds of one item group, most valuable first."""
         query = f"""
             SELECT
-                W."ItemCode" AS "ItemCode",
-                IFNULL(M."ItemName", '') AS "ItemName",
-                IFNULL(M."InvntryUom", '') AS "Uom",
-                W."OnHand" AS "Quantity",
-                W."StockValue" AS "Value"
-            FROM "{self.schema}"."OITW" W
-            JOIN "{self.schema}"."OITM" M ON M."ItemCode" = W."ItemCode"
-            WHERE W."WhsCode" = ?
-              AND M."ItmsGrpCod" = ?
-              AND W."OnHand" <> 0
-            ORDER BY W."StockValue" DESC, W."ItemCode"
+                S."ItemCode" AS "ItemCode",
+                IFNULL(S."ItemName", '') AS "ItemName",
+                IFNULL(S."InvntryUom", '') AS "Uom",
+                S."OnHand" AS "Quantity",
+                S."Price" AS "Price",
+                S."OnHand" * S."Price" AS "Value"
+            FROM ({self._stock_on_hand()}) S
+            WHERE S."WhsCode" = ?
+              AND S."ItmsGrpCod" = ?
+            ORDER BY "Value" DESC, S."ItemCode"
         """
         return self._rows(query, [warehouse, item_group])
 

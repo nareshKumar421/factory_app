@@ -12,7 +12,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
@@ -20,6 +20,7 @@ from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPConnectionError, SAPDataError
 from warehouse.models_manager import UserWarehouse
 
+from .hana_reader import AmountsReader
 from .models import StockOwner
 from .services import AmountsBoardService
 
@@ -200,12 +201,53 @@ class PlantStockTests(TestCase):
     def test_godown_items_reads_the_category_group(self):
         readers = healthy_readers()
         readers["JIVO_OIL"].items = [
-            {"ItemCode": "RM1", "ItemName": "Oil", "Uom": "KG", "Quantity": 10, "Value": 99.5}
+            {
+                "ItemCode": "RM1",
+                "ItemName": "Oil",
+                "Uom": "KG",
+                "Quantity": 10,
+                "Price": 9.95,
+                "Value": 99.5,
+            }
         ]
         payload = service(readers).godown_items("JIVO_OIL", "RM", "BH-LO")
         self.assertEqual(readers["JIVO_OIL"].calls[-1], ("items", "BH-LO", 106))
         self.assertEqual(payload["value"], 99.5)
         self.assertEqual(payload["items"][0]["item_code"], "RM1")
+        self.assertEqual(payload["items"][0]["price"], 9.95)
+
+
+class StockQueryTests(SimpleTestCase):
+    """The stock reads price what is on hand at the last purchase price."""
+
+    def reader(self):
+        reader = AmountsReader.__new__(AmountsReader)
+        reader.connection = mock.Mock(schema="JIVO_OIL_HANADB")
+        reader._rows = mock.Mock(return_value=[])
+        return reader
+
+    def assert_priced_at_last_purchase(self, query):
+        self.assertIn('"LastPurPrc"', query)
+        self.assertNotIn('"StockValue"', query)
+        # Foreign-currency prices are turned into rupees at the latest rate.
+        self.assertIn('"JIVO_OIL_HANADB"."ORTT"', query)
+        self.assertIn('W."OnHand" <> 0', query)
+
+    def test_godown_tiles(self):
+        reader = self.reader()
+        reader.stock_by_godown([102, 105, 106])
+        query, params = reader._rows.call_args.args
+        self.assert_priced_at_last_purchase(query)
+        self.assertIn('SUM(S."OnHand" * S."Price") AS "Value"', query)
+        self.assertEqual(params, [102, 105, 106])
+
+    def test_godown_items(self):
+        reader = self.reader()
+        reader.godown_items("BH-FG", 102)
+        query, params = reader._rows.call_args.args
+        self.assert_priced_at_last_purchase(query)
+        self.assertIn('S."Price" AS "Price"', query)
+        self.assertEqual(params, ["BH-FG", 102])
 
 
 class BoardTests(TestCase):

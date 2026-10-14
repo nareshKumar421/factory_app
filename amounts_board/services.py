@@ -234,6 +234,7 @@ class AmountsBoardService(SectionBuilder):
                 "item_name": row["ItemName"],
                 "uom": row["Uom"],
                 "quantity": round(float(row["Quantity"] or 0), 3),
+                "price": round(float(row["Price"] or 0), 4),
                 "value": _money(row["Value"]),
             }
             for row in rows
