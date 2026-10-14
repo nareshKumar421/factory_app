@@ -12,9 +12,9 @@ Electricity               Beverages' Electricity++ cost for the day, less
                           by that meter's own day and night readings, or by
                           its share of the day's cases where the meter was
                           read only once
-Fixed Manpower,           the Cost Master's monthly rate over 26 working days,
-Maintenance, Lab, Misc,   by the shift's share of the day's running hours
-Ground Water Extraction,
+Fixed Manpower,           the Cost Master's monthly rate over 26 working days;
+Maintenance, Lab, Misc,   a shift's sheet takes half of it, and a line's sheet
+Ground Water Extraction,  its share of the running hours
 AMC, Servicing Cost
 Batch Coding              bottles (cases x bottles per case) x rate a bottle
 Lubrication               litres (bottles x litres a bottle) x rate a litre
@@ -45,10 +45,15 @@ A run with no segments counts for the shift it was planned to start in.
 **Why shares.** Electricity++ allocates a meter's units per *day*, day and
 night readings together, and a month's salary is not earned per case, so a
 shift takes a share of the day: electricity by what each meter's own day and
-night readings measured (by cases where a meter had only one reading), the
-monthly heads by the hours the lines ran. When only one shift ran, it
-takes the whole day. The shares are of the *company's* day, so a line's
-sheets add up with every other line's to one day.
+night readings measured (by cases where a meter had only one reading). The
+monthly heads are the plant's for the day, whichever shift worked longer, so
+a shift's sheet takes **half** of them — the factory's rule (14 Oct 2026): a
+plant run day and night carries half its fixed cost on each shift. A day only
+one shift worked is entered as a whole-day sheet, which takes all of it; a
+shift sheet whose other shift logged no runs says so. A line's sheet takes its
+share of its shift's running hours (of the day's, on a whole-day sheet). The
+shares are of the *company's* day, so a line's sheets add up with every other
+line's to one day.
 
 Nothing here is saved: the page shows these as a new sheet's starting values,
 and what is saved is what the person entering it confirms.
@@ -76,6 +81,7 @@ from ..models import (
 
 ZERO = Decimal('0')
 ONE = Decimal('1')
+HALF = Decimal('0.5')
 PAISE = Decimal('0.01')
 
 DAY_STARTS = time(7)
@@ -184,6 +190,7 @@ class Production:
     bottles: Decimal = ZERO
     litres: Decimal = ZERO
     hours: Decimal = ZERO
+    shift_hours: Decimal = ZERO        # the company's, every line, in the shift
     day_hours: Decimal = ZERO          # the company's, every line
     #: (product, bottles a case, litres a bottle) -> cases: what was filled, SKU by SKU.
     skus: Dict[tuple, Decimal] = field(default_factory=dict)
@@ -202,6 +209,18 @@ class Production:
         if self.day_hours > 0:
             return self.hours / self.day_hours
         return ONE
+
+    @property
+    def line_share(self):
+        """A line's part of its shift's running hours; all of it if nothing ran."""
+        if self.shift_hours > 0:
+            return self.hours / self.shift_hours
+        return ONE
+
+    @property
+    def other_shift_hours(self):
+        """Running hours the day's other shift logged, every line."""
+        return self.day_hours - self.shift_hours
 
 
 def _runs(company, day, now):
@@ -275,8 +294,10 @@ def production(company, day, shift='', line=None, now=None):
     # Two runs on one line at once did not make the line run twice as long.
     for line_id, spans in intervals.items():
         result.day_hours += _hours(spans, whole)
+        in_shift = _hours(spans, window)
+        result.shift_hours += in_shift
         if line is None or line_id == line.id:
-            result.hours += _hours(spans, window)
+            result.hours += in_shift
 
     no_bottles, no_litres = [], []
     for part in shift_runs:
@@ -613,8 +634,28 @@ def defaults(company, day, shift='', line=None, now=None):
     whole_day = not shift and line is None
     case_part = '' if whole_day or made.case_share == ONE else \
         f" × {_pct(made.case_share)} of the day's cases"
-    hour_part = '' if whole_day or made.hour_share == ONE else \
-        f" × {_pct(made.hour_share)} of the day's running hours"
+
+    # The fixed heads: half the day on a shift's sheet, and a line's part of that.
+    if shift:
+        shift_name = FillingCostShift(shift).name.lower()
+        fixed_share = HALF * (made.line_share if line is not None else ONE)
+        fixed_part = f" × 50%, half the day for the {shift_name} shift"
+        if line is not None and made.line_share != ONE:
+            fixed_part += f" × {_pct(made.line_share)} of the shift's running hours"
+        other = made.other_shift_hours
+        if other < ONE:
+            other_name = 'night' if shift == FillingCostShift.DAY else 'day'
+            logged = 'no runs' if other <= 0 else f"only {_figure(other, 1)} h of running"
+            made.warnings.append(
+                f"The {other_name} shift has {logged} logged. A shift's sheet carries half the "
+                f"day's fixed cost; if only the {shift_name} shift worked, enter a whole-day "
+                f"sheet for all of it.")
+    elif line is not None:
+        fixed_share = made.hour_share
+        fixed_part = '' if fixed_share == ONE else \
+            f" × {_pct(fixed_share)} of the day's running hours"
+    else:
+        fixed_share, fixed_part = ONE, ''
 
     electricity = _electricity(company, day)
     if electricity is None:
@@ -660,10 +701,9 @@ def defaults(company, day, shift='', line=None, now=None):
         value = rate.rate
         if rate.basis in (CostBasis.PER_MONTH, CostBasis.PER_DAY):
             daily = value / FILLING_COST_WORKING_DAYS if rate.basis == CostBasis.PER_MONTH else value
-            share = ONE if whole_day else made.hour_share
             how = (f"₹{_rate(value)} a month ÷ {FILLING_COST_WORKING_DAYS} days"
                    if rate.basis == CostBasis.PER_MONTH else f"₹{_rate(value)} a day")
-            add(head, sign * daily * share, how + hour_part, 'cost_master')
+            add(head, sign * daily * fixed_share, how + fixed_part, 'cost_master')
         elif rate.basis == CostBasis.PER_BOTTLE:
             add(head, sign * made.bottles * value,
                 f"{_figure(made.bottles)} bottles × ₹{_rate(value)}", 'cost_master')

@@ -292,7 +292,9 @@ class FillingCostDefaultsTests(APITestCase):
     """A new sheet opens worked out from the shift's runs and the Cost Master.
 
     The fixture is the factory's own night-shift sheet for the 28th: 500 ML at
-    24 a box, 5,655 boxes, Fixed Manpower 46,154 and so on down to the total.
+    24 a box, 5,655 boxes, and so on down to the total. Its fixed heads are half
+    the day's since 14 Oct 2026: a shift's sheet carries half the plant's fixed
+    cost, and a day only one shift worked is entered as a whole-day sheet.
     """
 
     RATES = [
@@ -454,36 +456,55 @@ class FillingCostDefaultsTests(APITestCase):
         self.assertEqual(data['litres'], '67860')            # x 0.5 L
         self.assertEqual(self._amounts(data), {
             'Electricity': '32787.00',
-            'Fixed Manpower': '46153.85',   # 12,00,000 / 26; only night ran
-            'Maintenance': '9615.38',
+            'Fixed Manpower': '23076.92',   # 12,00,000 / 26, half for the shift
+            'Maintenance': '4807.69',
             'Batch Coding': '4071.60',      # 1,35,720 bottles x 0.03
             'Lubrication': '902.54',        # 67,860 L x 0.0133 (0.2 / 15)
-            'Lab': '192.31',
-            'Miscellaneous': '3846.15',     # 1,00,000 / 26
-            'Ground Water Extraction': '615.38',
-            'AMC': '827.31',
-            'Servicing Cost': '2859.73',
+            'Lab': '96.15',
+            'Miscellaneous': '1923.08',     # 1,00,000 / 26 / 2
+            'Ground Water Extraction': '307.69',
+            'AMC': '413.65',
+            'Servicing Cost': '1429.87',
             'Wastage': '4121.00',
             'Scrap Recurring': '-3090.75',  # a credit: 412.1 kg x 7.5
         })
-        self.assertEqual(data['warnings'], [])
+        # Only the night ran, so the sheet says where the other half goes.
+        self.assertEqual(data['warnings'], [
+            "The day shift has no runs logged. A shift's sheet carries half the day's "
+            "fixed cost; if only the night shift worked, enter a whole-day sheet for all of it."])
 
     def test_each_figure_says_where_it_came_from(self):
         self._night_of_the_28th()
         explain = {e['head']: e['explain'] for e in self._open('NIGHT')['entries']}
-        self.assertEqual(explain['Fixed Manpower'], '₹12,00,000 a month ÷ 26 days')
+        self.assertEqual(explain['Fixed Manpower'],
+                         '₹12,00,000 a month ÷ 26 days × 50%, half the day for the night shift')
         self.assertEqual(explain['Batch Coding'], '1,35,720 bottles × ₹0.03')
         self.assertIn('32,787', explain['Electricity'])
         self.assertIn('Preform 412.100 kg × ₹7.5', explain['Scrap Recurring'])
         self.assertIn('926678136 (wastage 28-09-2026 Night) ₹4,121', explain['Wastage'])
 
-    def test_the_day_shift_of_a_night_only_day_takes_nothing(self):
+    def test_the_day_shift_of_a_night_only_day_takes_no_production(self):
         self._night_of_the_28th()
         data = self._open('DAY')
         amounts = self._amounts(data)
         self.assertEqual(data['produced_cases'], '0.00')
-        self.assertEqual(amounts['Fixed Manpower'], '0.00')
         self.assertEqual(amounts['Electricity'], '0.00')
+        # A shift's half of the fixed cost is the plant's, run or not.
+        self.assertEqual(amounts['Fixed Manpower'], '23076.92')
+
+    def test_a_whole_day_sheet_takes_all_the_fixed_cost(self):
+        self._night_of_the_28th()
+        data = self._open('')
+        self.assertEqual(self._amounts(data)['Fixed Manpower'], '46153.85')
+        self.assertEqual(data['warnings'], [])
+
+    def test_a_shift_beside_a_short_overrun_says_how_little_the_other_ran(self):
+        self._night_of_the_28th()
+        # The day shift's only run: a quarter of an hour before 19:00.
+        self._run(2, [('2026-09-28 18:45', '2026-09-28 19:00', '50')])
+        warnings = self._open('NIGHT')['warnings']
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('The day shift has only 0.3 h of running logged', warnings[0])
 
     # -- two shifts -------------------------------------------------------------
 
@@ -491,10 +512,14 @@ class FillingCostDefaultsTests(APITestCase):
         self._night_of_the_28th()                                   # 10 h, 5,655
         self._run(2, [('2026-09-28 07:00', '2026-09-28 19:00', '3000')])  # 12 h
 
-        night, day = self._amounts(self._open('NIGHT')), self._amounts(self._open('DAY'))
-        # The monthly heads by running hours: 10 of 22, and 12 of 22.
-        self.assertEqual(night['Fixed Manpower'], '20979.02')
-        self.assertEqual(day['Fixed Manpower'], '25174.83')
+        night_sheet, day_sheet = self._open('NIGHT'), self._open('DAY')
+        night, day = self._amounts(night_sheet), self._amounts(day_sheet)
+        # The monthly heads half each, though the night ran 10 h to the day's 12.
+        self.assertEqual(night['Fixed Manpower'], '23076.92')
+        self.assertEqual(day['Fixed Manpower'], '23076.92')
+        # Both shifts ran, so neither says the other did not.
+        self.assertFalse([w for w in night_sheet['warnings'] + day_sheet['warnings']
+                          if 'whole-day sheet' in w])
         # Electricity by cases: 5,655 and 3,000 of 8,655.
         self.assertEqual(night['Electricity'], '21422.36')
         self.assertEqual(day['Electricity'], '11364.64')
@@ -536,8 +561,15 @@ class FillingCostDefaultsTests(APITestCase):
         data = self._open('NIGHT', line_id=self.line.id)
         self.assertEqual(data['produced_cases'], '5655.00')
         amounts = self._amounts(data)
-        self.assertEqual(amounts['Fixed Manpower'], '23076.92')     # half the hours
+        # The night's half of the day, and half of that: 10 of the night's 20 line-hours.
+        self.assertEqual(amounts['Fixed Manpower'], '11538.46')
         self.assertEqual(amounts['Batch Coding'], '4071.60')        # its own bottles
+        explain = {e['head']: e['explain'] for e in data['entries']}
+        self.assertIn("× 50%, half the day for the night shift × 50% of the shift's running hours",
+                      explain['Fixed Manpower'])
+        # A line's whole-day sheet: its part of the day's running hours.
+        self.assertEqual(self._amounts(self._open('', line_id=self.line.id))['Fixed Manpower'],
+                         '23076.92')
 
     def test_drafts_and_other_days_are_left_out(self):
         self._night_of_the_28th()
@@ -617,7 +649,8 @@ class FillingCostDefaultsTests(APITestCase):
         self.assertEqual(heads['AMC']['aliases'], ['AMC - Rs. 21510/26'])
         self.assertEqual(heads['Servicing Cost']['aliases'], ['Servicing Cost - Rs. 74353/26'])
         self.assertEqual(heads['Scrap Recurring']['aliases'], ['Scrap Recovering'])
-        self.assertEqual(heads['AMC']['explain'], '₹21,510 a month ÷ 26 days')
+        self.assertEqual(heads['AMC']['explain'],
+                         '₹21,510 a month ÷ 26 days × 50%, half the day for the night shift')
 
     # -- wastage from SAP ---------------------------------------------------------
 
