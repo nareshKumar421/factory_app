@@ -1835,13 +1835,30 @@ class VoucherNumbersTests(CashBookAPITestCase):
         response = self.post(serial_number=207)
         self.assertIn(str(first.data["id"]), str(response.data["serial_number"]))
 
-    def test_a_cancelled_line_keeps_its_number(self):
-        """Handing it on would make two payments answer to one voucher."""
+    def test_a_cancelled_line_frees_its_number(self):
+        """A cancelled line is out of the book, and so is its number."""
         entry = CashEntry.objects.get(id=self.post(serial_number=207).data["id"])
         services.cancel_entry(user=self.custodian, entry=entry)
         response = self.post(serial_number=207)
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(self.post().data["serial_number"], 208)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["serial_number"], 207)
+
+    def test_the_next_voucher_can_close_the_gap_a_cancel_left(self):
+        """612 cancelled, 613 renumbered to 612: the register reads on."""
+        cancelled = CashEntry.objects.get(id=self.post(serial_number=612).data["id"])
+        after = self.post(serial_number=613).data["id"]
+        services.cancel_entry(user=self.custodian, entry=cancelled)
+        response = self.client.patch(
+            f"{BASE}/entries/{after}/", {"serial_number": 612}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["serial_number"], 612)
+
+    def test_the_next_number_follows_the_live_book(self):
+        self.post()
+        last = CashEntry.objects.get(id=self.post().data["id"])
+        services.cancel_entry(user=self.custodian, entry=last)
+        self.assertEqual(self.post().data["serial_number"], 2)
 
     def test_the_form_is_told_what_comes_next(self):
         self.post()

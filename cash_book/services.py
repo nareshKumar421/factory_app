@@ -363,16 +363,15 @@ def _clean_approver(company, direction, approver, *, required=True):
 def next_serial(company) -> int:
     """The number the next voucher gets.
 
-    One past the highest this company has used, cancelled entries included: a
-    cancelled line keeps its number, and handing it to somebody else would
-    make two different payments answer to one voucher number in whatever
-    paperwork already quotes it.
+    One past the highest live number. A cancelled line is out of the book and
+    holds no number against it: cancel the last voucher and the next one takes
+    its number, so the register keeps running without a gap.
 
     Lines with no voucher hold no number, so they never move this on: the book
     can carry a fortnight of bank deductions and the next voucher is still the
     one after the last voucher.
     """
-    highest = CashEntry.objects.filter(company=company).aggregate(
+    highest = CashEntry.objects.filter(company=company, is_active=True).aggregate(
         top=Max("serial_number")
     )["top"]
     return (highest or 0) + 1
@@ -386,7 +385,9 @@ def _clean_serial(company, serial, *, entry=None):
     * nothing given -- the next free number, which is the ordinary case;
     * a dash -- no number at all, because no voucher was ever written for this
       line (see :data:`~cash_book.constants.NO_VOUCHER_MARKS`);
-    * a number -- that one, if no other entry already answers to it.
+    * a number -- that one, if no other live entry already answers to it.
+      A cancelled line does not count: the custodian closing the gap it left
+      is the usual reason for typing a number at all.
     """
     if serial is None:
         return next_serial(company)
@@ -415,7 +416,9 @@ def _clean_serial(company, serial, *, entry=None):
     if number < 1:
         raise ValidationError({"serial_number": "A voucher number starts at 1."})
 
-    taken = CashEntry.objects.filter(company=company, serial_number=number)
+    taken = CashEntry.objects.filter(
+        company=company, is_active=True, serial_number=number
+    )
     if entry is not None:
         taken = taken.exclude(pk=entry.pk)
     clash = taken.first()

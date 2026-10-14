@@ -571,12 +571,14 @@ class CashEntry(BaseModel):
         ordering = ["id"]
         verbose_name_plural = "Cash entries"
         constraints = [
-            # Two lines with one number is the end of a register: a voucher
-            # number that does not name one entry names none.
+            # Two live lines with one number is the end of a register: a
+            # voucher number that does not name one entry names none. A
+            # cancelled line is out of the book, so it holds no number against
+            # the live ones -- the next voucher may close the gap it left.
             models.UniqueConstraint(
                 fields=["company", "serial_number"],
-                condition=models.Q(serial_number__isnull=False),
-                name="cash_entry_serial_unique_per_company",
+                condition=models.Q(serial_number__isnull=False, is_active=True),
+                name="cash_entry_live_serial_unique_per_company",
             ),
         ]
         indexes = [
