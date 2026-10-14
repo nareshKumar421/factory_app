@@ -740,7 +740,7 @@ class LineClearanceItemUpdateSerializer(serializers.Serializer):
 
 class LineClearanceAttachmentSerializer(serializers.ModelSerializer):
     uploaded_by_name = serializers.CharField(
-        source='uploaded_by.get_full_name', read_only=True, default=None
+        source='uploaded_by.full_name', read_only=True, default=None
     )
 
     class Meta:
@@ -762,7 +762,7 @@ class LineClearanceCreateSerializer(serializers.Serializer):
 class LineClearanceDecisionLogSerializer(serializers.ModelSerializer):
     decision_label = serializers.CharField(source='get_decision_display', read_only=True)
     decided_by_name = serializers.CharField(
-        source='decided_by.get_full_name', read_only=True, default=None
+        source='decided_by.full_name', read_only=True, default=None
     )
 
     class Meta:
