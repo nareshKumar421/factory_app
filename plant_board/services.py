@@ -1897,6 +1897,15 @@ class PlantBoardService:
                 logger.warning("plant_board: dispatch by item could not be read: %s", exc)
                 dispatch_read = False
 
+        made_days: Dict[str, List[Dict[str, Any]]] = {}
+        made_days_read = window_from is not None and window_to is not None
+        if made_days_read:
+            try:
+                made_days = self._made_days(list(rows), window_from, window_to)
+            except DatabaseError as exc:
+                logger.warning("plant_board: made days could not be read: %s", exc)
+                made_days_read = False
+
         out: List[Dict[str, Any]] = []
         for held in rows.values():
             planned_qty = held["planned_qty"]
@@ -1940,6 +1949,11 @@ class PlantBoardService:
                     "pf_qty": (floor["qty"] if floor else 0.0) if stock_read else None,
                     "pf_tons": (floor["tons"] if floor else 0.0) if stock_read else None,
                     "warehouses": places,
+                    # The days the lines packed it, off Production Execution;
+                    # null when that read failed rather than an empty list.
+                    "made_days": (
+                        made_days.get(held["item_code"], []) if made_days_read else None
+                    ),
                     **self._dispatch_figures(
                         dispatched.get(held["item_code"]),
                         dispatch_read,
@@ -1956,6 +1970,94 @@ class PlantBoardService:
                 row["item_code"],
             )
         )
+        return out
+
+    def _made_days(
+        self, item_codes: Sequence[str], window_from: date, window_to: date
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """The days each SKU was packed, off the lines' own register.
+
+        READ FROM PRODUCTION EXECUTION, NOT FROM SAP, because that is where a
+        run's date lives: SAP's receipt is dated when it is posted, which can
+        be a day or more after the shift. So these days will not always add up
+        to the row's Made, which is SAP's receipt -- a run not yet posted is
+        here and not there, and that is the point of showing both.
+
+        Produced is the run's ``total_production``, or the sum of its segments
+        while the run is still open -- the same rule as today's tile. Cases are
+        what the floor types; pieces and litres go through the run's own
+        snapshot factors and are null where the run carries none, never a
+        guess. A run that packed nothing is not a day the SKU was made.
+        """
+        codes = [code for code in item_codes if code]
+        if not codes:
+            return {}
+        runs = list(
+            ProductionRun.objects.filter(
+                company__code=self.company_code,
+                item_code__in=codes,
+                date__gte=window_from,
+                date__lte=window_to,
+            ).values(
+                "id", "date", "item_code", "line__name", "total_production",
+                "pieces_per_case", "litres_per_piece",
+            )
+        )
+        if not runs:
+            return {}
+        segments = {
+            row["production_run"]: row["cases"] or ZERO
+            for row in ProductionSegment.objects.filter(
+                production_run_id__in=[run["id"] for run in runs]
+            )
+            .values("production_run")
+            .annotate(cases=Sum("produced_cases"))
+        }
+
+        by_day: Dict[tuple, Dict[str, Any]] = {}
+        for run in runs:
+            cases = run["total_production"] or ZERO
+            if cases <= ZERO:
+                cases = segments.get(run["id"], ZERO)
+            if cases <= ZERO:
+                continue
+            held = by_day.setdefault(
+                (run["item_code"], run["date"]),
+                {"cases": ZERO, "pieces": ZERO, "litres": ZERO,
+                 "runs": 0, "lines": set(), "unconverted": False},
+            )
+            held["cases"] += cases
+            held["runs"] += 1
+            if run["line__name"]:
+                held["lines"].add(run["line__name"])
+            per_case = run["pieces_per_case"]
+            if not per_case:
+                held["unconverted"] = True
+                continue
+            pieces = cases * per_case
+            held["pieces"] += pieces
+            if run["litres_per_piece"]:
+                held["litres"] += pieces * run["litres_per_piece"]
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for (code, day), held in by_day.items():
+            out.setdefault(code, []).append(
+                {
+                    "date": day.isoformat(),
+                    "cases": _f(held["cases"]),
+                    # Null when any run that day had no case factor: a part
+                    # total would read as the whole day's.
+                    "pieces": None if held["unconverted"] else _f(held["pieces"]),
+                    "tons": (
+                        None if held["unconverted"] or held["litres"] <= ZERO
+                        else _tons(held["litres"])
+                    ),
+                    "runs": held["runs"],
+                    "lines": sorted(held["lines"]),
+                }
+            )
+        for days in out.values():
+            days.sort(key=lambda row: row["date"])
         return out
 
     @staticmethod

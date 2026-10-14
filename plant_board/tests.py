@@ -2338,6 +2338,10 @@ class PlanBySkuTests(SimpleTestCase):
         patcher = mock.patch("plant_board.services.plan_stock_warehouses", return_value=None)
         self.counted = patcher.start()
         self.addCleanup(patcher.stop)
+        # The made days read Production Execution: a database, so stubbed.
+        days = mock.patch.object(PlantBoardService, "_made_days", return_value={})
+        days.start()
+        self.addCleanup(days.stop)
 
     def test_only_the_ticked_warehouses_are_counted(self):
         self.counted.return_value = {"BH-FG"}
@@ -2458,3 +2462,65 @@ class PlanBySkuTests(SimpleTestCase):
         )[0]
         self.assertFalse(row["dispatch_read"])
         self.assertIsNone(row["dispatch_qty"])
+
+
+class MadeDaysTests(TestCase):
+    """The days a plan SKU was packed, off the lines' own register."""
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Jivo Oil", code="JIVO_OIL")
+        self.line_a = ProductionLine.objects.create(company=self.company, name="Line A")
+        self.line_b = ProductionLine.objects.create(company=self.company, name="Line B")
+        self.number = 0
+
+    def make_run(self, on, produced, item="FG1", line=None, per_case=20, litres=1):
+        self.number += 1
+        return ProductionRun.objects.create(
+            company=self.company,
+            line=line or self.line_a,
+            run_number=self.number,
+            date=on,
+            item_code=item,
+            total_production=produced,
+            pieces_per_case=per_case,
+            litres_per_piece=litres,
+            status="COMPLETED",
+        )
+
+    def days(self):
+        return service()._made_days(["FG1", "FG5"], date(2026, 10, 1), date(2026, 10, 14))
+
+    def test_runs_on_one_day_are_one_row_across_lines(self):
+        self.make_run(date(2026, 10, 3), 100, line=self.line_a)
+        self.make_run(date(2026, 10, 3), 50, line=self.line_b)
+        self.make_run(date(2026, 10, 2), 10)
+        rows = self.days()["FG1"]
+        self.assertEqual([row["date"] for row in rows], ["2026-10-02", "2026-10-03"])
+        self.assertEqual(rows[1]["cases"], 150.0)
+        self.assertEqual(rows[1]["pieces"], 3000.0)
+        self.assertEqual(rows[1]["tons"], 3.0)
+        self.assertEqual(rows[1]["runs"], 2)
+        self.assertEqual(rows[1]["lines"], ["Line A", "Line B"])
+
+    def test_an_open_run_counts_its_segments_and_an_empty_one_is_no_day(self):
+        run = self.make_run(date(2026, 10, 5), 0)
+        ProductionSegment.objects.create(
+            production_run=run, start_time=timezone.now(), produced_cases=25
+        )
+        self.make_run(date(2026, 10, 6), 0)
+        rows = self.days()["FG1"]
+        self.assertEqual([(row["date"], row["cases"]) for row in rows], [("2026-10-05", 25.0)])
+
+    def test_a_day_without_a_case_factor_has_no_pieces_rather_than_a_part(self):
+        self.make_run(date(2026, 10, 7), 10)
+        self.make_run(date(2026, 10, 7), 10, per_case=None)
+        row = self.days()["FG1"][0]
+        self.assertEqual(row["cases"], 20.0)
+        self.assertIsNone(row["pieces"])
+        self.assertIsNone(row["tons"])
+
+    def test_outside_the_window_or_another_sku_is_left_out(self):
+        self.make_run(date(2026, 9, 30), 10)
+        self.make_run(date(2026, 10, 15), 10)
+        self.make_run(date(2026, 10, 8), 10, item="OTHER")
+        self.assertEqual(self.days(), {})
