@@ -1707,13 +1707,10 @@ class BarcodeService:
         if pallet.status not in PALLET_MANUAL_TERMINAL_STATUSES and (
             pallet.status != PalletStatus.DISPATCHED or pallet.available_boxes
         ):
-            if pallet.available_boxes and pallet.dispatched_boxes:
-                pallet.status = PalletStatus.PARTIAL
-                pallet.dispatched_at = None
-                pallet.dispatch_session = None
-            elif not pallet.available_boxes and total_boxes:
+            if not pallet.available_boxes and total_boxes:
                 pallet.status = PalletStatus.EMPTY
             elif pallet.available_boxes:
+                # Any live box keeps the pallet ACTIVE, dispatched siblings or not.
                 pallet.status = PalletStatus.ACTIVE
                 pallet.dispatched_at = None
                 pallet.dispatch_session = None

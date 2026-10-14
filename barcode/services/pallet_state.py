@@ -39,16 +39,21 @@ def recalculate_pallet_state(company, pallet: Pallet, user=None, note="", trigge
     ``trigger`` labels what caused the recalculation ("load" / "unload" from the
     vehicle_load service, "" otherwise) so the pallet-level trail only records
     *real* vehicle events: a pallet loaded in several scan chunks flips
-    PARTIAL ⇄ INSIDE_VEHICLE repeatedly as more of its boxes surface to scan,
+    ACTIVE ⇄ INSIDE_VEHICLE repeatedly as more of its boxes surface to scan,
     and without this the trail filled up with LOAD/UNLOAD pairs even though no
     box ever left a truck.
+
+    Every box on the pallet counts, whichever company owns it. A box ICBT'd to
+    Jivo Mart stays on its Oil pallet, and Mart's load of that one box used to
+    recount the pallet from Mart's boxes alone: it saw only the loaded box and
+    stamped the pallet INSIDE_VEHICLE (or DISPATCHED) while its Oil boxes were
+    still ACTIVE. ``company`` only labels the trail rows and the WMS sync.
     """
-    boxes = list(Box.objects.filter(company=company, pallet=pallet))
+    boxes = list(Box.objects.filter(pallet=pallet))
     active_boxes = [box for box in boxes if box.status in (BoxStatus.ACTIVE, BoxStatus.PARTIAL)]
     loaded_boxes = [box for box in boxes if box.status == BoxStatus.INSIDE_VEHICLE]
     dispatched_boxes = [box for box in boxes if box.status == BoxStatus.DISPATCHED]
     removed_box_count = PalletBoxHistory.objects.filter(
-        company=company,
         pallet=pallet,
         action="BOX_DISPATCHED_SEPARATELY",
     ).values("box_id").distinct().count()
@@ -79,15 +84,12 @@ def recalculate_pallet_state(company, pallet: Pallet, user=None, note="", trigge
                 else pallet.dispatch_session
             )
             pallet.dispatched_at = pallet.dispatched_at or timezone.now()
-        elif active_boxes and (dispatched_boxes or loaded_boxes or removed_box_count):
-            pallet.status = PalletStatus.PARTIAL
-            # Holds live stock again -> not a dispatched pallet; clear the dispatch
-            # stamp so active-only flows (intercompany transfer) stop rejecting it.
-            pallet.dispatched_at = None
-            pallet.dispatch_session = None
         elif not active_boxes:
             pallet.status = PalletStatus.EMPTY
         else:
+            # One live box makes the pallet ACTIVE, even with others loaded or
+            # dispatched: PARTIAL was refused by clear, void and split. Clear the
+            # dispatch stamp so active-only flows (intercompany transfer) take it.
             pallet.status = PalletStatus.ACTIVE
             pallet.dispatched_at = None
             pallet.dispatch_session = None

@@ -851,9 +851,10 @@ class BarcodeWorkflowTests(TestCase):
         self.assertEqual(bm.to_bin, 'A-01-1')
 
     def test_pallet_move_allowed_for_partial_pallet(self):
-        """A PARTIAL pallet (some boxes dispatched, some live) can still be moved
-        between godowns; only its live boxes relocate. Regression for godown/move
-        pallet hiding PARTIAL pallets."""
+        """A part-dispatched pallet (some boxes dispatched, some live) can still be
+        moved between godowns; only its live boxes relocate. Regression for
+        godown/move pallet hiding PARTIAL pallets; the recount now calls such a
+        pallet ACTIVE."""
         from .services.pallet_state import recalculate_pallet_state
 
         boxes = self._generate_boxes(count=2)
@@ -865,13 +866,13 @@ class BarcodeWorkflowTests(TestCase):
         pallet = self.service.add_boxes_to_pallet(
             pallet.id, [b.id for b in boxes], user=self.user,
         )
-        # Dispatch one box so the pallet becomes PARTIAL.
+        # Dispatch one box; the pallet stays ACTIVE on the box left.
         Box.objects.filter(id=boxes[1].id).update(
             status=BoxStatus.DISPATCHED, qty=Decimal('0'),
         )
         recalculate_pallet_state(self.company, pallet)
         pallet.refresh_from_db()
-        self.assertEqual(pallet.status, PalletStatus.PARTIAL)
+        self.assertEqual(pallet.status, PalletStatus.ACTIVE)
 
         moved = self.service.move_pallet(
             pallet.id, to_warehouse='FG02', to_bin='A-02-1', notes='', user=self.user,
@@ -2526,7 +2527,7 @@ class BarcodeDispatchWorkflowTests(TestCase):
         self.assertIsNone(boxes[0].pallet_id)
         self.assertEqual(boxes[0].status, BoxStatus.DISPATCHED)
         self.assertIsNotNone(boxes[0].removed_from_pallet_at)
-        self.assertEqual(pallet.status, PalletStatus.PARTIAL)
+        self.assertEqual(pallet.status, PalletStatus.ACTIVE)
         self.assertEqual(pallet.available_boxes, 1)
         self.assertEqual(pallet.box_history.filter(action='BOX_DISPATCHED_SEPARATELY').count(), 1)
 
@@ -2723,7 +2724,7 @@ class BarcodeDispatchWorkflowTests(TestCase):
             boxes[0].refresh_from_db()
             pallet.refresh_from_db()
             self.assertIsNone(boxes[0].pallet_id)
-            self.assertEqual(pallet.status, PalletStatus.PARTIAL)
+            self.assertEqual(pallet.status, PalletStatus.ACTIVE)
 
             pallet_history_response = self.client.get(f'/api/v1/barcode/pallets/{pallet.id}/history/')
             self.assertEqual(pallet_history_response.status_code, 200)
@@ -2899,7 +2900,7 @@ class DispatchSettlementTests(TestCase):
         settle_dispatched_boxes(self.company, [self._fresh_boxes(boxes)[0]], self.user)
 
         pallet.refresh_from_db()
-        self.assertEqual(pallet.status, PalletStatus.PARTIAL)
+        self.assertEqual(pallet.status, PalletStatus.ACTIVE)
         self.assertEqual(pallet.box_count, 2)
         # Pallet still occupies its bin, but the WMS box count is decremented.
         wms_pallet = WmsPallet.objects.get(company=self.company, data__licensePlate=pallet.pallet_id)
@@ -2928,7 +2929,7 @@ class DispatchSettlementTests(TestCase):
         recalculate_pallet_state(self.company, pallet)
 
         pallet.refresh_from_db()
-        self.assertEqual(pallet.status, PalletStatus.PARTIAL)  # not stuck DISPATCHED
+        self.assertEqual(pallet.status, PalletStatus.ACTIVE)  # not stuck DISPATCHED
         self.assertIsNone(pallet.dispatched_at)  # dispatch stamp cleared
         self.assertIsNone(pallet.dispatch_session_id)
         self.assertEqual(pallet.box_count, 1)

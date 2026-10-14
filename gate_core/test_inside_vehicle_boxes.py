@@ -91,9 +91,9 @@ class InsideVehicleBoxTests(TestCase):
         ).get()
         self.assertEqual(movement.from_bin, "A-01")
         self.assertIn("DOCK-1", movement.notes)
-        # One box still active -> pallet is PARTIAL, still at its bin.
+        # One box still active -> pallet stays ACTIVE, still at its bin.
         self.pallet.refresh_from_db()
-        self.assertEqual(self.pallet.status, PalletStatus.PARTIAL)
+        self.assertEqual(self.pallet.status, PalletStatus.ACTIVE)
         self.assertEqual(self.pallet.box_count, 1)
 
     def test_full_pallet_load_stages_pallet_and_frees_wms_location(self):
@@ -118,6 +118,26 @@ class InsideVehicleBoxTests(TestCase):
         self.assertTrue(
             WmsMovement.objects.filter(company=self.company, data__type="OUTBOUND").exists()
         )
+
+    def test_other_company_load_leaves_pallet_live_while_a_box_is_active(self):
+        """One box ICBT'd to Mart and loaded on a Mart docking must not put the
+        Oil pallet in the vehicle: its other box is still ACTIVE. Regression for
+        PLT-20261014-XX-150, stamped INSIDE_VEHICLE / 0 boxes over 9 ACTIVE."""
+        mart = Company.objects.create(name="Jivo Mart", code="JIVO_MART")
+        reassign_boxes_to_company([self.box1], mart, user=self.user, reference="ICBT-1")
+        self.box1.refresh_from_db()
+        load_boxes_into_vehicle(mart, [self.box1], self.user, reference="Docking DOCK-1")
+        self.pallet.refresh_from_db()
+        self.assertEqual(self.pallet.status, PalletStatus.ACTIVE)
+        self.assertEqual(self.pallet.box_count, 1)
+        self.assertEqual(self.pallet.total_qty, Decimal("20"))
+        self.assertEqual(self.pallet.current_bin, "A-01")
+
+        # Settling Mart's box doesn't mark the pallet DISPATCHED either.
+        settle_dispatched_boxes(mart, [self.box1], self.user, note="Docking DOCK-1")
+        self.pallet.refresh_from_db()
+        self.assertEqual(self.pallet.status, PalletStatus.ACTIVE)
+        self.assertEqual(self.pallet.box_count, 1)
 
     def test_load_skips_non_loadable_and_is_idempotent(self):
         self.box1.status = BoxStatus.DISPATCHED
@@ -191,11 +211,11 @@ class InsideVehicleBoxTests(TestCase):
             self.company, [self.box1, self.box2], self.user, reference="Docking DOCK-1"
         )
         # A third box of the pallet surfaces to scan (e.g. handed over between
-        # chunks) -> pallet drops back to PARTIAL. Not a vehicle event.
+        # chunks) -> pallet drops back to ACTIVE. Not a vehicle event.
         box3 = self._box("BOX-TEST-0003", pallet=self.pallet)
         recalculate_pallet_state(self.company, self.pallet)
         self.pallet.refresh_from_db()
-        self.assertEqual(self.pallet.status, PalletStatus.PARTIAL)
+        self.assertEqual(self.pallet.status, PalletStatus.ACTIVE)
         # Chunk 2 on the SAME docking -> collapses into the existing LOAD.
         load_boxes_into_vehicle(
             self.company, [box3], self.user, reference="Docking DOCK-1"

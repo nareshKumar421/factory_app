@@ -152,7 +152,7 @@ class PalletScanOntoDockingTests(TestCase):
         self.assertFalse(result.bin_freed)
 
         pallet.refresh_from_db()
-        self.assertEqual(pallet.status, PalletStatus.PARTIAL)
+        self.assertEqual(pallet.status, PalletStatus.ACTIVE)
         self.assertEqual(
             Box.objects.filter(pallet=pallet, status=BoxStatus.ACTIVE).count(), 2
         )
