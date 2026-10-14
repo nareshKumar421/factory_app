@@ -12,10 +12,9 @@ where, row by row, and ``checks.py`` looks in that for what the GRPO says
 should be there. Knowing the answer makes the reading a matter of finding it.
 
 Handwriting is the exception OCR is poor at, and the one mark the checklist
-needs is a signature. That is judged from the pixels instead: the "Rate Check"
-label is found by OCR, the stamp's own printed rule beside it is erased, and
-whatever ink is left is measured against the label's height. A blank line left
-nothing (0.00–0.13 on the samples); a pen signature left about 1.0.
+needs is a signature. That is judged from the pixels instead: Kulbeer's on the
+check stamp's "Rate Check" line, found by its label and held by shape to
+signatures of his kept with the app (``rate_check_signature``).
 
 Small vendors' bill books print the GST lines with a dotted blank for the rate,
 "+SGST@..........%", and the rate is written in by hand. OCR reads the dots
@@ -31,7 +30,7 @@ import threading
 from importlib import metadata
 from typing import Any
 
-from .stamp_signature import read_stamp_signature
+from .rate_check_signature import is_colour, read_rate_check, stamp_ink_only
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +49,6 @@ MAX_PAGES = 4
 #: Cores one read may use, so a read does not take every core from gunicorn.
 OCR_THREADS = 4
 
-#: Ink left on the Rate Check line, per label height squared.
-SIGNATURE_BLANK_BELOW = 0.25
-SIGNATURE_SIGNED_ABOVE = 0.6
-
-RATE_CHECK_LABEL = re.compile(r"rate\s*ch", re.I)
 #: The gate's receiving stamp: "G. No." (not "GR/RR No.").
 GATE_STAMP_LABEL = re.compile(r"\bG\s*\.\s*:?\s*No", re.I)
 #: JIVO's purchase order numbers: nine digits from 2 (220926152).
@@ -97,19 +91,23 @@ def engine_name() -> str:
 def read_invoice(content: bytes, filename: str, signer: str = "") -> tuple[dict[str, Any], str]:
     """``(what is printed where, the engine that read it)``. Raises ``InvoiceReadError``.
 
-    ``signer``: whose kept marks the gate stamp's signature is held to.
+    ``signer``: whose kept signatures the Rate Check line's is held to.
     """
     images = _page_images(content, filename)
     lines: list[dict] = []
     rate_check: dict = {"found": False}
-    stamp_signature: dict = {"found": False}
     for page, image in enumerate(images, start=1):
         page_lines = mend_slash_dashes(fill_rate_blanks(image, _ocr(image, page)))
         lines.extend(page_lines)
         if not rate_check["found"]:
-            rate_check = rate_check_marks(image, page_lines)
-        if not stamp_signature["found"]:
-            stamp_signature = read_stamp_signature(image, page_lines, signer)
+            rate_check = read_rate_check(image, page_lines, signer)
+    # Where the check stamp landed on the bill's print, OCR may read its
+    # labels into the print; its blue ink alone reads cleanly.
+    for page, image in enumerate(images, start=1):
+        if rate_check["found"]:
+            break
+        if is_colour(image):
+            rate_check = read_rate_check(image, _ocr(stamp_ink_only(image), page), signer)
     if not lines:
         raise InvoiceReadError("No text could be read off the bill. Is the scan blank or upside down?")
     return {
@@ -119,7 +117,6 @@ def read_invoice(content: bytes, filename: str, signer: str = "") -> tuple[dict[
         "po_numbers": list(dict.fromkeys(m for line in lines for m in PO_NUMBER.findall(line["text"]))),
         "gate_stamp_date": gate_stamp_date(lines),
         "rate_check": rate_check,
-        "stamp_signature": stamp_signature,
     }, engine_name()
 
 
@@ -370,60 +367,3 @@ def mend_slash_dashes(page_lines: list[dict]) -> list[dict]:
             line = {**line, "text": text, "ocr_text": line.get("ocr_text", line["text"])}
         mended.append(line)
     return mended
-
-
-# ---------------------------------------------------------------------------
-# The Rate Check line
-# ---------------------------------------------------------------------------
-
-def rate_check_marks(image, page_lines: list[dict]) -> dict:
-    """How much was written on the stamp's "Rate Check" line, and what OCR made of it."""
-    import cv2
-    import numpy as np
-
-    label = next((line for line in page_lines if RATE_CHECK_LABEL.search(line["text"])), None)
-    if label is None:
-        return {"found": False}
-    x0, y0, x1, y1 = label["box"]
-    h = max(1, y1 - y0)
-    top, bottom = max(0, y0 - int(0.7 * h)), min(image.shape[0], y1 + int(0.4 * h))
-    band = image[top:bottom, x1: min(image.shape[1], x1 + 700)]
-    if band.size == 0:
-        return {"found": True, "ink": None, "signed": None, "text": ""}
-
-    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-    ink = (gray < 150).astype(np.uint8) * 255
-    # The stamp prints a long rule after the label; find where it ends, so the
-    # gate stamp or the printed text further right is not counted.
-    rule = cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (45, 1)))
-    _, _, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(rule, np.ones((7, 25), np.uint8)))
-    runs = [s for s in stats[1:] if s[cv2.CC_STAT_LEFT] < 120 and s[cv2.CC_STAT_WIDTH] > 120]
-    if not runs:
-        return {"found": True, "ink": None, "signed": None, "text": ""}
-    right = max(int(s[cv2.CC_STAT_LEFT] + s[cv2.CC_STAT_WIDTH]) for s in runs) + 30
-
-    ink, rule = ink[:, :right], rule[:, :right]
-    rule = cv2.dilate(rule, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
-    rest = cv2.subtract(ink, rule)
-    rest = cv2.morphologyEx(rest, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
-    _, _, stats, _ = cv2.connectedComponentsWithStats(rest)
-    strokes = [
-        s for s in stats[1:]
-        if s[cv2.CC_STAT_HEIGHT] >= 0.4 * h or s[cv2.CC_STAT_WIDTH] >= 1.5 * h
-    ]
-    amount = round(sum(int(s[cv2.CC_STAT_AREA]) for s in strokes) / (h * h), 2)
-
-    # Anything OCR read inside the rule's span is somebody's writing.
-    written = " ".join(
-        line["text"] for line in page_lines
-        if line is not label
-        and line["box"][0] >= x1 - 5 and line["box"][2] <= x1 + right + 5
-        and line["box"][1] >= top - 5 and line["box"][3] <= bottom + 5
-    )
-    if amount < SIGNATURE_BLANK_BELOW:
-        signed = False
-    elif amount > SIGNATURE_SIGNED_ABOVE:
-        signed = True
-    else:
-        signed = None
-    return {"found": True, "ink": amount, "signed": signed, "text": written}

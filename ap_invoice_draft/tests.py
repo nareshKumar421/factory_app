@@ -21,14 +21,13 @@ from rest_framework.test import APIClient
 from company.models import Company, UserCompany, UserRole
 from sap_client.exceptions import SAPDataError, SAPOutcomeUnknown, SAPValidationError
 
-from . import checks, stamp_signature, tds
+from . import checks, rate_check_signature, tds
 from .invoice_reader import (
     InvoiceReadError,
     fill_rate_blanks,
     gate_stamp_date,
     group_rows,
     mend_slash_dashes,
-    rate_check_marks,
     read_invoice,
 )
 from .models import (
@@ -71,7 +70,7 @@ SSY_GRPO = {
     ],
 }
 
-def _bill(rows, *, lines=None, rate_check=None, stamp_signature=None, gate_stamp_date="", po_numbers=()):
+def _bill(rows, *, lines=None, rate_check=None, gate_stamp_date="", po_numbers=()):
     """A bill as ``invoice_reader.read_invoice`` returns it: one box per row
     unless the test lays the boxes out itself."""
     return {
@@ -83,8 +82,7 @@ def _bill(rows, *, lines=None, rate_check=None, stamp_signature=None, gate_stamp
         ],
         "po_numbers": list(po_numbers),
         "gate_stamp_date": gate_stamp_date,
-        "rate_check": rate_check or {"found": True, "ink": 0.0, "signed": False, "text": ""},
-        "stamp_signature": stamp_signature or {"found": True, "signed": False, "signer": "Kulbeer", "match": None},
+        "rate_check": rate_check or {"found": True, "signed": False, "ink": 0.0, "signer": "Kulbeer", "match": None},
     }
 
 
@@ -324,33 +322,36 @@ class GRPOTimingCheckTests(SimpleTestCase):
 
 
 class RateCheckSignatureTests(SimpleTestCase):
-    def _with(self, **mark):
-        return {**SSY_INVOICE, "stamp_signature": {"found": True, "signed": True, "signer": "Kulbeer", **mark}}
+    def _with(self, **line):
+        return {**SSY_INVOICE, "rate_check": {"found": True, "signed": True, "ink": 1.5, "signer": "Kulbeer", **line}}
 
-    def test_kulbeers_mark_passes(self):
-        finding = checks.check_rate_check_signature(self._with(match=0.74))
+    def test_kulbeers_signature_passes(self):
+        finding = checks.check_rate_check_signature(self._with(match=0.65))
         self.assertEqual(finding.status, CheckStatus.PASS)
-        self.assertIn("signed with Kulbeer's mark (likeness 0.74)", finding.detail)
+        self.assertIn("Kulbeer has signed the Rate Check line (likeness 0.65)", finding.detail)
 
-    def test_another_mark_needs_a_look(self):
-        finding = checks.check_rate_check_signature(self._with(match=0.46))
+    def test_another_signature_needs_a_look(self):
+        finding = checks.check_rate_check_signature(self._with(match=0.41))
         self.assertEqual(finding.status, CheckStatus.REVIEW)
-        self.assertIn("not like Kulbeer's mark (likeness 0.46)", finding.detail)
+        self.assertIn("not like Kulbeer's signature (likeness 0.41)", finding.detail)
 
-    def test_a_blank_signature_box_fails(self):
-        self.assertEqual(_status(checks.check_rate_check_signature(SSY_INVOICE)), CheckStatus.FAIL)
+    def test_a_blank_line_fails(self):
+        finding = checks.check_rate_check_signature(SSY_INVOICE)
+        self.assertEqual(finding.status, CheckStatus.FAIL)
+        self.assertEqual(finding.detail, "Nobody has signed the Rate Check line.")
 
-    def test_no_kept_marks_to_hold_it_to_needs_a_look(self):
+    def test_no_kept_signatures_to_hold_it_to_needs_a_look(self):
         finding = checks.check_rate_check_signature(self._with(match=None))
         self.assertEqual(finding.status, CheckStatus.REVIEW)
         self.assertIn("Confirm it is Kulbeer's", finding.detail)
 
     def test_no_stamp_found_needs_a_look(self):
-        invoice = {**SSY_INVOICE, "stamp_signature": {"found": False}}
+        invoice = {**SSY_INVOICE, "rate_check": {"found": False}}
         self.assertEqual(_status(checks.check_rate_check_signature(invoice)), CheckStatus.REVIEW)
 
     def test_a_bill_read_before_this_asks_to_be_read_again(self):
-        invoice = {key: value for key, value in SSY_INVOICE.items() if key != "stamp_signature"}
+        # Read before 2026-10-13: ink measured, nobody's signature held to his.
+        invoice = {**SSY_INVOICE, "rate_check": {"found": True, "ink": 1.21, "signed": True, "text": ""}}
         finding = checks.check_rate_check_signature(invoice)
         self.assertEqual(finding.status, CheckStatus.REVIEW)
         self.assertIn("Read the bill again", finding.detail)
@@ -851,7 +852,7 @@ class CreateTests(ServiceTestCase):
 class ReadInvoiceTests(ServiceTestCase):
     def test_reading_again_replaces_what_was_read_and_rechecks(self):
         entry = self.service.create(27481, _pdf(), self.user)
-        signed = {**SSY_INVOICE, "stamp_signature": {"found": True, "signed": True, "signer": "Kulbeer", "match": 0.74}}
+        signed = {**SSY_INVOICE, "rate_check": {"found": True, "signed": True, "ink": 1.5, "signer": "Kulbeer", "match": 0.65}}
         self.read.return_value = (signed, "RapidOCR test 2")
         self.service.read_invoice(entry)
         entry.refresh_from_db()
@@ -1069,152 +1070,132 @@ def _page(width=1400, height=700):
     return np.full((height, width, 3), 255, np.uint8)
 
 
-def _stamp(image, label_box=(100, 300, 280, 340)):
-    """The check stamp's Rate Check line: the label (a box, as OCR finds it)
-    and the long printed rule after it."""
+STAMP_BLUE = (150, 40, 30)
+PEN_BLUE = (120, 30, 20)
+
+
+def _check_stamp(image, x0=100, y0=300, h=40, labels=("Quantity Check", "Quality Check", "Rate Check"),
+                 colour=True):
+    """JIVO's check stamp: three labels, each with its printed rule after it,
+    Rate Check's foot at ``y0 + h``; and the labels as OCR finds them."""
     import cv2
-    x0, y0, x1, y1 = label_box
-    cv2.line(image, (x1 + 8, y1 - 6), (x1 + 290, y1 - 9), (150, 40, 30), 7)
-    return {"page": 1, "text": "Rate Chock", "score": 0.9, "box": list(label_box)}
+    ink = STAMP_BLUE if colour else (40, 40, 40)
+    lines = []
+    for index, text in enumerate(("Quantity Check", "Quality Check", "Rate Check")):
+        top = y0 - (2 - index) * int(1.6 * h)
+        (width, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, h / 42, 2)
+        cv2.putText(image, text, (x0, top + h - 8), cv2.FONT_HERSHEY_SIMPLEX, h / 42, ink, 2)
+        cv2.line(image, (x0 + width + h // 3, top + h - 6), (x0 + int(11 * h), top + h - 9), ink, 6)
+        if text in labels:
+            lines.append({"page": 1, "text": text, "score": 0.9, "box": [x0, top, x0 + width, top + h]})
+    return lines
 
 
-@skipUnless(_HAS_OCR, "the OCR packages are not installed")
-class RateCheckMarksTests(SimpleTestCase):
-    def test_the_printed_rule_alone_is_blank(self):
-        image = _page()
-        label = _stamp(image)
-        marks = rate_check_marks(image, [label])
-        self.assertEqual((marks["found"], marks["signed"]), (True, False))
-        self.assertLess(marks["ink"], 0.25)
-
-    def test_a_pen_signature_over_the_rule_is_signed(self):
-        import cv2
-        import numpy as np
-        image = _page()
-        label = _stamp(image)
-        points = [(300 + i * 2, 330 - int(30 * np.sin(i / 8))) for i in range(130)]
-        cv2.polylines(image, [np.array(points, np.int32)], False, (120, 40, 30), 3)
-        marks = rate_check_marks(image, [label])
-        self.assertTrue(marks["signed"])
-        self.assertGreater(marks["ink"], 0.6)
-
-    def test_ink_beyond_the_rule_is_not_counted(self):
-        import cv2
-        image = _page()
-        label = _stamp(image)
-        # The gate stamp's handwriting further right on the same line.
-        cv2.putText(image, "HR69F", (800, 335), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.5, (120, 40, 30), 3)
-        self.assertFalse(rate_check_marks(image, [label])["signed"])
-
-    def test_no_label_no_finding(self):
-        self.assertEqual(rate_check_marks(_page(), []), {"found": False})
-
-
-def _drawn_stamp(mark=None, text="", angle=0.0, borders=True):
-    """The gate's stamp as it lands on a bill: border, heading, the printed
-    "Signature" and its dotted line, signed with ``mark`` (a kept mark's
-    image) or ``text``; and the heading and village lines as OCR finds them."""
-    import cv2
-    w, x0, y0 = 410, 300, 200
-    page = _page(1100, 900)
-    blue = (150, 40, 30)
-    right, bottom = x0 + int(1.01 * w), y0 + int(0.71 * w)
-    if borders:
-        cv2.rectangle(page, (x0 - int(0.05 * w), y0 - int(0.08 * w)), (right, bottom), blue, 4)
-    cv2.line(page, (x0 + int(0.47 * w), y0 + int(0.2 * w)), (x0 + int(0.47 * w), bottom), blue, 3)
-    cv2.putText(page, "JIVO WELLNESS PVT. LTD.", (x0, y0 + 30), cv2.FONT_HERSHEY_TRIPLEX, 1.05, blue, 2)
-    word = cv2.imread(str(stamp_signature.WORD_TEMPLATE), cv2.IMREAD_GRAYSCALE)
-    word = cv2.resize(word, None, fx=w / 409, fy=w / 409, interpolation=cv2.INTER_NEAREST)
-    wx, wy = x0 + int(0.80 * w) - word.shape[1], bottom - int(0.02 * w) - word.shape[0]
-    page[wy: wy + word.shape[0], wx: wx + word.shape[1]][word < 128] = blue
-    for x in range(wx + word.shape[1] + 2, right - 6, 9):
-        cv2.rectangle(page, (x, bottom - 12), (x + 3, bottom - 9), blue, -1)
-    if mark is not None:
-        h, mw = mark.shape
-        mx, my = x0 + int(0.82 * w), bottom - int(0.02 * w) - h
-        page[my: my + h, mx: mx + mw][mark < 128] = (110, 30, 20)
-    if text:
-        cv2.putText(page, text, (x0 + int(0.82 * w), bottom - int(0.04 * w)),
-                    cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.3, (110, 30, 20), 3)
-    if angle:
-        turn = cv2.getRotationMatrix2D((550, 450), angle, 1.0)
-        page = cv2.warpAffine(page, turn, (1100, 900), borderValue=(255, 255, 255))
-    lines = [
-        {"page": 1, "text": "JIVO WELLNESS PVT. LTD.", "score": 0.9, "box": [x0, y0, x0 + w, y0 + 40]},
-        {"page": 1, "text": "Village Bhakharpur, Ganaur", "score": 0.9, "box": [x0 + 15, y0 + 38, x0 + w - 15, y0 + 70]},
-    ]
-    return page, lines
-
-
-def _kept_marks(leave_out=""):
+def _kept_signatures(leave_out=""):
     import cv2
     return {
         path.stem: cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        for path in sorted(stamp_signature.REFERENCES.glob("kulbeer_*.png"))
+        for path in sorted(rate_check_signature.REFERENCES.glob("kulbeer_*.png"))
         if not leave_out or leave_out not in path.stem
     }
 
 
+def _sign(image, signature, x0=100, y0=300, h=40, colour=True):
+    """Write a kept signature across the Rate Check rule, where he starts it."""
+    rule = rate_check_signature.REFERENCE_LABEL_HEIGHT * -rate_check_signature.BODY_RISE[0]
+    top, left = y0 + h - 6 - int(rule), x0 + int(5.8 * h)
+    rows, cols = signature.shape
+    image[top: top + rows, left: left + cols][signature < 128] = PEN_BLUE if colour else (30, 30, 30)
+
+
 @skipUnless(_HAS_OCR, "the OCR packages are not installed")
-class StampSignatureTests(SimpleTestCase):
-    """Kulbeer's mark in the gate stamp's Signature box, matched by its shape."""
+class RateCheckLineTests(SimpleTestCase):
+    """Kulbeer's signature on the check stamp's Rate Check line."""
 
-    def _read(self, leave_out="raj-969", **drawn):
-        page, lines = _drawn_stamp(**drawn)
-        others = [stamp_signature.mark_shape(255 - m) for m in _kept_marks(leave_out).values()]
-        with mock.patch.object(stamp_signature, "reference_shapes", return_value=others):
-            return stamp_signature.read_stamp_signature(page, lines, "Kulbeer")
+    def _read(self, image, lines, leave_out="ssy-2096"):
+        others = [rate_check_signature._shape(255 - cut) for cut in _kept_signatures(leave_out).values()]
+        with mock.patch.object(rate_check_signature, "reference_shapes", return_value=others):
+            return rate_check_signature.read_rate_check(image, lines, "Kulbeer")
 
-    def test_each_kept_mark_matches_the_others(self):
-        marks = {name: stamp_signature.mark_shape(255 - m) for name, m in _kept_marks().items()}
-        self.assertEqual(len(marks), 6)
-        for name, shape in marks.items():
-            with self.subTest(mark=name):
-                best = max(stamp_signature.likeness(shape, other) for o, other in marks.items() if o != name)
+    def _turned(self, image, angle):
+        import cv2
+        turn = cv2.getRotationMatrix2D((350, 280), angle, 1.0)
+        return cv2.warpAffine(image, turn, (image.shape[1], image.shape[0]), borderValue=(255, 255, 255))
+
+    def test_each_kept_signature_matches_the_others(self):
+        shapes = {name: rate_check_signature._shape(255 - cut) for name, cut in _kept_signatures().items()}
+        self.assertEqual(len(shapes), 7)
+        for name, shape in shapes.items():
+            with self.subTest(signature=name):
+                best = max(rate_check_signature.likeness(shape, other) for o, other in shapes.items() if o != name)
                 self.assertGreaterEqual(best, checks.SIGNATURE_MATCH_MIN)
 
-    def test_his_mark_on_the_stamp_is_his(self):
-        raj = _kept_marks()["kulbeer_raj-969"]
-        for angle in (0.0, 2.0):  # stamps go on by hand, at an angle
+    def test_his_signature_across_the_line_is_his(self):
+        for angle in (0.0, 3.0):  # stamps go on by hand, at an angle
             with self.subTest(angle=angle):
-                mark = self._read(mark=raj, angle=angle)
-                self.assertEqual((mark["found"], mark["signed"]), (True, True))
-                self.assertGreaterEqual(mark["match"], checks.SIGNATURE_MATCH_MIN)
+                image = _page()
+                lines = _check_stamp(image)
+                _sign(image, _kept_signatures()["kulbeer_ssy-2096"])
+                line = self._read(self._turned(image, angle), lines)
+                self.assertEqual((line["found"], line["signed"]), (True, True))
+                self.assertGreaterEqual(line["match"], checks.SIGNATURE_MATCH_MIN)
 
-    def test_found_by_its_printed_word_when_its_borders_break_up(self):
-        # Landed on the bill's table (Pioneer PP/R/26-27/1627): no long border lines.
-        mark = self._read(mark=_kept_marks()["kulbeer_raj-969"], borders=False)
-        self.assertGreaterEqual(mark["match"], checks.SIGNATURE_MATCH_MIN)
+    def test_on_a_black_and_white_scan(self):
+        image = _page()
+        lines = _check_stamp(image, colour=False)
+        _sign(image, _kept_signatures()["kulbeer_ssy-2096"], colour=False)
+        self.assertGreaterEqual(self._read(image, lines)["match"], checks.SIGNATURE_MATCH_MIN)
 
-    def test_someone_elses_signature_is_not(self):
-        for text in ("Raj", "Amit"):
+    def test_a_blank_line_is_unsigned(self):
+        image = _page()
+        line = self._read(image, _check_stamp(image))
+        self.assertEqual((line["found"], line["signed"], line["match"]), (True, False, None))
+
+    def test_someone_elses_signature_is_not_his(self):
+        import cv2
+        for name in ("Amit", "Raj"):
+            with self.subTest(name=name):
+                image = _page()
+                lines = _check_stamp(image)
+                # As big as a signature: from well above the rule to below it.
+                cv2.putText(image, name, (330, 352), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 3.0, PEN_BLUE, 3)
+                line = self._read(image, lines)
+                self.assertTrue(line["signed"])
+                self.assertLess(line["match"], checks.SIGNATURE_MATCH_MIN)
+
+    def test_the_gate_stamp_after_the_line_is_not_a_signature(self):
+        import cv2
+        image = _page()
+        lines = _check_stamp(image)
+        # The gate stamp's box and its handwritten vehicle no., level with the line.
+        cv2.rectangle(image, (700, 180), (1100, 420), STAMP_BLUE, 4)
+        cv2.putText(image, "V.No. HR69F", (720, 335), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.5, PEN_BLUE, 3)
+        self.assertFalse(self._read(image, lines)["signed"])
+
+    def test_found_under_the_other_two_labels_when_ocr_missed_it(self):
+        image = _page()
+        lines = _check_stamp(image, labels=("Quantity Check", "Quality Check"))
+        _sign(image, _kept_signatures()["kulbeer_ssy-2096"])
+        self.assertGreaterEqual(self._read(image, lines)["match"], checks.SIGNATURE_MATCH_MIN)
+
+    def test_label_as_ocr_misreads_it(self):
+        for text in ("Rate Chock", "Rato Check", "iate Check", "Rate Chosk"):
             with self.subTest(text=text):
-                self.assertLess(self._read(text=text)["match"], checks.SIGNATURE_MATCH_MIN)
+                quality = {"page": 1, "text": "Quality Cho«k", "box": [100, 236, 284, 276]}
+                rate = {"page": 1, "text": text, "box": [100, 300, 284, 340]}
+                self.assertEqual(rate_check_signature.rate_check_label([quality, rate]), [100, 300, 284, 340])
 
-    def test_a_blank_box_is_unsigned(self):
-        self.assertEqual(self._read(), {"found": True, "signed": False, "signer": "Kulbeer", "match": None})
+    def test_the_bills_rate_column_is_not_the_label(self):
+        lines = [{"page": 1, "text": "Rate", "box": [1000, 800, 1060, 830]},
+                 {"page": 1, "text": "HSN/SAC Tax Rate", "box": [60, 1500, 290, 1540]}]
+        self.assertIsNone(rate_check_signature.rate_check_label(lines))
 
     def test_no_stamp_on_the_page(self):
-        page, lines = _drawn_stamp()
-        self.assertEqual(stamp_signature.read_stamp_signature(page, lines[:1], "Kulbeer"), {"found": False})
+        self.assertEqual(self._read(_page(), []), {"found": False})
 
-    def test_the_buyers_name_is_not_the_stamp(self):
-        lines = [
-            {"page": 1, "text": "JIVO WELLNESS PVT. LTD - GANNUR", "score": 0.9, "box": [93, 572, 585, 602]},
-            {"page": 1, "text": "20/9/2 & 10/1/2, VILLAGE BAKHARPUR", "score": 0.9, "box": [93, 600, 500, 625]},
-        ]
-        self.assertEqual(stamp_signature.stamp_headings(lines), [])
-
-    def test_the_village_line_read_together_with_the_bills_print(self):
-        # Pioneer PP/R/26-27/1627: the stamp sits over the bill's "IGST".
-        heading = {"page": 1, "text": "JIVO WELLNESS PVT. LTD.", "score": 0.9, "box": [927, 1220, 1360, 1267]}
-        village = {"page": 1, "text": "IGST Village Bhakharpur C naur, Sonipat I ryana", "score": 0.9,
-                   "box": [874, 1254, 1351, 1303]}
-        self.assertEqual(stamp_signature.stamp_headings([heading, village]), [heading])
-
-    def test_his_kept_marks_are_found_by_name(self):
-        self.assertEqual(len(stamp_signature.reference_shapes("Kulbeer")), 6)
-        self.assertEqual(stamp_signature.reference_shapes("Someone"), [])
+    def test_his_kept_signatures_are_found_by_name(self):
+        self.assertEqual(len(rate_check_signature.reference_shapes("Kulbeer")), 7)
+        self.assertEqual(rate_check_signature.reference_shapes("Someone"), [])
 
 
 class RowsTests(SimpleTestCase):
@@ -1368,18 +1349,31 @@ class InvoiceReaderTests(SimpleTestCase):
 
     def test_a_photo_is_read_into_rows_po_numbers_and_the_rate_check(self):
         image = _page()
-        label = _stamp(image)
         page_lines = [
             {"page": 1, "text": "Invoice No. : SNP-0969/26-27", "score": 1, "box": [80, 100, 500, 120]},
             {"page": 1, "text": "PO_NUMBER : 220926043", "score": 1, "box": [820, 101, 1200, 121]},
-            label,
+            *_check_stamp(image),
         ]
         with mock.patch("ap_invoice_draft.invoice_reader._ocr", return_value=page_lines):
             data, engine = read_invoice(self._png(image), "RAJ-969.jpg")
         self.assertIn("RapidOCR", engine)
         self.assertEqual(data["po_numbers"], ["220926043"])
         self.assertEqual(data["rows"][0]["text"], "Invoice No. : SNP-0969/26-27 PO_NUMBER : 220926043")
-        self.assertEqual(data["rate_check"]["signed"], False)
+        self.assertEqual((data["rate_check"]["found"], data["rate_check"]["signed"]), (True, False))
+        self.assertEqual(data["rate_check"]["signer"], "")
+
+    def test_a_stamp_read_into_the_bills_print_is_read_again_in_its_own_ink(self):
+        # TPAC 2606001529: the stamp landed on the bill's footer and OCR read
+        # its labels into the print ("SUBJECT TO HARIDWAR U2QUBUTYHIONGK").
+        image = _page()
+        stamp = _check_stamp(image)
+        _sign(image, _kept_signatures()["kulbeer_ssy-2096"])
+        printed = [{"page": 1, "text": "SUBJECT TO HARIDWAR U2QUBUTYHIONGK", "score": 1, "box": [80, 240, 700, 280]}]
+        with mock.patch("ap_invoice_draft.invoice_reader._ocr", side_effect=[printed, stamp]) as ocr:
+            data, _ = read_invoice(self._png(image), "TPAC-1529.jpg", signer="Kulbeer")
+        self.assertEqual(ocr.call_count, 2)
+        self.assertEqual((data["rate_check"]["found"], data["rate_check"]["signed"]), (True, True))
+        self.assertGreaterEqual(data["rate_check"]["match"], checks.SIGNATURE_MATCH_MIN)
 
     def test_nothing_read_is_an_error(self):
         with mock.patch("ap_invoice_draft.invoice_reader._ocr", return_value=[]):

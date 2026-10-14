@@ -26,10 +26,11 @@ EXPECTED_WAREHOUSE = "BH-PM"
 GRPO_DAYS_AFTER_ARRIVAL = 3
 #: Whose signature the bill's "Rate Check" line must carry.
 RATE_CHECKER = "Kulbeer"
-#: How alike the mark in the gate stamp's Signature box must be to his kept
-#: marks (``stamp_signature.likeness``, 0..1) to be his. His own score
-#: 0.69-0.75 against each other, other handwriting on the bills at most 0.57.
-SIGNATURE_MATCH_MIN = 0.62
+#: How alike the signature on the Rate Check line must be to his kept ones
+#: (``rate_check_signature.likeness``, 0..1) to be his. His own score
+#: 0.61-0.69 against each other; other people's signatures on the check
+#: stamp, and a vendor's seal across the line, at most 0.46.
+SIGNATURE_MATCH_MIN = 0.53
 #: Who the printed Purchase Order must name as its approver.
 PO_APPROVER = "Gagandeep Singh"
 #: The gate's over-receipt allowance, as ``raw_material_gatein`` applies it.
@@ -56,7 +57,7 @@ LABELS = {
     "warehouse": f"GRPO is received into {EXPECTED_WAREHOUSE}",
     "gst": "Invoice GST matches the PO's GST",
     "grpo_timing": f"GRPO made within {GRPO_DAYS_AFTER_ARRIVAL} days of arrival",
-    "rate_check_signature": f"{RATE_CHECKER}'s signature on the invoice's stamp",
+    "rate_check_signature": f"{RATE_CHECKER}'s signature on the invoice's Rate Check stamp",
     "po_approver": f"PO print approved by {PO_APPROVER}",
     "po_rate": "PO rate matches GRPO rate",
     "invoice_qty": "Invoice qty matches GRPO qty",
@@ -374,41 +375,43 @@ def check_grpo_timing(grpo: dict, invoice: Optional[dict], arrival: Optional[dic
 # ---------------------------------------------------------------------------
 
 def check_rate_check_signature(invoice: Optional[dict]) -> Finding:
-    """From ``invoice["stamp_signature"]``: the mark in the gate stamp's
-    Signature box, held to Kulbeer's kept marks by its shape
-    (``stamp_signature.read_stamp_signature``)."""
+    """From ``invoice["rate_check"]``: what is written on the check stamp's
+    Rate Check line, held to Kulbeer's kept signatures by its shape
+    (``rate_check_signature.read_rate_check``)."""
     if invoice is None:
         return _finding("rate_check_signature", CheckStatus.UNKNOWN, NOT_READ)
-    mark = invoice.get("stamp_signature")
-    if mark is None:
+    line = invoice.get("rate_check") or {}
+    if line.get("found") and "signer" not in line:
+        # Read before signatures were held to his (2026-10-13).
         return _finding(
             "rate_check_signature", CheckStatus.REVIEW,
-            "The bill was read before the stamp's signature was looked at. Read the bill again.",
+            "The bill was read before signatures were matched. Read the bill again.",
         )
-    match = mark.get("match")
-    facts = {"match": match}
-    if not mark.get("found"):
+    match = line.get("match")
+    facts = {"ink": line.get("ink"), "match": match}
+    if not line.get("found"):
         return _finding(
             "rate_check_signature", CheckStatus.REVIEW,
-            "The stamp's Signature box could not be found on the scan. Check the paper.", **facts,
+            "The Rate Check stamp could not be found on the scan. Check the paper.", **facts,
         )
-    if not mark.get("signed"):
+    if not line.get("signed"):
         return _finding(
-            "rate_check_signature", CheckStatus.FAIL, "Nobody has signed the stamp's Signature box.", **facts,
+            "rate_check_signature", CheckStatus.FAIL, "Nobody has signed the Rate Check line.", **facts,
         )
     if match is None:
         return _finding(
             "rate_check_signature", CheckStatus.REVIEW,
-            f"The stamp is signed. Confirm it is {RATE_CHECKER}'s.", **facts,
+            f"The Rate Check line is signed. Confirm it is {RATE_CHECKER}'s.", **facts,
         )
     if match >= SIGNATURE_MATCH_MIN:
         return _finding(
             "rate_check_signature", CheckStatus.PASS,
-            f"The stamp is signed with {RATE_CHECKER}'s mark (likeness {match:.2f}).", **facts,
+            f"{RATE_CHECKER} has signed the Rate Check line (likeness {match:.2f}).", **facts,
         )
     return _finding(
         "rate_check_signature", CheckStatus.REVIEW,
-        f"The stamp is signed, but not like {RATE_CHECKER}'s mark (likeness {match:.2f}). Confirm whose it is.",
+        f"The Rate Check line is signed, but not like {RATE_CHECKER}'s signature (likeness {match:.2f}). "
+        "Confirm whose it is.",
         **facts,
     )
 
