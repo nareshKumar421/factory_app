@@ -220,6 +220,28 @@ class PlantBoardReader:
         """
         return self._rows(query, [PRODUCTION_FLOOR, date_from, date_to])
 
+    def floor_production_by_item_day(self, date_from, date_to) -> List[Dict[str, Any]]:
+        """The same receipts again, by SKU AND day, for the date-wise drill.
+
+        Dated by the receipt's posting, which is what lets the drill set it
+        against the lines' own run dates and show where a day was posted late.
+        """
+        query = f"""
+            SELECT
+                N."ItemCode"                                  AS "ItemCode",
+                N."DocDate"                                   AS "Day",
+                SUM(N."InQty")                                AS "Pieces",
+                SUM(N."InQty" * ({LITRES_PER_UNIT}))          AS "Litres"
+            FROM "{self.schema}"."OINM" N
+            JOIN "{self.schema}"."OITM" M ON M."ItemCode" = N."ItemCode"
+            WHERE N."TransType" = {TRANS_TYPE_PRODUCTION_RECEIPT}
+              AND N."Warehouse" = ?
+              AND IFNULL(N."InQty", 0) > 0
+              AND N."DocDate" >= ? AND N."DocDate" <= ?
+            GROUP BY N."ItemCode", N."DocDate"
+        """
+        return self._rows(query, [PRODUCTION_FLOOR, date_from, date_to])
+
     # ------------------------------------------------------------------
     # 3. What was ordered this plan month, and how much of it came
     # ------------------------------------------------------------------

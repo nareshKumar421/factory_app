@@ -1897,6 +1897,32 @@ class PlantBoardService:
                 logger.warning("plant_board: dispatch by item could not be read: %s", exc)
                 dispatch_read = False
 
+        # SAP's receipts per day, for the date-wise drill beside the lines'
+        # own days. Null on a failed read: the totals above still stand.
+        sap_days: Dict[str, List[Dict[str, Any]]] = {}
+        sap_days_read = window_from is not None and window_to is not None
+        if sap_days_read:
+            try:
+                for item in self.reader.floor_production_by_item_day(
+                    window_from, window_to
+                ) or []:
+                    code = item.get("ItemCode")
+                    day = _as_date(item.get("Day"))
+                    if code not in rows or day is None:
+                        continue
+                    sap_days.setdefault(code, []).append(
+                        {
+                            "date": day.isoformat(),
+                            "pieces": round(_f(item.get("Pieces")), 2),
+                            "tons": _tons(item.get("Litres")),
+                        }
+                    )
+                for days in sap_days.values():
+                    days.sort(key=lambda row: row["date"])
+            except Exception as exc:  # noqa: BLE001 - the plan still stands without it
+                logger.warning("plant_board: made by day could not be read: %s", exc)
+                sap_days_read = False
+
         made_days: Dict[str, List[Dict[str, Any]]] = {}
         made_days_read = window_from is not None and window_to is not None
         if made_days_read:
@@ -1911,6 +1937,11 @@ class PlantBoardService:
             planned_qty = held["planned_qty"]
             produced_qty = held["produced_qty"]
             per_case = held.pop("pieces_per_case")
+            if not per_case:
+                # Off the plan there is no case factor, so the row could not
+                # be read in cases at all. The lines' own runs carry SAP's
+                # factor as snapshotted, so take it from them where they agree.
+                per_case = self._case_factor(made_days.get(held["item_code"], []))
             planned_litres = held.pop("planned_litres")
             produced_litres = held.pop("produced_litres")
             places = sorted(
@@ -1954,6 +1985,10 @@ class PlantBoardService:
                     "made_days": (
                         made_days.get(held["item_code"], []) if made_days_read else None
                     ),
+                    # SAP's receipts by posting date, for the same drill.
+                    "sap_made_days": (
+                        sap_days.get(held["item_code"], []) if sap_days_read else None
+                    ),
                     **self._dispatch_figures(
                         dispatched.get(held["item_code"]),
                         dispatch_read,
@@ -1971,6 +2006,18 @@ class PlantBoardService:
             )
         )
         return out
+
+    @staticmethod
+    def _case_factor(days: Sequence[Dict[str, Any]]) -> Optional[float]:
+        """Pieces per case from the made days, if every day gives the same one."""
+        factors = {
+            round(day["pieces"] / day["cases"], 4)
+            for day in days
+            if day.get("pieces") and day.get("cases")
+        }
+        if len(factors) != 1 or any(day.get("pieces") is None for day in days):
+            return None
+        return factors.pop()
 
     def _made_days(
         self, item_codes: Sequence[str], window_from: date, window_to: date

@@ -87,6 +87,9 @@ class FakeReader:
         """The same receipts by SKU. Empty by default, for the same reason."""
         return getattr(self, "floor_item_rows", [])
 
+    def floor_production_by_item_day(self, date_from, date_to):
+        return getattr(self, "floor_day_rows", [])
+
     def stock_by_warehouse(self, item_codes):
         """On hand per SKU and warehouse. Empty by default."""
         return getattr(self, "stock_rows", [])
@@ -2462,6 +2465,23 @@ class PlanBySkuTests(SimpleTestCase):
         )[0]
         self.assertFalse(row["dispatch_read"])
         self.assertIsNone(row["dispatch_qty"])
+
+
+class CaseFactorTests(SimpleTestCase):
+    """An off-plan SKU's case factor, taken from the lines' own runs."""
+
+    def test_one_factor_across_the_days_is_used(self):
+        days = [{"cases": 10, "pieces": 200}, {"cases": 5, "pieces": 100}]
+        self.assertEqual(PlantBoardService._case_factor(days), 20)
+
+    def test_disagreeing_or_unknown_factors_give_none(self):
+        self.assertIsNone(PlantBoardService._case_factor(
+            [{"cases": 10, "pieces": 200}, {"cases": 10, "pieces": 120}]
+        ))
+        self.assertIsNone(PlantBoardService._case_factor(
+            [{"cases": 10, "pieces": 200}, {"cases": 5, "pieces": None}]
+        ))
+        self.assertIsNone(PlantBoardService._case_factor([]))
 
 
 class MadeDaysTests(TestCase):
